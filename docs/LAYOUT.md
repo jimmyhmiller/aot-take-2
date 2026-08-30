@@ -298,8 +298,8 @@ Written here because they are cheap to state and expensive to learn:
 
 ## 9. Provenance
 
-Simple is Apache License 2.0. We re-implement rather than copy. `NOTICE` carries the attribution;
-`licenses/Apache-2.0.txt` is the license text. Licensing is handled once, there — it is not a
-per-file concern.
+Simple is Apache License 2.0. We re-implement rather than copy. `NOTICE` carries the attribution
+and links to Simple's license. This project is licensed under Apache License 2.0 through the root
+`LICENSE`; licensing is handled once at project level, not per file.
 
 `jsl/` is not derived from Simple.

@@ -113,8 +113,8 @@ Read Simple's source before writing that header. Not memory — the source. Wher
 that is a decision to record, and having Simple's version on the same screen is what makes the
 divergence visible as a decision instead of a drift.
 
-Licensing is handled once, at the project level, in `NOTICE` and `licenses/Apache-2.0.txt`. It is
-not a per-file concern.
+Licensing is handled once at project level: `LICENSE` licenses this project under Apache-2.0, and
+`NOTICE` attributes Simple and links to its license. It is not a per-file concern.
 
 ---
 

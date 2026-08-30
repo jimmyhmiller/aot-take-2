@@ -62,11 +62,9 @@ This project re-implements, in Coil, the algorithms demonstrated by
 [SeaOfNodes/Simple](https://github.com/SeaOfNodes/Simple) (Apache License 2.0). No Simple source is
 copied here; what is taken is the design, followed closely and deliberately.
 
-See [NOTICE](NOTICE) for the attribution and [licenses/Apache-2.0.txt](licenses/Apache-2.0.txt) for
-the license text.
+See [NOTICE](NOTICE) for the Simple attribution and
+[Simple's license](https://github.com/SeaOfNodes/Simple/blob/7657c2312ac4d3d9ad3f0f992d023d4443055a75/LICENSE).
 
 `jsl/` is not derived from Simple; its definitions cite ECMA-262 directly.
 
-**This project's own license is not yet chosen.** Until it is, treat the repository as
-all-rights-reserved. Note that Apache-2.0 is the upstream license and its terms travel with the
-derived design.
+This project, including `jsl/`, is licensed under the [Apache License, Version 2.0](LICENSE).
