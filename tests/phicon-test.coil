@@ -1,0 +1,159 @@
+;; Pushing a constant up through a Phi.
+
+;;
+;; `(x op (phi c0 c1 …)) op k` becomes `x op (phi (c0 op k) (c1 op k) …)` — a merge of constants
+;; followed by an operation becomes a merge of ALREADY-COMPUTED constants. In a loop that is the
+;; difference between doing the arithmetic every iteration and doing it never.
+(module aot.tests.phicon)
+(import "coil.assert" :use *)
+(import "aot.node.boot" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.arith" :use *)
+(import "aot.node.compare" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.node.phicon" :use *)
+(import "aot.tests.support" :use *)
+(import "aot.type.type" :use *)
+
+;; Build a 3-path Region with a Phi of three constants on it, so nothing is on the edge of
+;; collapsing. Returns the Phi.
+(defn mk-const-phi [(a i64) (b i64) (c i64)] (-> (dyn NodeOps))
+  (let [st (start-make (ty-int-bot))
+        r (region-make)]
+    (region-add-path! r (cproj-make st 0 "p0"))
+    (region-add-path! r (fresh-ctrl (cproj-make st 0 "c")))
+    (region-add-path! r (fresh-ctrl (cproj-make st 0 "c")))
+    (let [p (phi-make r (ty-int-bot) "cs")]
+      (phi-add-value! p (con-int a))
+      (phi-add-value! p (con-int b))
+      (phi-add-value! p (con-int c))
+      (n-keep! p)
+      p)))
+
+(deftest pcon_accepts_a_phi_of_constants_and_rejects_one_that_is_not
+         (boot! 1)
+         (let [p (mk-const-phi 1 2 3)
+               probe (con-int 0)]
+           (assert (match (pcon p probe) (Some [_] true) (None [] false))))
+         (let [st (start-make (ty-int-bot))
+               r (region-make)]
+           (region-add-path! r (cproj-make st 0 "p0"))
+           (region-add-path! r (fresh-ctrl (cproj-make st 0 "c")))
+           (region-add-path! r (fresh-ctrl (cproj-make st 0 "c")))
+           (let [p (phi-make r (ty-int-bot) "mixed")]
+             (phi-add-value! p (con-int 1))
+             (phi-add-value! p (con-make (ty-int-range 0 9)))  ; not a constant
+             (phi-add-value! p (con-int 3))
+             (n-keep! p)
+             (assert (match (pcon p (con-int 0)) (Some [_] false) (None [] true))))))
+
+(deftest a_constant_is_pushed_up_through_a_phi_and_folds_on_every_arm
+         ;; This is the whole rewrite: `(phi 1 2 3) + 10` becomes `(phi 11 12 13)`, with the additions
+         ;; already done.
+         (boot! 1)
+         (let [p (mk-const-phi 1 2 3)
+               sum (add-make p (con-int 10))]
+           (n-keep! sum)
+           (add-set-mode! sum MODE-INT)
+           (match (phi-con sum true)
+             (None [] (assert false))
+             (Some [r]
+                   (do
+                     (assert-eq (n-op r) OP-PHI)
+                     ;; Each arm is a folded constant, not a surviving Add.
+                     (assert-eq (n-ty (n-in! r 1)) (ty-int-con 11))
+                     (assert-eq (n-ty (n-in! r 2)) (ty-int-con 12))
+                     (assert-eq (n-ty (n-in! r 3)) (ty-int-con 13)))))))
+
+(deftest the_rewrite_is_refused_when_the_phi_is_about_to_collapse
+         ;; A 2-input Phi is collapsing. Racing it produces a Phi on a Region that no longer exists.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               r (region-make)]
+           (region-add-path! r (cproj-make st 0 "p0"))
+           (let [p (phi-make r (ty-int-bot) "one")]
+             (phi-add-value! p (con-int 1))
+             (n-keep! p)
+             (let [sum (add-make p (con-int 10))]
+               (n-keep! sum)
+               (add-set-mode! sum MODE-INT)
+               (assert (match (phi-con sum true) (Some [_] false) (None [] true)))))))
+
+(deftest the_rewrite_is_refused_when_the_right_side_is_high
+         ;; Acting on an unanalysed operand is acting on nothing.
+         (boot! 1)
+         (let [p (mk-const-phi 1 2 3)
+               sum (add-make p (con-make TY-TOP))]
+           (n-keep! sum)
+           (assert (match (phi-con sum true) (Some [_] false) (None [] true)))))
+
+(deftest the_rewrite_is_refused_when_the_right_side_is_neither_constant_nor_a_const_phi
+         (boot! 1)
+         (let [p (mk-const-phi 1 2 3)
+               sum (add-make p (con-make (ty-int-range 0 9)))]
+           (n-keep! sum)
+           (add-set-mode! sum MODE-INT)
+           (assert (match (phi-con sum true) (Some [_] false) (None [] true)))))
+
+(deftest two_phis_must_be_on_the_same_region
+         ;; Otherwise the arms do not correspond and the rewrite merges values from different merges.
+         (boot! 1)
+         (let [p1 (mk-const-phi 1 2 3)
+               p2 (mk-const-phi 10 20 30)  ; a DIFFERENT region
+               sum (add-make p1 p2)]
+           (n-keep! sum)
+           (add-set-mode! sum MODE-INT)
+           (assert (match (phi-con sum true) (Some [_] false) (None [] true)))))
+
+(deftest binop_copy_preserves_the_operator_and_the_mode
+         ;; A copy that reverted to UNKNOWN would have to re-derive the mode, and on operands that are not
+         ;; yet typed it would derive the wrong one. And `a < b` copied must not become `a <= b`.
+         (boot! 1)
+         (let [a (con-make (ty-int-range 0 10))
+               b (con-make (ty-int-range 5 20))
+               lt (lt-make a b)]
+           (cmp-set-mode! lt MODE-INT)
+           (match (n-binop-copy lt b a)
+             (None [] (assert false))
+             (Some [c]
+                   (do
+                     (assert-eq (n-op c) OP-LT)
+                     (assert-eq (cmp-mode c) MODE-INT)))))
+         (let [x (con-make (ty-int-range 0 10))
+               y (con-make (ty-int-range 5 20))
+               s (add-make x y)]
+           (add-set-mode! s MODE-INT)
+           (match (n-binop-copy s y x)
+             (None [] (assert false))
+             (Some [c]
+                   (do
+                     (assert-eq (n-op c) OP-ADD)
+                     (assert-eq (add-mode c) MODE-INT))))))
+
+(deftest a_non_binop_reports_that_it_cannot_copy
+         ;; The default answer, so a rewrite written over "some binary operator" bails cleanly rather than
+         ;; building a malformed node.
+         (boot! 1)
+         (let [c (con-int 5)]
+           (assert (match (n-binop-copy c c c) (Some [_] false) (None [] true)))))
+
+(deftest all_cons_registers_a_dependency_on_the_first_non_constant
+         ;; So that a rewrite blocked today is retried when that input sharpens. Without it the
+         ;; optimisation is simply lost, and the loss is invisible.
+         (boot! 1)
+         (let [p (mk-const-phi 1 2 3)
+               probe (con-int 0)]
+           (assert (n-all-cons? p probe)))
+         (let [st (start-make (ty-int-bot))
+               r (region-make)]
+           (region-add-path! r (cproj-make st 0 "p0"))
+           (region-add-path! r (fresh-ctrl (cproj-make st 0 "c")))
+           (region-add-path! r (fresh-ctrl (cproj-make st 0 "c")))
+           (let [p (phi-make r (ty-int-bot) "mixed")]
+             (phi-add-value! p (con-int 1))
+             (phi-add-value! p (con-make (ty-int-range 0 9)))
+             (phi-add-value! p (con-int 3))
+             (n-keep! p)
+             (assert (not (n-all-cons? p (con-int 0)))))))

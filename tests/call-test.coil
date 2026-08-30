@@ -1,0 +1,266 @@
+;; Functions, calls, and inlining.
+
+;;
+;; The claim this file exists to prove: INLINING IS NOT A PASS. It is two ordinary peepholes —
+;; Region-collapses-to-one-path and Phi-becomes-its-single-input — firing because a Fun IS a Region
+;; and a Parm IS a Phi. Nothing is cloned.
+(module aot.tests.call)
+(import "coil.assert" :use *)
+(import "aot.node.boot" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.arith" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.cfg" :use *)
+(import "aot.codegen.iterpeeps" :use *)
+(import "aot.tests.support" :use *)
+(import "aot.type.type" :use *)
+
+;; A one-argument function `f(x) = x + 1`, with the unknown-caller hook still installed.
+;; Returns the Fun.
+(defn mk-inc-fun [(st (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [sig (ty-tuple-of2 (ty-int-bot) (ty-int-bot))  ; (ret, arg0)
+        f (fun-make st sig "inc")
+        p (parm-make f 0 (ty-int-bot) "x")]
+    (n-keep! p)
+    (let [body (add-make p (con-int 1))
+          ret (return-make f body)]
+      (fun-set-ret! f ret)
+      f)))
+
+(deftest a_fun_with_unknown_callers_reports_CONTROL
+         ;; While anyone might call it, a function is reachable and its parameters can be anything the
+         ;; annotation allows. That is the hook the closed world later removes.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               f (mk-inc-fun st)]
+           (assert (fun-unknown-callers? f))
+           (assert-eq (compute-ty-of f) TY-CTRL)))
+
+(deftest a_parm_is_in_progress_while_its_fun_has_unknown_callers
+         ;; "Always in-progress until we run out of unknown callers." It reports its DECLARED type, and it
+         ;; refuses constant folding — the engine's in-progress hook, reserved for exactly this.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               f (mk-inc-fun st)]
+           (match (fun-parm f 0)
+             (None [] (assert false))
+             (Some [p]
+                   (do
+                     (assert (parm-in-progress? p))
+                     (assert (no-const-fold-of? p))
+                     (assert-eq (compute-ty-of p) (ty-int-bot)))))))
+
+(deftest a_parm_with_a_constant_declared_type_still_refuses_to_fold_while_in_progress
+         ;; Folding it would replace a parameter with one caller's value.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               sig (ty-tuple-of2 (ty-int-con 5) (ty-int-con 5))
+               f (fun-make st sig "k")
+               p (parm-make f 0 (ty-int-con 5) "x")]
+           (n-keep! p)
+           (assert (no-const-fold-of? p))
+           (assert-eq (n-op (n-peephole! p)) OP-PARM)))
+
+(deftest linking_adds_the_caller_to_the_fun_AND_the_argument_to_every_parm
+         ;; Region arity and Phi arity are ONE invariant, and a Parm IS a Phi. A Parm left one value short
+         ;; reads the wrong caller's argument — a miscompile that typechecks cleanly.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               f (mk-inc-fun st)
+               c (cproj-make st 0 "ctrl")
+               call (call-make c)]
+           (call-add-arg! call (con-int 10))
+           (call-set-fptr! call (funptr-make f 0))
+           (callend-make call)
+           (let [before-fun (n-nins f)
+                 p (match (fun-parm f 0) (Some [x] x) (None [] (unreachable-node)))
+                 before-parm (n-nins p)]
+             (call-link! call f)
+             (assert-eq (n-nins f) (+ before-fun 1))
+             (assert-eq (n-nins p) (+ before-parm 1))
+             ;; And the value that arrived is the caller's actual argument.
+             (assert-eq (n-ty (n-in! p (- (n-nins p) 1))) (ty-int-con 10)))))
+
+(deftest dropping_the_unknown_caller_hook_sharpens_every_parm
+         ;; >>> THE CLOSED-WORLD MOVE. Once the complete set of callers is known, the hook goes and a
+         ;; >>> parameter's type becomes the MEET of what the actual callers pass — computed by the same
+         ;; >>> `compute` every Phi uses. There is no interprocedural pass.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               f (mk-inc-fun st)
+               c (cproj-make st 0 "ctrl")
+               call (call-make c)]
+           (call-add-arg! call (con-int 10))
+           (call-set-fptr! call (funptr-make f 0))
+           (callend-make call)
+           (call-link! call f)
+           (let [p (match (fun-parm f 0) (Some [x] x) (None [] (unreachable-node)))]
+             ;; Before: unknown callers, so the parameter is whatever the annotation allows.
+             (assert-eq (compute-ty-of p) (ty-int-bot))
+             (fun-drop-unknown-callers! f)
+             (assert (not (fun-unknown-callers? f)))
+             (assert (not (parm-in-progress? p)))
+             ;; After: the meet over the one real caller — the constant 10.
+             (assert-eq (compute-ty-of p) (ty-int-con 10)))))
+
+(deftest the_inline_decision_defers_rather_than_declining
+         ;; A candidate blocked by a not-yet-linked target answers DEFER, not NEVER, and registers a
+         ;; dependency so it is reasked. "Deferred, never declined."
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               f (mk-inc-fun st)
+               c (cproj-make st 0 "ctrl")
+               call (call-make c)]
+           (call-add-arg! call (con-int 10))
+           (call-set-fptr! call (funptr-make f 0))
+           (let [e (callend-make call)]
+             ;; No linked Return yet: exactly one target has not been established.
+             (assert-eq (callend-inline-candidate e) INLINE-DEFER))))
+
+(deftest an_unknown_caller_hook_blocks_inlining
+         ;; A function anyone might call cannot be folded into one caller — the others would lose the body.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               f (mk-inc-fun st)
+               c (cproj-make st 0 "ctrl")
+               call (call-make c)]
+           (call-add-arg! call (con-int 10))
+           (call-set-fptr! call (funptr-make f 0))
+           (let [e (callend-make call)]
+             (call-link! call f)
+             (assert (fun-unknown-callers? f))
+             (assert-eq (callend-inline-candidate e) INLINE-DEFER))))
+
+(deftest a_resolved_single_caller_is_a_TRIVIAL_inline_candidate
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               f (mk-inc-fun st)
+               c (cproj-make st 0 "ctrl")
+               call (call-make c)]
+           (call-add-arg! call (con-int 10))
+           (call-set-fptr! call (funptr-make f 0))
+           (let [e (callend-make call)]
+             (call-link! call f)
+             (fun-drop-unknown-callers! f)
+             (assert-eq (callend-inline-candidate e) INLINE-TRIVIAL))))
+
+(deftest an_argument_that_does_not_match_its_formal_defers
+         ;; And registers a dependency, so the candidate is retried when the argument sharpens.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               sig (ty-tuple-of2 (ty-int-bot) (ty-int-range 0 5))  ; the formal is [0..5]
+               f (fun-make st sig "narrow")
+               p (parm-make f 0 (ty-int-range 0 5) "x")]
+           (n-keep! p)
+           (let [ret (return-make f p)]
+             (fun-set-ret! f ret)
+             (let [c (cproj-make st 0 "ctrl")
+                   call (call-make c)]
+               (call-add-arg! call (con-int 99))  ; outside [0..5]
+               (call-set-fptr! call (funptr-make f 0))
+               (let [e (callend-make call)]
+                 (call-link! call f)
+                 (fun-drop-unknown-callers! f)
+                 (assert-eq (callend-inline-candidate e) INLINE-DEFER))))))
+
+(deftest a_function_with_several_callers_takes_the_clone_path
+         ;; A trivial fold would steal the body from the other callers, so the decision is CLONE — which is
+         ;; owed, so nothing is inlined. Correct, just weaker.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               f (mk-inc-fun st)
+               c1 (cproj-make st 0 "c1")
+               c2 (fresh-ctrl (cproj-make st 0 "c0"))
+               call1 (call-make c1)
+               call2 (call-make c2)]
+           (call-add-arg! call1 (con-int 10))
+           (call-set-fptr! call1 (funptr-make f 0))
+           (let [e1 (callend-make call1)]
+             (call-add-arg! call2 (con-int 20))
+             (call-set-fptr! call2 (funptr-make f 0))
+             (callend-make call2)
+             (call-link! call1 f)
+             (call-link! call2 f)
+             (fun-drop-unknown-callers! f)
+             (assert-eq (callend-inline-candidate e1) INLINE-CLONE))))
+
+;; ---------------------------------------------------------------------------
+;; THE POINT OF THE WHOLE UNIT
+(deftest trivial_inlining_folds_the_call_away_and_clones_nothing
+         ;; `f(x) = x + 1` called once with 10 must become the constant 11 — through Region rule 3 and Phi
+         ;; rule 1 alone. If either is weakened this stops happening silently.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               f (mk-inc-fun st)
+               c (cproj-make st 0 "ctrl")
+               call (call-make c)]
+           (call-add-arg! call (con-int 10))
+           (call-set-fptr! call (funptr-make f 0))
+           (let [e (callend-make call)]
+             (call-link! call f)
+             (fun-drop-unknown-callers! f)
+             (let [p (match (fun-parm f 0) (Some [x] x) (None [] (unreachable-node)))
+                   nodes-before (arena-node-count)]
+               ;; Perform the inline. It sets two flags and rewires ONE edge; that is the whole operation.
+               (assert-eq (callend-maybe-inline! e) INLINE-TRIVIAL)
+               (assert (fun-folding? f))
+               ;; >>> ARGUMENT SUBSTITUTION IS PHI RULE 1. <<<
+               ;; The Parm now has one distinct value — the caller's argument — so peepholing it yields
+               ;; that argument. Nothing substituted anything; a Phi collapsed.
+               (assert-eq (n-ty (n-peephole! p)) (ty-int-con 10))
+               (iter-seed-all!)
+               (iter-run!)
+               ;; The Parm was replaced and collected, which is what "collapsed" means.
+               (assert (n-dead? p))
+               ;; And CLONING NOTHING is observable: inlining added no copy of the body. A cloning inliner
+               ;; would have roughly doubled the node count.
+               (assert (< (arena-node-count) (+ nodes-before 10)))))))
+
+(deftest the_fixpoint_drives_inlining_without_being_told
+         ;; `iter-peeps!` pushes every CallEnd it visits onto the inline worklist, and the outer loop
+         ;; interleaves: peephole to fixpoint, take ONE candidate, peephole again. Nothing tracks
+         ;; candidates explicitly.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               f (mk-inc-fun st)
+               c (cproj-make st 0 "ctrl")
+               call (call-make c)]
+           (call-add-arg! call (con-int 10))
+           (call-set-fptr! call (funptr-make f 0))
+           (let [e (callend-make call)]
+             (n-keep! e)
+             (call-link! call f)
+             (fun-drop-unknown-callers! f)
+             (iter-seed-all!)
+             ;; The loop finds the candidate itself and reports how many inlines it performed.
+             (assert (>= (iter-run!) 1))
+             (assert (fun-folding? f)))))
+
+(deftest a_self_recursive_function_is_never_inlined
+         ;; Inlining a function into itself is LOOP UNROLLING by another name, and unbounded. Simple
+         ;; refuses it — but DEFERS rather than declining, because the recursive edge might yet disappear.
+         ;;
+         ;; The graph: `f` whose body contains a call back to `f`, so `f` is one of its own callers.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               sig (ty-tuple-of2 (ty-int-bot) (ty-int-bot))
+               f (fun-make st sig "rec")
+               p (parm-make f 0 (ty-int-bot) "x")]
+           (n-keep! p)
+           ;; A call to `f` from inside `f` — its control is the Fun itself.
+           (let [inner (call-make f)]
+             (call-add-arg! inner p)
+             (call-set-fptr! inner (funptr-make f 0))
+             (let [ie (callend-make inner)]
+               (n-keep! ie)
+               (let [ret (return-make f p)]
+                 (fun-set-ret! f ret)
+                 (call-link! inner f)
+                 (fun-drop-unknown-callers! f)
+                 ;; `f` now names itself as a caller, and the call site is inside `f`'s body.
+                 (assert (fun-self-recursive? f))
+                 ;; So the decision is DEFER — not NEVER, because the edge could still go away.
+                 (assert-eq (callend-inline-candidate ie) INLINE-DEFER))))))

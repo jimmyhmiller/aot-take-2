@@ -1,0 +1,292 @@
+;; ============================================================================
+
+;; PHI  —  port of Simple's `node/PhiNode.java`
+;; ============================================================================
+;;
+;; Input 0 is the Region or Loop. Inputs 1..n are the values, ONE PER PATH, positionally matched to
+;; the Region's inputs 1..n. A Phi is PINNED: it executes in its Region and code motion may not
+;; move it.
+;;
+;; ## compute — three cases, and the middle one is load-bearing
+;;
+;;     region is dead (XCTRL/TOP)  -> TOP
+;;     region IN PROGRESS          -> the DECLARED type, not the meet
+;;     otherwise                   -> TOP meet over inputs on LIVE paths only
+;;
+;; Two details of the third case matter:
+;;
+;; - It SKIPS paths whose control is XCONTROL or TOP. A Phi does not merge a value that cannot
+;;   arrive. This is what lets a loop Phi have a sensible type before the back edge is analysed —
+;;   and it is also why provisionality hides below any local check, which is why `ty-proven?` has
+;;   to be transitive over the whole input cone rather than a one-level test.
+;;
+;; - It calls `addDep` on each Region input it consults. If a control path later dies, this Phi is
+;;   re-queued. Without that dependency the Phi keeps a stale meet forever.
+;;
+;; ## Loop widening — the termination argument
+;;
+;; On a LOOP Phi whose type is an integer and is FALLING, Simple does not let it fall one value at
+;; a time. `same_but_slightly_wider_than` jumps it toward the declared bound. Consider
+;; `for (i = 0; ...; i++)`: the Phi is 0, then meets 1 to give [0..1], then [0..2] — a fixpoint
+;; that takes as many iterations as the loop has values. Widening jumps to the declared range in a
+;; bounded number of steps. Without it, the optimiser terminates only in the sense that the
+;; universe is finite.
+;;
+;; ## idealize — Simple's rules in order
+;;
+;; 0. If the Region collapsed to something that is not a Region, become `in(1)`.
+;;    If the Region is in progress, or has no inputs, or this Phi is unused — do nothing.
+;;
+;; 1. SINGLE UNIQUE INPUT -> become it. This is the rule that makes inlining work: when a Fun
+;;    collapses to one path its Parms are Phis with one distinct value, and that value is the
+;;    caller's actual argument. Argument substitution is this rule, not a substitution pass.
+;;
+;;    "Unique" ignores self-references, so a loop Phi whose only other input is itself collapses.
+;;
+;; 2. Bail if the Region still has a dead path — it is about to fold, so do not race it.
+;;
+;; 3. PULL THE OP DOWN THROUGH THE PHI ("same_op"). If every input is the same operation with the
+;;    same shape, rewrite `Phi(op(a1,b1), op(a2,b2))` into `op(Phi(a1,a2), Phi(b1,b2))`, creating a
+;;    Phi only for the argument positions that actually differ.
+;;
+;;    The guards are the whole content of the rule, and each one is a bug someone had:
+;;      - same class, same input count, and NO control input (a pinned op cannot be moved);
+;;      - for memory ops, the same alias — merging two different alias classes is a miscompile;
+;;      - a Load whose memory is clobbered by a Store among its users cannot be pulled forward;
+;;      - an Escape or a MemMerge is refused outright (aliases must stay straight);
+;;      - at most ONE input may have other users; two and the rewrite duplicates work rather than
+;;        removing it. `addDep` is registered on the extra users so it retries if they go away;
+;;      - a ScopeNode input means a LAZY PHI that has not been realised yet — not a real value.
+;;
+;; 4. NULL-CHECK MERGES. Two forms, both about not losing the narrowing a guard established:
+;;      - `Phi(zero, Guard_nonzero(N))` -> `N`. The Cast's join effect is being lost anyway.
+;;      - `if (val) ...; Phi(region, false=null, true=val)` -> `val`, when the Region's idom is the
+;;        If that tested `val`. Simple walks up the idom chain from the NULL side to confirm it
+;;        really arrives through the FALSE projection before firing — the pattern is not enough,
+;;        the dominance has to hold.
+;;
+;; ## MemPhi
+;;
+;; A Phi over a memory edge rather than a value edge, carrying an alias class. Same node, same
+;; rules; `PhiNode.make` picks the subclass from the type (alias 1 = the bulk "all memory" phi).
+;; It matters that this is the SAME node kind: every rule above then applies to memory merges with
+;; no second implementation to keep in agreement.
+;;
+;; ## Lazy phis are NOT here
+;;
+;; Simple creates a Phi only when a variable is actually assigned on more than one path; until then
+;; the scope slot points at the enclosing scope. That machinery lives in `aot.node.scope`, because
+;; ============================================================================
+;; STATUS: implemented. Rules 0-2 and the single-unique-input collapse are live and tested.
+;; The same-op pull-down (rule 3) and the null-check merges (rule 4) are recorded below as owed —
+;; they need MemOp and Guard/Cast, which belong to the memory and dynamic units. They are
+;; OPTIMISATIONS: their absence makes weaker code, never wrong code.
+;; ============================================================================
+(module aot.node.phi)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.type.type" :use *)
+
+;; Input 0 is the Region or Loop. Inputs 1..n are the values, ONE PER PATH, positionally matched to
+;; the Region's inputs 1..n.
+(defstruct PhiNode [(hdr NodeHdr) (declared i64) (name (slice u8))])
+
+(defn phi-region [(p (dyn NodeOps))] (-> (dyn NodeOps))
+  (n-in! p 0))
+
+(defn phi-declared-ty [(p (dyn NodeOps))] (-> i64)
+  (if (and (!= (n-op p) OP-PHI) (!= (n-op p) OP-MEMPHI))
+      (do (panic "phi-declared-ty: not a Phi") TY-BOT)
+      (.declared (primitive/cast (ptr PhiNode) (hdr p)))))
+
+;; Simple's three cases:
+;;
+;;   region dead (XCTRL/TOP)  -> TOP
+;;   region IN PROGRESS       -> the DECLARED type, not the meet
+;;   otherwise                -> TOP meet over inputs on LIVE paths ONLY
+;;
+;; Two details of the third case are load-bearing:
+;;
+;;   It SKIPS paths whose control is XCONTROL or TOP. A Phi does not merge a value that cannot
+;;   arrive. That is what lets a loop Phi have a sensible type before the back edge is analysed —
+;;   and it is also why provisionality hides below any local check, which is why `ty-proven?` must
+;;   be transitive over the whole input cone rather than a one-level test.
+;;
+;;   It calls `n-add-dep!` on each Region input consulted. If a control path later dies, this Phi is
+;;   re-queued. Without that dependency the Phi keeps a stale meet forever.
+(defn phi-compute [(p (dyn NodeOps))] (-> i64)
+  (match (n-in-safe p 0)
+    (None [] TY-TOP)
+    (Some [r]
+          (if (or (= (n-ty r) TY-XCTRL) (= (n-ty r) TY-TOP))
+              TY-TOP
+              (if (or (not (or (= (n-op r) OP-REGION) (= (n-op r) OP-LOOP)))
+                      (region-in-progress? r))
+                  ;; In progress: report the DECLARED type. Reporting the meet here lets `i+1` fold
+                  ;; to a literal and deletes the loop.
+                  (phi-declared-ty p)
+                  (let [cnt (n-nins p)
+                        (mut i) 1
+                        (mut t) TY-TOP]
+                    (loop (if (>= (load i) cnt)
+                              (break 0)
+                              (do
+                                (match (n-in-safe r (load i))
+                                  (Some [rc]
+                                        (do
+                                          (n-add-dep! rc p)
+                                          (if (or (= (n-ty rc) TY-XCTRL) (= (n-ty rc) TY-TOP))
+                                              0
+                                              (match (n-in-safe p (load i))
+                                                (Some [v] (set! (mut t) (ty-meet (load t) (n-ty v))))
+                                                (None [] 0)))))
+                                  (None [] 0))
+                                (set! (mut i) (+ (load i) 1))
+                                (continue))))
+                    (load t)))))))
+
+;; The single DISTINCT input, ignoring self-references, or None if the inputs differ.
+;;
+;; >>> THIS IS THE RULE THAT MAKES INLINING WORK. When a Fun collapses to one path its Parms are
+;; >>> Phis with one distinct value, and that value is the caller's actual argument. Argument
+;; >>> substitution IS this rule, not a substitution pass.
+;;
+;; Ignoring self-references is what lets a loop Phi whose only other input is itself collapse.
+(defn phi-single-unique-input [(p (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [cnt (n-nins p)
+        (mut i) 1
+        (mut found) (None [(dyn NodeOps)])
+        (mut differs) false]
+    (loop (if (or (>= (load i) cnt) (load differs))
+              (break 0)
+              (do
+                (match (n-in-safe p (load i))
+                  (Some [v]
+                        (if (n-same? v p)
+                            0  ; self-reference: ignore
+                            (match (load found)
+                              (None [] (set! (mut found) (Some v)))
+                              (Some [f] (if (n-same? f v) 0 (set! (mut differs) true))))))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (if (load differs) (None [(dyn NodeOps)]) (load found))))
+
+;; Does any of the Region's paths carry XCONTROL? If so the Region is about to fold, and this Phi
+;; must not race it.
+(defn phi--region-has-dead-path? [(r (dyn NodeOps))] (-> bool)
+  (let [cnt (n-nins r)
+        (mut i) 1
+        (mut yes) false]
+    (loop (if (or (>= (load i) cnt) (load yes))
+              (break 0)
+              (do
+                (match (n-in-safe r (load i))
+                  (Some [v] (if (= (n-ty v) TY-XCTRL) (set! (mut yes) true) 0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load yes)))
+
+(defn phi-idealize [(p (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (match (n-in-safe p 0)
+    ;; 0. The Region collapsed to something that is not a Region: become input 1.
+    (None [] (n-in p 1))
+    (Some [r]
+          (if (not (or (= (n-op r) OP-REGION) (= (n-op r) OP-LOOP)))
+              (n-in p 1)
+              (if (or (or (region-in-progress? r) (<= (n-nins r) 1)) (= (n-nouts p) 0))
+                  (None [(dyn NodeOps)])
+                  ;; 1. SINGLE UNIQUE INPUT -> become it.
+                  (match (phi-single-unique-input p)
+                    (Some [live] (Some live))
+                    (None []
+                          ;; 2. Bail if the Region still has a dead path — it is about to fold, so
+                          ;; do not race it.
+                          (if (phi--region-has-dead-path? r)
+                              (None [(dyn NodeOps)])
+                              ;; 3, 4: owed. See the header.
+                              (None [(dyn NodeOps)])))))))))
+
+(impl NodeOps PhiNode
+  (hdr [(self (ptr PhiNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr PhiNode))] (-> (slice u8)) (.name self))
+  (is-const? [(self (ptr PhiNode))] (-> bool) false)
+  ;; A Phi on an IN-PROGRESS Region reports its DECLARED type, which may well be constant. Folding
+  ;; it then would replace a loop-carried variable with its initial value — this is exactly the hook
+  ;; the engine reserved for half-built nodes.
+  (no-const-fold? [(self (ptr PhiNode))]
+                  (-> bool)
+                  (match (n-in (primitive/make-dyn NodeOps self) 0)
+                    (Some [r]
+                          (if (or (= (n-op r) OP-REGION) (= (n-op r) OP-LOOP))
+                              (region-in-progress? r)
+                              false))
+                    (None [] true)))
+  ;; PINNED: a Phi executes in its Region and code motion may not move it.
+  (is-pinned? [(self (ptr PhiNode))] (-> bool) true)
+  (binop-copy [(self (ptr PhiNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)]))
+  (compute [(self (ptr PhiNode))] (-> i64) (phi-compute (primitive/make-dyn NodeOps self)))
+  (idealize [(self (ptr PhiNode))]
+            (-> (Option (dyn NodeOps)))
+            (phi-idealize (primitive/make-dyn NodeOps self)))
+  (eq-extra [(self (ptr PhiNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (or (= (n-op other) OP-PHI) (= (n-op other) OP-MEMPHI)))
+  (hash-extra [(self (ptr PhiNode))] (-> i64) 151))
+
+;; Build a Phi on `region` with a declared type.
+;;
+;; While the region is in progress the Phi reports `declared`, NOT the meet of its inputs — the
+;; back-edge value has no type yet.
+(defn phi-make [(region (dyn NodeOps)) (declared i64) (name (slice u8))] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [PhiNode] (alloc/create [PhiNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.declared p) declared)
+    (set! (.name p) name)
+    (n-init! d OP-PHI)
+    (n-add-def! d (Some region))
+    (n-set-ty! d declared)
+    d))
+
+(defn phi-add-value! [(p (dyn NodeOps)) (v (dyn NodeOps))] (-> i64)
+  (n-add-def! p (Some v)))
+
+;; Append a null placeholder, matching an in-progress Region's open final path.
+(defn phi-open! [(p (dyn NodeOps))] (-> i64)
+  (n-add-def! p (None [(dyn NodeOps)])))
+
+;; Close the Phi by filling that placeholder. MUST happen BEFORE the Loop's control back edge.
+;;
+;; The order is the whole of the loop protocol. Close control first and the Phi momentarily reads
+;; its declared zero, `i+1` folds to the literal 1, the Phi loses its only other user, and the loop
+;; is deleted with no error reported.
+(defn phi-close! [(p (dyn NodeOps)) (v (dyn NodeOps))] (-> i64)
+  (let [last (- (n-nins p) 1)]
+    (match (n-in p last)
+      (Some [_] (broken "phi-close!: the phi is not open"))
+      (None [] (n-set-def! p last (Some v))))))
+
+;; --- owed to the memory and dynamic units, and NOT stubs ---
+;;
+;; 3. PULL THE OP DOWN THROUGH THE PHI ("same_op"): `Phi(op(a1,b1), op(a2,b2))` becomes
+;;    `op(Phi(a1,a2), Phi(b1,b2))`, creating a Phi only where the argument positions differ. Its
+;;    guards are the content of the rule and each is a bug someone had: same class, same input
+;;    count, no control input; matching alias for memory ops; a Load clobbered by a Store among its
+;;    users cannot be pulled forward; Escape and MemMerge refused outright; at most ONE input may
+;;    have other users; a ScopeNode input means an unrealised lazy Phi.
+;;
+;; 4. NULL-CHECK MERGES: `Phi(zero, Guard_nonzero(N))` -> `N`, and
+;;    `if (val) …; Phi(region, false=null, true=val)` -> `val` when the Region's idom is the If that
+;;    tested `val` — confirmed by walking the idom chain from the NULL side to check it really
+;;    arrives through the FALSE projection. The pattern alone is not enough; the dominance has to
+;;    hold.
+;;
+;; Both are optimisations. Each gets a named test when its unit lands.

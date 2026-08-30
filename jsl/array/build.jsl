@@ -1,0 +1,612 @@
+;; Array construction. These are the first definitions that ALLOCATE, and they are what make the
+;; read-only entries in `read.jsl` verifiable: a definition can now build the array it then reads,
+;; so the whole path lives inside one function and memory never has to cross a call.
+;;
+;; `%NewArray` allocates and tags; `%ArrayStore` writes an element and yields the new heap, which
+;; the lowering threads. Neither appears as a memory operand in the source.
+
+(builtin InitializeArray :transitioning true :params [(array dyn)] :ret dyn
+  (let [(layout (object-layout-init array OrdinaryObjectBase))
+        (extensible (internal-slot-store layout Extensible true))
+        (family (object-method-family-set extensible ArrayExoticMethods))
+        (prototype (InitializeObjectPrototype family (BuiltinPrototypeValue 17)))]
+    array))
+
+(macro NewArray :transitioning true :params [] :ret dyn
+  (InitializeArray (%NewArray)))
+(builtin IsArray
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-isarray"
+  :spec-name "IsArray"
+  :status partial
+  :deviation "Proxy target recursion and revoked-Proxy TypeError behavior are not yet implemented."
+  :params [(value dyn)] :ret bool
+  (%IsArray value))
+
+(callable ArrayIsArray1 :transitioning true :params [(value dyn)] :ret dyn
+  (%Box (IsArray value)))
+
+(builtin ArrayIsArrayValue :transitioning true :params [] :ret dyn
+  (let [(function (%Box (closure ArrayIsArray1)))
+        (lengthKey (ToPropertyKey "length"))
+        (nameKey (ToPropertyKey "name"))
+        (lengthStored (%DefinePropertyValue function lengthKey (%Box 1)))
+        (lengthMarked (%SetPropertyAttributes function lengthKey 4))
+        (nameStored (%DefinePropertyValue function nameKey (%Box "isArray")))
+        (nameMarked (%SetPropertyAttributes function nameKey 4))]
+    function))
+
+;; https://tc39.es/ecma262/#sec-array-len. The one-argument constructor distinguishes a Number
+;; length from an ordinary first element at runtime; that dispatch belongs here, not in syntax
+;; lowering. ClampedIndex supplies the current machine-index representation of ToUint32-sized
+;; lengths. Exact RangeError validation for non-integral and overflowing lengths remains separate.
+(builtin ArrayFromOne :transitioning true :params [(value dyn)] :ret dyn
+  (let [(out (NewArray))]
+    (if (IsNumber value)
+        (let [(resized (%ArrayResize out (ClampedIndex value 4294967295) out))] out)
+        (let [(stored (%ArrayStore out 0 (%Box value)))] out))))
+
+;; Append one concat argument, spreading it exactly when its runtime tag is Array.
+(builtin ArrayConcatValue :transitioning true :params [(out dyn) (value dyn)] :ret dyn
+  (if (%IsArray value)
+      (let [(array (%UnboxArray value))
+            (len (%ArrayLen array))]
+        (loop [(i 0 int)]
+          (if (%Le len i) out
+            (let [(stored (%ArrayStore out (%ArrayLen out) (%ArrayLoad array i)))]
+              (recur (%Add i 1))))))
+      (let [(stored (%ArrayStore out (%ArrayLen out) value))] out)))
+
+;; Iterative depth-first flattening. The explicit value/depth stacks are the DSL equivalent of
+;; Torque builtins using a work list: recursion remains a source-level policy, not compiler
+;; recursion that would infinitely expand an inlined macro.
+(builtin ArrayFlat :transitioning true :params [(source dyn) (depth dyn)] :ret dyn
+  (let [(object (ObjectFromValue (RequireObjectCoercible source)))
+        (max-depth (ClampedIndex depth 2147483647))
+        (out (%NewArray))
+        (values (%NewArray))
+        (depths (%NewArray))
+        (seed-len (ArrayLikeLength object))
+        (seeded
+          (loop [(i seed-len int) (count 0 int)]
+            (if (%Le i 0) count
+              (let [(j (%Sub i 1))]
+                (if (ArrayLikeHasIndex object j)
+                    (let [(sv (%ArrayStore values (%ArrayLen values) (ArrayLikeGet object j)))
+                          (sd (%ArrayStore depths (%ArrayLen depths) (%BoxInt max-depth)))]
+                      (recur j (%Add count 1)))
+                    (recur j count))))))]
+    (loop [(remaining seeded)]
+      (if (%Le remaining 0) out
+        (let [(slot (%Sub (%ArrayLen values) 1))
+              (value (%ArrayLoad values slot))
+              (d (%UnboxInt (%ArrayLoad depths slot)))
+              (rv (%ArrayResize values slot value))
+              (rd (%ArrayResize depths slot (%Box d)))]
+          (if (if (%Lt 0 d) (%IsArray value) false)
+              (let [(array (%UnboxArray value))
+                    (n (%ArrayLen array))
+                    (pushed
+                      (loop [(i n int) (count 0 int)]
+                        (if (%Le i 0) count
+                          (let [(j (%Sub i 1))]
+                            (if (ArrayLikeHasIndex value j)
+                                (let [(sv (%ArrayStore values (%ArrayLen values)
+                                                       (ArrayLikeGet value j)))
+                                      (sd (%ArrayStore depths (%ArrayLen depths)
+                                                       (%Box (%Sub d 1))))]
+                                  (recur j (%Add count 1)))
+                                (recur j count))))))]
+                (recur (%Add (%Sub remaining 1) pushed)))
+              (let [(stored (%ArrayStore out (%ArrayLen out) value))]
+                (recur (%Sub remaining 1)))))))))
+
+;; https://tc39.es/ecma262/#sec-array.prototype.push, ONE ARGUMENT AT A TIME.
+;;
+;; The spec's `push` is variadic and JSL has no variadic signature, so the frontend keeps the
+;; argument loop and calls this once per argument. That is not a workaround being tolerated: the
+;; loop is over the SYNTAX, whose length is known at compile time, so unrolling it in the frontend
+;; is what a variadic JSL definition would have had to be lowered into anyway.
+;;
+;; The length is re-read on each call rather than being carried, which is what makes the
+;; one-at-a-time factoring correct: the answer is the length AFTER this element, so `a.push(x, y)`
+;; answers len+2 by answering len+1 twice over a heap that moved in between.
+(builtin ArrayPush1 :params [(a dyn) (v dyn)] :ret int
+  (let [(len (%ArrayLen a))
+        (ignored (%ArrayStore a len v))]
+    (%Add len 1)))
+
+;; `a.push()` with no arguments is the length, unchanged — and it still has to be an OPERATION,
+;; because `a.length` and `a.push()` are the same answer through two different paths and only one
+;; of them existed in the library.
+(macro ArrayLength :params [(a dyn)] :ret int (%ArrayLen a))
+
+;; https://tc39.es/ecma262/#sec-array.prototype.pop.
+;;
+;; THE THIRD OPERAND OF `%ArrayResize` IS WHY THAT PRIMITIVE HAS THREE. `v` is not data the resize
+;; consumes; it is the value whose load must happen before the write that destroys it. Written as
+;; a plain two-operand resize the load of the last element is ordered only by the memory chain,
+;; which does not say a read precedes a later write of the same memory, so the scheduler floats it
+;; past the shortening and selection refuses the block with `MSEL-MEMORY-ORDER`.
+;;
+;; SPEC STEP 3 IS THE CLAMP, NOT A BRANCH. `[].pop()` must be `undefined` and must leave the length
+;; at 0, and clamping the index to [0, len] gets both for free: on an empty array the index is 0, a
+;; load past the end already reads `undefined`, and resizing to 0 changes nothing. The hand-written
+;; path this replaces had no guard at all and resized an empty array to -1.
+;;
+;; Written as `(if (%Le len 0) undefined ...)` instead — which is the spec's own shape — it is a Phi
+;; over `Const undefined` and a boxed load, and the seam does not carry that: `popped * 10 +
+;; values[0]` then answered one low, because the Phi reaches the multiply unboxed while the sibling
+;; load does not. The branch-free form has one representation on every path, and it is also the
+;; smaller graph.
+(builtin ArrayPop :transitioning true :params [(a dyn)] :ret dyn
+  (let [(last (Clamp (%Sub (%ArrayLen a) 1) 0 (%ArrayLen a)))
+        (v (%ArrayLoad a last))
+        (ignored (%ArrayResize a last v))]
+    v))
+
+;; https://tc39.es/ecma262/#sec-array.prototype.shift.
+;;
+;; The elements move down by one IN A LOOP, where the hand-written path emitted a single bulk
+;; `OP-ARRAYCOPY`. That is the one place this conversion changes the emitted shape rather than only
+;; its author: JSL has no bulk-copy primitive, and adding one would be a machine-surface op whose
+;; only caller is this line. The loop is the same O(n) work spelled in the language.
+;;
+;; `head` is loaded before the loop overwrites index 0, and it is also the resize's ordering value,
+;; so the read that produces the RESULT is pinned ahead of the write that shortens the array.
+;;
+;; The empty case is the same clamp `pop` uses, and for the same reason: `last` is 0, so the loop
+;; never runs, the resize is a no-op, and the load of index 0 answers `undefined`.
+(builtin ArrayShift :transitioning true :params [(a dyn)] :ret dyn
+  (let [(last (Clamp (%Sub (%ArrayLen a) 1) 0 (%ArrayLen a)))
+        (head (%ArrayLoad a 0))
+        (moved (loop [(i 0 int)]
+                 (if (%Le last i) i
+                   (let [(ignored (%ArrayStore a i (%ArrayLoad a (%Add i 1))))]
+                     (recur (%Add i 1))))))
+        (ignored2 (%ArrayResize a last head))]
+    head))
+
+;; https://tc39.es/ecma262/#sec-array.prototype.unshift, one syntax argument at a time. The
+;; frontend visits arguments right-to-left, so repeated calls preserve their source order.
+;;
+;; NEVER BOUND A LOOP BY THE LENGTH OF AN ARRAY THE LOOP GROWS. This read the receiver's length
+;; into a `let` first -- `(len (%ArrayLen a))` -- and used `len` as the write-back loop's bound.
+;; That binding does not stay fixed: the loop stores at `i + 1`, which reaches the end and EXTENDS
+;; `a`, and the bound followed it. Every `unshift` then failed to terminate, at any length
+;; including zero -- 200,000,000 evaluator steps on a two-element array.
+;;
+;; The bound now comes from `copy`, which is written once and never grown afterwards, so it cannot
+;; move however much the receiver does.
+;;
+;; `ArrayShift` and `ArrayReverse` have the same loop-over-an-array shape and are NOT affected,
+;; which is worth knowing before copying either as a template: both only ever store WITHIN the
+;; existing bounds, so their receiver's length never changes while they iterate. `shift`'s resize
+;; is its last binding, outside the loop, deliberately.
+;; repros/array-unshift-does-not-terminate.js.
+(builtin ArrayUnshift1 :transitioning true :params [(a dyn) (v dyn)] :ret int
+  (let [(copy (%NewArray))
+        (copied
+          (loop [(i 0 int)]
+            (if (%Le (%ArrayLen a) i) i
+              (let [(stored (%ArrayStore copy i (%ArrayLoad a i)))]
+                (recur (%Add i 1))))))
+        (head (%ArrayStore a 0 v))
+        (moved
+          (loop [(i 0 int)]
+            (if (%Le (%ArrayLen copy) i) i
+              (let [(stored2 (%ArrayStore a (%Add i 1) (%ArrayLoad copy i)))]
+                (recur (%Add i 1))))))]
+    (%Add (%ArrayLen copy) 1)))
+
+;; https://tc39.es/ecma262/#sec-array.prototype.reverse. Swapping only the lower half makes odd
+;; lengths leave their centre element untouched.
+(builtin ArrayReverse :transitioning true :params [(a dyn)] :ret dyn
+  (let [(len (%ArrayLen a))
+        (copy (%NewArray))
+        (copied
+          (loop [(i 0 int)]
+            (if (%Le len i) i
+              (let [(stored (%ArrayStore copy i (%ArrayLoad a i)))]
+                (recur (%Add i 1))))))]
+    ;; Two passes make the memory dependency explicit: no receiver element is overwritten until
+    ;; every original value has reached the scratch array.
+    (loop [(i 0 int)]
+      (if (%Le len i) a
+        (let [(stored (%ArrayStore a i (%ArrayLoad copy (%Sub (%Sub len 1) i))))]
+          (recur (%Add i 1)))))))
+
+;; https://tc39.es/ecma262/#sec-array.prototype.fill. Bounds use the same relative-index rule as
+;; slice, but fill mutates and returns its receiver.
+(builtin ArrayFill :transitioning true
+  :params [(a dyn) (value dyn) (start dyn) (end dyn) (has-end bool)] :ret dyn
+  (let [(object (ObjectFromValue (RequireObjectCoercible a)))
+        (len (ArrayLikeLength object))
+        (lo (let [(n (ToIntegerOrInfinity start))]
+              (if (%IsInt n)
+                  (let [(i (%UnboxInt n))]
+                    (Clamp (if (%Lt i 0) (%Add len i) i) 0 len))
+                  (if (%Lt (%UnboxFlt n) 0.0) 0 len))))
+        (hi (if has-end
+                (let [(n (ToIntegerOrInfinity end))]
+                  (if (%IsInt n)
+                      (let [(i (%UnboxInt n))]
+                        (Clamp (if (%Lt i 0) (%Add len i) i) 0 len))
+                      (if (%Lt (%UnboxFlt n) 0.0) 0 len)))
+                len))]
+    (loop [(i lo int)]
+      (if (%Le hi i) object
+        (let [(stored (SetProperty object i value))]
+          (recur (%Add i 1)))))))
+
+;; The normalized insertion/deletion point shared by splice's deletion and the frontend's
+;; syntax-argument insertion loop. Keeping it named in JSL prevents the two halves of variadic
+;; splice from acquiring different negative-index rules.
+(builtin ArraySpliceStart :transitioning true :params [(a dyn) (start int)] :ret int
+  (let [(len (%ArrayLen a))]
+    (Clamp (if (%Lt start 0) (%Add len start) start) 0 len)))
+
+;; Delete a range and close the gap. A negative count is the frontend's explicit "argument was
+;; absent" sentinel and means the remainder; an actual negative JavaScript deleteCount clamps to
+;; zero before it reaches this definition.
+(builtin ArraySpliceDelete :transitioning true :params [(a dyn) (start int) (count int)] :ret dyn
+  (let [(len (%ArrayLen a))
+        (n (if (%Lt count 0) (%Sub len start) (Clamp count 0 (%Sub len start))))
+        (out (%NewArray))
+        (tail (%NewArray))
+        (deleted
+          (loop [(i 0 int)]
+            (if (%Le n i) i
+              (let [(stored (%ArrayStore out i (%ArrayLoad a (%Add start i))))]
+                (recur (%Add i 1))))))
+        (tail-len (%Sub len (%Add start n)))
+        (copied
+          (loop [(i 0 int)]
+            (if (%Le tail-len i) i
+              (let [(stored (%ArrayStore tail i (%ArrayLoad a (%Add (%Add start n) i))))]
+                (recur (%Add i 1))))))
+        (closed
+          (loop [(i 0 int)]
+            (if (%Le tail-len i) i
+              (let [(stored (%ArrayStore a (%Add start i) (%ArrayLoad tail i)))]
+                (recur (%Add i 1))))))
+        (ordered (%ArrayLoad out 0))
+        (resized (%ArrayResize a (%Sub len n) ordered))]
+    out))
+
+;; Insert one already-evaluated syntax argument. The frontend invokes this left-to-right after
+;; deletion; a scratch copy prevents destructive right shifts from overtaking their source reads.
+(builtin ArraySpliceInsert1 :transitioning true :params [(a dyn) (start int) (offset int) (value dyn)] :ret dyn
+  (let [(at (%Add start offset))
+        (len (%ArrayLen a))
+        (tail (%NewArray))
+        (tail-len (%Sub len at))
+        (copied
+          (loop [(i 0 int)]
+            (if (%Le tail-len i) i
+              (let [(stored (%ArrayStore tail i (%ArrayLoad a (%Add at i))))]
+                (recur (%Add i 1))))))
+        (inserted (%ArrayStore a at value))]
+    (loop [(i 0 int)]
+      (if (%Le tail-len i) a
+        (let [(stored (%ArrayStore a (%Add (%Add at i) 1) (%ArrayLoad tail i)))]
+          (recur (%Add i 1)))))))
+
+(builtin ArrayOfAppend1 :params [(a dyn) (value dyn)] :ret dyn
+  (let [(stored (%ArrayStore a (%ArrayLen a) value))] a))
+
+;; https://tc39.es/ecma262/#sec-array.from for the iterable kinds this runtime represents today.
+;; String iteration is by Unicode code point, not UTF-16 code unit: a valid surrogate pair is
+;; concatenated into one element and advances by two units.
+(builtin ArrayFrom :transitioning true :params [(source dyn)] :ret dyn
+  (let [(out (%NewArray))]
+    (if (%IsArray source)
+        (let [(array (%UnboxArray source))
+              (len (%ArrayLen array))]
+          (loop [(i 0 int)]
+            (if (%Le len i) out
+              (let [(stored (%ArrayStore out i (%ArrayLoad array i)))]
+                (recur (%Add i 1))))))
+        (if (%IsString source)
+            (let [(string (%UnboxString source))
+                  (len (%StringLen string))]
+              (loop [(i 0 int) (at 0 int)]
+                (if (%Le len i) out
+                  (let [(first (%StringCharCode string i))
+                        (paired
+                          (if (if (%Le 55296 first) (%Le first 56319) false)
+                              (if (%Lt (%Add i 1) len)
+                                  (let [(second (%StringCharCode string (%Add i 1)))]
+                                    (if (if (%Le 56320 second) (%Le second 57343) false)
+                                        true false))
+                                  false)
+                              false))
+                        (character
+                          (if paired
+                              (%StringConcat (%StringFromCode first)
+                                             (%StringFromCode (%StringCharCode string (%Add i 1))))
+                              (%StringFromCode first)))
+                        (stored (%ArrayStore out at (%Box character)))]
+                    (recur (%Add i (if paired 2 1)) (%Add at 1))))))
+            (%Throw "TypeError: Array.from source is not iterable")))))
+
+;; https://tc39.es/ecma262/#sec-array.prototype.slice, over a fresh array.
+;;
+;; The bounds are the SLICE rule, not the substring rule, and they are the same two lines
+;; `StringSlice` carries: a negative index maps to `len + index`, and the result is empty when the
+;; start passes the end — never swapped. Sharing `Clamp` is what keeps those two definitions from
+;; drifting apart.
+;;
+;; No `%ArrayResize` here. `%ArrayStore` past the end grows the array, so writing `hi - lo`
+;; elements into a fresh one leaves exactly that length, and a zero-width slice is the empty array
+;; `%NewArray` already produced.
+(builtin ArraySlice :transitioning true :params [(a dyn) (start int) (end int)] :ret dyn
+  (let [(len (%ArrayLen a))
+        (lo (Clamp (if (%Lt start 0) (%Add len start) start) 0 len))
+        (hi (Clamp (if (%Lt end 0) (%Add len end) end) 0 len))
+        (out (%NewArray))]
+    (loop [(i lo int)]
+      (if (%Le hi i) out
+        (let [(ignored (%ArrayStore out (%Sub i lo) (%ArrayLoad a i)))]
+          (recur (%Add i 1)))))))
+
+;; https://tc39.es/ecma262/#sec-array.prototype.map. Array elements already carry the tagged
+;; JavaScript representation expected by a callback. The index and receiver array are boxed at the
+;; semantic boundary, and the callback result is stored without changing its representation.
+(macro ArrayLikeLength :transitioning true :params [(src dyn)] :ret int
+  (ToMachineLength (LengthOfArrayLike src) 2147483647))
+
+(macro ArrayLikeHasIndex :transitioning true :params [(src dyn) (index int)] :ret bool
+  (HasProperty src (%BoxInt index)))
+
+(macro ArrayLikeGet :transitioning true :params [(src dyn) (index int)] :ret dyn
+  (GetProperty src (%BoxInt index)))
+
+(builtin ArrayMap :transitioning true :params [(src dyn) (callback dyn) (thisArg dyn)] :ret dyn
+  (let [(len (ArrayLikeLength src))
+        (out (NewArray))
+        (prepared (%ArrayResize out len out))]
+    (loop [(i 0 int)]
+      (if (%Le len i) out
+        (if (ArrayLikeHasIndex src i)
+            (let [(mapped (Call (%Box callback) thisArg
+                                                       (ArrayLikeGet src i) (%BoxInt i) src))
+                  (ignored (%ArrayStore out i mapped))]
+              (recur (%Add i 1)))
+            (recur (%Add i 1)))))))
+
+;; Compile-time-unrolled literal callbacks use these policies. The frontend supplies literal
+;; values/counts; callback invocation and array semantics remain DSL-owned.
+(builtin ArrayMapAt :transitioning true
+  :params [(src dyn) (callback dyn) (out dyn) (i int) (thisArg dyn)] :ret dyn
+  (let [(mapped (Call (%Box callback) thisArg
+                                             (%ArrayLoad src i) (%BoxInt i) src))
+        (ignored (%ArrayStore out i mapped))]
+    out))
+
+(builtin ArrayReduceValueAt :transitioning true
+  :params [(value dyn) (callback dyn) (accumulator dyn) (i int)] :ret dyn
+  (Call callback (%Box undefined) accumulator value (%BoxInt i) (%Box undefined)))
+
+(builtin ArrayFilterLiteral8 :transitioning true
+  :params [(callback dyn) (v0 dyn) (v1 dyn) (v2 dyn) (v3 dyn)
+           (v4 dyn) (v5 dyn) (v6 dyn) (v7 dyn)] :ret dyn
+  (let [(out (%NewArray))
+        (j0 0)
+        (p0 (ToBoolean (Call callback (%Box undefined) v0 (%Box 0) (%Box undefined))))
+        (s0 (%ArrayStore out j0 v0)) (j1 (if p0 (%Add j0 1) j0))
+        (p1 (ToBoolean (Call callback (%Box undefined) v1 (%Box 1) (%Box undefined))))
+        (s1 (%ArrayStore out j1 v1)) (j2 (if p1 (%Add j1 1) j1))
+        (p2 (ToBoolean (Call callback (%Box undefined) v2 (%Box 2) (%Box undefined))))
+        (s2 (%ArrayStore out j2 v2)) (j3 (if p2 (%Add j2 1) j2))
+        (p3 (ToBoolean (Call callback (%Box undefined) v3 (%Box 3) (%Box undefined))))
+        (s3 (%ArrayStore out j3 v3)) (j4 (if p3 (%Add j3 1) j3))
+        (p4 (ToBoolean (Call callback (%Box undefined) v4 (%Box 4) (%Box undefined))))
+        (s4 (%ArrayStore out j4 v4)) (j5 (if p4 (%Add j4 1) j4))
+        (p5 (ToBoolean (Call callback (%Box undefined) v5 (%Box 5) (%Box undefined))))
+        (s5 (%ArrayStore out j5 v5)) (j6 (if p5 (%Add j5 1) j5))
+        (p6 (ToBoolean (Call callback (%Box undefined) v6 (%Box 6) (%Box undefined))))
+        (s6 (%ArrayStore out j6 v6)) (j7 (if p6 (%Add j6 1) j6))
+        (p7 (ToBoolean (Call callback (%Box undefined) v7 (%Box 7) (%Box undefined))))
+        (s7 (%ArrayStore out j7 v7)) (j8 (if p7 (%Add j7 1) j7))
+        (resized (%ArrayResize out j8 out))]
+    out))
+
+(builtin ArrayFilter :transitioning true
+  :params [(src dyn) (callback dyn) (thisArg dyn)] :ret dyn
+  (let [(len (ArrayLikeLength src))
+        (out (NewArray))
+        (selected-count (%NewArray))
+        (count-ready (%ArrayStore selected-count 0 (%BoxInt 0)))
+        ;; Reserve the maximum dense result once, then publish the selected count at exit.
+        (prepared (%ArrayResize out len out))]
+    (loop [(i 0 int)]
+      (if (%Le len i)
+          (let [(j (%UnboxInt (%ArrayLoad selected-count 0)))
+                (resized (%ArrayResize out j out))]
+            out)
+        (if (ArrayLikeHasIndex src i)
+            (let [(value (ArrayLikeGet src i))
+                  (selected (ToBoolean
+                              (Call (%Box callback) thisArg
+                                                          value (%BoxInt i) src)))]
+              (if selected
+                  (let [(j (%UnboxInt (%ArrayLoad selected-count 0)))
+                        (ignored (%ArrayStore out j value))
+                        (counted (%ArrayStore selected-count 0 (%BoxInt (%Add j 1))))]
+                    (recur (%Add i 1)))
+                  (recur (%Add i 1))))
+            (recur (%Add i 1)))))))
+
+(builtin ArrayForEach :transitioning true
+  :params [(src dyn) (callback dyn) (thisArg dyn)] :ret dyn
+  (let [(len (ArrayLikeLength src))]
+    (loop [(i 0 int)]
+      (if (%Le len i) (%Box undefined)
+        (if (ArrayLikeHasIndex src i)
+            (let [(ignored (Call (%Box callback) thisArg
+                                                        (ArrayLikeGet src i) (%BoxInt i) src))]
+              (recur (%Add i 1)))
+            (recur (%Add i 1)))))))
+
+(builtin ArraySome :transitioning true :params [(src dyn) (callback dyn) (thisArg dyn)] :ret bool
+  (let [(len (ArrayLikeLength src))]
+    (loop [(i 0 int)]
+      (if (%Le len i) false
+        (if (ArrayLikeHasIndex src i)
+            (if (ToBoolean
+                  (Call (%Box callback) thisArg
+                                               (ArrayLikeGet src i) (%BoxInt i) src))
+                true
+                (recur (%Add i 1)))
+            (recur (%Add i 1)))))))
+
+(builtin ArrayEvery :transitioning true :params [(src dyn) (callback dyn) (thisArg dyn)] :ret bool
+  (let [(len (ArrayLikeLength src))]
+    (loop [(i 0 int)]
+      (if (%Le len i) true
+        (if (ArrayLikeHasIndex src i)
+            (if (ToBoolean
+                  (Call (%Box callback) thisArg
+                                               (ArrayLikeGet src i) (%BoxInt i) src))
+                (recur (%Add i 1))
+                false)
+            (recur (%Add i 1)))))))
+
+(builtin ArrayFind :transitioning true :params [(src dyn) (callback dyn) (thisArg dyn)] :ret dyn
+  (let [(len (ArrayLikeLength src))]
+    (loop [(i 0 int)]
+      (if (%Le len i) (%Box undefined)
+        (let [(value (ArrayLikeGet src i))]
+          (if (ToBoolean
+                (Call (%Box callback) thisArg value (%BoxInt i) src))
+              value
+              (recur (%Add i 1))))))))
+
+(builtin ArrayFindIndex :transitioning true
+  :params [(src dyn) (callback dyn) (thisArg dyn)] :ret int
+  (let [(len (ArrayLikeLength src))]
+    (loop [(i 0 int)]
+      (if (%Le len i) -1
+        (if (ToBoolean
+              (Call (%Box callback) thisArg
+                                           (ArrayLikeGet src i) (%BoxInt i) src))
+            i
+            (recur (%Add i 1)))))))
+
+;; The accumulator is a loop-carried JavaScript value. Older lowering could not select that dyn Phi
+;; and used a one-element scratch array instead; carrying it directly removes an allocation plus a
+;; load and store around every callback while spelling the specification more faithfully.
+(builtin ArrayReduceInitial :transitioning true
+  :params [(src dyn) (callback dyn) (initial dyn)] :ret dyn
+  (let [(object (RequireObjectCoercible src))
+        (len (ArrayLikeLength object))]
+    (loop [(i 0 int) (acc initial dyn)]
+      (if (%Le len i) acc
+        (if (ArrayLikeHasIndex object i)
+            (recur (%Add i 1)
+                   (Call (%Box callback) (%Box undefined)
+                                               acc (ArrayLikeGet object i) (%BoxInt i) object))
+            (recur (%Add i 1) acc))))))
+
+(builtin ArrayReduce
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-array.prototype.reduce"
+  :spec-name "Array.prototype.reduce"
+  :status partial
+  :deviation "The frontend selects separate initial-value helpers; species, full sparse/exotic coverage, and all error boundaries are not yet proven."
+  :transitioning true :params [(src dyn) (callback dyn)] :ret dyn
+  (let [(object (RequireObjectCoercible src))
+        (len (ArrayLikeLength object))]
+    (loop [(i 0 int) (found false bool) (acc (%Box undefined) dyn)]
+      (if (%Le len i)
+          (if found acc (%Throw "TypeError: Reduce of empty array with no initial value"))
+          (if (ArrayLikeHasIndex object i)
+              (let [(value (ArrayLikeGet object i))]
+                (if found
+                    (recur (%Add i 1) true
+                           (Call (%Box callback) (%Box undefined)
+                                                       acc value (%BoxInt i) object))
+                    (recur (%Add i 1) true value)))
+              (recur (%Add i 1) found acc))))))
+
+(builtin ArrayReduceRightInitial :transitioning true
+  :params [(src dyn) (callback dyn) (initial dyn)] :ret dyn
+  (let [(object (RequireObjectCoercible src))]
+    (loop [(i (%Sub (ArrayLikeLength object) 1) int) (acc initial dyn)]
+      (if (%Lt i 0) acc
+        (if (ArrayLikeHasIndex object i)
+            (recur (%Sub i 1)
+                   (Call (%Box callback) (%Box undefined)
+                                               acc (ArrayLikeGet object i) (%BoxInt i) object))
+            (recur (%Sub i 1) acc))))))
+
+(builtin ArrayReduceRight :transitioning true :params [(src dyn) (callback dyn)] :ret dyn
+  (let [(object (RequireObjectCoercible src))
+        (len (ArrayLikeLength object))]
+    (loop [(i (%Sub len 1) int) (found false bool) (acc (%Box undefined) dyn)]
+      (if (%Lt i 0)
+          (if found acc (%Throw "TypeError: Reduce of empty array with no initial value"))
+          (if (ArrayLikeHasIndex object i)
+              (let [(value (ArrayLikeGet object i))]
+                (if found
+                    (recur (%Sub i 1) true
+                           (Call (%Box callback) (%Box undefined)
+                                                       acc value (%BoxInt i) object))
+                    (recur (%Sub i 1) true value)))
+              (recur (%Sub i 1) found acc))))))
+
+(builtin ArraySort :transitioning true :params [(src dyn) (callback dyn)] :ret dyn
+  (let [(len (%ArrayLen src))]
+    (loop [(end (%Sub len 1))]
+      (if (%Le end 0) src
+        (let [(pass
+                (loop [(i 0 int)]
+                  (if (%Le end i) i
+                    (let [(left (%ArrayLoad src i))
+                          (right (%ArrayLoad src (%Add i 1)))
+                          (order (Call callback (%Box undefined) left right))]
+                      (if (%Lt 0 order)
+                          (let [(first (%ArrayStore src i right))
+                                (second (%ArrayStore src (%Add i 1) left))]
+                            (recur (%Add i 1)))
+                          (recur (%Add i 1)))))))]
+          (recur (%Sub end 1)))))))
+
+(builtin ArraySortDefault :transitioning true :params [(src dyn)] :ret dyn
+  (let [(len (%ArrayLen src))]
+    (loop [(end (%Sub len 1))]
+      (if (%Le end 0) src
+        (let [(pass
+                (loop [(i 0 int)]
+                  (if (%Le end i) i
+                    (let [(left (%ArrayLoad src i))
+                          (right (%ArrayLoad src (%Add i 1)))
+                          (order (%StringCompare (ToStringValue left) (ToStringValue right)))]
+                      (if (%Lt 0 order)
+                          (let [(first (%ArrayStore src i right))
+                                (second (%ArrayStore src (%Add i 1) left))]
+                            (recur (%Add i 1)))
+                          (recur (%Add i 1)))))))]
+          (recur (%Sub end 1)))))))
+
+;; https://tc39.es/ecma262/#sec-array.prototype.flatmap -- FlattenIntoArray with depth 1, and the
+;; depth is the whole subtlety: a mapped element is SPREAD when it is an array and APPENDED when it
+;; is not. This used to do neither. It unboxed EVERY mapped value as an object and read its length,
+;; so `[1, 2, 3].flatMap(x => x)` -- whose callback answers a number -- read the length of a number
+;; and produced the EMPTY array where node says "1,2,3".
+;;
+;; `ArrayConcatValue` IS that append-or-spread step, already written for `concat`, so this is the
+;; loop and nothing else. It could not be written this way until `be-array-value?` learned to follow
+;; a `Call` to its callee's returns: `ArrayConcatValue` asks `%IsArray`, and an array returned from a
+;; function was not array-tagged, so `flatMap(x => [x, x])` appended three arrays instead of
+;; spreading six numbers. Both callbacks are in `tests/native-execution-test.coil` now, because the
+;; two shapes fail in opposite directions and one of them passing proves nothing about the other.
+(builtin ArrayFlatMap :transitioning true
+  :params [(src dyn) (callback dyn) (thisArg dyn)] :ret dyn
+  (let [(len (%ArrayLen src))
+        (out (%NewArray))]
+    (loop [(i 0 int)]
+      (if (%Le len i) out
+        (let [(mapped (Call (%Box callback) thisArg
+                                                   (%ArrayLoad src i) (%BoxInt i) src))
+              (appended (ArrayConcatValue out mapped))]
+          (recur (%Add i 1)))))))

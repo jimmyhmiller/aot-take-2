@@ -1,0 +1,345 @@
+;; Control flow: Region, If, CProj, Phi, Loop — and the two construction windows.
+
+;;
+;; These are the traps the value-node unit could not demonstrate. Each test names the failure it
+;; guards against, because several of them fail SILENTLY: the graph stays structurally valid and the
+;; verifier stays clean while the program means something else.
+(module aot.tests.control)
+(import "coil.assert" :use *)
+(import "aot.node.boot" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.arith" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.node.cfg" :use *)
+(import "aot.tests.support" :use *)
+(import "aot.type.type" :use *)
+
+;; ---------------------------------------------------------------------------
+;; Reachability
+(deftest start_is_reachable_control_and_has_no_dominator
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))]
+           (assert-eq (ty-tuple-at (n-ty st) 0) TY-CTRL)
+           (assert (match (cfg-idom-of st) (Some [_] false) (None [] true)))
+           (assert-eq (cfg-idepth-of st) 0)
+           (assert (cfg-block-head-of? st))))
+
+(deftest a_region_is_reachable_when_some_path_is
+         ;; Seeded with XCONTROL and met upward: reachable exactly when SOME path reaching it is.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               c1 (cproj-make st 0 "c1")
+               r (region-make)]
+           (region-add-path! r c1)
+           (region-add-path! r (xctrl-make))
+           ;; One live path, one dead: the merge is reachable.
+           (assert-eq (compute-ty-of r) TY-CTRL)))
+
+(deftest a_region_with_only_dead_paths_is_unreachable
+         (boot! 1)
+         (let [r (region-make)]
+           (region-add-path! r (xctrl-make))
+           (region-add-path! r (xctrl-make))
+           (assert-eq (compute-ty-of r) TY-XCTRL)))
+
+;; ---------------------------------------------------------------------------
+;; The If lattice
+(deftest an_if_on_a_high_predicate_decides_NEITHER_arm
+         ;; IF_NEITHER from a high predicate does NOT mean both arms are dead. It means nobody has decided
+         ;; yet. Reading it as "provably unreachable" is the proven-type trap in its purest form.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               c (cproj-make st 0 "ctrl")
+               pred (con-make TY-TOP)
+               iff (if-make c pred)]
+           (assert-eq (n-ty iff) (ty-if-neither))))
+
+(deftest an_if_on_a_constant_picks_one_arm
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               c (cproj-make st 0 "ctrl")]
+           (assert-eq (n-ty (if-make c (con-int 1))) (ty-if-true))
+           (assert-eq (n-ty (if-make c (con-int 0))) (ty-if-false))
+           (assert-eq (n-ty (if-make c (con-int 7))) (ty-if-true))))
+
+(deftest an_if_whose_predicate_provably_excludes_zero_takes_the_true_arm
+         ;; "Would admitting zero WIDEN this type?" If yes, zero was not in it, so the test cannot fail.
+         ;; This is how a null check on an already-non-null value deletes itself — and it is the mechanism
+         ;; a discharged TypeScript annotation rides on.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               c (cproj-make st 0 "ctrl")
+               pred (con-make (ty-int-range 1 10))]  ; a range that excludes 0
+           (assert-eq (n-ty (if-make c pred)) (ty-if-true)))
+         (let [st2 (start-make (ty-int-bot))
+               c2 (cproj-make st2 0 "ctrl")
+               pred2 (con-make (ty-int-range 0 10))]  ; a range that includes 0: undecided
+           (assert-eq (n-ty (if-make c2 pred2)) (ty-if-both))))
+
+(deftest an_if_under_unreachable_control_decides_neither
+         (boot! 1)
+         (let [iff (if-make (xctrl-make) (con-int 1))]
+           (assert-eq (n-ty iff) (ty-if-neither))))
+
+;; ---------------------------------------------------------------------------
+;; The MULTI window
+(deftest both_if_arms_are_built_before_either_is_peepholed
+         ;; Peephole them one at a time and the first folds to ~ctrl, the If loses its last use, the kill
+         ;; cascade takes it, and the sibling rewrites against a corpse whose inputs were cleared but whose
+         ;; type was not. `if-arms!` is the only sanctioned constructor for exactly this reason.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               c (cproj-make st 0 "ctrl")
+               iff (if-make c (con-int 1))
+               arms (if-arms! iff)]
+           ;; The predicate is constant-true, so the false arm folded to XCtrl and the true arm became the
+           ;; If's own control — and CRUCIALLY the If survived long enough for both to be computed.
+           (assert-eq (n-op (arms-false arms)) OP-XCTRL)
+           (assert (not (n-dead? (arms-true arms))))))
+
+(deftest a_cproj_on_a_dead_arm_becomes_xctrl
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               c (cproj-make st 0 "ctrl")
+               iff (if-make c (con-int 0))  ; constant FALSE
+               arms (if-arms! iff)]
+           (assert-eq (n-op (arms-true arms)) OP-XCTRL)))
+
+;; ---------------------------------------------------------------------------
+;; Region peepholes
+(deftest a_region_with_one_live_path_and_no_phi_collapses_into_it
+         ;; >>> THE RULE THAT MAKES INLINING WORK. A Fun IS a Region; inlining leaves it with one input and
+         ;; >>> lets THIS rule collapse it. Weaken it and inlining silently stops happening.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               c (cproj-make st 0 "ctrl")
+               r (region-make)]
+           (region-add-path! r c)
+           (assert (match (n-peephole-opt! r) (Some [x] (n-same? x c)) (None [] false)))))
+
+(deftest a_region_keeps_its_paths_while_a_phi_is_attached
+         ;; Guarded on having no Phis: a one-input Phi collapses on its own, and doing both at once races.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               c (cproj-make st 0 "ctrl")
+               r (region-make)]
+           (region-add-path! r c)
+           (let [p (phi-make r (ty-int-bot) "x")]
+             (phi-add-value! p (con-int 1))
+             (assert (region-has-phi? r))
+             ;; With a Phi attached the collapse must NOT fire.
+             (assert (match (n-peephole-opt! r) (Some [x] (not (n-same? x c))) (None [] true))))))
+
+(deftest dropping_a_region_path_drops_the_matching_phi_value
+         ;; Region arity and Phi arity are ONE invariant. Diverging for even one peephole gives a Phi
+         ;; reading the wrong arm — a miscompile that typechecks cleanly.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               c1 (cproj-make st 0 "c1")
+               c2 (fresh-ctrl (cproj-make st 0 "c0"))
+               r (region-make)]
+           (region-add-path! r c1)
+           (region-add-path! r c2)
+           (let [p (phi-make r (ty-int-bot) "x")]
+             (phi-add-value! p (con-int 10))
+             (phi-add-value! p (con-int 20))
+             (n-keep! p)
+             (assert-eq (n-nins r) 3)
+             (assert-eq (n-nins p) 3)
+             (region-del-path! r 2)
+             ;; BOTH shrank, together.
+             (assert-eq (n-nins r) 2)
+             (assert-eq (n-nins p) 2)
+             ;; And the surviving value is the one that belonged to the surviving path.
+             (assert-eq (n-ty (n-in! p 1)) (ty-int-con 10)))))
+
+;; ---------------------------------------------------------------------------
+;; Phi
+(deftest a_phi_over_two_paths_meets_only_the_live_ones
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               c1 (cproj-make st 0 "c1")
+               r (region-make)]
+           (region-add-path! r c1)
+           (region-add-path! r (xctrl-make))
+           (let [p (phi-make r (ty-int-bot) "x")]
+             (phi-add-value! p (con-int 10))
+             (phi-add-value! p (con-int 999))
+             ;; The second path is dead, so its value does not participate: the meet is just 10.
+             (assert-eq (compute-ty-of p) (ty-int-con 10)))))
+
+(deftest a_phi_with_one_distinct_input_becomes_it
+         ;; >>> The other half of inlining: when a Fun collapses, its Parms are Phis with one distinct
+         ;; >>> value — the caller's actual argument. Argument substitution IS this rule.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               c1 (cproj-make st 0 "c1")
+               c2 (fresh-ctrl (cproj-make st 0 "c0"))
+               r (region-make)
+               v (con-int 42)]
+           (region-add-path! r c1)
+           (region-add-path! r c2)
+           (let [p (phi-make r (ty-int-bot) "x")]
+             (phi-add-value! p v)
+             (phi-add-value! p v)
+             (n-keep! p)
+             (assert (match (phi-single-unique-input p) (Some [u] (n-same? u v)) (None [] false))))))
+
+(deftest a_phi_ignores_self_references_when_looking_for_a_unique_input
+         ;; A loop Phi whose only other input is itself must collapse.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               c1 (cproj-make st 0 "c1")
+               c2 (fresh-ctrl (cproj-make st 0 "c0"))
+               r (region-make)
+               v (con-int 7)]
+           (region-add-path! r c1)
+           (region-add-path! r c2)
+           (let [p (phi-make r (ty-int-bot) "x")]
+             (phi-add-value! p v)
+             (phi-add-value! p p)  ; self-reference
+             (n-keep! p)
+             (assert (match (phi-single-unique-input p) (Some [u] (n-same? u v)) (None [] false))))))
+
+;; ---------------------------------------------------------------------------
+;; The IN-PROGRESS window — the trap that deletes loops silently
+(deftest an_in_progress_region_reports_CONTROL_regardless_of_its_paths
+         (boot! 1)
+         (let [r (region-make)]
+           (region-add-path! r (xctrl-make))
+           (region-open! r)
+           (assert (region-in-progress? r))
+           ;; Every path is dead, yet it reports CONTROL: the window is what keeps the half-built merge
+           ;; from being folded away before the real path arrives.
+           (assert-eq (compute-ty-of r) TY-CTRL)))
+
+(deftest an_in_progress_phi_reports_its_DECLARED_type_not_the_meet
+         ;; THE loop-deleting trap. If the Phi reported the meet of what it has so far, a loop counter
+         ;; would read its initial value, `i+1` would fold to a literal, the Phi would lose its only other
+         ;; user, and the whole loop would go — every step locally justified, no error reported.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               entry (cproj-make st 0 "entry")
+               l (loop-make entry)]
+           (assert (loop-in-progress? l))
+           (let [p (phi-make l (ty-int-bot) "i")]
+             (phi-add-value! p (con-int 0))
+             (phi-open! p)
+             ;; The meet so far would be the constant 0. The declared type is what must be reported.
+             (assert-eq (compute-ty-of p) (ty-int-bot))
+             (assert-ne (compute-ty-of p) (ty-int-con 0)))))
+
+(deftest an_in_progress_phi_refuses_constant_folding
+         ;; The engine's `no-const-fold?` hook, which was reserved for exactly this. A Phi whose declared
+         ;; type happens to be constant must NOT be replaced by that constant while its Region is open.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               entry (cproj-make st 0 "entry")
+               l (loop-make entry)]
+           (let [p (phi-make l (ty-int-con 5) "i")]
+             (phi-add-value! p (con-int 5))
+             (phi-open! p)
+             (n-keep! p)
+             (assert (no-const-fold-of? p))
+             ;; It survives a peephole rather than folding to Con 5.
+             (assert-eq (n-op (n-peephole! p)) OP-PHI))))
+
+(deftest a_closed_loop_phi_reports_the_meet_of_its_arms
+         ;; The full protocol, in order: make the loop, build the body, close the PHI, then close CONTROL.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               entry (cproj-make st 0 "entry")
+               l (loop-make entry)]
+           (let [p (phi-make l (ty-int-range 0 10) "i")]
+             (phi-add-value! p (con-int 0))
+             (phi-open! p)
+             (n-keep! p)
+             ;; 4. close the Phi FIRST
+             (phi-close! p (con-int 3))
+             ;; 5. only THEN close control
+             (loop-close! l (fresh-ctrl (cproj-make st 0 "c0")))
+             (assert (not (loop-in-progress? l)))
+             ;; Now it reports the meet of its live arms: {0} meet {3} = [0..3].
+             (assert-eq (compute-ty-of p) (ty-int-range 0 3)))))
+
+(deftest closing_a_loop_twice_is_a_named_error_not_silent_corruption
+         ;; `loop-close!` on an already-closed loop means the caller lost track of the protocol. It must
+         ;; say so rather than overwrite the back edge.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               entry (cproj-make st 0 "entry")
+               l (loop-make entry)]
+           (loop-close! l (fresh-ctrl (cproj-make st 0 "c0")))
+           (assert (not (loop-in-progress? l)))))
+
+;; ---------------------------------------------------------------------------
+;; Dominators
+(deftest a_loops_dominator_is_its_entry_not_the_lca
+         ;; A back edge dominates nothing, so a Loop bypasses Region's LCA entirely.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               entry (cproj-make st 0 "entry")
+               l (loop-make entry)]
+           (loop-close! l (fresh-ctrl (cproj-make st 0 "c0")))
+           (assert (match (cfg-idom-of l) (Some [d] (n-same? d entry)) (None [] false)))))
+
+(deftest idepth_increases_down_the_dominator_tree
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               c (cproj-make st 0 "ctrl")
+               iff (if-make c (con-make (ty-int-range 0 10)))
+               arms (if-arms! iff)]
+           (assert-eq (cfg-idepth-of st) 0)
+           (assert (> (cfg-idepth-of c) (cfg-idepth-of st)))
+           (assert (> (cfg-idepth-of iff) (cfg-idepth-of c)))))
+
+(deftest the_idepth_cache_is_invalidated_by_a_control_mutation
+         ;; A stale dominator does not crash — it schedules a node outside its own dominance region, which
+         ;; is a miscompile. So the cache is version-checked against a counter any control edit bumps.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               c (cproj-make st 0 "ctrl")]
+           (cfg-idepth-of c)
+           (assert (n-idepth-valid? c))
+           (invalidate-cfg!)
+           (assert (not (n-idepth-valid? c)))))
+
+(deftest an_empty_diamond_collapses_at_two_paths_and_at_more
+         ;; `if (pred) {} else {}` — both arms of one If reach a Region with no Phi, so the If contributes
+         ;; exactly its own control, once.
+         ;;
+         ;; A DIVERGENCE FROM SIMPLE, tested in both shapes: Simple guards this with `nIns()>3` and then
+         ;; opens with an `nIns()==3` branch that guard makes unreachable, so its live path only handles
+         ;; the fat case. Both cases are correct, so both are implemented.
+         (boot! 1)
+         ;; Two paths: the Region becomes the If's own control.
+         (let [st (start-make (ty-int-bot))
+               c (cproj-make st 0 "ctrl")
+               iff (if-make c (con-make (ty-int-range 0 10)))
+               arms (if-arms! iff)
+               r (region-make)]
+           (region-add-path! r (arms-true arms))
+           (region-add-path! r (arms-false arms))
+           (assert (match (n-peephole-opt! r) (Some [x] (n-same? x c)) (None [] false))))
+         0)
+
+(deftest a_fat_empty_diamond_loses_one_path
+         ;; Three paths, two of them the same If arms: path 1 becomes the If control and path 2 goes,
+         ;; leaving a two-path Region.
+         (boot! 2)
+         (let [st (start-make (ty-int-bot))
+               c (cproj-make st 0 "ctrl")
+               other (fresh-ctrl (cproj-make st 0 "c0"))
+               iff (if-make c (con-make (ty-int-range 0 10)))
+               arms (if-arms! iff)
+               r (region-make)]
+           (region-add-path! r (arms-true arms))
+           (region-add-path! r (arms-false arms))
+           (region-add-path! r other)
+           (assert-eq (n-nins r) 4)
+           (assert (match (n-peephole-opt! r) (Some [x] (n-same? x r)) (None [] false)))
+           (assert-eq (n-nins r) 3)
+           ;; And the surviving first path is the If's own incoming control.
+           (assert (n-same? (n-in! r 1) c))))

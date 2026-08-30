@@ -1,0 +1,520 @@
+;; ============================================================================
+
+;; ARITHMETIC  —  port of Simple's ArithNode, AddNode, SubNode, MulNode, MinusNode
+;; ============================================================================
+;;
+;; One file, because the peepholes are one system. Add's "sink constants right, then fold
+;; `(x+c1)+c2` into `x+(c1+c2)`" and Mul's are the same rewrite; on separate screens they drift.
+;;
+;; ## MODE — the one-shot arithmetic selection
+;;
+;; Simple's `ArithNode` carries `_mode`: 0 unknown, 1 integer, 2 float. It is set ONCE and never
+;; unset (`setMode` asserts `_mode==0`), and `setMode` calls `unlock` first because the mode
+;; participates in the GVN hash and equality — two Adds are the same node only if they are the same
+;; ARITHMETIC.
+;;
+;; While the mode is 0 the node is generic and NO algebraic identity may fire. Simple's Add opens
+;; with exactly that:  `if( _mode==0 ) return super.idealize();`
+;;
+;; Mode selection from the operand types (Simple's `ArithNode.mode`):
+;;     either side float                  -> 2
+;;     both sides int / memptr / funptr   -> 1
+;;     otherwise                          -> 0, still unknown
+;;
+;; For JavaScript this is where the language shows through. `a + b` in source is NOT this node — it
+;; is a call to `JsAdd` (docs/FRONTEND.md), which does ToPrimitive, checks for strings, and only
+;; then reaches `%Add` on raw numbers. THIS node is that `%Add`: its operands are already raw. The
+;; mode settles once the optimiser has proven which representation flows in.
+;;
+;; ## Add's rules, in Simple's order
+;;
+;;   0. mode still 0            -> generic, nothing may fire
+;;   1. x + 0                   -> x         (0 + x already canonicalised to x + 0)
+;;   2. x + x, integer mode     -> x << 1
+;;   3. non-add + add           -> swap      (goal: a LEFT SPINE of adds, constants on the right)
+;;   4. x + (-y)                -> x - y
+;;   5. x + (y + z)             -> (x + y) + z    (rotate; kills the add on the RHS)
+;;   6. (x + c1) + c2           -> x + (c1 + c2)  (the inner pair then folds)
+;;   7. spine ordering          -> rotate to gather similar terms
+;;
+;; Rule 6 is where `addDep` earns its place, and Simple says so: "If lhs.in(2) is not a constant, we
+;; add ourselves as a dependency because if it later became a constant then we could make this
+;; transformation." Without it, an Add that could not fold today is never revisited.
+;;
+;; Rule 5's shape comment is worth keeping: after the swaps we may see (add add non), (add non non)
+;; or (add add add), but NEVER (add non add). The canonical form is what makes the later rules a
+;; finite set of cases instead of a search.
+;;
+;; ## Rules deliberately NOT here yet, and why that is not a stub
+;;
+;; Simple's Add also calls `phiCon`, pushing a constant up through a Phi:
+;; `((x + (phi cons)) + con)` becomes `x + (phi con+con …)`. That needs Phi, which belongs to the
+;; control-flow unit. It is an OPTIMISATION, not a semantic requirement — its absence makes worse
+;; code, never wrong code — so it is recorded as owed rather than stubbed. Same for `spine_cmp`'s
+;; Phi-aware ordering (rule 7).
+;;
+;; The distinction matters: a missing MECHANISM (no addDep, no GVN) means the thing is not what it
+;; claims to be. A missing OPTIMISATION that depends on a node kind which does not exist yet is
+;; correct-but-weaker, and visible.
+;;
+;; ## Overflow never wraps
+;;
+;; A wrapped constant is a lie about the program, and in JavaScript doubly so — numbers are doubles
+;; and the int representation is an optimisation we chose. On overflow the range widens to the
+;; integer bottom instead. The check comes BEFORE the constant fold: `MAX+1` is a two-constant case,
+;; so a fold-first ordering claims it before any check runs.
+(module aot.node.arith)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.phicon" :use *)
+(import "aot.type.type" :use *)
+
+(const MODE-UNKNOWN 0)
+
+(const MODE-INT 1)
+
+(const MODE-FLT 2)
+
+;; Inputs: 0 = control (absent for a pure node), 1 = lhs, 2 = rhs.
+(const ARITH-LHS 1)
+
+(const ARITH-RHS 2)
+
+(const INT-MAX 9223372036854775807)
+
+(const INT-MIN -9223372036854775808)
+
+;; ---------------------------------------------------------------------------
+;; Shared helpers
+
+;; Simple's `ArithNode.mode`. An int and a float do NOT combine: they are two raw machine
+;; representations, and picking one would silently reinterpret the other.
+(defn arith-mode-of [(lt i64) (rt i64)] (-> i64)
+  (if (or (ty-flt? lt) (ty-flt? rt))
+      MODE-FLT
+      (if (and (ty-int? lt) (ty-int? rt))
+          MODE-INT
+          MODE-UNKNOWN)))
+
+;; Overflow detection.
+;;
+;; These were hand-rolled bounds comparisons, and `mul-overflows?` was a DIVISION ROUND-TRIP — a
+;; divide per multiply, purely to detect overflow, on the constant-folding path of every `Mul`. The
+;; primitives are the hardware flag, and their signedness follows the operand type.
+;;
+;; NOTE the bound: overflow is against the TRUE 64-bit limits, matching Simple, whose
+;; `TypeInteger.BOT` is `[Long.MIN_VALUE .. Long.MAX_VALUE]`. An earlier version here used a
+;; SYMMETRIC `-(2^63-1)` low bound so that negation never overflowed. That was an unnoticed
+;; deviation, and it only surfaced when the overflow primitives — which use the real limits —
+;; disagreed with it. `minus-compute-ty` guards the true min explicitly, exactly as Simple does.
+(defn add-overflows? [(a i64) (b i64)] (-> bool)
+  (primitive/iadd-overflow? a b))
+
+(defn sub-overflows? [(a i64) (b i64)] (-> bool)
+  (primitive/isub-overflow? a b))
+
+(defn mul-overflows? [(a i64) (b i64)] (-> bool)
+  (primitive/imul-overflow? a b))
+
+;; Is `t` the integer constant `v`?
+(defn int-con-is? [(t i64) (v i64)] (-> bool)
+  (and (ty-int? t) (and (ty-constant? t) (= (ty-int-lo t) v))))
+
+;; ---------------------------------------------------------------------------
+;; Add
+(defstruct AddNode [(hdr NodeHdr) (mode i64)])
+
+(defn add-mode [(n (dyn NodeOps))] (-> i64)
+  (.mode (primitive/cast (ptr AddNode) (hdr n))))
+
+;; Set the one-shot mode. Unlocks first: the mode participates in the GVN hash and equality.
+(defn add-set-mode! [(n (dyn NodeOps)) (m i64)] (-> i64)
+  (if (!= (add-mode n) MODE-UNKNOWN)
+      (broken "add-set-mode!: mode is one-shot and was already settled")
+      (do
+        (n-unlock! n)
+        (set! (.mode (primitive/cast (ptr AddNode) (hdr n))) m)
+        0)))
+
+(defn add-compute-ty [(lt i64) (rt i64)] (-> i64)
+  (if (or (ty-high? lt) (ty-high? rt))
+      TY-TOP
+      (if (and (ty-int? lt) (ty-int? rt))
+          (let [alo (ty-int-lo lt)
+                ahi (ty-int-hi lt)
+                blo (ty-int-lo rt)
+                bhi (ty-int-hi rt)]
+            (if (or (add-overflows? alo blo) (add-overflows? ahi bhi))
+                (ty-int-bot)
+                (ty-int-range (+ alo blo) (+ ahi bhi))))
+          TY-BOT)))
+
+(defn add-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [lhs (n-in! d ARITH-LHS)
+        rhs (n-in! d ARITH-RHS)]
+    (if (= (add-mode d) MODE-UNKNOWN)
+        ;; 0. Settle the mode before any algebraic identity fires.
+        (let [m (arith-mode-of (n-ty lhs) (n-ty rhs))]
+          (if (= m MODE-UNKNOWN)
+              (None [(dyn NodeOps)])
+              (do (add-set-mode! d m) (Some d))))
+        (if (int-con-is? (n-ty rhs) 0)
+            ;; 1. x + 0 -> x
+            (Some lhs)
+            (if (and (n-same? lhs rhs) (= (add-mode d) MODE-INT))
+                ;; 2. x + x -> x << 1, integer mode only
+                (Some (shl-make lhs (con-int 1)))
+                (if (and (!= (n-op lhs) OP-ADD) (= (n-op rhs) OP-ADD))
+                    ;; 3. non-add + add -> swap, building a left spine
+                    (Some (n-swap12! d))
+                    (if (= (n-op lhs) OP-ADD)
+                        ;; 6. (x + c1) + c2 -> x + (c1 + c2)
+                        ;;
+                        ;; The dependency is the point: if `c1` is not constant today but becomes
+                        ;; one later, this rewrite becomes available and must be retried.
+                        (let [c1 (n-in! lhs ARITH-RHS)]
+                          (n-add-dep! c1 d)
+                          (if (and (ty-constant? (n-ty c1)) (ty-constant? (n-ty rhs)))
+                              (Some (add-make (n-in! lhs ARITH-LHS)
+                                              (n-peephole! (add-make c1 rhs))))
+                              ;; 7. Push a constant up through a Phi. `rotate` is true: Add is
+                              ;; associative, so the left side may itself be an Add wrapping the Phi.
+                              (phi-con d true)))
+                        ;; Same rule with no Add on the left to rotate through.
+                        (phi-con d true))))))))
+
+(impl NodeOps AddNode
+  (hdr [(self (ptr AddNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr AddNode))] (-> (slice u8)) "Add")
+  (is-const? [(self (ptr AddNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr AddNode))] (-> bool) false)
+  (is-pinned? [(self (ptr AddNode))] (-> bool) false)
+  ;; Preserve the settled arithmetic mode: a copy that reverts to UNKNOWN would have to re-derive it,
+  ;; and on operands that are not yet typed it would derive the WRONG one.
+  (binop-copy [(self (ptr AddNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (Some (add-make-mode lhs rhs (.mode self))))
+  (compute [(self (ptr AddNode))]
+           (-> i64)
+           (let [d (primitive/make-dyn NodeOps self)]
+             (add-compute-ty (n-ty (n-in! d ARITH-LHS)) (n-ty (n-in! d ARITH-RHS)))))
+  (idealize [(self (ptr AddNode))]
+            (-> (Option (dyn NodeOps)))
+            (add-idealize (primitive/make-dyn NodeOps self)))
+  (eq-extra [(self (ptr AddNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (if (!= (n-op other) OP-ADD)
+                false
+                (= (.mode self) (.mode (primitive/cast (ptr AddNode) (hdr other))))))
+  (hash-extra [(self (ptr AddNode))] (-> i64) (+ 7 (* (.mode self) 31))))
+
+(defn add-make [(lhs (dyn NodeOps)) (rhs (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [AddNode] (alloc/create [AddNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.mode p) MODE-UNKNOWN)
+    (n-init! d OP-ADD)
+    (n-add-def! d (None [(dyn NodeOps)]))
+    (n-add-def! d (Some lhs))
+    (n-add-def! d (Some rhs))
+    (n-set-ty! d (compute d))
+    d))
+
+;; ---------------------------------------------------------------------------
+;; Sub
+(defstruct SubNode [(hdr NodeHdr) (mode i64)])
+
+(defn sub-mode [(n (dyn NodeOps))] (-> i64)
+  (.mode (primitive/cast (ptr SubNode) (hdr n))))
+
+(defn sub-set-mode! [(n (dyn NodeOps)) (m i64)] (-> i64)
+  (if (!= (sub-mode n) MODE-UNKNOWN)
+      (broken "sub-set-mode!: mode is one-shot and was already settled")
+      (do
+        (n-unlock! n)
+        (set! (.mode (primitive/cast (ptr SubNode) (hdr n))) m)
+        0)))
+
+;; The range of a difference is [alo-bhi .. ahi-blo] — the LOW bound uses the other side's HIGH.
+;; Getting that backwards produces a range that excludes reachable values, which is unsound in the
+;; direction that matters: the optimiser would believe something false.
+(defn sub-compute-ty [(lt i64) (rt i64)] (-> i64)
+  (if (or (ty-high? lt) (ty-high? rt))
+      TY-TOP
+      (if (and (ty-int? lt) (ty-int? rt))
+          (let [alo (ty-int-lo lt)
+                ahi (ty-int-hi lt)
+                blo (ty-int-lo rt)
+                bhi (ty-int-hi rt)]
+            (if (or (sub-overflows? alo bhi) (sub-overflows? ahi blo))
+                (ty-int-bot)
+                (ty-int-range (- alo bhi) (- ahi blo))))
+          TY-BOT)))
+
+(defn sub-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [lhs (n-in! d ARITH-LHS)
+        rhs (n-in! d ARITH-RHS)]
+    (if (= (sub-mode d) MODE-UNKNOWN)
+        (let [m (arith-mode-of (n-ty lhs) (n-ty rhs))]
+          (if (= m MODE-UNKNOWN)
+              (None [(dyn NodeOps)])
+              (do (sub-set-mode! d m) (Some d))))
+        (if (int-con-is? (n-ty rhs) 0)
+            ;; x - 0 -> x
+            (Some lhs)
+            ;; x - x -> 0. Integer mode ONLY: for floats this is false when x is NaN.
+            (if (and (n-same? lhs rhs) (= (sub-mode d) MODE-INT))
+                (Some (con-int 0))
+                (None [(dyn NodeOps)]))))))
+
+(impl NodeOps SubNode
+  (hdr [(self (ptr SubNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr SubNode))] (-> (slice u8)) "Sub")
+  (is-const? [(self (ptr SubNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr SubNode))] (-> bool) false)
+  (is-pinned? [(self (ptr SubNode))] (-> bool) false)
+  (binop-copy [(self (ptr SubNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (Some (sub-make-mode lhs rhs (.mode self))))
+  (compute [(self (ptr SubNode))]
+           (-> i64)
+           (let [d (primitive/make-dyn NodeOps self)]
+             (sub-compute-ty (n-ty (n-in! d ARITH-LHS)) (n-ty (n-in! d ARITH-RHS)))))
+  (idealize [(self (ptr SubNode))]
+            (-> (Option (dyn NodeOps)))
+            (sub-idealize (primitive/make-dyn NodeOps self)))
+  (eq-extra [(self (ptr SubNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (if (!= (n-op other) OP-SUB)
+                false
+                (= (.mode self) (.mode (primitive/cast (ptr SubNode) (hdr other))))))
+  (hash-extra [(self (ptr SubNode))] (-> i64) (+ 11 (* (.mode self) 31))))
+
+(defn sub-make [(lhs (dyn NodeOps)) (rhs (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [SubNode] (alloc/create [SubNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.mode p) MODE-UNKNOWN)
+    (n-init! d OP-SUB)
+    (n-add-def! d (None [(dyn NodeOps)]))
+    (n-add-def! d (Some lhs))
+    (n-add-def! d (Some rhs))
+    (n-set-ty! d (compute d))
+    d))
+
+;; ---------------------------------------------------------------------------
+;; Mul
+(defstruct MulNode [(hdr NodeHdr) (mode i64)])
+
+(defn mul-mode [(n (dyn NodeOps))] (-> i64)
+  (.mode (primitive/cast (ptr MulNode) (hdr n))))
+
+(defn mul-set-mode! [(n (dyn NodeOps)) (m i64)] (-> i64)
+  (if (!= (mul-mode n) MODE-UNKNOWN)
+      (broken "mul-set-mode!: mode is one-shot and was already settled")
+      (do
+        (n-unlock! n)
+        (set! (.mode (primitive/cast (ptr MulNode) (hdr n))) m)
+        0)))
+
+;; Only the two-constant case folds. A general range product is the min and max over all four corner
+;; products, and the sign cases are exactly where an off-by-one becomes an UNSOUND range — so the
+;; honest answer for a non-constant pair is the integer bottom until that is written and tested
+;; properly. Widening is always safe; narrowing wrongly is not.
+(defn mul-compute-ty [(lt i64) (rt i64)] (-> i64)
+  (if (or (ty-high? lt) (ty-high? rt))
+      TY-TOP
+      (if (and (ty-int? lt) (ty-int? rt))
+          (if (and (ty-constant? lt) (ty-constant? rt))
+              (let [a (ty-int-lo lt)
+                    b (ty-int-lo rt)]
+                (if (mul-overflows? a b) (ty-int-bot) (ty-int-con (* a b))))
+              (ty-int-bot))
+          TY-BOT)))
+
+(defn mul-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [lhs (n-in! d ARITH-LHS)
+        rhs (n-in! d ARITH-RHS)]
+    (if (= (mul-mode d) MODE-UNKNOWN)
+        (let [m (arith-mode-of (n-ty lhs) (n-ty rhs))]
+          (if (= m MODE-UNKNOWN)
+              (None [(dyn NodeOps)])
+              (do (mul-set-mode! d m) (Some d))))
+        (if (int-con-is? (n-ty rhs) 1)
+            ;; x * 1 -> x
+            (Some lhs)
+            ;; Sink the constant to the RHS so the rule above sees a canonical form.
+            (if (and (ty-constant? (n-ty lhs)) (not (ty-constant? (n-ty rhs))))
+                (Some (n-swap12! d))
+                (None [(dyn NodeOps)]))))))
+
+(impl NodeOps MulNode
+  (hdr [(self (ptr MulNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr MulNode))] (-> (slice u8)) "Mul")
+  (is-const? [(self (ptr MulNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr MulNode))] (-> bool) false)
+  (is-pinned? [(self (ptr MulNode))] (-> bool) false)
+  (binop-copy [(self (ptr MulNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (Some (mul-make-mode lhs rhs (.mode self))))
+  (compute [(self (ptr MulNode))]
+           (-> i64)
+           (let [d (primitive/make-dyn NodeOps self)]
+             (mul-compute-ty (n-ty (n-in! d ARITH-LHS)) (n-ty (n-in! d ARITH-RHS)))))
+  (idealize [(self (ptr MulNode))]
+            (-> (Option (dyn NodeOps)))
+            (mul-idealize (primitive/make-dyn NodeOps self)))
+  (eq-extra [(self (ptr MulNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (if (!= (n-op other) OP-MUL)
+                false
+                (= (.mode self) (.mode (primitive/cast (ptr MulNode) (hdr other))))))
+  (hash-extra [(self (ptr MulNode))] (-> i64) (+ 13 (* (.mode self) 31))))
+
+(defn mul-make [(lhs (dyn NodeOps)) (rhs (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [MulNode] (alloc/create [MulNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.mode p) MODE-UNKNOWN)
+    (n-init! d OP-MUL)
+    (n-add-def! d (None [(dyn NodeOps)]))
+    (n-add-def! d (Some lhs))
+    (n-add-def! d (Some rhs))
+    (n-set-ty! d (compute d))
+    d))
+
+;; ---------------------------------------------------------------------------
+;; Shl — needed by Add's `x + x -> x << 1`
+(defstruct ShlNode [(hdr NodeHdr) (pad i64)])
+
+(defn shl-compute-ty [(lt i64) (rt i64)] (-> i64)
+  (if (or (ty-high? lt) (ty-high? rt))
+      TY-TOP
+      (if (and (ty-int? lt) (ty-int? rt))
+          (if (and (ty-constant? lt) (ty-constant? rt))
+              (let [v (ty-int-lo lt)
+                    s (ty-int-lo rt)]
+                ;; A shift count outside 0..63 is undefined at the machine level, so refuse to fold
+                ;; rather than inventing the host's answer.
+                (if (or (< s 0) (> s 63))
+                    (ty-int-bot)
+                    (if (mul-overflows? v (primitive/ishl 1 s))
+                        (ty-int-bot)
+                        (ty-int-con (primitive/ishl v s)))))
+              (ty-int-bot))
+          TY-BOT)))
+
+(impl NodeOps ShlNode
+  (hdr [(self (ptr ShlNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr ShlNode))] (-> (slice u8)) "Shl")
+  (is-const? [(self (ptr ShlNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr ShlNode))] (-> bool) false)
+  (is-pinned? [(self (ptr ShlNode))] (-> bool) false)
+  (binop-copy [(self (ptr ShlNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)]))
+  (compute [(self (ptr ShlNode))]
+           (-> i64)
+           (let [d (primitive/make-dyn NodeOps self)]
+             (shl-compute-ty (n-ty (n-in! d ARITH-LHS)) (n-ty (n-in! d ARITH-RHS)))))
+  (idealize [(self (ptr ShlNode))]
+            (-> (Option (dyn NodeOps)))
+            (let [d (primitive/make-dyn NodeOps self)]
+              ;; x << 0 -> x
+              (if (int-con-is? (n-ty (n-in! d ARITH-RHS)) 0)
+                  (Some (n-in! d ARITH-LHS))
+                  (None [(dyn NodeOps)]))))
+  (eq-extra [(self (ptr ShlNode)) (other (dyn NodeOps))] (-> bool) (= (n-op other) OP-SHL))
+  (hash-extra [(self (ptr ShlNode))] (-> i64) 17))
+
+(defn shl-make [(lhs (dyn NodeOps)) (rhs (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [ShlNode] (alloc/create [ShlNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.pad p) 0)
+    (n-init! d OP-SHL)
+    (n-add-def! d (None [(dyn NodeOps)]))
+    (n-add-def! d (Some lhs))
+    (n-add-def! d (Some rhs))
+    (n-set-ty! d (compute d))
+    d))
+
+;; ---------------------------------------------------------------------------
+;; Minus — unary negation
+(defstruct MinusNode [(hdr NodeHdr) (mode i64)])
+
+(defn minus-compute-ty [(t i64)] (-> i64)
+  (if (ty-high? t)
+      TY-TOP
+      (if (ty-int? t)
+          (let [lo (ty-int-lo t)
+                hi (ty-int-hi t)]
+            ;; Negating the minimum overflows, so the range widens rather than wrapping.
+            (if (or (= lo INT-MIN) (= hi INT-MIN))
+                (ty-int-bot)
+                (ty-int-range (- 0 hi) (- 0 lo))))
+          TY-BOT)))
+
+(impl NodeOps MinusNode
+  (hdr [(self (ptr MinusNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr MinusNode))] (-> (slice u8)) "Minus")
+  (is-const? [(self (ptr MinusNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr MinusNode))] (-> bool) false)
+  (is-pinned? [(self (ptr MinusNode))] (-> bool) false)
+  (binop-copy [(self (ptr MinusNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)]))
+  (compute [(self (ptr MinusNode))]
+           (-> i64)
+           (minus-compute-ty (n-ty (n-in! (primitive/make-dyn NodeOps self) ARITH-LHS))))
+  (idealize [(self (ptr MinusNode))]
+            (-> (Option (dyn NodeOps)))
+            (let [d (primitive/make-dyn NodeOps self)
+                  v (n-in! d ARITH-LHS)]
+              ;; -(-x) -> x
+              (if (= (n-op v) OP-MINUS)
+                  (Some (n-in! v ARITH-LHS))
+                  (None [(dyn NodeOps)]))))
+  (eq-extra [(self (ptr MinusNode)) (other (dyn NodeOps))] (-> bool) (= (n-op other) OP-MINUS))
+  (hash-extra [(self (ptr MinusNode))] (-> i64) 19))
+
+(defn minus-make [(v (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [MinusNode] (alloc/create [MinusNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.mode p) MODE-UNKNOWN)
+    (n-init! d OP-MINUS)
+    (n-add-def! d (None [(dyn NodeOps)]))
+    (n-add-def! d (Some v))
+    (n-set-ty! d (compute d))
+    d))
+
+;; --- owed to the control-flow unit (S2), and NOT stubs ---
+;;
+;;   phiCon     push a constant up through a Phi. Needs Phi.
+;;   spine_cmp  the Phi-aware spine ordering behind Add's rule 7.
+;;
+;; Both are optimisations. Their absence produces weaker code, never wrong code, and each gets a
+;; named test when Phi lands.
+
+;; Constructors that preserve an already-settled mode. `binop-copy` needs these: a copy that reverted
+;; to UNKNOWN would have to re-derive the mode, and on operands that are not yet typed it would
+;; derive the wrong one.
+(defn add-make-mode [(lhs (dyn NodeOps)) (rhs (dyn NodeOps)) (m i64)] (-> (dyn NodeOps))
+  (let [d (add-make lhs rhs)]
+    (if (= m MODE-UNKNOWN) 0 (add-set-mode! d m))
+    d))
+
+(defn sub-make-mode [(lhs (dyn NodeOps)) (rhs (dyn NodeOps)) (m i64)] (-> (dyn NodeOps))
+  (let [d (sub-make lhs rhs)]
+    (if (= m MODE-UNKNOWN) 0 (sub-set-mode! d m))
+    d))
+
+(defn mul-make-mode [(lhs (dyn NodeOps)) (rhs (dyn NodeOps)) (m i64)] (-> (dyn NodeOps))
+  (let [d (mul-make lhs rhs)]
+    (if (= m MODE-UNKNOWN) 0 (mul-set-mode! d m))
+    d))

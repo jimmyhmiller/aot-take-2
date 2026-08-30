@@ -1,0 +1,757 @@
+;; The type lattice.
+
+;;
+;; Types form a symmetric complete bounded lattice, interned so that identity is equality. A `Ty`
+;; is a dense `i64` index into the intern table — small, hashable, printable, serialisable, and
+;; usable as a bitset offset, which is what every worklist and golden test wants.
+;;
+;; The payload is a `defsum`, deliberately: forgetting a kind in `meet` is a silent miscompile, and
+;; an exhaustive `match` turns that class of mistake into a compile error. Variable-arity children
+;; (tuple members, struct fields, shape field lists) live in a side array addressed by
+;; `(offset,len)`, which keeps the sum small and non-recursive.
+;;
+;; The lattice is dual-symmetric: `dual` flips high and low, `join(a,b) = dual(meet(dual a, dual b))`,
+;; and `isa(a,b)` is `meet(a,b) == B` — see `ty-isa?` for why that direction and not the other.
+;; Getting `dual` wrong breaks the optimistic analysis in ways the pessimistic one cannot see, so
+;; `dual(dual(t)) == t` is a tested identity.
+(module aot.type.type)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "aot.util.panic" :use *)
+
+;; ---------------------------------------------------------------------------
+;; The kinds
+;;
+;; Ordered so that the "simple" kinds — those with no children and no payload — come first.
+(defsum TyKind
+  ;; --- simple: no payload, no children ---
+  (TBot)  ; ALL — the bottom of the lattice; "any value at all"
+  (TTop)  ; ANY — the top; the ABSENCE of information, not a claim
+  (TCtrl)  ; reachable control
+  (TXCtrl)  ; unreachable control (the high element of the control axis)
+  (TNil)  ; low null, all flavours
+  (TXNil)  ; high/choice null
+  ;; --- scalars ---
+  (TInt [(lo i64) (hi i64)])  ; inclusive range; lo==hi is a constant
+  (TFlt [(sz i64) (con f64)])  ; Simple's encoding: -64/-32 high, 0 CONSTANT (value in con), 32/64 low
+  ;; --- pointers ---
+  (TPtr [(nilable bool) (to i64)])
+  (TMemPtr [(nilable bool) (strct i64)])
+  (TFunPtr [(sig i64) (fidx i64)])  ; signature Ty + a function-index set
+  ;; --- memory and aggregates ---
+  (TMem [(alias i64) (elem i64)])
+  (TStruct [(nameoff i64) (namelen i64) (fldoff i64) (fldlen i64)])
+  (TTuple [(off i64) (len i64)])
+  (TRpc [(off i64) (len i64)])
+  ;; --- beyond Simple: the dynamic axis, shapes, strings ---
+  (TDyn [(tags i64) (high bool)])  ; a SET over the NaN-box tag axis, plus a high/low flag
+  (TShape [(shapes i64)])  ; a shape-set id — see aot.shape
+  (TStr [(conoff i64) (conlen i64)]))
+
+;; Well-known interned ids. Assigned by `ty-boot!` in exactly this order, so they are constants and
+;; every printed graph and golden hash agrees across runs.
+(const TY-INVALID 0)  ; never a real type; a header `ty` of 0 means "never computed"
+
+(const TY-BOT 1)
+
+(const TY-TOP 2)
+
+(const TY-CTRL 3)
+
+(const TY-XCTRL 4)
+
+(const TY-NIL 5)
+
+(const TY-XNIL 6)
+
+;; ---------------------------------------------------------------------------
+;; The intern table
+;;
+;; One global table per process. `kinds` is indexed by `Ty`; `kids` is the shared side array;
+;; `index` maps a structural hash to the head of a chain, and `chain` is the parallel next-link.
+(defstruct TyTable
+  [(kinds (ArrayList TyKind))
+   (kids (ArrayList i64))
+   (chain (ArrayList i64))
+   (index (HashMap i64 i64))
+   (booted bool)])
+
+(defn ty-table [] (-> (ptr TyTable))
+  (primitive/alloc-static TyTable))
+
+(defn ty-boot! [] (-> i64)
+  (let [t (ty-table)]
+    (if (.booted t)
+        0
+        (let [a (alloc/malloc-allocator)]
+          (set! (.kinds t) (al-new [TyKind] a))
+          (set! (.kids t) (al-new [i64] a))
+          (set! (.chain t) (al-new [i64] a))
+          (set! (.index t) (hm-new-scalar [i64 i64] a))
+          (set! (.booted t) true)
+          ;; Slot 0 is TY-INVALID and is never handed out.
+          (push! (field t kinds) (TBot))
+          (push! (field t chain) 0)
+          ;; The simple types, in the order their constants declare.
+          (ty-intern (TBot))
+          (ty-intern (TTop))
+          (ty-intern (TCtrl))
+          (ty-intern (TXCtrl))
+          (ty-intern (TNil))
+          (ty-intern (TXNil))
+          0))))
+
+(defn ty-kind [(t i64)] (-> TyKind)
+  (do
+    (ty-boot!)
+    (if (or (<= t 0) (>= t (len (.kinds (ty-table)))))
+        (do (panic-i "ty-kind: type id out of range" t) (TBot))
+        (get (.kinds (ty-table)) t))))
+
+(defn ty-count [] (-> i64)
+  (do (ty-boot!) (len (.kinds (ty-table)))))
+
+;; ---------------------------------------------------------------------------
+;; Structural hash and equality — what interning is built on
+(defn ty-hash [(k TyKind)] (-> i64)
+  (match k
+    (TBot [] 0x100)
+    (TTop [] 0x101)
+    (TCtrl [] 0x102)
+    (TXCtrl [] 0x103)
+    (TNil [] 0x104)
+    (TXNil [] 0x105)
+    (TInt [lo hi] (^ (* lo 1000003) (* hi 31)))
+    (TFlt [sz con] (^ (* sz 7919) (primitive/cast i64 con)))
+    (TPtr [nilable to] (^ (if nilable 17 19) (* to 131)))
+    (TMemPtr [nilable strct] (^ (if nilable 23 29) (* strct 137)))
+    (TFunPtr [sig fidx] (^ (* sig 139) (* fidx 149)))
+    (TMem [alias elem] (^ (* alias 151) (* elem 157)))
+    (TStruct [no nl fo fl] (^ (^ (* no 163) (* nl 167)) (^ (* fo 173) (* fl 179))))
+    (TTuple [off ln] (tuple--hash off ln))
+    (TRpc [off len] (^ (* off 193) (* len 197)))
+    (TDyn [tags high] (^ (* tags 199) (if high 7 11)))
+    (TShape [shapes] (* shapes 211))
+    (TStr [co cl] (^ (* co 223) (* cl 227)))))
+
+(defn ty-kind-eq? [(a TyKind) (b TyKind)] (-> bool)
+  (match a
+    (TBot [] (match b (TBot [] true) (_ false)))
+    (TTop [] (match b (TTop [] true) (_ false)))
+    (TCtrl [] (match b (TCtrl [] true) (_ false)))
+    (TXCtrl [] (match b (TXCtrl [] true) (_ false)))
+    (TNil [] (match b (TNil [] true) (_ false)))
+    (TXNil [] (match b (TXNil [] true) (_ false)))
+    (TInt [lo hi] (match b (TInt [l2 h2] (and (= lo l2) (= hi h2))) (_ false)))
+    (TFlt [sz con] (match b (TFlt [s2 c2] (and (= sz s2) (primitive/fcmp-eq con c2))) (_ false)))
+    (TPtr [nl to] (match b (TPtr [n2 t2] (and (= nl n2) (= to t2))) (_ false)))
+    (TMemPtr [nl s] (match b (TMemPtr [n2 s2] (and (= nl n2) (= s s2))) (_ false)))
+    (TFunPtr [sg fx] (match b (TFunPtr [g2 x2] (and (= sg g2) (= fx x2))) (_ false)))
+    (TMem [al el] (match b (TMem [a2 e2] (and (= al a2) (= el e2))) (_ false)))
+    (TStruct [no nl fo fl]
+             (match b
+               (TStruct [a2 b2 c2 d2] (and (and (= no a2) (= nl b2)) (and (= fo c2) (= fl d2))))
+               (_ false)))
+    (TTuple [o l] (match b (TTuple [o2 l2] (tuple--eq? o l o2 l2)) (_ false)))
+    (TRpc [o l] (match b (TRpc [o2 l2] (and (= o o2) (= l l2))) (_ false)))
+    (TDyn [tg th] (match b (TDyn [g2 h2] (and (= tg g2) (= th h2))) (_ false)))
+    (TShape [sh] (match b (TShape [h2] (= sh h2)) (_ false)))
+    (TStr [co cl] (match b (TStr [o2 l2] (and (= co o2) (= cl l2))) (_ false)))))
+
+;; Intern `k`, returning its `Ty`. Identity is equality from here on.
+(defn ty-intern [(k TyKind)] (-> i64)
+  (let [t (ty-table)
+        h (ty-hash k)
+        (mut cur)
+          (match (get (.index t) h)
+            (Some [v] v)
+            (None [] 0))]
+    (loop (if (= (load cur) 0)
+              (break 0)
+              (if (ty-kind-eq? (get (.kinds t) (load cur)) k)
+                  (break 0)
+                  (do
+                    (set! (mut cur) (get (.chain t) (load cur)))
+                    (continue)))))
+    (if (!= (load cur) 0)
+        (load cur)
+        (let [id (len (.kinds t))
+              head
+                (match (get (.index t) h)
+                  (Some [v] v)
+                  (None [] 0))]
+          (push! (field t kinds) k)
+          (push! (field t chain) head)
+          (set! (field t index) h id)
+          id))))
+
+;; ---------------------------------------------------------------------------
+;; Constructors
+(defn ty-int-range [(lo i64) (hi i64)] (-> i64)
+  (do
+    (ty-boot!)
+    (if (> lo hi) (panic "ty-int-range: empty range; the high int is TY-TOP") 0)
+    (ty-intern (TInt lo hi))))
+
+(defn ty-int-con [(v i64)] (-> i64)
+  (ty-int-range v v))
+
+(defn ty-int-bot [] (-> i64)
+  (ty-int-range -9223372036854775808 9223372036854775807))
+
+;; ---------------------------------------------------------------------------
+;; Predicates
+(defn ty-simple? [(t i64)] (-> bool)
+  (match (ty-kind t)
+    (TBot [] true)
+    (TTop [] true)
+    (TCtrl [] true)
+    (TXCtrl [] true)
+    (TNil [] true)
+    (TXNil [] true)
+    (_ false)))
+
+;; High = at or above the lattice centreline.
+;;
+;; NOTE, and it is the whole of the proven-type rule: `TTop` is the ABSENCE of information, while
+;; every other high type is a CLAIM someone computed. `ty-high?` answers a question about the
+;; lattice, NOT the question "may a rewrite act on this". That second question is `ty-proven?`.
+(defn ty-high? [(t i64)] (-> bool)
+  (match (ty-kind t)
+    (TTop [] true)
+    (TXCtrl [] true)
+    (TXNil [] true)
+    ;; A HIGH integer is a range with its bounds REVERSED — Simple's `TypeInteger.isHigh()` is
+    ;; literally `_min > _max`. `ty-dual` produces exactly that by swapping them, and it is the only
+    ;; thing that may: `ty-int-range` refuses lo > hi, so a reversed range can only have come from a
+    ;; dual. It reads as "the empty set of integers", which is the high end of the integer axis.
+    ;;
+    ;; Missing this case makes `ty-high?` answer a per-axis question with a single-axis test, and
+    ;; every `compute` that guards on it silently treats an unanalysed integer as a known one.
+    (TInt [lo hi] (> lo hi))
+    ;; A dynamic type is high exactly when its flag says so.
+    (TDyn [tags high] high)
+    ;; Likewise a high float: `ty-dual` negates the width tag.
+    (TFlt [sz con] (< sz 0))
+    (_ false)))
+
+(defn ty-constant? [(t i64)] (-> bool)
+  (match (ty-kind t)
+    (TInt [lo hi] (= lo hi))
+    (TFlt [sz c] (= sz 0))
+    (TNil [] true)
+    (_ false)))
+
+(defn ty-high-or-const? [(t i64)] (-> bool)
+  (or (ty-high? t) (ty-constant? t)))
+
+;; ---------------------------------------------------------------------------
+;; dual / meet / join / isa
+(defn ty-dual [(t i64)] (-> i64)
+  (match (ty-kind t)
+    (TBot [] TY-TOP)
+    (TTop [] TY-BOT)
+    (TCtrl [] TY-XCTRL)
+    (TXCtrl [] TY-CTRL)
+    (TNil [] TY-XNIL)
+    (TXNil [] TY-NIL)
+    ;; An integer range duals by swapping its bounds: [lo..hi] is the low interval, [hi..lo] the
+    ;; high "choice" one. Simple encodes both with the same struct and a reversed test.
+    (TInt [lo hi] (ty-intern (TInt hi lo)))
+    ;; A float duals the same way. `sz` 0 means "not a constant" and is its own dual at the
+    ;; per-width bottom; a constant float duals to the matching high constant, which we encode by
+    ;; negating the width tag rather than adding a second field.
+    ;; A CONSTANT float is SELF-DUAL — it sits on the centreline. Everything else flips its width
+    ;; sign, which is exactly Simple's `_isConstant() ? this : new TypeFloat(-_sz, 0)`.
+    (TFlt [sz con] (if (= sz 0) (ty-intern (TFlt 0 con)) (ty-intern (TFlt (- 0 sz) 0.0))))
+    ;; The dynamic axis duals by flipping the high/low flag and KEEPING the set. That is why the flag
+    ;; exists: a pure set with complement-duality has no centreline, so nothing could be `high`.
+    (TDyn [tags high] (ty-intern (TDyn tags (not high))))
+    ;; A tuple duals MEMBERWISE. `dual(IF_TRUE)` is therefore `(~ctrl, ctrl)`, which is `IF_FALSE` —
+    ;; and that symmetry is what makes `join` on If outcomes mean the right thing.
+    (TTuple [off ln]
+            (if (= ln 2)
+                (ty-tuple-of2 (ty-dual (ty-tuple-at t 0)) (ty-dual (ty-tuple-at t 1)))
+                (if (= ln 3)
+                    (ty-tuple-of3 (ty-dual (ty-tuple-at t 0))
+                                  (ty-dual (ty-tuple-at t 1))
+                                  (ty-dual (ty-tuple-at t 2)))
+                    (do
+                      (unimplemented "ty-dual: tuple arity above 3"
+                                     "src/type/type.coil — widen when Call lands")
+                      TY-BOT))))
+    (_ (do (unimplemented "ty-dual for this kind" "docs/LAYOUT.md — src/type/, S1") TY-BOT))))
+
+;; The lattice meet. Commutative, associative, idempotent and monotone — every one of which is a
+;; tested property, because a `meet` that is merely "mostly right" produces a compiler that is
+;; mostly right.
+(defn ty-meet [(a i64) (b i64)] (-> i64)
+  (if (= a b)
+      a
+      (if (= a TY-BOT)
+          TY-BOT
+          (if (= b TY-BOT)
+              TY-BOT
+              (if (= a TY-TOP)
+                  b
+                  (if (= b TY-TOP)
+                      a
+                      (ty-meet-hard a b)))))))
+
+(defn ty-meet-hard [(a i64) (b i64)] (-> i64)
+  (match (ty-kind a)
+    ;; Control is its own mini-lattice: any - ~ctrl - ctrl - all.
+    (TCtrl [] (match (ty-kind b) (TXCtrl [] TY-CTRL) (_ TY-BOT)))
+    (TXCtrl [] (match (ty-kind b) (TCtrl [] TY-CTRL) (_ TY-BOT)))
+    ;; Integer ranges meet by widening to the union interval.
+    (TInt [alo ahi]
+          (match (ty-kind b)
+            (TInt [blo bhi] (ty-intern (TInt (if (< alo blo) alo blo) (if (> ahi bhi) ahi bhi))))
+            ;; An int and a float have no common refinement short of BOT. In JavaScript both are
+            ;; `number`, but that unification belongs on the DYNAMIC axis (src/type/dyn.coil), not
+            ;; here: these two are raw machine representations, and merging them silently would let
+            ;; an unboxed int flow where a double is expected.
+            (_ TY-BOT)))
+    ;; Two floats meet to the same width when the widths agree and both are the non-constant form;
+    ;; two different constants meet to the non-constant float of that width; anything else is BOT.
+    (TFlt [asz acon]
+          (match (ty-kind b)
+            (TFlt [bsz bcon]
+                  (if (and (= asz bsz) (primitive/fcmp-eq acon bcon))
+                      (ty-intern (TFlt asz acon))
+                      (ty-intern (TFlt 0 0.0))))
+            (_ TY-BOT)))
+    ;; Nil meets its own dual back to nil, exactly as control does.
+    (TNil [] (match (ty-kind b) (TXNil [] TY-NIL) (_ TY-BOT)))
+    (TXNil [] (match (ty-kind b) (TNil [] TY-NIL) (_ TY-BOT)))
+    ;; The dynamic axis. See the header at `ty-dyn` for why the mixed case is conservative.
+    (TDyn [atags ahigh]
+          (match (ty-kind b)
+            (TDyn [btags bhigh]
+                  (if (and ahigh bhigh)
+                      ;; both high: the mirror of union is intersection; empty is TOP
+                      (ty-dyn-high (primitive/iand atags btags))
+                      ;; both low, or mixed: the union, LOW. Mixed is a sound lower bound rather
+                      ;; than the greatest one — precision, never soundness.
+                      (ty-dyn (primitive/ior atags btags))))
+            (_ TY-BOT)))
+    ;; Two tuples meet MEMBERWISE, and only when their arities agree. Different arities have no
+    ;; common refinement — a two-member If outcome and a three-member Start outcome are not
+    ;; comparable, and pretending otherwise would let a Proj read a member that does not exist.
+    (TTuple [aoff aln]
+            (match (ty-kind b)
+              (TTuple [boff bln]
+                      (if (!= aln bln)
+                          TY-BOT
+                          (if (= aln 2)
+                              (ty-tuple-of2 (ty-meet (ty-tuple-at a 0) (ty-tuple-at b 0))
+                                            (ty-meet (ty-tuple-at a 1) (ty-tuple-at b 1)))
+                              (if (= aln 3)
+                                  (ty-tuple-of3 (ty-meet (ty-tuple-at a 0) (ty-tuple-at b 0))
+                                                (ty-meet (ty-tuple-at a 1) (ty-tuple-at b 1))
+                                                (ty-meet (ty-tuple-at a 2) (ty-tuple-at b 2)))
+                                  (do
+                                    (unimplemented "ty-meet: tuple arity above 3"
+                                                   "src/type/type.coil — widen when Call lands")
+                                    TY-BOT)))))
+              (_ TY-BOT)))
+    (_ (do (unimplemented "ty-meet for this kind pair" "docs/LAYOUT.md — src/type/, S1") TY-BOT))))
+
+(defn ty-join [(a i64) (b i64)] (-> i64)
+  (ty-dual (ty-meet (ty-dual a) (ty-dual b))))
+
+;; `a isa b` — a is at least as specific as b; every value a admits, b admits too.
+;;
+;; The direction is `meet(a,b) == B`, not `== a`. Meet moves DOWN toward BOT (more values), so the
+;; meet of a specific type with a general one is the GENERAL one, and that is what identifies b as
+;; the upper bound. Writing `== a` inverts the whole relation, which reads plausibly and makes
+;; every `Cast` discharge itself: `ty-isa? ANY t` would be true for every t.
+(defn ty-isa? [(a i64) (b i64)] (-> bool)
+  (= (ty-meet a b) b))
+
+;; ---------------------------------------------------------------------------
+;; The proven-type test
+;;
+;; `compute` is an OPTIMISTIC analysis and may act on whatever type it currently holds. Any
+;; IRREVERSIBLE rewrite must first prove the type: transitively over the node's whole input cone,
+;; as a fixpoint test, not merely "is it not ANY".
+;;
+;; Deferred, never declined: a proof-gated rewrite that fails today is re-queued, because nothing
+;; else would bring it back.
+(defn ty-proven? [(t i64)] (-> bool)
+  (do
+    (unimplemented "ty-proven?" "docs/LAYOUT.md §8 — the proven-type rule, S1")
+    false))
+
+;; ---------------------------------------------------------------------------
+;; Float constructors
+;;
+;; Simple's `TypeFloat._sz` encoding, ported exactly:  -64 high flt · -32 high f32 · 0 CONSTANT
+;; (the value lives in `con`) · 32 low f32 · 64 low flt.  `isHigh` is `sz < 0`; a CONSTANT is
+;; SELF-DUAL, because it sits on the lattice centreline.
+(defn ty-flt [(sz i64)] (-> i64)
+  (do (ty-boot!) (ty-intern (TFlt sz 0.0))))
+
+(defn ty-flt-con [(v f64)] (-> i64)
+  (do (ty-boot!) (ty-intern (TFlt 0 v))))
+
+(defn ty-flt-bot [] (-> i64)
+  (ty-flt 64))
+
+;; Which raw machine representation does this type name? The arithmetic families ask this to settle
+;; their one-shot mode, and it is deliberately NOT "is this a number": an int and a float are two
+;; representations, and conflating them is how an unboxed int reaches a double operand.
+(defn ty-int? [(t i64)] (-> bool)
+  (match (ty-kind t) (TInt [lo hi] true) (_ false)))
+
+(defn ty-flt? [(t i64)] (-> bool)
+  (match (ty-kind t) (TFlt [sz con] true) (_ false)))
+
+;; The integer bounds, for a type that is an int range. Panics otherwise — a caller that has not
+;; checked `ty-int?` is asking a question with no answer.
+(defn ty-int-lo [(t i64)] (-> i64)
+  (match (ty-kind t) (TInt [lo hi] lo) (_ (panic "ty-int-lo: not an integer type"))))
+
+(defn ty-int-hi [(t i64)] (-> i64)
+  (match (ty-kind t) (TInt [lo hi] hi) (_ (panic "ty-int-hi: not an integer type"))))
+
+(defn ty-flt-value [(t i64)] (-> f64)
+  (match (ty-kind t) (TFlt [sz con] con) (_ (do (panic "ty-flt-value: not a float type") 0.0))))
+
+;; ---------------------------------------------------------------------------
+;; Tuples — what a MULTI node produces
+;;
+;; Start, If, Call, CallEnd and New each produce several values at once, and a Proj selects one.
+;; The members live in the shared `kids` side array addressed by `(offset,len)`, which is what keeps
+;; `TyKind` small and non-recursive.
+(defn ty-tuple-of2 [(a i64) (b i64)] (-> i64)
+  (do
+    (ty-boot!)
+    (let [t (ty-table)
+          off (len (.kids t))]
+      (push! [i64] (mut (.kids t)) a)
+      (push! [i64] (mut (.kids t)) b)
+      (let [id (ty-intern (TTuple off 2))] (tuple--trim! id off) id))))
+
+(defn ty-tuple-of3 [(a i64) (b i64) (c i64)] (-> i64)
+  (do
+    (ty-boot!)
+    (let [t (ty-table)
+          off (len (.kids t))]
+      (push! [i64] (mut (.kids t)) a)
+      (push! [i64] (mut (.kids t)) b)
+      (push! [i64] (mut (.kids t)) c)
+      (let [id (ty-intern (TTuple off 3))] (tuple--trim! id off) id))))
+
+(defn ty-tuple? [(t i64)] (-> bool)
+  (match (ty-kind t) (TTuple [off ln] true) (_ false)))
+
+(defn ty-tuple-len [(t i64)] (-> i64)
+  (match (ty-kind t) (TTuple [off ln] ln) (_ 0)))
+
+;; Member `i` of a tuple. Out of range is a hard error, not a silent TOP: a Proj reading past its
+;; multi's arity means the two disagree about the node's shape, and inventing an answer hides it.
+(defn ty-tuple-at [(t i64) (i i64)] (-> i64)
+  (match (ty-kind t)
+    (TTuple [off ln]
+            (if (or (< i 0) (>= i ln))
+                (do (panic-i "ty-tuple-at: tuple index out of range" i) TY-BOT)
+                (get (.kids (ty-table)) (+ off i))))
+    (_ (do (panic "ty-tuple-at: not a tuple") TY-BOT))))
+
+;; ---------------------------------------------------------------------------
+;; The four If outcomes
+;;
+;; An If produces a two-member tuple: member 0 is the TRUE projection, member 1 the FALSE one.
+;; `IF-NEITHER` is what an If reports while its predicate is still high — do NOT read that as "both
+;; arms are dead", it means "nobody has decided yet". This is the proven-type rule in miniature.
+(defn ty-if-both [] (-> i64)
+  (ty-tuple-of2 TY-CTRL TY-CTRL))
+
+(defn ty-if-true [] (-> i64)
+  (ty-tuple-of2 TY-CTRL TY-XCTRL))
+
+(defn ty-if-false [] (-> i64)
+  (ty-tuple-of2 TY-XCTRL TY-CTRL))
+
+(defn ty-if-neither [] (-> i64)
+  (ty-tuple-of2 TY-XCTRL TY-XCTRL))
+
+;; ---------------------------------------------------------------------------
+;; Out-of-bounds
+;;
+;; Simple's `Type.oob()`: when a node asks its input for a member the input does not have — because
+;; the input is not a tuple at all — the answer is the input's own extreme. High stays high (nothing
+;; is known yet), low goes to the bottom (anything could be there).
+(defn ty-oob [(t i64)] (-> i64)
+  (if (ty-high? t) TY-TOP TY-BOT))
+
+;; The control-flavoured version, for a CProj whose multi is not yet a tuple.
+(defn ty-oob-ctrl [(t i64)] (-> i64)
+  (if (ty-high? t) TY-TOP TY-BOT))
+
+;; ---------------------------------------------------------------------------
+;; Tuple interning is STRUCTURAL, over the members
+;;
+;; The obvious implementation — hash and compare `(offset,len)` — is wrong, and wrong in a way that
+;; is easy to miss: every constructor call appends fresh members to the side array, so two tuples
+;; with identical members land at different offsets and intern as DIFFERENT types. Identity then
+;; stops being equality for exactly the types `If` reports, and every comparison against
+;; `ty-if-true` fails while every printed graph still looks correct.
+;;
+;; So both the hash and the equality read THROUGH the offset to the members.
+(defn tuple--hash [(off i64) (ln i64)] (-> i64)
+  (let [(mut h) (+ (* ln 191) 0x9e3779b9)
+        (mut i) 0]
+    (loop (if (>= (load i) ln)
+              (break 0)
+              (do
+                (set! (mut h) (^ (* (load h) 31) (get (.kids (ty-table)) (+ off (load i)))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load h)))
+
+(defn tuple--eq? [(o1 i64) (l1 i64) (o2 i64) (l2 i64)] (-> bool)
+  (if (!= l1 l2)
+      false
+      (let [(mut i) 0
+            (mut same) true]
+        (loop (if (or (>= (load i) l1) (not (load same)))
+                  (break 0)
+                  (do
+                    (if (!= (get (.kids (ty-table)) (+ o1 (load i)))
+                            (get (.kids (ty-table)) (+ o2 (load i))))
+                        (set! (mut same) false)
+                        0)
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        (load same))))
+
+;; After interning a tuple, drop the members we speculatively appended if an equal tuple already
+;; existed. Without this the side array grows without bound on a hot path — every `If` compute
+;; builds a tuple, and there are only four distinct ones in the whole compiler.
+(defn tuple--trim! [(t i64) (saved i64)] (-> i64)
+  (match (ty-kind t)
+    (TTuple [off ln]
+            (if (= off saved)
+                0  ; this call is the one that owns those members
+                (let [(mut i) (len (.kids (ty-table)))]
+                  (loop (if (<= (load i) saved)
+                            (break 0)
+                            (do
+                              (match (pop! (mut (.kids (ty-table)))) (Some [_] 0) (None [] 0))
+                              (set! (mut i) (- (load i) 1))
+                              (continue))))
+                  0)))
+    (_ 0)))
+
+;; The side array's length — a test uses this to assert that repeated tuple construction does not
+;; grow it, which is the observable consequence of interning working.
+(defn ty-kids-len [] (-> i64)
+  (do (ty-boot!) (len (.kids (ty-table)))))
+
+;; ---------------------------------------------------------------------------
+;; Booleans are integers
+;;
+;; Simple has no separate boolean type: `BOOL` is the integer range [0..1], `TRUE` is the constant 1
+;; and `FALSE` is the constant 0. That is not a shortcut — it is what lets `If` take any integer as
+;; a predicate, and what makes `x == 0` and `!x` the same node after a peephole.
+(defn ty-bool [] (-> i64)
+  (ty-int-range 0 1))
+
+(defn ty-true [] (-> i64)
+  (ty-int-con 1))
+
+(defn ty-false [] (-> i64)
+  (ty-int-con 0))
+
+;; The HIGH bool — `BOOL.dual()`. What a comparison reports while an operand is still unanalysed:
+;; "the answer will be a boolean, but nobody has computed which".
+(defn ty-bool-high [] (-> i64)
+  (ty-dual (ty-bool)))
+
+;; ---------------------------------------------------------------------------
+;; Function pointers
+;;
+;; `sig` is a tuple type — member 0 is the return, members 1.. are the arguments. `fidx` is a SET of
+;; function indices, held as a bitset.
+;;
+;; The set is the whole point, and it is what the closed-world assumption buys. A call site whose set
+;; is a SINGLETON is a direct call with no dispatch at all; a set of two is a guarded pair; the full
+;; set is the generic path. An open world would make this axis useless, which is one concrete place
+;; the closed-world decision pays for itself.
+(defn ty-funptr [(sig i64) (fidx i64)] (-> i64)
+  (do (ty-boot!) (ty-intern (TFunPtr sig fidx))))
+
+(defn ty-funptr? [(t i64)] (-> bool)
+  (match (ty-kind t) (TFunPtr [sig fidx] true) (_ false)))
+
+(defn ty-funptr-sig [(t i64)] (-> i64)
+  (match (ty-kind t) (TFunPtr [sig fidx] sig) (_ (panic "ty-funptr-sig: not a function pointer"))))
+
+(defn ty-funptr-fidxs [(t i64)] (-> i64)
+  (match (ty-kind t) (TFunPtr [sig fidx] fidx) (_ (panic "ty-funptr-fidxs: not a function pointer"))))
+
+;; Exactly one function index — a DIRECT call. `x & (x-1)` clears the lowest set bit; if nothing
+;; remains and x was non-zero, x had exactly one bit.
+(defn ty-funptr-single? [(t i64)] (-> bool)
+  (let [f (ty-funptr-fidxs t)]
+    (and (!= f 0) (= (primitive/iand f (- f 1)) 0))))
+
+;; The one index in a singleton set, as a bit position.
+(defn ty-funptr-the-fidx [(t i64)] (-> i64)
+  (let [f (ty-funptr-fidxs t)
+        (mut i) 0
+        (mut x) f]
+    (if (not (ty-funptr-single? t))
+        (do (panic "ty-funptr-the-fidx: the function-index set is not a singleton") 0)
+        (do
+          (loop (if (!= (primitive/iand (load x) 1) 0)
+                    (break 0)
+                    (do
+                      (set! (mut x) (primitive/ishr (load x) 1))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (load i)))))
+
+;; The signature's return type and argument count.
+(defn ty-sig-ret [(sig i64)] (-> i64)
+  (ty-tuple-at sig 0))
+
+(defn ty-sig-nargs [(sig i64)] (-> i64)
+  (- (ty-tuple-len sig) 1))
+
+(defn ty-sig-arg [(sig i64) (i i64)] (-> i64)
+  (ty-tuple-at sig (+ i 1)))
+
+;; ---------------------------------------------------------------------------
+;; THE DYNAMIC AXIS
+;;
+;; Simple has no equivalent — this is the axis that makes the lattice describe JavaScript rather
+;; than C, and its design is ours.
+;;
+;; A dynamic value's type is a SET OF TAGS: undefined, null, bool, int, double, string, symbol,
+;; object, function. Held as a bitset, with a HIGH/LOW flag:
+;;
+;;   LOW  S  "the value is one of S"       — a claim someone computed. Bigger S is LOWER.
+;;   HIGH S  its mirror                     — the optimistic form the dual produces.
+;;
+;; The flag is why the axis needs one at all: a pure set with complement-duality has no centreline,
+;; so nothing could answer `ty-high?`, and the optimistic pass would have nowhere to start.
+;;
+;; ## meet
+;;
+;;   low A  meet low B   = low (A ∪ B)      more possibilities is more general
+;;   high A meet high B  = high (A ∩ B)     the mirror; an empty intersection is TOP
+;;   mixed               = low (A ∪ B)      CONSERVATIVE — see below
+;;
+;; The mixed case is deliberately imprecise. `meet` must be a LOWER bound of both, and `low (A ∪ B)`
+;; is one — just not necessarily the GREATEST. That costs precision, never soundness, and the exact
+;; answer needs a rule for how a proven claim relates to an optimistic guess on the same axis, which
+;; is worth getting right with a test rather than guessing now. Recorded here so it reads as a
+;; decision rather than an oversight.
+;;
+;; ## What this buys
+;;
+;; A SINGLETON low set is a proven representation, so the value unboxes. Two tags is a guard with two
+;; arms. The full set is the generic path. A TypeScript annotation lands here: `number` is
+;; int-or-double, `string` is the string tag, and whether the guard folds is decided by the
+;; interprocedural fixpoint agreeing with it — never by the annotation alone.
+
+;; Build a low (claimed) tag set. An EMPTY set means no value can be here, which is TOP.
+(defn ty-dyn [(tags i64)] (-> i64)
+  (do
+    (ty-boot!)
+    (if (= tags 0) TY-TOP (ty-intern (TDyn tags false)))))
+
+;; Build the high (optimistic) mirror. A FULL high set is the top of this axis.
+(defn ty-dyn-high [(tags i64)] (-> i64)
+  (do
+    (ty-boot!)
+    (if (= tags 0) TY-TOP (ty-intern (TDyn tags true)))))
+
+(defn ty-dyn? [(t i64)] (-> bool)
+  (match (ty-kind t) (TDyn [tags high] true) (_ false)))
+
+(defn ty-dyn-tags [(t i64)] (-> i64)
+  (match (ty-kind t) (TDyn [tags high] tags) (_ (do (panic "ty-dyn-tags: not a dynamic type") 0))))
+
+(defn ty-dyn-high? [(t i64)] (-> bool)
+  (match (ty-kind t) (TDyn [tags high] high) (_ false)))
+
+;; Exactly one tag, and LOW — a proven representation. This is the test that decides whether a value
+;; can be unboxed and kept in a register rather than as a NaN-boxed word.
+(defn ty-monomorphic? [(t i64)] (-> bool)
+  (match (ty-kind t)
+    (TDyn [tags high] (and (not high) (and (!= tags 0) (= (primitive/iand tags (- tags 1)) 0))))
+    (_ false)))
+
+;; Does this tag set contain that one?
+(defn ty-dyn-has? [(t i64) (tag i64)] (-> bool)
+  (!= (primitive/iand (ty-dyn-tags t) tag) 0))
+
+;; The tag bitset. One bit per NaN-box tag.
+(const TAG-UNDEFINED 1)
+
+(const TAG-NULL 2)
+
+(const TAG-BOOL 4)
+
+(const TAG-INT 8)
+
+(const TAG-DOUBLE 16)
+
+(const TAG-STRING 32)
+
+(const TAG-SYMBOL 64)
+
+(const TAG-OBJECT 128)
+
+(const TAG-FUNCTION 256)
+
+(const TAG-ANY 511)
+
+;; `number` in TypeScript is int-or-double. The compiler keeps them apart because an int is worth
+;; keeping unboxed, while the language says they are one type.
+(const TAG-NUMBER 24)
+
+;; ---------------------------------------------------------------------------
+;; OWED lattice kinds
+;;
+;; These land with the units that need them. They live HERE rather than in per-family modules for a
+;; reason worth stating, because `docs/LAYOUT.md` originally proposed the split and it does not
+;; survive contact with Coil's module system:
+;;
+;;   `ty-meet` and `ty-dual` dispatch on the kind, and their arms CONSTRUCT types. If the
+;;   constructors lived in family modules, those modules would import `aot.type.type` and
+;;   `aot.type.type` would need to import them back. Coil has no cyclic imports, and routing every
+;;   constructor through a function-pointer hook would be indirection for no gain.
+;;
+;; Java gets the split for free because `Type.xmeet` dispatches virtually into the subclass. We
+;; cannot, so the lattice is ONE module. It is cohesive rather than merely convenient: the sum, the
+;; intern table, `meet`, `dual`, and the constructors those two call are a single mechanism.
+;;
+;; What the family modules WOULD have held that is genuinely separable — printing and parsing — is
+;; in `aot.print.text`, where round-tripping is tested.
+(defn ty-ptr [(nilable bool) (to i64)] (-> i64)
+  (do (unimplemented "ty-ptr" "the memory unit — src/type/type.coil") 0))
+
+(defn ty-memptr [(nilable bool) (strct i64)] (-> i64)
+  (do (unimplemented "ty-memptr" "the memory unit — src/type/type.coil") 0))
+
+(defn ty-mem [(alias i64) (elem i64)] (-> i64)
+  (do (unimplemented "ty-mem" "the memory unit — src/type/type.coil") 0))
+
+(defn ty-struct [(name (slice u8))] (-> i64)
+  (do (unimplemented "ty-struct" "the memory unit — src/type/type.coil") 0))
+
+(defn ty-shape-set [(shapes i64)] (-> i64)
+  (do (unimplemented "ty-shape-set" "the shape unit — src/type/type.coil") 0))
+
+(defn ty-str [] (-> i64)
+  (do (unimplemented "ty-str" "the string unit — src/type/type.coil") 0))
+
+(defn ty-rpc [(returns (slice i64))] (-> i64)
+  (do (unimplemented "ty-rpc" "separate compilation — src/type/type.coil") 0))

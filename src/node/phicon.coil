@@ -1,0 +1,126 @@
+;; ============================================================================
+
+;; PUSHING A CONSTANT UP THROUGH A PHI  —  port of Simple's `AddNode.phiCon`
+;; ============================================================================
+;;
+;; The rewrite:
+;;
+;;     (x op (phi c0 c1 …)) op k     becomes     x op (phi (c0 op k) (c1 op k) …)
+;;
+;; and the inner constants then fold, so a merge of constants followed by an operation becomes a
+;; merge of ALREADY-COMPUTED constants. In a loop that is the difference between doing the
+;; arithmetic every iteration and doing it never.
+;;
+;; It lives in its own module because BOTH `aot.node.arith` and `aot.node.compare` need it, and
+;; compare already imports arith — putting it in arith would work, but this is the honest home for a
+;; rewrite that belongs to neither.
+;;
+;; ## Why it does not fight the opposite rule
+;;
+;; Simple's own note, and it is the thing that makes this safe: *"this is the exact reverse of Phi
+;; pulling a common op down to reduce total op-count. We don't get in an endless push-up push-down
+;; peephole cycle because the constants all fold first."*
+;;
+;; That is the whole termination argument. Phi rule 3 pulls `op` DOWN through a Phi; this pushes a
+;; constant UP through one. They are inverses. The cycle does not happen because pushing up produces
+;; `c0 op k`, which is two constants and folds immediately — so the shape rule 3 would match on is
+;; gone before it can look.
+;;
+;; ## The guards, and what each one prevents
+;;
+;;   - `rhs` is high  -> bail. Acting on an unanalysed operand is acting on nothing.
+;;   - the left side must be a Phi of ALL CONSTANTS (`pcon`), or — when rotating — an op of the same
+;;     class whose RIGHT input is such a Phi. Rotating across different operators is not valid:
+;;     `(x + phi) * k` is not `x + (phi * k)`.
+;;   - a Parm is never eligible even though it IS a Phi. Its inputs are call sites, and rebuilding
+;;     the operator on each would push work into every caller.
+;;   - the Phi's Region must have more than 2 inputs — a 2-input Phi is about to collapse, and
+;;     racing it produces a Phi on a Region that no longer exists.
+;;   - `rhs` must be a constant or itself a Phi of constants.
+;;   - if BOTH sides are Phis they must be on the SAME Region, or the arms do not correspond and the
+;;     rewrite merges values from different merges.
+;;
+;; `n-all-cons?` registers a dependency on the first non-constant input, so a rewrite blocked today
+;; is retried when that input sharpens.
+(module aot.node.phicon)
+(import "coil.primitive" :as primitive)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.type.type" :use *)
+
+;; Simple's `pcon`: is `n` a Phi (and NOT a Parm) whose inputs are all constants?
+(defn pcon [(n (dyn NodeOps)) (dep (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (if (!= (n-op n) OP-PHI)
+      (None [(dyn NodeOps)])
+      (if (n-all-cons? n dep) (Some n) (None [(dyn NodeOps)]))))
+
+;; Does this node's Region have more than two inputs? A 2-input Phi is collapsing.
+(defn phicon--region-wide-enough? [(phi (dyn NodeOps))] (-> bool)
+  (match (n-in phi 0)
+    (None [] false)
+    (Some [r] (> (n-nins r) 2))))
+
+;; The rewrite. `rotate` is true for associative operators (Add, Mul, EQ) where the left side may be
+;; another op of the same class whose right input is the Phi.
+;;
+;; Returns the replacement, or None when any guard fails.
+(defn phi-con [(op (dyn NodeOps)) (rotate bool)] (-> (Option (dyn NodeOps)))
+  (let [lhs (n-in! op 1)
+        rhs (n-in! op 2)]
+    (if (ty-high? (n-ty rhs))
+        (None [(dyn NodeOps)])
+        (let [(mut lphi) (pcon lhs op)]
+          ;; Rotating: the left side is an op of the SAME class whose right input is the Phi.
+          (if (and (and rotate (match (load lphi) (Some [_] false) (None [] true)))
+                   (and (> (n-nins lhs) 2) (= (n-op lhs) (n-op op))))
+              (set! (mut lphi) (pcon (n-in! lhs 2) op))
+              0)
+          (match (load lphi)
+            (None [] (None [(dyn NodeOps)]))
+            (Some [lp]
+                  (if (not (phicon--region-wide-enough? lp))
+                      (None [(dyn NodeOps)])
+                      ;; The right side: a constant, or a Phi of constants on the SAME Region.
+                      (let [rhs-is-phi (= (n-op rhs) OP-PHI)]
+                        (if (and (not (ty-constant? (n-ty rhs)))
+                                 (match (pcon rhs op) (Some [_] false) (None [] true)))
+                            (None [(dyn NodeOps)])
+                            (if (and rhs-is-phi
+                                     (not (edge-same? (n-in lp 0) (n-in rhs 0))))
+                                (None [(dyn NodeOps)])
+                                (phicon--build op lhs lp rhs rhs-is-phi)))))))))))
+
+;; Build the pushed-up Phi: one copy of the operator per arm, each peepholed so the two constants
+;; fold immediately — which is what stops the push-up/pull-down cycle.
+(defn phicon--build [(op (dyn NodeOps))
+                     (lhs (dyn NodeOps))
+                     (lp (dyn NodeOps))
+                     (rhs (dyn NodeOps))
+                     (rhs-is-phi bool)] (-> (Option (dyn NodeOps)))
+  (let [region (n-in! lp 0)
+        cnt (n-nins lp)
+        newphi (phi-make region (n-ty op) "phicon")]
+    (n-keep! newphi)
+    (let [(mut i) 1
+          (mut ok) true]
+      (loop (if (or (>= (load i) cnt) (not (load ok)))
+                (break 0)
+                (do
+                  (let [arm-l (n-in! lp (load i))
+                        arm-r (if rhs-is-phi (n-in! rhs (load i)) (n-in! op 2))]
+                    (match (n-binop-copy op arm-l arm-r)
+                      (Some [c] (phi-add-value! newphi (n-peephole! c)))
+                      ;; Not a binop after all: the caller asked for a rewrite this node cannot do.
+                      ;; Bail rather than build a malformed Phi.
+                      (None [] (do (set! (mut ok) false) 0))))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      (n-unkeep! newphi)
+      (if (not (load ok))
+          (None [(dyn NodeOps)])
+          ;; Rotating case: the left side was an op wrapping the Phi, so it has to be rebuilt around
+          ;; the new Phi. Otherwise the Phi IS the answer.
+          (if (n-same? lhs lp)
+              (Some newphi)
+              (n-binop-copy op (n-in! lhs 1) newphi))))))

@@ -1,0 +1,295 @@
+;; ============================================================================
+
+;; ITERATE PEEPHOLES TO A FIXPOINT  —  port of Simple's `IterPeeps.java`
+;; ============================================================================
+;;
+;; The pessimistic pass. Every type starts wherever parsing left it and only FALLS; peepholes
+;; rewrite the graph until nothing more applies.
+;;
+;; ## The invariant, and it is checkable
+;;
+;;     For every node: either it is ON the worklist, or NO peephole applies to it.
+;;
+;; Simple checks this directly (`progressOnList`) under an expensive-assert flag. It is quadratic —
+;; linear check at each of linearly many steps — so it is sampled rather than always on. Keep it,
+;; and keep it runnable: when a new rule misbehaves this assert is what localises it, and a
+;; correctness check you cannot turn on is not a check.
+;;
+;; ## The seeded random worklist is not a detail
+;;
+;; The worklist pops in a SEEDED RANDOM order, deliberately. A rewrite that is only correct under
+;; one traversal order is a broken rewrite, and a fixed order hides that behind a green gate. The
+;; seed is recorded in every failure so a red run reproduces exactly.
+;;
+;; Vary it. Order-dependent bugs in a sea-of-nodes optimiser show up on a MINORITY of seeds.
+;;
+;; ## The two worklists — inlining lives inside this fixpoint
+;;
+;; There is a second worklist, of CallEnd nodes, and ONE loop interleaves them. Simple's `iterate`:
+;;
+;;     didInline = false; defer = []
+;;     loop:
+;;       iteratePeeps()                       ; clean up everything that does not grow the code
+;;       inlined = false
+;;       while (cend = workInline.pop()):
+;;         if cend is dead: continue
+;;         d = cend.maybeInline()
+;;         if d == DEFER: defer.push(cend)
+;;         if d >  0:     inlined = true; BREAK   ; one at a time, then re-clean
+;;       if inlined:      didInline = true; continue
+;;       if !didInline:   break                   ; nothing fired and nothing fired earlier: done
+;;       didInline = false; requeue(defer); defer.clear()
+;;
+;; Three things to preserve exactly:
+;;
+;; - ONE inline per round, then re-run peepholes. Inlining is the only transform here that GROWS
+;;   the graph, so it is rationed and the cleanup runs between.
+;; - The DEFER list is retried only after some inline actually fired. If nothing fired, nothing
+;;   that was waiting on cleanup can have become ready, so retrying would spin.
+;; - `iteratePeeps` pushes every CallEnd it peepholes onto the inline worklist, so a call that
+;;   sharpens becomes a candidate without anyone tracking that explicitly.
+;;
+;; ## The inner loop, and the "free go again"
+;;
+;;     while (n = work.pop()):
+;;       if n is dead: continue
+;;       x = n.peepholeOpt()
+;;       if n is a CallEnd: workInline.push(n)
+;;       if x != null:
+;;         if x is dead: continue
+;;         if x has no type yet: x.setType(x.compute())     ; brand-new nodes need an initial type
+;;         push all of N's outputs (the CHANGING node, not x)
+;;         push x itself — "everybody gets a free go again in case they didn't get made in their
+;;                          final form"
+;;
+;; That last line is load-bearing: `idealize` may return a node built out of other fresh nodes that
+;; have not themselves been peepholed, and without the free re-queue they never are.
+;;
+;; Note it pushes the outputs of `n`, the node that CHANGED — not of `x`, which may be a
+;; pre-existing node whose neighbours are already settled.
+;;
+;; STATUS: implemented, including the INLINE worklist and its interleaving.
+(module aot.codegen.iterpeeps)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.call" :use *)
+(import "aot.type.type" :use *)
+
+;; ---------------------------------------------------------------------------
+
+;; Run every code-reducing, type-lifting peephole until the node worklist is dry.
+;;
+;; Simple's inner loop, in full — and the tail of it is load-bearing in a way that is easy to miss:
+;;
+;;     while (n = work.pop()):
+;;       if n is dead: continue
+;;       x = n.peepholeOpt()
+;;       if n is a CallEnd: workInline.push(n)
+;;       if x != null:
+;;         if x is dead: continue
+;;         if x has no type: x.setType(x.compute())     ; brand-new nodes need an initial type
+;;         if x != n or x is not a Constant:
+;;           push n's OUTPUTS        — the node that CHANGED, not x
+;;           push x                  — "a free go again in case it wasn't made in final form"
+;;           push x's INPUTS         — a self-returning peephole may have rewritten its own edges,
+;;                                     and the new defs gained a user whose own backwards,
+;;                                     user-sensitive peepholes may now apply
+;;           if x != n:
+;;             push n's INPUTS       — they have a new user
+;;             push x's OUTPUTS
+;;             n.subsume(x)          ; <<< THE REPLACEMENT. Without this the loop peepholes
+;;                                   ;     nodes and never wires the result into the graph.
+(defn iter-peeps! [] (-> i64)
+  (let [(mut count) 0]
+    (loop (match (code-work-pop!)
+            (None [] (break 0))
+            (Some [id]
+                  (match (arena-node id)
+                    (None [] (continue))
+                    (Some [n]
+                          (if (n-dead? n)
+                              (continue)
+                              (do
+                                (set! (mut count) (+ (load count) 1))
+                                ;; Every CallEnd VISITED becomes an inline candidate. This is how a
+                                ;; call that sharpens enters the inline worklist without anyone
+                                ;; tracking candidates explicitly.
+                                (if (= (n-op n) OP-CALLEND) (code-inline-push! (n-nid n)) 0)
+                                (match (n-peephole-opt! n)
+                                  (None [] 0)
+                                  (Some [x] (iter--apply! n x)))
+                                (continue))))))))
+    (load count)))
+
+;; The replacement half of the loop above.
+(defn iter--apply! [(n (dyn NodeOps)) (x (dyn NodeOps))] (-> i64)
+  (if (n-dead? x)
+      0
+      (do
+        (if (= (n-ty x) TY-INVALID) (n-set-ty! x (compute x)) 0)
+        ;; A Constant that returned itself has nothing to propagate.
+        (if (and (n-same? x n) (= (n-op x) OP-CON))
+            0
+            (do
+              (code-add-outputs! n)
+              (code-add! x)
+              (code-add-inputs! x)
+              (if (n-same? x n)
+                  0
+                  (do
+                    (code-add-inputs! n)
+                    (code-add-outputs! x)
+                    ;; Keep `x` alive across the surgery: subsuming `n` kills it, and that
+                    ;; cascade can reach `x` if `x` has no users yet.
+                    (n-keep! x)
+                    (n-subsume! n x)
+                    (n-unkeep! x)
+                    0)))))))
+
+;; The outer loop: peepholes and inlining interleaved, to a fixpoint.
+(defn iter-run! [] (-> i64)
+  ;; Simple's `iterate`, exactly:
+  ;;
+  ;;     didInline = false; defer = []
+  ;;     loop:
+  ;;       iteratePeeps()                       ; clean up everything that does not grow the code
+  ;;       inlined = false
+  ;;       while (cend = workInline.pop()):
+  ;;         if cend is dead: continue
+  ;;         d = cend.maybeInline()
+  ;;         if d == DEFER: defer.push(cend)
+  ;;         if d >  0:     inlined = true; BREAK   ; ONE at a time, then re-clean
+  ;;       if inlined:      didInline = true; continue
+  ;;       if !didInline:   break                   ; nothing fired, and nothing fired earlier
+  ;;       didInline = false; requeue(defer); defer.clear()
+  ;;
+  ;; Three things to preserve exactly:
+  ;;
+  ;;   ONE inline per round, then re-run peepholes. Inlining is the only transform here that
+  ;;   GROWS the graph, so it is rationed and the cleanup runs between.
+  ;;
+  ;;   The DEFER list is retried only after some inline ACTUALLY FIRED. If nothing fired, nothing
+  ;;   waiting on cleanup can have become ready, so retrying would spin.
+  ;;
+  ;;   `iter-peeps!` pushes every CallEnd it visits onto the inline worklist, so a call that
+  ;;   sharpens becomes a candidate without anyone tracking that explicitly.
+  (let [(mut did-inline) false
+        (mut rounds) 0]
+    (loop (do
+            (iter-peeps!)
+            (let [fired (iter--one-inline!)]
+              (if fired
+                  (do
+                    (set! (mut did-inline) true)
+                    (set! (mut rounds) (+ (load rounds) 1))
+                    (continue))
+                  (if (not (load did-inline))
+                      (break 0)
+                      (do
+                        (set! (mut did-inline) false)
+                        (iter--requeue-deferred!)
+                        (continue)))))))
+    (load rounds)))
+
+;; Seed every live node in the arena onto the worklist. Used to start a fixpoint over a graph that
+;; was built by hand rather than parsed.
+(defn iter-seed-all! [] (-> i64)
+  (let [cnt (arena-node-count)
+        (mut i) 1
+        (mut added) 0]
+    (loop (if (> (load i) cnt)
+              (break 0)
+              (do
+                (match (arena-node (load i))
+                  (Some [n]
+                        (if (n-dead? n)
+                            0
+                            (do (code-add! n) (set! (mut added) (+ (load added) 1)))))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load added)))
+
+;; THE INVARIANT: for every live node, either it is ON the worklist, or NO peephole applies to it.
+;;
+;; Simple's `progressOnList`. It sets `_midAssert` and then simply CALLS `peepholeOpt` on every node
+;; not on the worklist, asserting it returns null — the flag is what makes that safe, because it
+;; suppresses worklist pushes and dependency registration for the duration.
+;;
+;; Quadratic: linear at each of linearly many steps. Sampled in normal runs, forced on when a rule
+;; set is misbehaving — it is what localises a peephole that fires without re-queueing.
+;;
+;; Returns the number of nodes that VIOLATED the invariant; 0 is success. Also reports how many it
+;; actually checked, so a caller can state a floor rather than trusting a vacuous pass.
+(defn iter-check-fixpoint [] (-> i64)
+  (let [cnt (arena-node-count)
+        (mut i) 1
+        (mut bad) 0]
+    (set-mid-assert! true)
+    (loop (if (> (load i) cnt)
+              (break 0)
+              (do
+                (match (arena-node (load i))
+                  (Some [n]
+                        (if (or (n-dead? n) (code-on-worklist? (n-nid n)))
+                            0
+                            (match (n-peephole-opt! n)
+                              (Some [_] (set! (mut bad) (+ (load bad) 1)))
+                              (None [] 0))))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (set-mid-assert! false)
+    (load bad)))
+
+;; How many live nodes there are to check — the counted floor under `iter-check-fixpoint`.
+(defn iter-live-count [] (-> i64)
+  (let [cnt (arena-node-count)
+        (mut i) 1
+        (mut live) 0]
+    (loop (if (> (load i) cnt)
+              (break 0)
+              (do
+                (match (arena-node (load i))
+                  (Some [n] (if (n-dead? n) 0 (set! (mut live) (+ (load live) 1))))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load live)))
+
+;; The seed this run is using. Recorded in every failure report so a red run reproduces.
+(defn iter-seed [] (-> i64)
+  (code-seed))
+
+;; ---------------------------------------------------------------------------
+;; The inline worklist
+;;
+;; A SECOND worklist, of CallEnd nodes. `iter-peeps!` pushes every CallEnd it visits onto it, so a
+;; call that sharpens becomes a candidate without anyone tracking that explicitly.
+
+;; Pop candidates until ONE fires. Deferred candidates are collected and retried later — but only
+;; after something actually fired, because otherwise nothing waiting on cleanup can have become
+;; ready and retrying would spin.
+;;
+;; Returns true when an inline happened.
+(defn iter--one-inline! [] (-> bool)
+  (let [(mut fired) false]
+    (loop (match (code-inline-pop!)
+            (None [] (break 0))
+            (Some [id]
+                  (match (arena-node id)
+                    (None [] (continue))
+                    (Some [cend]
+                          (if (n-dead? cend)
+                              (continue)
+                              (let [d (callend-maybe-inline! cend)]
+                                (if (= d INLINE-DEFER)
+                                    (do (code-defer-inline! id) (continue))
+                                    (if (> d 0)
+                                        (do (set! (mut fired) true) (break 0))
+                                        (continue))))))))))
+    (load fired)))
+
+;; Move every deferred candidate back onto the inline worklist.
+(defn iter--requeue-deferred! [] (-> i64)
+  (code-requeue-deferred!))

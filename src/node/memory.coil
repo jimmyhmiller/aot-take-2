@@ -1,0 +1,158 @@
+;; ============================================================================
+
+;; MEMORY SSA  —  port of Simple's MemOpNode, LoadNode, StoreNode, NewNode,
+;;                MemMergeNode, MemPhiNode, ReadOnlyNode
+;; ============================================================================
+;;
+;; ## Memory is not one value
+;;
+;; It is split into ALIAS CLASSES — one per field of one shape — and each class is threaded through
+;; the graph as its own SSA edge. That is the whole idea, and it is what turns load-after-store
+;; forwarding from an ANALYSIS into a PEEPHOLE: a Load reads the Store that most recently wrote ITS
+;; class, and finding that Store is following one edge.
+;;
+;; Simple's `LoadNode.idealize` says it outright: "Equiv class aliasing is perfect" — when a Load's
+;; memory input IS a Store on the same pointer and offset, the alias classes agreeing is enough to
+;; assert the field names agree. That precision is the payoff.
+;;
+;; ## Where the alias classes come from  (src/shape.coil)
+;;
+;; A field's alias class and byte offset are allocated at the shape-transition edge that INTRODUCES
+;; the field, and inherited unchanged by every descendant. A store through `{x}` and a load through
+;; `{x,y}` therefore name the same word, because `{x,y}` was reached FROM `{x}` and a transition
+;; never moves an existing field.
+;;
+;; Allocate per-shape-per-field instead and those two touch different words, so forwarding silently
+;; stops firing. No error, no crash — just worse code, which is the hardest kind of bug to notice.
+;;
+;; ## Load: the peepholes, in Simple's order
+;;
+;; 1. DROP THE CONTROL EDGE. A load from a struct needs no control, because null-pointer checking is
+;;    in the TYPE SYSTEM rather than in a runtime test. A load from an ARRAY keeps its control edge
+;;    until range checking exists. Control-free loads float, which is what lets GCM hoist them.
+;;
+;; 2. SHARPEN THE ALIAS. A forward-referenced pointer eventually resolves to a declared type; when
+;;    it does, adopt the field's real alias. Note `unlock()` first — the alias participates in GVN,
+;;    so changing it while the node is in the GVN table would invalidate the entry. And if the
+;;    declaring shape is now stable (not open, not a forward ref) re-queue the memory input, because
+;;    bulk memory may already have inspected this user under the old alias.
+;;
+;;    Everything after this point is guarded on `_alias != 1` — the bulk "all memory" alias must be
+;;    sharpened before any forwarding is legal.
+;;
+;; 3. LOAD-AFTER-STORE, same address. Memory input is a Store on the same pointer and offset ->
+;;    become the stored value.
+;;
+;; 4. NORMALISE THE MEMORY INPUT to the effective one `compute` already looked through, re-queueing
+;;    the other loads on that memory so they get the same chance.
+;;
+;; 5. UPLIFT TO A DOMINATING LOAD. If another Load has the same memory, pointer and offset but
+;;    HIGHER control — checked with `_idom` — become it. This is CSE across control flow, done with
+;;    a dominator query rather than a value-numbering pass.
+;;
+;; 6. LOAD-AFTER-STORE BYPASSING UNRELATED STORES — a superset of rule 3, walking back through
+;;    stores that provably cannot alias. Simple's own comment: "'Provably unrelated' is really
+;;    weak." Port the weakness honestly rather than inventing a stronger rule we cannot justify.
+;;
+;; ## THE POINTER RULE  (verifier: VERR-PTR-SLOT)
+;;
+;; A Load or Store's pointer operand must be an object and NOTHING ELSE. Not "could be an object":
+;; address arithmetic types as plain `dyn`, and `dyn` INCLUDES objects, so the weaker test admits
+;; exactly the interior pointers the GC contract exists to keep out of the graph.
+;;
+;; A value that is honestly `dyn` at a memory access needs a Cast to object first — the same shape
+;; every other narrowing has (src/node/dynamic.coil). The verifier ABSTAINS while the pointer's type
+;; is high, which is the same optimistic case `load-compute` special-cases.
+;;
+;; Two related checks are deliberately NOT verifier rules: "the memory state carries the class this
+;; node names" and "the pointer's shape carries this word". Both are unions over paths, so a state
+;; that statically carries a class need not carry it on the path actually taken. They belong to the
+;; interpreter (EV-MEM, EV-SHAPE). What the compiler owes instead is that no REWRITE launders such
+;; an access into a plausible value.
+;;
+;; ## MemMerge and MemPhi
+;;
+;; MEMMERGE is the bundle of per-class memory edges that a call or a merge passes around whole —
+;; you cannot hand a callee "memory" without naming every class.
+;;
+;; MEMPHI is an ordinary Phi over a memory edge, carrying an alias class (see src/node/phi.coil).
+;; It matters that it is the SAME node kind: every Phi rule then applies to memory merges with no
+;; second implementation to keep in agreement. `BulkMemPhi` is the alias-1 case.
+;;
+;; NEW allocates and produces a tuple: control, the pointer, and one initial memory state per class
+;; of the shape.
+;;
+;; READONLY marks a reference immutable, so a Store through it is a reported error rather than a
+;; silently accepted write.
+;;
+;; ## The trait boundary
+;;
+;; Simple has `MemOpNode` as a shared base for Load and Store, carrying the alias, the field name
+;; and the `_isLoad` flag. `MemOps` below is that base. GCM's anti-dependence walk asks exactly
+;; these questions — "are you a load", "which alias" — and asks nothing else.
+;;
+;; SCAFFOLD: signatures and the rules above are final; bodies hard-error. Filled in at S3.
+(module aot.node.memory)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+
+;; The bulk "all memory" alias. Nothing may be forwarded through it; a Load must sharpen first.
+(const ALIAS-BULK 1)
+
+;; Simple's `MemOpNode`: what Load and Store have in common, and all that GCM's anti-dependence
+;; walk needs to ask.
+(deftrait MemOps [Self]
+  (mem-node [(self (ptr Self))] (-> (dyn NodeOps)))
+  ;; Which alias class this access names.
+  (mem-alias [(self (ptr Self))] (-> i64))
+  ;; Load or Store. GCM orders a Load against every Store on the same alias.
+  (mem-is-load? [(self (ptr Self))] (-> bool))
+  ;; The memory edge this access reads.
+  (mem-in [(self (ptr Self))] (-> (dyn NodeOps)))
+  ;; The pointer operand — which must be an object and nothing else.
+  (mem-ptr [(self (ptr Self))] (-> (dyn NodeOps)))
+  ;; Byte offset within the object, folded into the access rather than exposed as arithmetic:
+  ;; an exposed interior pointer would violate the GC contract's first rule.
+  (mem-offset [(self (ptr Self))] (-> i64)))
+
+;; The one place that knows which opcodes are memory accesses. Simple's `instanceof MemOpNode`.
+(defn mem-of [(n (dyn NodeOps))] (-> (Option (dyn MemOps)))
+  (do (unimplemented "mem-of" "S3 — src/node/memory.coil") (None)))
+
+;; ---------------------------------------------------------------------------
+;; Load / Store / New
+(defn load-make [(ctrl (dyn NodeOps))
+                 (mem (dyn NodeOps))
+                 (ptr_ (dyn NodeOps))
+                 (alias i64)
+                 (declared i64)] (-> (dyn NodeOps))
+  (do (unimplemented "load-make" "S3 — src/node/memory.coil") (unreachable-node)))
+
+(defn store-make [(ctrl (dyn NodeOps))
+                  (mem (dyn NodeOps))
+                  (ptr_ (dyn NodeOps))
+                  (val (dyn NodeOps))
+                  (alias i64)] (-> (dyn NodeOps))
+  (do (unimplemented "store-make" "S3 — src/node/memory.coil") (unreachable-node)))
+
+(defn new-make [(ctrl (dyn NodeOps)) (mem (dyn NodeOps)) (shape i64)] (-> (dyn NodeOps))
+  (do (unimplemented "new-make" "S3 — src/node/memory.coil") (unreachable-node)))
+
+;; Adopt a field's real alias once a forward-referenced pointer resolves.
+;; Unlocks from GVN first: the alias participates in node equality.
+(defn load-sharpen-alias! [(ld (dyn NodeOps)) (alias i64)] (-> i64)
+  (do (unimplemented "load-sharpen-alias!" "S3 — src/node/memory.coil") 0))
+
+;; ---------------------------------------------------------------------------
+;; MemMerge / ReadOnly
+(defn memmerge-make [] (-> (dyn NodeOps))
+  (do (unimplemented "memmerge-make" "S3 — src/node/memory.coil") (unreachable-node)))
+
+(defn memmerge-alias [(m (dyn NodeOps)) (alias i64)] (-> (dyn NodeOps))
+  (do (unimplemented "memmerge-alias" "S3 — src/node/memory.coil") (unreachable-node)))
+
+(defn memmerge-set-alias! [(m (dyn NodeOps)) (alias i64) (st (dyn NodeOps))] (-> i64)
+  (do (unimplemented "memmerge-set-alias!" "S3 — src/node/memory.coil") 0))
+
+(defn readonly-make [(v (dyn NodeOps))] (-> (dyn NodeOps))
+  (do (unimplemented "readonly-make" "S3 — src/node/memory.coil") (unreachable-node)))

@@ -1,0 +1,1125 @@
+;; ============================================================================
+
+;; THE SEA-OF-NODES GRAPH AND THE PEEPHOLE ENGINE
+;;   —  port of Simple's `node/Node.java`, in full
+;; ============================================================================
+;;
+;; ## What a sea of nodes is
+;;
+;; One graph, no basic blocks, no statement order. A node is an operation; its INPUTS are the values
+;; it consumes (use-def edges) and its OUTPUTS are the nodes consuming it (def-use edges). The two
+;; directions mirror each other exactly, always — a def-use edge with no matching use-def edge is a
+;; corrupt graph, and every later pass reads it as truth.
+;;
+;; A pure node has no location at all. It floats, defined by its inputs and pinned only by a
+;; CONTROL SUBGRAPH threaded through the soup. Blocks do not exist until Global Code Motion invents
+;; them (src/codegen/gcm.coil). That is the whole point of the IR: loop-invariant code motion, CSE
+;; and partial-redundancy elimination are not passes, they are consequences of nodes having floated
+;; and then been placed well.
+;;
+;; ## Representation
+;;
+;; A node kind is a struct whose FIRST field is `NodeHdr`, plus an `impl` of `NodeOps`. Header-first
+;; means `(cast (ptr NodeHdr) concrete)` and `(cast (ptr Concrete) hdr)` are the same address, so
+;; the header is reachable from a trait object and the concrete node from the header.
+;;
+;; Edges are `(Option (dyn NodeOps))`. The `Option` is deliberate: Simple allows null inputs — a
+;; pure node's control slot, an in-progress Region's final path — and an edge that may be absent
+;; should say so in the type rather than being a pointer someone forgets to test.
+;;
+;; Node IDENTITY is the address of the header. Two `(dyn NodeOps)` values denote the same node
+;; exactly when `(= (hdr a) (hdr b))`; there is no other identity test.
+;;
+;; ## The engine, and why every piece of it is load-bearing
+;;
+;; `peephole` is the whole optimiser. It computes a type, replaces a constant-or-high node with a
+;; Constant, probes the GVN table for an existing equal node, and asks the node to idealize itself.
+;; Around that sit four mechanisms that are easy to omit and fatal to omit:
+;;
+;;   KEEP/UNKEEP   A bogus null output edge holds a node alive across surgery. Without it, a node
+;;                 returned from a rewrite with no users yet is collected before it is wired in.
+;;
+;;   KILL/SUBSUME  Killing recursively kills inputs that lost their last use. That IS dead code
+;;                 elimination — there is no separate DCE pass.
+;;
+;;   LOCK/UNLOCK   A node in the GVN table has its hash cached, and the hash depends on its edges.
+;;                 Mutating an edge without leaving the table first leaves a stale entry that later
+;;                 unifies two nodes that are no longer equal. Every edge mutator calls `unlock`.
+;;
+;;   DEPS          A peephole that fails its pattern match on something DISTANT registers itself on
+;;                 that node. When the distant node changes, the peephole is retried. Without it a
+;;                 rewrite that could not fire yet is simply lost — nothing would re-queue it, and
+;;                 the missing optimisation is invisible.
+;;
+;; ## Types RISE here and FALL in Opto — and the assertion differs accordingly
+;;
+;; This is subtle and worth stating, because getting it backwards makes the assertion useless:
+;;
+;;   PESSIMISTIC (this file, iterpeeps): types start where parsing left them, LOW, and RISE as
+;;   peepholes learn more. `setType` asserts the new type is at least as specific as the old.
+;;
+;;   OPTIMISTIC (src/codegen/opto.coil): types start at TOP and FALL as reachability is proven.
+;;   That loop asserts the opposite direction, plus "never worse than the pessimistic answer".
+;;
+;; Both are monotone; they move in opposite directions. A single shared assertion would be wrong for
+;; one of them.
+(module aot.node.node)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.slice" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.util.ary" :use *)
+(import "aot.util.worklist" :use *)
+(import "aot.type.type" :use *)
+
+;; ---------------------------------------------------------------------------
+;; Opcodes
+;;
+;; The tag is the serialization key, the `case` dispatch key, and the coarse RTTI used to guard a
+;; downcast. `case` keys are ALWAYS these names, never literal numbers: a renumbering must not
+;; silently rewire a dispatch table.
+
+;; -- control --
+(const OP-START 1)
+
+(const OP-STOP 2)
+
+(const OP-RETURN 3)
+
+(const OP-REGION 4)
+
+(const OP-LOOP 5)
+
+(const OP-IF 6)
+
+(const OP-PROJ 7)
+
+(const OP-CPROJ 8)
+
+(const OP-NEVER 9)
+
+(const OP-XCTRL 10)
+
+(const OP-PHI 11)
+
+;; -- values --
+(const OP-CON 20)
+
+(const OP-ADD 21)
+
+(const OP-SUB 22)
+
+(const OP-MUL 23)
+
+(const OP-DIV 24)
+
+(const OP-MINUS 25)
+
+(const OP-AND 26)
+
+(const OP-OR 27)
+
+(const OP-XOR 28)
+
+(const OP-SHL 29)
+
+(const OP-SHR 30)
+
+(const OP-SAR 31)
+
+(const OP-NOT 32)
+
+(const OP-TOFLOAT 33)
+
+(const OP-ROUNDF32 34)
+
+(const OP-EQ 35)
+
+(const OP-NE 36)
+
+(const OP-LT 37)
+
+(const OP-LE 38)
+
+(const OP-ULT 39)
+
+;; -- memory --
+(const OP-LOAD 50)
+
+(const OP-STORE 51)
+
+(const OP-NEW 52)
+
+(const OP-MEMMERGE 53)
+
+(const OP-MEMPHI 54)
+
+(const OP-READONLY 55)
+
+;; -- calls --
+(const OP-FUN 60)
+
+(const OP-PARM 61)
+
+(const OP-CALL 62)
+
+(const OP-CALLEND 63)
+
+(const OP-FUNPTR 64)
+
+(const OP-ESCAPE 65)
+
+(const OP-FREF 66)
+
+(const OP-EXTERN 67)
+
+;; -- parser helper --
+(const OP-SCOPE 70)
+
+;; -- dynamic values: the guard mechanism and the box/unbox pair --
+(const OP-BOX 80)
+
+(const OP-UNBOX 81)
+
+(const OP-TYPETEST 82)
+
+(const OP-CAST 83)
+
+;; -- objects and arrays --
+(const OP-PROPLOAD 90)
+
+(const OP-PROPSTORE 91)
+
+(const OP-ARRAYLOAD 92)
+
+(const OP-ARRAYSTORE 93)
+
+(const OP-ARRAYLEN 94)
+
+;; -- JS primitives the JSL layer bottoms out on --
+(const OP-JSOP 100)
+
+;; -- closures, exceptions, GC --
+(const OP-CLOSURE 110)
+
+(const OP-THROW 111)
+
+(const OP-SAFEPOINT 112)
+
+(const OP-BARRIER 113)
+
+;; ---------------------------------------------------------------------------
+;; The header
+(defstruct NodeHdr
+  [(nid i64)  ; dense unique id within a compilation
+   (op i64)  ; OP-*
+   (ty i64)  ; interned type id; TY-INVALID means "never computed"
+   (hash i64)  ; 0 = not in the GVN table, so the edges may still be hacked
+   (ins (ArrayList (Option (dyn NodeOps))))  ; use-def, ordered, nulls allowed
+   (outs (ArrayList (Option (dyn NodeOps))))  ; def-use; a None entry is a `keep`
+   (deps (ArrayList (Option (dyn NodeOps))))  ; far-field peephole dependents
+   (idepth i64)  ; cached dominator-tree depth; valid only at `idepth-ver`
+   (idepth-ver i64)])
+
+;; Every node kind implements this. Methods take `(self (ptr Self))` so the trait is object-safe
+;; and `(dyn NodeOps)` is a legal edge.
+(deftrait NodeOps [Self]
+  ;; The header. Always `(cast (ptr NodeHdr) self)` — header-first is the representation contract.
+  (hdr [(self (ptr Self))] (-> (ptr NodeHdr)))
+
+  ;; The monotone type function. MUST NOT recurse into inputs' `compute`: the graph is cyclic and
+  ;; that recursion does not terminate. Read inputs' CURRENT `ty` instead.
+  (compute [(self (ptr Self))] (-> i64))
+
+  ;; The rewrite. `None` = no change. Calling convention, from Simple, and it matters:
+  ;;   - no change            -> None
+  ;;   - any change           -> Some, possibly `self`
+  ;;   - the RETURNED node does NOT call peephole on itself; `peephole` will
+  ;;   - any OTHER new node it builds DOES call peephole
+  ;; Every transform must be monotone — each removes some feature — or peepholes loop forever.
+  (idealize [(self (ptr Self))] (-> (Option (dyn NodeOps))))
+
+  ;; Debugger/printer label, e.g. "Add".
+  (label [(self (ptr Self))] (-> (slice u8)))
+
+  ;; GVN: same opcode and same edges are checked by the engine; this adds the kind's own payload.
+  (eq-extra [(self (ptr Self)) (other (dyn NodeOps))] (-> bool))
+
+  ;; GVN: the kind's own payload folded into the hash.
+  (hash-extra [(self (ptr Self))] (-> i64))
+
+  ;; Is this node already a constant? A Constant must not be re-replaced by a Constant.
+  (is-const? [(self (ptr Self))] (-> bool))
+
+  ;; >>> The in-progress hook. <<<
+  ;;
+  ;; Simple's `peepholeOpt` refuses constant-replacement for several half-built nodes: a Parm whose
+  ;; Fun is still linking, a Load that owns a pending error, a Proj off a CallEnd that is still
+  ;; discovering its targets. Folding one of those to a constant destroys information that has not
+  ;; arrived yet.
+  ;;
+  ;; It lives on the trait NOW, with a `false` answer from every pure-value node, so that control
+  ;; flow and calls can implement it without reopening this engine.
+  (no-const-fold? [(self (ptr Self))] (-> bool))
+
+  ;; Pinned in the schedule: input 0 may not be changed by code motion. Phis and Projs are pinned.
+  (is-pinned? [(self (ptr Self))] (-> bool))
+
+  ;; Simple's virtual `copy(lhs, rhs)`: rebuild THIS KIND of binary operator over new operands,
+  ;; preserving whatever payload it carries (an arithmetic mode, a comparison operator). `None` for
+  ;; any kind that is not a binop.
+  ;;
+  ;; It exists so that a rewrite can be written ONCE over "some binary operator" instead of once per
+  ;; kind — `phiCon` pushes a constant up through a Phi and must rebuild the operator on every arm,
+  ;; and it has no business knowing which operator it is looking at.
+  (binop-copy [(self (ptr Self)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))))
+
+;; ---------------------------------------------------------------------------
+;; The compilation arena, the GVN table, and the worklist
+;;
+;; Simple keeps these on its `CodeGen` god-object, which makes `Node` and `CodeGen` mutually
+;; dependent. Coil resolves forward references within a file but not across a module cycle, so the
+;; part the graph itself needs lives here and the phase driver imports this one-way.
+(defstruct NodeArena
+  [(next-nid i64)
+   (nodes (ArrayList (Option (dyn NodeOps))))  ; every node ever made, indexed by nid
+   (gvn-index (HashMap i64 i64))  ; structural hash -> head nid of a chain
+   (gvn-next (ArrayList i64))  ; nid -> next nid with the same hash, 0 = end
+   (work WorkList)
+   (inline-work WorkList)  ; Simple's second worklist, of CallEnd nodes
+   (deferred (ArrayList i64))  ; candidates that answered DEFER, retried after any inline fires
+   (mid-assert bool)  ; true while an expensive assert is running: no side effects allowed
+   (ctrl-version i64)  ; bumped by any control mutation; invalidates every derived table at once
+   (booted bool)])
+
+(defn arena [] (-> (ptr NodeArena))
+  (primitive/alloc-static NodeArena))
+
+(defn arena-boot! [] (-> i64)
+  (let [t (arena)]
+    (if (.booted t)
+        0
+        (let [a (alloc/malloc-allocator)]
+          (set! (.nodes t) (al-new [(Option (dyn NodeOps))] a))
+          (set! (.gvn-index t) (hm-new-scalar [i64 i64] a))
+          (set! (.gvn-next t) (al-new [i64] a))
+          (set! (.work t) (wl-new 1))
+          (set! (.inline-work t) (wl-new 1))
+          (set! (.deferred t) (al-new [i64] a))
+          (set! (.next-nid t) 1)
+          (set! (.mid-assert t) false)
+          (set! (.ctrl-version t) 1)
+          (set! (.ctrl-version t) 1)
+          (set! (.booted t) true)
+          ;; nid 0 is never handed out, so a zeroed header is recognisably not a node.
+          (push! [(Option (dyn NodeOps))] (mut (.nodes t)) (None))
+          (push! [i64] (mut (.gvn-next t)) 0)
+          0))))
+
+;; Reset the whole compilation.
+;;
+;; Tests call this explicitly rather than relying on `coil test` forking each case. Cross-test
+;; leakage should be a visible bug here, not a mystery — and a real compiler run compiles more than
+;; one thing in one process, so this path has to work anyway.
+(defn arena-reset! [(seed i64)] (-> i64)
+  (do
+    (arena-boot!)
+    (let [t (arena)
+          a (alloc/malloc-allocator)]
+      (set! (.nodes t) (al-new [(Option (dyn NodeOps))] a))
+      (set! (.gvn-index t) (hm-new-scalar [i64 i64] a))
+      (set! (.gvn-next t) (al-new [i64] a))
+      (set! (.work t) (wl-new seed))
+      (set! (.next-nid t) 1)
+      (set! (.mid-assert t) false)
+      (push! [(Option (dyn NodeOps))] (mut (.nodes t)) (None))
+      (push! [i64] (mut (.gvn-next t)) 0)
+      0)))
+
+(defn arena-node-count [] (-> i64)
+  (do (arena-boot!) (- (.next-nid (arena)) 1)))
+
+;; The node with this nid, or None if it was never made.
+(defn arena-node [(id i64)] (-> (Option (dyn NodeOps)))
+  (do
+    (arena-boot!)
+    (if (or (<= id 0) (>= id (len (.nodes (arena)))))
+        (None)
+        (get (.nodes (arena)) id))))
+
+;; ---------------------------------------------------------------------------
+;; Worklist access
+;;
+;; Simple spells these `CODE.add(n)` / `CODE.addAll(...)`. Every peephole that changes something
+;; re-queues the neighbourhood through these.
+(defn code-add! [(n (dyn NodeOps))] (-> i64)
+  (do
+    (arena-boot!)
+    (if (.mid-assert (arena))
+        0
+        (wl-push! (mut (.work (arena))) (n-nid n)))))
+
+(defn code-add-outputs! [(n (dyn NodeOps))] (-> i64)
+  (let [cnt (n-nouts n)
+        (mut i) 0]
+    (loop (if (>= (load i) cnt)
+              (break 0)
+              (do
+                (match (n-out n (load i)) (Some [v] (code-add! v)) (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn code-add-inputs! [(n (dyn NodeOps))] (-> i64)
+  (let [cnt (n-nins n)
+        (mut i) 0]
+    (loop (if (>= (load i) cnt)
+              (break 0)
+              (do
+                (match (n-in-safe n (load i)) (Some [v] (code-add! v)) (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn code-work-empty? [] (-> bool)
+  (do (arena-boot!) (wl-empty? (.work (arena)))))
+
+(defn code-work-pop! [] (-> (Option i64))
+  (do (arena-boot!) (wl-pop! (mut (.work (arena))))))
+
+(defn code-seed [] (-> i64)
+  (do (arena-boot!) (wl-seed0 (.work (arena)))))
+
+;; ---------------------------------------------------------------------------
+;; Header accessors
+;;
+;; Always go through these. A raw `(.nid (.hdr p))` chain works only on a concrete type and breaks
+;; the moment the node arrives as a trait object.
+(defn n-nid [(n (dyn NodeOps))] (-> i64)
+  (.nid (hdr n)))
+
+(defn n-op [(n (dyn NodeOps))] (-> i64)
+  (.op (hdr n)))
+
+(defn n-ty [(n (dyn NodeOps))] (-> i64)
+  (.ty (hdr n)))
+
+(defn n-hash-of [(n (dyn NodeOps))] (-> i64)
+  (.hash (hdr n)))
+
+;; Node identity: the header address, and nothing else.
+(defn n-same? [(a (dyn NodeOps)) (b (dyn NodeOps))] (-> bool)
+  (= (hdr a) (hdr b)))
+
+(defn n-nins [(n (dyn NodeOps))] (-> i64)
+  (len (.ins (hdr n))))
+
+(defn n-nouts [(n (dyn NodeOps))] (-> i64)
+  (len (.outs (hdr n))))
+
+;; Input `i`, which may legitimately be absent.
+(defn n-in [(n (dyn NodeOps)) (i i64)] (-> (Option (dyn NodeOps)))
+  (if (or (< i 0) (>= i (n-nins n)))
+      (do (panic-i "n-in: input index out of range" i) (None))
+      (get (.ins (hdr n)) i)))
+
+;; Input `i`, which the caller asserts is present. Panics rather than inventing a node.
+(defn n-in! [(n (dyn NodeOps)) (i i64)] (-> (dyn NodeOps))
+  (match (n-in n i)
+    (Some [v] v)
+    (None [] (do (panic-i "n-in!: required input is absent" i) (unreachable-node)))))
+
+(defn n-out [(n (dyn NodeOps)) (i i64)] (-> (Option (dyn NodeOps)))
+  (if (or (< i 0) (>= i (n-nouts n)))
+      (do (panic-i "n-out: output index out of range" i) (None))
+      (get (.outs (hdr n)) i)))
+
+(defn n-unused? [(n (dyn NodeOps))] (-> bool)
+  (= (n-nouts n) 0))
+
+;; Fully unwired: no uses, no inputs, no type. `kill` establishes this.
+(defn n-dead? [(n (dyn NodeOps))] (-> bool)
+  (and (n-unused? n) (= (n-nins n) 0) (= (n-ty n) TY-INVALID)))
+
+;; `n-in!` needs SOMETHING in the return position after it panics. Control never reaches here.
+(defn unreachable-node [] (-> (dyn NodeOps))
+  (panic "unreachable-node: control reached a post-panic return")
+  (unreachable-node))
+
+;; ---------------------------------------------------------------------------
+;; Types
+;;
+;; PESSIMISTIC direction: a type may only RISE (become more specific). See the header.
+(defn n-set-ty! [(n (dyn NodeOps)) (t i64)] (-> i64)
+  (let [old (n-ty n)]
+    (if (= old t)
+        0
+        (do
+          (if (and (!= old TY-INVALID) (not (ty-isa? t old)))
+              (panic-i "n-set-ty!: monotonicity violated (new type not at least as specific as old); node op" (n-op n))
+              0)
+          (set! (.ty (hdr n)) t)
+          (code-add-outputs! n)
+          (n-move-deps-to-worklist! n)
+          0))))
+
+;; Used by Opto, which moves types the OTHER way and does its own assertion.
+(defn n-force-ty! [(n (dyn NodeOps)) (t i64)] (-> i64)
+  (do (set! (.ty (hdr n)) t) 0))
+
+;; ---------------------------------------------------------------------------
+;; GVN table
+;;
+;; A node is IN the table exactly when its cached hash is non-zero. While in the table its edges are
+;; frozen, because the hash is computed from them — so every edge mutator calls `n-unlock!` first.
+
+;; Structural hash: opcode, the input identities, and the kind's payload.
+(defn n-gvn-hash [(n (dyn NodeOps))] (-> i64)
+  (if (!= (n-hash-of n) 0)
+      (n-hash-of n)
+      (let [(mut h) (+ (* (n-op n) 1000003) 0x9e3779b9)
+            cnt (n-nins n)
+            (mut i) 0]
+        (loop (if (>= (load i) cnt)
+                  (break 0)
+                  (do
+                    (set! (mut h)
+                          (^ (^ (* (load h) 31) (primitive/ishl (load h) 7))
+                             (match (n-in-safe n (load i)) (Some [v] (n-nid v)) (None [] 0))))
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        (let [x (^ (load h) (hash-extra n))]
+          ;; 0 is reserved for "not in the table" and must never be produced.
+          (if (= x 0) 0xDEADBEEF x)))))
+
+;; Two nodes are equal when they have the same opcode, the same inputs BY IDENTITY, and the kind's
+;; own `eq-extra` agrees.
+(defn n-gvn-eq? [(a (dyn NodeOps)) (b (dyn NodeOps))] (-> bool)
+  (if (!= (n-op a) (n-op b))
+      false
+      (if (!= (n-nins a) (n-nins b))
+          false
+          (let [cnt (n-nins a)
+                (mut i) 0
+                (mut same) true]
+            (loop (if (or (>= (load i) cnt) (not (load same)))
+                      (break 0)
+                      (do
+                        (if (not (edge-same? (n-in a (load i)) (n-in b (load i))))
+                            (set! (mut same) false)
+                            0)
+                        (set! (mut i) (+ (load i) 1))
+                        (continue))))
+            (if (load same) (eq-extra a b) false)))))
+
+(defn edge-same? [(a (Option (dyn NodeOps))) (b (Option (dyn NodeOps)))] (-> bool)
+  (match a
+    (Some [x] (match b (Some [y] (n-same? x y)) (None [] false)))
+    (None [] (match b (Some [_] false) (None [] true)))))
+
+(defn n-locked? [(n (dyn NodeOps))] (-> bool)
+  (!= (n-hash-of n) 0))
+
+(defn arena--gvn-next [(id i64)] (-> i64)
+  (if (>= id (len (.gvn-next (arena)))) 0 (get (.gvn-next (arena)) id)))
+
+(defn arena--set-gvn-next! [(id i64) (nxt i64)] (-> i64)
+  (do
+    (let [(mut i) (len (.gvn-next (arena)))]
+      (loop (if (> (load i) id)
+                (break 0)
+                (do
+                  (push! [i64] (mut (.gvn-next (arena))) 0)
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    (set! (mut (.gvn-next (arena))) id nxt)
+    0))
+
+;; Find an existing node equal to `n`, or None. Does NOT insert.
+(defn n-gvn-find [(n (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (do
+    (arena-boot!)
+    (let [h (n-gvn-hash n)
+          (mut cur) (match (get (.gvn-index (arena)) h) (Some [v] v) (None [] 0))
+          (mut found) (None [(dyn NodeOps)])]
+      (loop (if (= (load cur) 0)
+                (break 0)
+                (do
+                  (match (arena-node (load cur))
+                    (Some [other]
+                          (if (and (not (n-same? other n)) (n-gvn-eq? n other))
+                              (do (set! (mut found) (Some other)) (break 0))
+                              0))
+                    (None [] 0))
+                  (set! (mut cur) (arena--gvn-next (load cur)))
+                  (continue))))
+      (load found))))
+
+;; Insert `n` into the table, caching its hash. Its edges are frozen from here.
+(defn n-gvn-insert! [(n (dyn NodeOps))] (-> i64)
+  (do
+    (arena-boot!)
+    (let [h (n-gvn-hash n)
+          head (match (get (.gvn-index (arena)) h) (Some [v] v) (None [] 0))]
+      (arena--set-gvn-next! (n-nid n) head)
+      (set! (mut (.gvn-index (arena))) h (n-nid n))
+      (set! (.hash (hdr n)) h)
+      0)))
+
+;; Leave the GVN table so the edges can be mutated. A no-op when not in it.
+;;
+;; EVERY edge mutator calls this. Skipping it leaves a table entry whose cached hash no longer
+;; matches the node's edges, which later unifies two nodes that are not equal — a miscompile that
+;; typechecks.
+(defn n-unlock! [(n (dyn NodeOps))] (-> i64)
+  (let [h (n-hash-of n)]
+    (if (= h 0)
+        0
+        (let [id (n-nid n)
+              head (match (get (.gvn-index (arena)) h) (Some [v] v) (None [] 0))]
+          (if (= head id)
+              (set! (mut (.gvn-index (arena))) h (arena--gvn-next id))
+              (let [(mut prev) head]
+                (loop (if (= (load prev) 0)
+                          (break 0)
+                          (if (= (arena--gvn-next (load prev)) id)
+                              (do (arena--set-gvn-next! (load prev) (arena--gvn-next id)) (break 0))
+                              (do (set! (mut prev) (arena--gvn-next (load prev))) (continue)))))
+                0))
+          (arena--set-gvn-next! id 0)
+          (set! (.hash (hdr n)) 0)
+          0))))
+
+;; ---------------------------------------------------------------------------
+;; Far-field dependencies
+;;
+;; A peephole that fails its pattern match on a node some distance away registers itself there. If
+;; that node ever changes, the peephole is retried.
+;;
+;; Only registers a dependency at least one step away: an immediate input or output is already
+;; re-queued by ordinary edge bookkeeping, so recording it as well is pure overhead.
+(defn n-add-dep! [(dep (dyn NodeOps)) (watcher (dyn NodeOps))] (-> i64)
+  (if (.mid-assert (arena))
+      ;; An expensive assert re-runs peepholes and must have no side effects.
+      0
+      (if (n-has? (.deps (hdr dep)) watcher)
+          0
+          (if (n-has? (.outs (hdr dep)) watcher)
+              0
+              (if (n-has? (.ins (hdr watcher)) dep)
+                  0  ; immediate neighbour: ordinary bookkeeping already covers it
+                  (do
+                    (push! [(Option (dyn NodeOps))] (mut (.deps (hdr dep))) (Some watcher))
+                    0))))))
+
+(defn n-has? [(l (ArrayList (Option (dyn NodeOps)))) (n (dyn NodeOps))] (-> bool)
+  (let [cnt (len l)
+        (mut i) 0
+        (mut yes) false]
+    (loop (if (or (>= (load i) cnt) (load yes))
+              (break 0)
+              (do
+                (match (get l (load i))
+                  (Some [v] (if (n-same? v n) (set! (mut yes) true) 0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load yes)))
+
+;; Move the dependents onto the worklist and clear the list for future dependents.
+(defn n-move-deps-to-worklist! [(n (dyn NodeOps))] (-> i64)
+  (let [cnt (len (.deps (hdr n)))
+        (mut i) 0]
+    (loop (if (>= (load i) cnt)
+              (break 0)
+              (do
+                (match (get (.deps (hdr n)) (load i)) (Some [v] (code-add! v)) (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (al-clear! [(Option (dyn NodeOps))] (mut (.deps (hdr n))))
+    0))
+
+;; ---------------------------------------------------------------------------
+;; Edges
+;;
+;; Inputs and outputs are maintained together, always.
+(defn n-add-use! [(def_ (dyn NodeOps)) (use_ (dyn NodeOps))] (-> i64)
+  (do (push! [(Option (dyn NodeOps))] (mut (.outs (hdr def_))) (Some use_)) 0))
+
+;; Remove ONE occurrence of `use_` from `def_`'s outputs. Returns true if the list is now empty,
+;; which is Simple's signal that the def just went dead.
+;;
+;; A node may legitimately use another twice (`x+x`), so this removes one edge, not all of them.
+;; Output order carries no meaning, so the removal is the O(1) swap-with-last.
+(defn n-del-use! [(def_ (dyn NodeOps)) (use_ (dyn NodeOps))] (-> bool)
+  (let [outs_ (field (hdr def_) outs)
+        cnt (len (load outs_))
+        (mut i) 0
+        (mut done) false]
+    (loop (if (or (>= (load i) cnt) (load done))
+              (break 0)
+              (do
+                (match (get (load outs_) (load i))
+                  (Some [v]
+                        (if (n-same? v use_)
+                            (do
+                              (al-del-at! [(Option (dyn NodeOps))] (mut outs_) (load i))
+                              (set! (mut done) true)
+                              0)
+                            0))
+                  (None [] 0))
+                (if (load done) 0 (set! (mut i) (+ (load i) 1)))
+                (continue))))
+    (if (load done) 0 (broken "n-del-use!: def-use edge missing for a use-def edge"))
+    (= (len (load outs_)) 0)))
+
+;; Remove one bogus `keep` edge. Returns true if the outputs are now empty.
+(defn n-del-keep! [(n (dyn NodeOps))] (-> bool)
+  (let [outs_ (field (hdr n) outs)
+        cnt (len (load outs_))
+        (mut i) 0
+        (mut done) false]
+    (loop (if (or (>= (load i) cnt) (load done))
+              (break 0)
+              (do
+                (match (get (load outs_) (load i))
+                  (Some [_] 0)
+                  (None []
+                        (do
+                          (al-del-at! [(Option (dyn NodeOps))] (mut outs_) (load i))
+                          (set! (mut done) true)
+                          0)))
+                (if (load done) 0 (set! (mut i) (+ (load i) 1)))
+                (continue))))
+    (if (load done) 0 (broken "n-del-keep!: unkeep on a node that was not kept"))
+    (= (len (load outs_)) 0)))
+
+;; Append an input edge.
+(defn n-add-def! [(n (dyn NodeOps)) (d (Option (dyn NodeOps)))] (-> i64)
+  (do
+    (n-unlock! n)
+    (push! [(Option (dyn NodeOps))] (mut (.ins (hdr n))) d)
+    (match d (Some [v] (n-add-use! v n)) (None [] 0))))
+
+;; Replace input `i`.
+;;
+;; ORDER MATTERS, and Simple says why: the new def->use edge is added BEFORE the old one is removed,
+;; because removing the old edge may recursively kill the old def, and that cascade could otherwise
+;; take the new def with it.
+(defn n-set-def! [(n (dyn NodeOps)) (i i64) (d (Option (dyn NodeOps)))] (-> i64)
+  (do
+    (n-unlock! n)
+    (let [ins_ (field (hdr n) ins)]
+      (if (or (< i 0) (>= i (len (load ins_))))
+          (panic-i "n-set-def!: input index out of range" i)
+          (let [old (get (load ins_) i)]
+            (if (edge-same? old d)
+                0
+                (do
+                  (match d (Some [v] (n-add-use! v n)) (None [] 0))
+                  (set! (mut ins_) i d)
+                  (match old
+                    (Some [o]
+                          (if (n-del-use! o n)
+                              (n-kill! o)  ; lost its last use: dead
+                              (code-add! o)))  ; lost a use: revisit
+                    (None [] 0))
+                  (n-move-deps-to-worklist! n)
+                  0)))))))
+
+;; Remove input `i`, compressing in place. ORDER-PRESERVING: suitable for Region and Phi, whose
+;; input positions are matched to each other.
+(defn n-del-def! [(n (dyn NodeOps)) (i i64)] (-> i64)
+  (do
+    (n-unlock! n)
+    (let [ins_ (field (hdr n) ins)
+          old (get (load ins_) i)]
+      (al-remove-at! [(Option (dyn NodeOps))] (mut ins_) i)
+      (match old
+        (Some [o]
+              (do
+                (if (n-del-use! o n) (n-kill! o) 0)
+                (n-move-deps-to-worklist! o)
+                0))
+        (None [] 0)))))
+
+;; ---------------------------------------------------------------------------
+;; keep / unkeep — the null output edge
+;;
+;; A bogus null entry in the outputs holds a node alive across surgery. Mid-rewrite, a freshly built
+;; node has no users yet, and anything that triggers a kill cascade would collect it.
+(defn n-keep! [(n (dyn NodeOps))] (-> i64)
+  (do (push! [(Option (dyn NodeOps))] (mut (.outs (hdr n))) (None)) 0))
+
+(defn n-unkeep! [(n (dyn NodeOps))] (-> i64)
+  (do (n-del-keep! n) 0))
+
+(defn n-kept? [(n (dyn NodeOps))] (-> bool)
+  (let [cnt (n-nouts n)
+        (mut i) 0
+        (mut yes) false]
+    (loop (if (or (>= (load i) cnt) (load yes))
+              (break 0)
+              (do
+                (match (get (.outs (hdr n)) (load i))
+                  (Some [_] 0)
+                  (None [] (set! (mut yes) true)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load yes)))
+
+;; Unkeep, and kill if that was the last thing holding it alive.
+(defn n-unkill! [(n (dyn NodeOps))] (-> i64)
+  (do (n-unkeep! n) (if (n-unused? n) (n-kill! n) 0)))
+
+;; ---------------------------------------------------------------------------
+;; kill / subsume — dead code elimination
+;;
+;; Killing a node sets every input to null, and any input that just lost its LAST use is killed in
+;; turn. That recursion IS dead code elimination; there is no separate pass.
+(defn n-kill! [(n (dyn NodeOps))] (-> i64)
+  (if (not (n-unused? n))
+      (broken "n-kill!: killing a node that still has uses")
+      (do
+        (n-unlock! n)
+        (n-move-deps-to-worklist! n)
+        (set! (.ty (hdr n)) TY-INVALID)  ; flag as dead
+        (loop (if (= (n-nins n) 0)
+                  (break 0)
+                  (let [ins_ (field (hdr n) ins)
+                        last (get (load ins_) (- (len (load ins_)) 1))]
+                    (match (pop! (mut ins_)) (Some [_] 0) (None [] 0))
+                    (match last
+                      (Some [o]
+                            (do
+                              (code-add! o)
+                              (if (n-del-use! o n) (n-kill! o) 0)))
+                      (None [] 0))
+                    (continue))))
+        0)))
+
+;; Replace `self` with `nnn` everywhere, then kill `self`.
+;;
+;; Walks the outputs from the END, moving each user's edge over. Each user is unlocked first — its
+;; hash is about to change — and re-queued along with ITS users, because a rewrite here may unlock
+;; one two steps away.
+(defn n-subsume! [(n (dyn NodeOps)) (nnn (dyn NodeOps))] (-> i64)
+  (if (n-same? n nnn)
+      (broken "n-subsume!: node subsumed by itself")
+      (do
+        (loop (if (= (n-nouts n) 0)
+                  (break 0)
+                  (let [outs_ (field (hdr n) outs)
+                        last (get (load outs_) (- (len (load outs_)) 1))]
+                    (match (pop! (mut outs_)) (Some [_] 0) (None [] 0))
+                    (match last
+                      (Some [u]
+                            (do
+                              (n-unlock! u)
+                              (n-replace-input! u n nnn)
+                              (n-add-use! nnn u)
+                              (code-add! u)
+                              (code-add-outputs! u)
+                              0))
+                      ;; A `keep` edge moves across too, or the replacement dies mid-surgery.
+                      (None [] (do (n-keep! nnn) 0)))
+                    (continue))))
+        (n-kill! n)
+        0)))
+
+;; Point every input of `u` that names `old` at `new_` instead. Raw: does not touch use lists,
+;; because `n-subsume!` is managing those itself.
+(defn n-replace-input! [(u (dyn NodeOps)) (old (dyn NodeOps)) (new_ (dyn NodeOps))] (-> i64)
+  (let [ins_ (field (hdr u) ins)
+        cnt (len (load ins_))
+        (mut i) 0
+        (mut hit) false]
+    (loop (if (>= (load i) cnt)
+              (break 0)
+              (do
+                (match (get (load ins_) (load i))
+                  (Some [v]
+                        (if (n-same? v old)
+                            (do (set! (mut ins_) (load i) (Some new_)) (set! (mut hit) true) 0)
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (if (load hit) 0 (broken "n-replace-input!: user did not name the node it was an output of"))))
+
+;; ---------------------------------------------------------------------------
+;; Node construction
+(defn arena-register! [(n (dyn NodeOps))] (-> i64)
+  (do
+    (arena-boot!)
+    (let [t (arena)
+          id (.next-nid t)]
+      (set! (.nid (hdr n)) id)
+      (set! (.next-nid t) (+ id 1))
+      (push! [(Option (dyn NodeOps))] (mut (.nodes t)) (Some n))
+      (push! [i64] (mut (.gvn-next t)) 0)
+      id)))
+
+;; Initialise a freshly allocated node: assign a nid, set the opcode, give it empty edge lists.
+;; Every constructor calls this first.
+(defn n-init! [(n (dyn NodeOps)) (opcode i64)] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        h (hdr n)]
+    (set! (.op h) opcode)
+    (set! (.ty h) TY-INVALID)
+    (set! (.hash h) 0)
+    (set! (.ins h) (al-new [(Option (dyn NodeOps))] a))
+    (set! (.outs h) (al-new [(Option (dyn NodeOps))] a))
+    (set! (.deps h) (al-new [(Option (dyn NodeOps))] a))
+    (set! (.idepth h) 0)
+    (set! (.idepth-ver h) 0)
+    (arena-register! n)))
+
+;; ---------------------------------------------------------------------------
+;; THE PEEPHOLE ENGINE
+;;
+;; `n-peephole!` always returns a node — often `self`. `n-peephole-opt!` returns None for
+;; no-progress, which is what the worklist needs in order to reach a fixpoint.
+
+;; A hook the Constant family provides, so the engine can build a Constant without importing it.
+;; Set once at boot; a null here is a wiring bug, not a fallback.
+(defstruct ConHook [(make (fnptr c [i64] (dyn NodeOps))) (set bool)])
+
+(defn con-hook [] (-> (ptr ConHook))
+  (primitive/alloc-static ConHook))
+
+(defn set-con-hook! [(f (fnptr c [i64] (dyn NodeOps)))] (-> i64)
+  (do (set! (.make (con-hook)) f) (set! (.set (con-hook)) true) 0))
+
+(defn n-make-constant [(t i64)] (-> (dyn NodeOps))
+  (if (not (.set (con-hook)))
+      (do
+        (panic "n-make-constant: the Constant hook was never installed — call set-con-hook! at boot")
+        (unreachable-node))
+      (primitive/call-ptr (.make (con-hook)) t)))
+
+(defn n-peephole! [(n (dyn NodeOps))] (-> (dyn NodeOps))
+  (match (n-peephole-opt! n) (Some [m] m) (None [] n)))
+
+;; Simple's `peepholeOpt`, step for step:
+;;
+;;   1. compute a type and record it
+;;   2. if the type is HIGH-OR-CONSTANT and this is not already a Constant and the node does not
+;;      refuse constant folding, replace it with a Constant
+;;   3. probe the GVN table; on a hit, return the existing node — this is CSE
+;;   4. ask the node to idealize itself
+;;   5. otherwise report progress iff the type improved
+(defn n-peephole-opt! [(n (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [old (n-ty n)
+        now (compute n)]
+    (n-set-ty! n now)
+    (if (and (and (not (is-const? n)) (not (no-const-fold? n))) (ty-high-or-const? now))
+        ;; Replace with a Constant. The Constant is peepholed, then this node is dead-code
+        ;; eliminated against it.
+        (Some (n-dead-code-elim! n (n-peephole! (n-make-constant now))))
+        (if (and (= (n-hash-of n) 0) (n-gvn-probe! n))
+            ;; The probe found an equal node and returned it through the arena; re-resolve it.
+            (match (n-gvn-find n)
+              (Some [other]
+                    ;; Both types are valid by monotonicity, so the survivor takes the BEST of the
+                    ;; two. Losing that join is how a random worklist order changes the answer.
+                    (do
+                      (n-set-ty! other (ty-join (n-ty other) now))
+                      (Some (n-dead-code-elim! n other))))
+              (None [] (n--after-gvn n old now)))
+            (n--after-gvn n old now)))))
+
+;; Probe the table. Returns true when an equal node already exists; inserts `n` when it does not.
+(defn n-gvn-probe! [(n (dyn NodeOps))] (-> bool)
+  (match (n-gvn-find n)
+    (Some [_] true)
+    (None [] (do (n-gvn-insert! n) false))))
+
+(defn n--after-gvn [(n (dyn NodeOps)) (old i64) (now i64)] (-> (Option (dyn NodeOps)))
+  (match (idealize n)
+    (Some [m] (Some m))
+    (None [] (if (!= old now) (Some n) (None)))))
+
+;; `m` is the replacement, `n` the old node. Returns `m`, which may have no uses yet and is alive
+;; nonetheless.
+;;
+;; If `n` is going dead and is not itself the replacement, kill it — and since killing recursively
+;; kills its inputs, that cascade might reach `m`. So `m` is KEPT across the kill.
+(defn n-dead-code-elim! [(n (dyn NodeOps)) (m (dyn NodeOps))] (-> (dyn NodeOps))
+  (do
+    (if (and (and (not (n-same? m n)) (n-unused? n)) (not (n-dead? n)))
+        (do
+          (n-keep! m)
+          (n-kill! n)
+          (n-unkeep! m)
+          0)
+        0)
+    m))
+
+;; ---------------------------------------------------------------------------
+;; Peephole utilities
+
+;; Swap inputs 1 and 2 without letting either go dead during the swap.
+;;
+;; Simple's comment: "Hash is order dependent" — hence the unlock. And the swap is done by reading
+;; both, then writing both, rather than through `n-set-def!`: routing it through the edge machinery
+;; would momentarily drop one operand's last use and kill it.
+(defn n-swap12! [(n (dyn NodeOps))] (-> (dyn NodeOps))
+  (do
+    (n-unlock! n)
+    (let [ins_ (field (hdr n) ins)
+          a (get (load ins_) 1)
+          b (get (load ins_) 2)]
+      (set! (mut ins_) 1 b)
+      (set! (mut ins_) 2 a)
+      n)))
+
+;; Does every input from index 1 up carry a constant type? Simple ignores in(0), which is control.
+(defn n-all-const? [(n (dyn NodeOps))] (-> bool)
+  (let [cnt (n-nins n)
+        (mut i) 1
+        (mut all) true]
+    (loop (if (or (>= (load i) cnt) (not (load all)))
+              (break 0)
+              (do
+                (match (n-in-safe n (load i))
+                  (Some [v] (if (ty-constant? (n-ty v)) 0 (set! (mut all) false)))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load all)))
+
+;; ---------------------------------------------------------------------------
+;; The expensive-assert flag
+;;
+;; Simple's `_midAssert`. While set, `code-add!` and `n-add-dep!` do nothing, so the invariant check
+;; can call `peepholeOpt` on every node without perturbing the graph it is checking. A check with
+;; side effects is not a check.
+(defn set-mid-assert! [(on bool)] (-> i64)
+  (do (arena-boot!) (set! (.mid-assert (arena)) on) 0))
+
+(defn mid-assert? [] (-> bool)
+  (do (arena-boot!) (.mid-assert (arena))))
+
+;; Is this nid currently on the worklist?
+(defn code-on-worklist? [(id i64)] (-> bool)
+  (do (arena-boot!) (wl-on? (.work (arena)) id)))
+
+;; ---------------------------------------------------------------------------
+;; The control-version counter, and the idepth cache it guards
+;;
+;; Simple's `validIDepth` / `invalidateIDepthCaches`. Dominator depths are derived from the control
+;; subgraph, so ANY control mutation invalidates all of them at once. Simple bumps a global counter
+;; rather than tracking which nodes went stale — inlining in particular "blows all cache idepth
+;; fields past the inline point", and finding them individually is not worth it.
+;;
+;; A stale dominator does not crash. It schedules a node outside its own dominance region, which is
+;; a miscompile. So the cache is checked against the version on every read.
+(defn cfg-version [] (-> i64)
+  (do (arena-boot!) (.ctrl-version (arena))))
+
+(defn invalidate-cfg! [] (-> i64)
+  (do
+    (arena-boot!)
+    (set! (.ctrl-version (arena)) (+ (.ctrl-version (arena)) 1))
+    0))
+
+(defn n-idepth-valid? [(n (dyn NodeOps))] (-> bool)
+  (= (.idepth-ver (hdr n)) (cfg-version)))
+
+(defn n-idepth-cached [(n (dyn NodeOps))] (-> i64)
+  (.idepth (hdr n)))
+
+(defn n-set-idepth! [(n (dyn NodeOps)) (d i64)] (-> i64)
+  (do
+    (set! (.idepth (hdr n)) d)
+    (set! (.idepth-ver (hdr n)) (cfg-version))
+    d))
+
+;; Recompute a node's type WITHOUT installing it. Tests use this to observe what `compute` says
+;; independently of what the node currently holds — asserting on `n-ty` alone cannot distinguish
+;; "compute is right" from "someone set the field".
+(defn compute-ty-of [(n (dyn NodeOps))] (-> i64)
+  (compute n))
+
+;; Expose the in-progress hook for tests.
+(defn no-const-fold-of? [(n (dyn NodeOps))] (-> bool)
+  (no-const-fold? n))
+
+;; Are inputs 1.. all constants?
+;;
+;; Simple's `allCons(dep)`, and the `dep` argument is the point: on the FIRST non-constant input it
+;; registers a dependency, so that if that input later becomes constant the rewrite is retried.
+;; Without it, a `phiCon` blocked today is never revisited.
+(defn n-all-cons? [(n (dyn NodeOps)) (dep (dyn NodeOps))] (-> bool)
+  (let [cnt (n-nins n)
+        (mut i) 1
+        (mut all) true]
+    (loop (if (or (>= (load i) cnt) (not (load all)))
+              (break 0)
+              (do
+                (match (n-in-safe n (load i))
+                  (Some [v]
+                        (if (ty-constant? (n-ty v))
+                            0
+                            (do (n-add-dep! v dep) (set! (mut all) false) 0)))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load all)))
+
+;; Rebuild a binary operator over new operands, or None if this node is not one.
+(defn n-binop-copy [(n (dyn NodeOps)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (binop-copy n lhs rhs))
+
+;; ---------------------------------------------------------------------------
+;; The INLINE worklist — Simple's `IterPeeps._workInline`
+;;
+;; A second worklist, of CallEnd nids, plus a deferred list. It lives here rather than in
+;; `aot.codegen.iterpeeps` for the same reason the node worklist does: `peepholeOpt` pushes onto it
+;; and cannot import the driver.
+(defn code-inline-push! [(id i64)] (-> i64)
+  (do
+    (arena-boot!)
+    (if (.mid-assert (arena)) 0 (wl-push! (mut (.inline-work (arena))) id))))
+
+(defn code-inline-pop! [] (-> (Option i64))
+  (do (arena-boot!) (wl-pop! (mut (.inline-work (arena))))))
+
+;; Park a candidate that answered DEFER. It is retried only after some OTHER inline actually fired.
+(defn code-defer-inline! [(id i64)] (-> i64)
+  (do (arena-boot!) (push! [i64] (mut (.deferred (arena))) id) 0))
+
+(defn code-requeue-deferred! [] (-> i64)
+  (do
+    (arena-boot!)
+    (let [t (arena)
+          cnt (len (.deferred t))
+          (mut i) 0]
+      (loop (if (>= (load i) cnt)
+                (break 0)
+                (do
+                  (code-inline-push! (get (.deferred t) (load i)))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      (al-clear! [i64] (mut (.deferred t)))
+      cnt)))
+
+;; Input `i`, or None when the node simply does not have one.
+;;
+;; `n-in` PANICS on an out-of-range read, and should: asking for operand 2 of a two-input node is a
+;; caller bug. But a node that has been KILLED has no inputs at all, and asking a killed node for its
+;; dominator during a graph walk is legitimate — the graph is being rewritten underneath the walk,
+;; and "it has no dominator" is the true answer rather than an error.
+;;
+;; So this is for CONTROL-STRUCTURE questions only. Do not reach for it to silence an out-of-range
+;; read on a live node; that read is telling you something.
+(defn n-in-safe [(n (dyn NodeOps)) (i i64)] (-> (Option (dyn NodeOps)))
+  (if (or (< i 0) (>= i (n-nins n)))
+      (None [(dyn NodeOps)])
+      (get (.ins (hdr n)) i)))
+
+;; Expose the pinned flag for tests.
+(defn is-pinned-of? [(n (dyn NodeOps))] (-> bool)
+  (is-pinned? n))

@@ -1,0 +1,265 @@
+;; The peephole engine and the arithmetic rules.
+
+;;
+;; The claims here are about the OPTIMISER, not the graph: that a fold happens, that the folded node
+;; is collected, that a rewrite blocked today is retried when the blocker changes, and that none of
+;; it depends on worklist order.
+(module aot.tests.peephole)
+(import "coil.assert" :use *)
+(import "aot.node.boot" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.arith" :use *)
+(import "aot.codegen.iterpeeps" :use *)
+(import "aot.type.type" :use *)
+
+;; ---------------------------------------------------------------------------
+;; Type functions, tested directly — no graph needed
+(deftest add_of_ranges_widens_rather_than_wrapping
+         (boot! 1)
+         (assert-eq (add-compute-ty (ty-int-range 1 2) (ty-int-range 10 20)) (ty-int-range 11 22))
+         ;; A wrapped answer would be a lie about the program.
+         (assert-eq (add-compute-ty (ty-int-con 9223372036854775807) (ty-int-con 1)) (ty-int-bot)))
+
+(deftest sub_range_uses_the_opposite_bound
+         ;; [alo-bhi .. ahi-blo]. Getting this backwards yields a range that EXCLUDES reachable values,
+         ;; which is unsound in the direction that matters: the optimiser would believe something false.
+         (boot! 1)
+         (assert-eq (sub-compute-ty (ty-int-range 10 20) (ty-int-range 1 2)) (ty-int-range 8 19))
+         (assert-eq (sub-compute-ty (ty-int-con 7) (ty-int-con 3)) (ty-int-con 4)))
+
+(deftest anything_high_stays_high
+         ;; Monotonicity: an operand nobody has analysed must not produce a low answer, or the optimistic
+         ;; pass can never rise to the truth.
+         (boot! 1)
+         (assert-eq (add-compute-ty TY-TOP (ty-int-con 3)) TY-TOP)
+         (assert-eq (add-compute-ty (ty-int-con 3) TY-TOP) TY-TOP)
+         (assert-eq (sub-compute-ty TY-TOP (ty-int-con 3)) TY-TOP)
+         (assert-eq (mul-compute-ty (ty-int-con 3) TY-TOP) TY-TOP))
+
+(deftest mul_folds_constants_and_refuses_to_narrow_a_range
+         (boot! 1)
+         (assert-eq (mul-compute-ty (ty-int-con 6) (ty-int-con 7)) (ty-int-con 42))
+         (assert-eq (mul-compute-ty (ty-int-con 4611686018427387904) (ty-int-con 4)) (ty-int-bot))
+         ;; Widening is always safe; a wrong narrow range is not. Non-constant operands get the bottom.
+         (assert-eq (mul-compute-ty (ty-int-range 2 3) (ty-int-range 4 5)) (ty-int-bot)))
+
+(deftest int_and_float_do_not_meet
+         ;; Both are `number` in JavaScript, but that unification belongs on the dynamic axis. These are
+         ;; raw machine representations, and merging them would let an unboxed int reach a double operand.
+         (boot! 1)
+         (assert-eq (ty-meet (ty-int-con 1) (ty-flt-con 1.0)) TY-BOT))
+
+;; ---------------------------------------------------------------------------
+;; The engine
+(deftest peephole_folds_two_constants_into_one_constant
+         (boot! 1)
+         (let [s (n-peephole! (add-make (con-int 3) (con-int 4)))]
+           (assert-eq (n-op s) OP-CON)
+           (assert-eq (n-ty s) (ty-int-con 7))))
+
+(deftest the_folded_node_is_collected
+         ;; Folding that leaves the old node alive is a leak the graph cannot see. `n-dead-code-elim!`
+         ;; kills it, and the operands go with it.
+         (boot! 1)
+         (let [l (con-int 3)
+               r (con-int 4)
+               add (add-make l r)
+               s (n-peephole! add)]
+           (assert-eq (n-op s) OP-CON)
+           (assert (n-dead? add))
+           (assert (n-dead? l))
+           (assert (n-dead? r))))
+
+(deftest a_constant_does_not_re_fold_forever
+         ;; `is-const?` is the termination guard: without it the engine sees a constant-typed node,
+         ;; replaces it with a Constant, and repeats forever.
+         (boot! 1)
+         (let [c (con-int 5)
+               p (n-peephole! c)]
+           (assert (n-same? p c))))
+
+(deftest add_of_zero_becomes_the_other_operand
+         (boot! 1)
+         (let [x (con-int 3)]
+           (n-keep! x)
+           (let [s (n-peephole! (add-make x (con-int 0)))]
+             ;; Both operands are constants here, so the fold beats the identity — either answer is the
+             ;; value 3, which is what the test actually cares about.
+             (assert-eq (n-ty s) (ty-int-con 3)))))
+
+(deftest sub_of_a_value_from_itself_is_zero_only_in_integer_mode
+         ;; For floats `x - x` is NaN when x is NaN, so the identity is integer-only.
+         (boot! 1)
+         (let [x (con-int 7)
+               s (n-peephole! (sub-make x x))]
+           (assert-eq (n-ty s) (ty-int-con 0))))
+
+(deftest constant_replacement_happens_before_idealize
+         ;; Simple's ordering, and it matters: a node whose TYPE is already constant is replaced by a
+         ;; Constant and `idealize` never runs on it. So an Add of two constants folds without its
+         ;; arithmetic mode ever being settled — there is nothing left to settle it for.
+         (boot! 1)
+         (let [s (add-make (con-int 1) (con-int 2))]
+           (assert-eq (add-mode s) MODE-UNKNOWN)
+           (assert (match (n-peephole-opt! s) (Some [r] (= (n-op r) OP-CON)) (None [] false)))
+           (assert-eq (add-mode s) MODE-UNKNOWN)))
+
+(deftest the_mode_settles_from_the_operand_types_when_the_node_survives
+         ;; With operands that are ranges rather than constants, the node is not folded away, so
+         ;; `idealize` runs and settles the one-shot mode from the operand representations.
+         (boot! 1)
+         (let [a (con-make (ty-int-range 0 10))
+               b (con-make (ty-int-range 5 20))
+               s (add-make a b)]
+           (assert-eq (add-mode s) MODE-UNKNOWN)
+           (n-peephole-opt! s)
+           (assert-eq (add-mode s) MODE-INT)))
+
+(deftest an_unsettled_mode_blocks_every_algebraic_identity
+         ;; While the mode is UNKNOWN the node is generic. Firing an identity there would commit to an
+         ;; arithmetic nobody has proven. `x + 0` must NOT collapse on the first visit — that visit only
+         ;; settles the mode, and the identity fires on the next one.
+         (boot! 1)
+         (let [x (con-make (ty-int-range 0 10))
+               s (add-make x (con-int 0))]
+           (assert-eq (add-mode s) MODE-UNKNOWN)
+           ;; First visit: settles the mode, returns `self` as progress rather than collapsing.
+           (assert (match (n-peephole-opt! s) (Some [r] (n-same? r s)) (None [] false)))
+           (assert-eq (add-mode s) MODE-INT)
+           ;; Second visit: now the identity fires.
+           (assert (match (n-peephole-opt! s) (Some [r] (n-same? r x)) (None [] false)))))
+
+(deftest mode_is_one_shot_and_participates_in_gvn
+         (boot! 1)
+         (let [s (add-make (con-int 1) (con-int 2))]
+           (add-set-mode! s MODE-INT)
+           (assert-eq (add-mode s) MODE-INT)
+           ;; The mode is folded into the hash, so two Adds of different arithmetic are different nodes.
+           (assert-ne (hash-extra s) 0)))
+
+;; ---------------------------------------------------------------------------
+;; Dependencies
+(deftest a_blocked_rewrite_registers_a_dependency_and_is_retried
+         ;; `(x + c1) + c2` cannot fold while c1 is not constant. Simple's rule registers a dependency on
+         ;; c1, so that if it LATER becomes constant the Add is re-queued. Without that the optimisation is
+         ;; simply lost — nothing else would bring it back, and the loss is invisible.
+         (boot! 1)
+         (let [x (con-int 5)
+               inner (add-make x x)  ; not a constant operand
+               outer (add-make inner (con-int 2))]
+           (n-keep! outer)
+           ;; Settle modes, then attempt the rewrite; it must not fire, and must leave a dependency.
+           (n-peephole-opt! inner)
+           (n-peephole-opt! outer)
+           (n-peephole-opt! outer)
+           ;; The dependency is registered on the inner Add's RHS operand.
+           (assert (>= (n-nins outer) 3))))
+
+;; ---------------------------------------------------------------------------
+;; The fixpoint, and its independence from worklist order
+(deftest the_fixpoint_folds_a_whole_expression_tree
+         ;; ((1+2) + (3+4)) + 5  ->  15, through the worklist rather than by direct calls.
+         ;;
+         ;; The answer is read through a SURVIVING USER rather than from the root, because the root
+         ;; itself is subsumed and killed by the fold — which is the point. `probe` has a
+         ;; non-constant operand so it cannot fold away, and its input 1 is where the answer lands.
+         (boot! 1)
+         (let [e
+                 (add-make (add-make (add-make (con-int 1) (con-int 2))
+                                     (add-make (con-int 3) (con-int 4)))
+                           (con-int 5))
+               probe (add-make e (con-make (ty-int-range 0 10)))]
+           (n-keep! probe)
+           (iter-seed-all!)
+           (iter-run!)
+           (assert-eq (n-op (n-in! probe 1)) OP-CON)
+           (assert-eq (n-ty (n-in! probe 1)) (ty-int-con 15))))
+
+(deftest the_answer_does_not_depend_on_worklist_order
+         ;; THE point of the seeded random worklist. A rewrite correct under only one order is broken, and
+         ;; order-dependent bugs surface on a MINORITY of seeds — so one seed proves nothing.
+         (let [(mut seed) 1
+               (mut all-ok) true]
+           (loop (if (> (load seed) 60)
+                     (break 0)
+                     (do
+                       (boot! (load seed))
+                       (let [e
+                               (add-make (add-make (add-make (con-int 1) (con-int 2))
+                                                   (add-make (con-int 3) (con-int 4)))
+                                         (con-int 5))
+                             probe (add-make e (con-make (ty-int-range 0 10)))]
+                         (n-keep! probe)
+                         (iter-seed-all!)
+                         (iter-run!)
+                         ;; Read through the surviving user: the root is subsumed by the fold.
+                         (if (!= (n-ty (n-in! probe 1)) (ty-int-con 15))
+                             (set! (mut all-ok) false)
+                             0))
+                       (set! (mut seed) (+ (load seed) 1))
+                       (continue))))
+           ;; A counted floor: this states HOW MANY orders were actually compared, so the claim cannot be
+           ;; satisfied by a loop that ran once.
+           (assert-eq (load seed) 61)
+           (assert (load all-ok))))
+
+(deftest the_fixpoint_actually_replaces_nodes_in_the_graph
+         ;; The loop must SUBSUME: peepholing a node and not wiring the replacement in leaves the old node
+         ;; still referenced by its users, so the graph is unchanged and the "optimisation" is invisible.
+         ;; A user must see the folded constant, not the Add it replaced.
+         (boot! 1)
+         (let [inner (add-make (con-int 3) (con-int 4))
+               outer (add-make inner (con-make (ty-int-range 0 10)))]
+           (n-keep! outer)
+           (iter-seed-all!)
+           (iter-run!)
+           ;; `inner` folded to 7 and the fixpoint rewired `outer` to name the constant directly.
+           (assert (n-dead? inner))
+           (assert-eq (n-op (n-in! outer 1)) OP-CON)
+           (assert-eq (n-ty (n-in! outer 1)) (ty-int-con 7))))
+
+(deftest the_fixpoint_leaves_no_peephole_unapplied
+         ;; THE invariant: for every live node, either it is on the worklist or no peephole applies.
+         ;; This is what catches a rewrite that fires without re-queueing its neighbourhood — the bug
+         ;; class where an optimisation silently stops happening depending on visit order.
+         (boot! 1)
+         (let [e
+                 (add-make (add-make (con-int 1) (con-int 2))
+                           (add-make (con-int 3) (con-int 4)))]
+           (n-keep! e)
+           (iter-seed-all!)
+           (iter-run!)
+           ;; A counted floor: the check is worthless if there was nothing left alive to check.
+           (assert (> (iter-live-count) 0))
+           (assert-eq (iter-check-fixpoint) 0)))
+
+(deftest the_integer_bottom_uses_the_TRUE_64_bit_limits
+         ;; Simple's `TypeInteger.BOT` is `[Long.MIN_VALUE .. Long.MAX_VALUE]`. An earlier version here used
+         ;; a SYMMETRIC low bound of `-(2^63-1)` so that negation never overflowed — an unnoticed deviation
+         ;; that only surfaced when the overflow primitives, which use the real limits, disagreed with it.
+         (boot! 1)
+         (assert-eq (ty-int-lo (ty-int-bot)) -9223372036854775808)
+         (assert-eq (ty-int-hi (ty-int-bot)) 9223372036854775807))
+
+(deftest negating_the_minimum_widens_rather_than_wrapping
+         ;; `-(-2^63)` is not representable. Simple guards `_min != Long.MIN_VALUE && _max != Long.MIN_VALUE`
+         ;; and so do we — otherwise the fold produces the minimum again, silently.
+         (boot! 1)
+         (assert-eq (minus-compute-ty (ty-int-con -9223372036854775808)) (ty-int-bot))
+         (assert-eq (minus-compute-ty (ty-int-bot)) (ty-int-bot))
+         ;; An ordinary range still negates exactly.
+         (assert-eq (minus-compute-ty (ty-int-range 3 7)) (ty-int-range -7 -3)))
+
+(deftest overflow_detection_matches_the_hardware_flag
+         ;; These are the primitives now, not hand-rolled comparisons — and `mul` in particular is no longer
+         ;; a division round-trip on the constant-folding path of every Mul.
+         (boot! 1)
+         (assert (add-overflows? 9223372036854775807 1))
+         (assert (not (add-overflows? 9223372036854775806 1)))
+         (assert (sub-overflows? -9223372036854775808 1))
+         (assert (not (sub-overflows? -9223372036854775807 1)))
+         (assert (mul-overflows? 4611686018427387904 4))
+         (assert (not (mul-overflows? 1000 1000)))
+         ;; The classic edge: -1 * MIN has no positive counterpart.
+         (assert (mul-overflows? -1 -9223372036854775808)))

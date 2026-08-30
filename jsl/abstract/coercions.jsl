@@ -1,0 +1,293 @@
+;; The abstract operations the language applies at operator and global-function boundaries, as
+;; opposed to the methods in `lib/string/` and `lib/array/`.
+;;
+;; EVERY ENTRY IS A `macro`. Each is a single primitive plus a name, so a `builtin` would add a call
+;; frame around one instruction and nothing else. That is the same split Torque draws, applied for
+;; the same reason: a macro is the right shape for an operation the caller is EMITTING rather than
+;; invoking. What the library contributes here is that the operation has one name and one spec
+;; reference, not that it has an implementation the frontend lacked.
+
+;; https://tc39.es/ecma262/#sec-tostring
+;;
+;; ToString of an OBJECT is ToPrimitive with hint string, which calls the object's `toString`, and
+;; an array's is `Array.prototype.toString` -- `String([1, 2, 3])` is "1,2,3" and not
+;; "[object Object]". The primitive cannot make that distinction on its own: it is handed a tagged
+;; word and answers a formatting rule, where the array case is a JavaScript algorithm over the
+;; elements. So the dispatch happens here, and `ArrayToStringValue` in lib/array/read.jsl is the
+;; algorithm.
+;;
+;; `%Box` BEFORE `%IsArray`, because `v` arrives as whatever machine word the caller had: an array
+;; is a RAW object pointer at most call sites and the tag test needs the tagged form. Boxing a value
+;; that is already tagged is the identity, and where the analysis has proven `v` is a number the
+;; whole test folds away and this is `%ToString` again.
+(builtin ToStringValue :transitioning true
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-tostring"
+  :spec-name "ToString"
+  :status partial
+  :deviation "BigInt values and the complete object ToPrimitive protocol are not yet implemented."
+  :params [(v dyn)] :ret dyn
+  (if (%IsSymbol (%Box v))
+      (ThrowTypeError "Cannot convert a Symbol value to a string")
+      (if (%IsObject (%Box v))
+          (let [(primitive (ToPrimitive (%Box v) "string"))]
+            (if (%IsSymbol primitive)
+                (ThrowTypeError "Cannot convert a Symbol value to a string")
+                (%ToString primitive)))
+          (%ToString v))))
+
+;; The same conversion CONTINUING an array walk already in progress, so the cycle stack it is
+;; already carrying is the one an inner array is checked against. `ArrayJoinSeen` is the only
+;; caller; `ToStringValue` above is the entry that starts a fresh stack.
+(builtin ToStringValueSeen :transitioning true :params [(v dyn) (seen dyn)] :ret str
+  (if (%IsArray (%Box v))
+      (%UnboxString (ArrayToStringValue (%Box v) seen))
+      (%ToString v)))
+
+;; ONE NODE, NO BRANCH, AND THAT IS DELIBERATE. The frontend emits this at every dynamic arithmetic
+;; operand, which includes operands inside functions other than the entry, and the guarded spelling
+;; — `(if (IsNumber v) v (%ToNumber v))`, the spec's own steps 1 and 2 — puts a Region and a Phi
+;; there. `tests/native-conformance/integrated-heap-program.ts` stopped compiling when it did:
+;; `tree.value + sum(tree.left)` inside `sum` produced a `New` anchored at Start and selection
+;; refused it with a dependency failure. `jsl-inline!` emitting control flow inside a non-entry
+;; function is the underlying limitation; it is written up in HANDOFF.md.
+;;
+;; The guard is worth having back once that is fixed. It is what keeps the runtime call off the
+;; numbers: unguarded, `call-loop` goes 9.6ms to 25.5ms and `math-loop` 73.3ms to 97.3ms.
+(builtin IsPrimitiveValue :params [(v dyn)] :ret bool
+  (if (IsNumber v)
+      true
+      (if (%IsSymbol v)
+          true
+      (if (%IsString v)
+          true
+          (if (%IsUndefined v)
+              true
+              (if (%IsNull v) true (%IsBool v)))))))
+
+;; https://tc39.es/ecma262/#sec-toprimitive. `preferredType = undefined` represents the omitted
+;; optional argument and therefore selects the specification's "default" hint. Well-known Symbol
+;; identity is published by the targeted JSL entry rather than by retaining the complete Symbol
+;; constructor closure in every coercion graph.
+(builtin ToPrimitive
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-toprimitive"
+  :spec-name "ToPrimitive"
+  :status partial
+  :deviation "Proxy exotic objects and BigInt are not represented. Until the intrinsic manifest publishes every inherited default conversion method, the no-@@toPrimitive fallback for represented Arrays, Functions, and primitive wrappers composes their unmodified intrinsic result directly; mutation of those inherited defaults is not yet supported."
+  :transitioning true :params [(input dyn) (preferredType dyn)] :ret dyn
+  (if (IsPrimitiveValue input)
+      input
+      (ToPrimitiveObject input preferredType)))
+
+;; Object-only continuation kept out of the overwhelmingly common primitive fast path. Making the
+;; canonical macro guard this called unit lets statically primitive arithmetic erase the entire
+;; heap/callback closure while still keeping exactly one implementation of the observable branch.
+(builtin ToPrimitiveObject
+  :specializes "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-toprimitive"
+  :deviation "Object-only continuation of canonical ToPrimitive; callers must establish that input is not primitive."
+  :transitioning true :params [(input dyn) (preferredType dyn)] :ret dyn
+  (let [(hint (if (%IsUndefined preferredType)
+                  "default"
+                  (if (StringEquals preferredType "string") "string" "number")))
+        (exoticToPrimitive (GetMethod input (SymbolToPrimitiveValue)))]
+    (if (%IsUndefined exoticToPrimitive)
+        (let [(ordinaryHint (if (StringEquals hint "default") "number" hint))]
+          (if (%IsArray input)
+              (ArrayToStringValue input (%NewArray))
+              (if (%IsFunction input)
+                  "function () {}"
+                  (if (HasInternalSlot input (InternalSlotNumberData))
+                      (%InternalTarget input)
+                      (if (HasInternalSlot input (InternalSlotBooleanData))
+                        (%InternalTarget input)
+                        (if (HasInternalSlot input (InternalSlotStringData))
+                            (%InternalTarget input)
+                            (if (HasInternalSlot input (InternalSlotSymbolData))
+                                (%InternalTarget input)
+                                (OrdinaryToPrimitive input ordinaryHint))))))))
+        (let [(result (Call exoticToPrimitive input hint))]
+          (if (IsPrimitiveValue result)
+              result
+              (ThrowTypeError "Cannot convert object to primitive value"))))))
+
+;; https://tc39.es/ecma262/#sec-ordinarytoprimitive. The two method orders are the algorithm's
+;; only hint-dependent structure. Each property read and call is observable and may complete
+;; abruptly, so both go through canonical Get and Call; a non-callable method is skipped and an
+;; Object result advances to the second method.
+(builtin OrdinaryToPrimitive
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-ordinarytoprimitive"
+  :spec-name "OrdinaryToPrimitive"
+  :status partial
+  :deviation "The represented intrinsic prototype surface does not yet publish every inherited default valueOf/toString method, and Proxy exotic objects and BigInt are not represented. Own and inherited represented methods, both hint orders, abrupt completion, receiver identity, non-callable skipping, and Object-result fallback follow the algorithm."
+  :transitioning true :params [(object dyn) (hint dyn)] :ret dyn
+  (if (StringEquals hint "string")
+      (let [(first (GetProperty object "toString"))]
+        (if (IsCallable first)
+            (let [(firstResult (Call first object))]
+              (if (IsPrimitiveValue firstResult)
+                  firstResult
+                  (let [(second (GetProperty object "valueOf"))]
+                    (if (IsCallable second)
+                        (let [(secondResult (Call second object))]
+                          (if (IsPrimitiveValue secondResult)
+                              secondResult
+                              (ThrowTypeError "Cannot convert object to primitive value")))
+                        (ThrowTypeError "Cannot convert object to primitive value")))))
+            (let [(second (GetProperty object "valueOf"))]
+              (if (IsCallable second)
+                  (let [(secondResult (Call second object))]
+                    (if (IsPrimitiveValue secondResult)
+                        secondResult
+                        (ThrowTypeError "Cannot convert object to primitive value")))
+                  (ThrowTypeError "Cannot convert object to primitive value")))))
+      (let [(first (GetProperty object "valueOf"))]
+        (if (IsCallable first)
+            (let [(firstResult (Call first object))]
+              (if (IsPrimitiveValue firstResult)
+                  firstResult
+                  (let [(second (GetProperty object "toString"))]
+                    (if (IsCallable second)
+                        (let [(secondResult (Call second object))]
+                          (if (IsPrimitiveValue secondResult)
+                              secondResult
+                              (ThrowTypeError "Cannot convert object to primitive value")))
+                        (ThrowTypeError "Cannot convert object to primitive value")))))
+            (let [(second (GetProperty object "toString"))]
+              (if (IsCallable second)
+                  (let [(secondResult (Call second object))]
+                    (if (IsPrimitiveValue secondResult)
+                        secondResult
+                        (ThrowTypeError "Cannot convert object to primitive value")))
+                  (ThrowTypeError "Cannot convert object to primitive value")))))))
+
+(macro ToPrimitiveNumber :transitioning true :params [(v dyn)] :ret dyn
+  ;; Primitive is both the overwhelmingly common path and the one static type information can
+  ;; usually prove. Put it first so ordinary numeric/string arithmetic does not retain object-only
+  ;; conversion calls in its graph.
+  (ToPrimitive (%Box v) "number"))
+
+;; https://tc39.es/ecma262/#sec-tonumber
+(builtin ToNumberValue :transitioning true
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-tonumber"
+  :spec-name "ToNumber"
+  :status partial
+  :deviation "BigInt values and the complete object ToPrimitive protocol are not yet implemented."
+  :params [(v dyn)] :ret dyn
+  (if (%IsSymbol v)
+      (ThrowTypeError "Cannot convert a Symbol value to a number")
+      (if (IsNumber v)
+      v
+      (%ToNumber (ToPrimitiveNumber (%Box v))))))
+
+;; https://tc39.es/ecma262/#sec-tointegerorinfinity. `%ToInteger` is the runtime's numeric
+;; truncation capability; it is not the abstract operation by itself because it cannot run the
+;; observable ToPrimitive/ToNumber protocol on an arbitrary ECMAScript value. Keep that policy in
+;; this one canonical JSL definition and let numeric-only algorithms use the primitive as such.
+(builtin ToIntegerOrInfinity
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-tointegerorinfinity"
+  :spec-name "ToIntegerOrInfinity"
+  :status partial
+  :deviation "BigInt values and the complete object ToPrimitive protocol, including @@toPrimitive and inherited/custom fallback methods, are not yet implemented."
+  :transitioning true :params [(argument dyn)] :ret dyn
+  (%ToInteger (ToNumberValue argument)))
+
+;; https://tc39.es/ecma262/#sec-number-constructor and #sec-boolean-constructor. Wrapper state is
+;; an internal slot, never an observable property. Kinds 100 and 101 are deliberately outside the
+;; array-iterator kind range (0..2), while sharing the representation-owned InternalTarget seam.
+(builtin NewNumberObject :transitioning true :params [(v dyn)] :ret dyn
+  (let [(object (%Box (%NewObject)))
+        (initialized (%InternalInit object (%Box (ToNumberValue v)) 100))
+        (prototype (InitializeObjectPrototype object (BuiltinPrototypeValue 19)))]
+    object))
+
+(builtin NewBooleanObject :transitioning true :params [(v dyn)] :ret dyn
+  (let [(object (%Box (%NewObject)))
+        (initialized (%InternalInit object (%Box (ToBoolean v)) 101))
+        (prototype (InitializeObjectPrototype object (BuiltinPrototypeValue 20)))]
+    object))
+
+(builtin NewStringObject :transitioning true :params [(v dyn)] :ret dyn
+  (let [(string (%Box (ToStringValue v)))
+        (object (%Box (%NewObject)))
+        (layout (object-layout-init object StringExoticBase))
+        (extensible (internal-slot-store layout Extensible true))
+        (stringSlot (internal-slot-store extensible StringData string))
+        (family (object-method-family-set stringSlot StringExoticMethods))
+        ;; Compatibility mirror until all legacy `%Internal*` consumers are migrated to named
+        ;; generated slots. It is representation storage, not a second source of String semantics.
+        (initialized (%InternalInit family string 102))
+        (prototype (InitializeObjectPrototype family (BuiltinPrototypeValue 18)))
+        ;; StringCreate installs `length` as a real own data property. Indexed code-unit
+        ;; properties are supplied by the String exotic [[GetOwnProperty]] method instead.
+        (lengthKey (ToPropertyKey "length"))
+        (lengthStored (%DefinePropertyValue object lengthKey (%Box (StringLength string))))
+        (lengthMarked (%SetPropertyAttributes object lengthKey 0))]
+    object))
+
+(builtin NewSymbolObject :transitioning true :params [(v dyn)] :ret dyn
+  (let [(object (%Box (%NewObject)))
+        (initialized (%InternalInit object (%Box v) 103))
+        (prototype (InitializeObjectPrototype object (BuiltinPrototypeValue 22)))]
+    object))
+
+;; https://tc39.es/ecma262/#sec-toobject. This is the single semantic boundary for converting an
+;; arbitrary value to an Object: nullish values throw, represented primitives allocate the exact
+;; wrapper family carrying its internal data slot, and existing Objects preserve identity.
+(builtin ToObject :transitioning true
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-toobject"
+  :spec-name "ToObject"
+  :status partial
+  :deviation "BigInt wrapper objects are not yet represented by the supported frontend/runtime surface."
+  :params [(v dyn)] :ret dyn
+  (let [(value (%Box v))]
+    (let [(coercible (RequireObjectCoercible value))]
+      (if (IsNumber coercible)
+          (NewNumberObject coercible)
+          (if (%IsBool coercible)
+              (NewBooleanObject coercible)
+              (if (%IsString coercible)
+                  (NewStringObject coercible)
+                  (if (%IsSymbol coercible) (NewSymbolObject coercible) coercible)))))))
+
+;; https://tc39.es/ecma262/#sec-object-value. `Object(value)` differs from ToObject only for null
+;; and undefined, which create a fresh ordinary Object instead of throwing. All other values must
+;; pass through the canonical ToObject operation so wrapper allocation is implemented once.
+(builtin ObjectFromValue :transitioning true :params [(v dyn)] :ret dyn
+  (let [(value (%Box v))]
+    (if (%IsUndefined value)
+        (InitializeOrdinaryObject (%Box (%NewObject)))
+        (if (%IsNull value)
+            (InitializeOrdinaryObject (%Box (%NewObject)))
+            (ToObject value)))))
+
+;; https://tc39.es/ecma262/#sec-parseint-string-radix
+(macro ParseIntValue :params [(s dyn) (radix dyn)] :ret dyn (%ParseInt s radix))
+
+;; https://tc39.es/ecma262/#sec-isnan-number — the GLOBAL isNaN, which coerces first and so differs
+;; from Number.isNaN: `isNaN("12x")` is true where `Number.isNaN("12x")` is false, because the
+;; global asks whether ToNumber of the argument is NaN and Number.isNaN asks whether the argument
+;; already IS the NaN value. Keep the coercion composition here rather than relying on the
+;; representation primitive's historical partial coercions.
+(macro GlobalIsNaN :transitioning true :params [(v dyn)] :ret bool
+  (%IsNaN (%Box (ToNumberValue v))))
+
+;; https://tc39.es/ecma262/#sec-string.fromcharcode, for the single-argument case the frontend emits.
+(macro StringFromCharCode :params [(c dyn)] :ret dyn (%StringFromCode c))
+
+(macro NumberToStringValue :params [(value dyn) (radix dyn)] :ret dyn
+  (%NumberToString value radix))
+
+(macro ThrowValue :params [(value dyn)] :ret dyn (%Throw value))
+;; https://tc39.es/ecma262/#sec-requireobjectcoercible. This is the one canonical nullish guard
+;; used by object conversion, generic built-ins, and destructuring. It deliberately returns the
+;; original value unchanged; wrapper allocation belongs to ToObject, not this operation.
+(builtin RequireObjectCoercible :transitioning true
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-requireobjectcoercible"
+  :spec-name "RequireObjectCoercible"
+  :status partial
+  :deviation "BigInt source values are not yet represented by the supported frontend/runtime surface."
+  :params [(value dyn)] :ret dyn
+  (if (%Eq value (%Box null))
+      (ThrowTypeError "Cannot convert undefined or null to object")
+      (if (%Eq value (%Box undefined))
+          (ThrowTypeError "Cannot convert undefined or null to object")
+          value)))

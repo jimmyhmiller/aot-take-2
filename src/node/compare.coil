@@ -1,0 +1,300 @@
+;; ============================================================================
+
+;; COMPARISONS AND NOT  —  port of Simple's `node/BoolNode.java` and `NotNode.java`
+;; ============================================================================
+;;
+;; Simple has five comparison classes sharing `BoolNode`. They are one file here because their
+;; `compute` and `idealize` are one implementation parameterised by the operator — only `doOp`
+;; differs, and that is four lines each.
+;;
+;; ## A boolean IS an integer
+;;
+;; There is no boolean type. `BOOL` is the integer range [0..1], `TRUE` is 1, `FALSE` is 0. That is
+;; what lets `If` take any integer as a predicate, and what makes `x == 0` and `!x` the same node
+;; after one peephole.
+;;
+;; ## compute — Simple's order, and every step matters
+;;
+;;     either operand HIGH        -> BOOL.dual()   ; "a boolean, but nobody has computed which"
+;;     the two inputs are THE SAME node -> LT gives FALSE; EQ, NE, LE, ULT give TRUE
+;;     mode still 0               -> BOOL          ; generic; do not guess an arithmetic
+;;     integer mode               -> the per-operator RANGE test below
+;;     float mode, both constant  -> the answer; otherwise BOOL
+;;
+;; The same-node case comes BEFORE the range test and is not an optimisation: `x < x` is false for
+;; every x including NaN-free floats, and no range comparison would discover it, because the ranges
+;; overlap perfectly.
+;;
+;; > NOTE, and this is a real deviation to record when floats arrive: Simple returns TRUE for
+;; > `x == x` on the same node in FLOAT mode too, which is wrong for NaN. It is correct for Simple
+;; > because Simple's floats never carry NaN through this path. JavaScript's do — `NaN === NaN` is
+;; > false — so when float mode becomes reachable here this case must be restricted to integers, the
+;; > same way `x - x -> 0` already is in `aot.node.arith`.
+;;
+;; ## The range tests — this is where a bounds check disappears
+;;
+;;     EQ / NE   ranges DISJOINT (a.hi < b.lo or a.lo > b.hi)  -> decided
+;;     LT        a.hi <  b.lo -> TRUE      a.lo >= b.hi -> FALSE
+;;     LE        a.hi <= b.lo -> TRUE      a.lo >  b.hi -> FALSE
+;;     ULT       the same as LT, compared UNSIGNED
+;;
+;; `ULT` exists for the array bounds-check idiom: `(unsigned)i < len` catches a negative index and an
+;; over-large one in a SINGLE branch, because a negative signed value is a huge unsigned one. It is
+;; not user-writable and its mode is always integer.
+;;
+;; When the interprocedural fixpoint proves an index is `[0..len)`, `ULT` folds to TRUE, the `If`
+;; folds to one arm, and the bounds check vanishes. That chain is the whole reason ranges are in the
+;; lattice.
+;;
+;; ## idealize
+;;
+;;   1. compare of the same node    -> the constant (as in `compute`)
+;;   2. settle the one-shot mode from the operand types
+;;   3. float mode with an integer operand -> insert a ToFloat  (owed: needs ToFloat)
+;;   4. EQ only: sink the constant right; otherwise sort by node id, so `a==b` and `b==a` GVN
+;;      together. Simple sorts on `_nid` — a stable, dense identity that exists for exactly this.
+;;   5. EQ only: `x == 0` becomes `!x`
+;;   6. push a constant up through a Phi  (owed: `phiCon`)
+(module aot.node.compare)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.arith" :use *)
+(import "aot.node.phicon" :use *)
+(import "aot.type.type" :use *)
+
+(const CMP-LHS 1)
+
+(const CMP-RHS 2)
+
+;; ---------------------------------------------------------------------------
+;; NOT — JavaScript truthiness-negate, and the node `x == 0` folds into
+;;
+;; Simple's `compute`:
+;;     high            -> BOOL.dual()
+;;     zero / nil      -> TRUE
+;;     provably non-zero -> FALSE
+;;     otherwise       -> BOOL
+;;
+;; JSL's `ToBoolean` is `(%Not (%Not v))` and `LogicalNot` is `(%Not v)` — so this node is exactly
+;; the `%Not` primitive those definitions bottom out in.
+(defstruct NotNode [(hdr NodeHdr) (pad i64)])
+
+(defn not-compute-ty [(t i64)] (-> i64)
+  (if (ty-high? t)
+      (ty-bool-high)
+      (if (= t TY-NIL)
+          (ty-true)
+          (if (ty-int? t)
+              (let [lo (ty-int-lo t)
+                    hi (ty-int-hi t)]
+                (if (and (= lo 0) (= hi 0))
+                    (ty-true)
+                    ;; Provably non-zero: the whole range sits strictly above or strictly below 0.
+                    (if (or (> lo 0) (< hi 0)) (ty-false) (ty-bool))))
+              (ty-bool)))))
+
+(impl NodeOps NotNode
+  (hdr [(self (ptr NotNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr NotNode))] (-> (slice u8)) "Not")
+  (is-const? [(self (ptr NotNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr NotNode))] (-> bool) false)
+  (is-pinned? [(self (ptr NotNode))] (-> bool) false)
+  (binop-copy [(self (ptr NotNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)]))
+  (compute [(self (ptr NotNode))]
+           (-> i64)
+           (not-compute-ty (n-ty (n-in! (primitive/make-dyn NodeOps self) CMP-LHS))))
+  (idealize [(self (ptr NotNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
+  (eq-extra [(self (ptr NotNode)) (other (dyn NodeOps))] (-> bool) (= (n-op other) OP-NOT))
+  (hash-extra [(self (ptr NotNode))] (-> i64) 157))
+
+(defn not-make [(v (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [NotNode] (alloc/create [NotNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.pad p) 0)
+    (n-init! d OP-NOT)
+    (n-add-def! d (None [(dyn NodeOps)]))
+    (n-add-def! d (Some v))
+    (n-set-ty! d (compute p))
+    d))
+
+;; ---------------------------------------------------------------------------
+;; The comparison family
+;;
+;; One struct carrying the operator, because `compute` and `idealize` are shared and only `doOp`
+;; differs. The operator participates in GVN equality and the hash: `a < b` and `a <= b` are
+;; different nodes over the same operands.
+(defstruct CmpNode [(hdr NodeHdr) (op-kind i64) (mode i64)])
+
+(defn cmp-kind [(n (dyn NodeOps))] (-> i64)
+  (.op-kind (primitive/cast (ptr CmpNode) (hdr n))))
+
+(defn cmp-mode [(n (dyn NodeOps))] (-> i64)
+  (.mode (primitive/cast (ptr CmpNode) (hdr n))))
+
+(defn cmp-set-mode! [(n (dyn NodeOps)) (m i64)] (-> i64)
+  (if (!= (cmp-mode n) MODE-UNKNOWN)
+      (broken "cmp-set-mode!: mode is one-shot and was already settled")
+      (do
+        (n-unlock! n)
+        (set! (.mode (primitive/cast (ptr CmpNode) (hdr n))) m)
+        0)))
+
+;; Unsigned comparison.
+;;
+;; Coil picks the machine instruction from the TYPE — `<` and `icmp-lt` on a `u64` are unsigned
+;; compares — so this is a cast, not a bit trick. (An earlier version flipped the sign bit by hand;
+;; that worked, but it reimplemented something the language already does correctly.)
+(defn ult? [(a i64) (b i64)] (-> bool)
+  (< (primitive/cast u64 a) (primitive/cast u64 b)))
+
+(defn ule? [(a i64) (b i64)] (-> bool)
+  (<= (primitive/cast u64 a) (primitive/cast u64 b)))
+
+;; The per-operator range test. `alo/ahi` and `blo/bhi` are the operand ranges.
+;;
+;; Returns TRUE, FALSE, or BOOL when the ranges overlap and the answer is genuinely unknown.
+(defn cmp-range [(kind i64) (alo i64) (ahi i64) (blo i64) (bhi i64)] (-> i64)
+  (if (= kind OP-LT)
+      (if (< ahi blo) (ty-true) (if (>= alo bhi) (ty-false) (ty-bool)))
+      (if (= kind OP-LE)
+          (if (<= ahi blo) (ty-true) (if (> alo bhi) (ty-false) (ty-bool)))
+          (if (= kind OP-ULT)
+              (if (ult? ahi blo) (ty-true) (if (not (ult? alo bhi)) (ty-false) (ty-bool)))
+              ;; EQ and NE share one test: the ranges are DISJOINT, so the answer is decided —
+              ;; and it is opposite for the two operators.
+              (let [both-const (and (= alo ahi) (and (= blo bhi) (= alo blo)))
+                    disjoint (or (< ahi blo) (> alo bhi))]
+                (if (= kind OP-EQ)
+                    (if both-const (ty-true) (if disjoint (ty-false) (ty-bool)))
+                    (if both-const (ty-false) (if disjoint (ty-true) (ty-bool)))))))))
+
+(defn cmp-compute [(d (dyn NodeOps))] (-> i64)
+  (let [lhs (n-in! d CMP-LHS)
+        rhs (n-in! d CMP-RHS)
+        lt (n-ty lhs)
+        rt (n-ty rhs)
+        kind (cmp-kind d)]
+    (if (or (ty-high? lt) (ty-high? rt))
+        (ty-bool-high)
+        ;; The SAME NODE on both sides. No range test discovers this — the ranges overlap perfectly.
+        ;;
+        ;; Integer-only, deliberately: `x < x` is false for every integer, but for a FLOAT `x == x`
+        ;; is false when x is NaN, and JavaScript's numbers are doubles. Simple answers TRUE here
+        ;; unconditionally because its floats never carry NaN through this path; ours will.
+        (if (and (n-same? lhs rhs) (= (cmp-mode d) MODE-INT))
+            (if (= kind OP-LT) (ty-false) (if (= kind OP-NE) (ty-false) (ty-true)))
+            (let [m (if (= (cmp-mode d) MODE-UNKNOWN) (arith-mode-of lt rt) (cmp-mode d))]
+              (if (= m MODE-UNKNOWN)
+                  (ty-bool)
+                  (if (and (= m MODE-INT) (and (ty-int? lt) (ty-int? rt)))
+                      (cmp-range kind (ty-int-lo lt) (ty-int-hi lt) (ty-int-lo rt) (ty-int-hi rt))
+                      (ty-bool))))))))
+
+(defn cmp-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [lhs (n-in! d CMP-LHS)
+        rhs (n-in! d CMP-RHS)
+        kind (cmp-kind d)]
+    ;; 1. Compare of the same node, integer mode. `compute` already reports the constant; returning
+    ;; it here lets the engine replace the node.
+    (if (and (n-same? lhs rhs) (= (cmp-mode d) MODE-INT))
+        (Some (con-make (if (= kind OP-LT)
+                            (ty-false)
+                            (if (= kind OP-NE) (ty-false) (ty-true)))))
+        ;; 2. Settle the one-shot mode.
+        (if (= (cmp-mode d) MODE-UNKNOWN)
+            (let [m (arith-mode-of (n-ty lhs) (n-ty rhs))]
+              (if (= m MODE-UNKNOWN)
+                  (None [(dyn NodeOps)])
+                  (do (cmp-set-mode! d m) (Some d))))
+            ;; 4 and 5 are EQ-only.
+            (if (= kind OP-EQ)
+                (if (ty-constant? (n-ty rhs))
+                    ;; 5. `x == 0` becomes `!x`. The two are the same value, and Not has the sharper
+                    ;; `compute`: it decides FALSE for any provably non-zero range, which the
+                    ;; disjointness test cannot do for a range straddling zero.
+                    (if (and (ty-int? (n-ty rhs)) (= (ty-int-lo (n-ty rhs)) 0))
+                        (Some (not-make lhs))
+                        (None [(dyn NodeOps)]))
+                    ;; 4. Sink the constant right; otherwise order by node id so that `a==b` and
+                    ;; `b==a` GVN together. The nid is a stable dense identity that exists for
+                    ;; exactly this kind of canonicalisation.
+                    (if (or (ty-constant? (n-ty lhs)) (> (n-nid lhs) (n-nid rhs)))
+                        (Some (n-swap12! d))
+                        ;; 6. Push a constant up through a Phi. EQ is associative for this purpose
+                        ;; (Simple passes `rotate = this instanceof EQ`); the ordering comparisons
+                        ;; are not, so they pass false.
+                        (phi-con d true)))
+                (phi-con d false))))))
+
+(impl NodeOps CmpNode
+  (hdr [(self (ptr CmpNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr CmpNode))] (-> (slice u8)) (cmp-op-name (.op-kind self)))
+  (is-const? [(self (ptr CmpNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr CmpNode))] (-> bool) false)
+  (is-pinned? [(self (ptr CmpNode))] (-> bool) false)
+  ;; Preserve BOTH the operator and the mode: `a < b` and `a <= b` are different nodes.
+  (binop-copy [(self (ptr CmpNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (Some (cmp--make (.op-kind self) lhs rhs (.mode self))))
+  (compute [(self (ptr CmpNode))] (-> i64) (cmp-compute (primitive/make-dyn NodeOps self)))
+  (idealize [(self (ptr CmpNode))]
+            (-> (Option (dyn NodeOps)))
+            (cmp-idealize (primitive/make-dyn NodeOps self)))
+  ;; The operator AND the mode participate: `a < b` and `a <= b` are different nodes, and so are an
+  ;; integer and a float comparison over the same operands.
+  (eq-extra [(self (ptr CmpNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (if (!= (n-op other) (.op-kind self))
+                false
+                (and (= (.op-kind self) (.op-kind (primitive/cast (ptr CmpNode) (hdr other))))
+                     (= (.mode self) (.mode (primitive/cast (ptr CmpNode) (hdr other)))))))
+  (hash-extra [(self (ptr CmpNode))] (-> i64) (+ (* (.op-kind self) 167) (* (.mode self) 31))))
+
+(defn cmp-op-name [(kind i64)] (-> (slice u8))
+  (if (= kind OP-EQ)
+      "EQ"
+      (if (= kind OP-NE)
+          "NE"
+          (if (= kind OP-LT) "LT" (if (= kind OP-LE) "LE" "ULT")))))
+
+(defn cmp--make [(kind i64) (lhs (dyn NodeOps)) (rhs (dyn NodeOps)) (mode i64)] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [CmpNode] (alloc/create [CmpNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.op-kind p) kind)
+    (set! (.mode p) mode)
+    (n-init! d kind)
+    (n-add-def! d (None [(dyn NodeOps)]))
+    (n-add-def! d (Some lhs))
+    (n-add-def! d (Some rhs))
+    (n-set-ty! d (compute p))
+    d))
+
+(defn eq-make [(a (dyn NodeOps)) (b (dyn NodeOps))] (-> (dyn NodeOps))
+  (cmp--make OP-EQ a b MODE-UNKNOWN))
+
+(defn ne-make [(a (dyn NodeOps)) (b (dyn NodeOps))] (-> (dyn NodeOps))
+  (cmp--make OP-NE a b MODE-UNKNOWN))
+
+(defn lt-make [(a (dyn NodeOps)) (b (dyn NodeOps))] (-> (dyn NodeOps))
+  (cmp--make OP-LT a b MODE-UNKNOWN))
+
+(defn le-make [(a (dyn NodeOps)) (b (dyn NodeOps))] (-> (dyn NodeOps))
+  (cmp--make OP-LE a b MODE-UNKNOWN))
+
+;; Unsigned less-than, for range checks. Not user-writable, and its mode is ALWAYS integer — Simple
+;; asserts that in the constructor.
+(defn ult-make [(a (dyn NodeOps)) (b (dyn NodeOps))] (-> (dyn NodeOps))
+  (cmp--make OP-ULT a b MODE-INT))
+
+;; --- owed, and NOT stubs ---
+;;   idealize rule 3: float mode with an integer operand inserts a ToFloat. Needs ToFloat.
+;;   idealize rule 6: `phiCon`, pushing a constant up through a Phi. Now unblocked by the control
+;;                    unit; the same rule is owed in `aot.node.arith`.

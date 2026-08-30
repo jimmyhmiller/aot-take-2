@@ -1,0 +1,360 @@
+;; The dynamic value: Box, Unbox, TypeTest, Cast.
+
+;;
+;; This is the file that makes the compiler a JavaScript compiler rather than a Simple compiler.
+;;
+;; REPRESENTATION. A dynamic value is one 64-bit word, NaN-boxed: doubles are stored directly and
+;; everything else lives in the NaN payload space. JavaScript numbers ARE doubles, so any
+;; representation that heap-boxes a non-small double loses numeric code outright. All floating NaNs
+;; canonicalise to the positive quiet NaN when boxed; the adjacent quiet-NaN prefixes carry the
+;; non-double tags. That payload loss is forced — the full set of double bit patterns already uses
+;; every 64-bit word, so preserving NaN payloads while adding other values to the same word is
+;; impossible.
+;;
+;; Box and Unbox are ORDINARY NODES and the optimiser cancels them in pairs. Unbox(Box(x)) is x,
+;; and that peephole is where an unboxed loop body comes from.
+;;
+;; GUARDS ARE CONTROL FLOW. A type guard is `If(TypeTest(v,T))` and then `Cast(T)` on the taken
+;; edge. There is deliberately no Guard opcode: every CFG peephole, dominator computation, code
+;; motion pass and dataflow solver already understands If/Region/Phi/Cast, and a distinct opcode
+;; would need bespoke handling in each. `cast-idealize` folds when the input already `isa` the cast
+;; type — which is exactly how a discharged TypeScript annotation disappears.
+;;
+;; Slow paths are ordinary CFG paths carrying a cold hint. Nothing downstream needs to know they
+;; are slow beyond block layout and spill costs.
+;;
+;; SCAFFOLD: signatures are final; bodies hard-error. Filled in at S3.
+;; ============================================================================
+;; STATUS: implemented. Box · Unbox · TypeTest · Cast, the pair-cancelling peephole, and the guard
+;; construction that ties them together. `Cast` is the port of Simple's `GuardNode`, generalised
+;; from zero/non-zero to any lattice point — which is what a TypeScript annotation needs.
+;; ============================================================================
+(module aot.node.dynamic)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.control" :use *)
+(import "aot.type.type" :use *)
+
+;; The representation an Unbox produces, and the tag a Box consumes.
+(const REP-INT TAG-INT)
+
+(const REP-DOUBLE TAG-DOUBLE)
+
+(const REP-BOOL TAG-BOOL)
+
+(const REP-OBJECT TAG-OBJECT)
+
+;; ---------------------------------------------------------------------------
+;; BOX — a raw value of known representation becomes one NaN-boxed word
+;;
+;; The type is the SINGLETON tag set for whatever the input's representation is. That singleton is
+;; what makes `Unbox(Box(x))` provable: the tag set is not merely known, it has exactly one member.
+(defstruct BoxNode [(hdr NodeHdr) (pad i64)])
+
+;; Which tag does this raw type box to?
+(defn box-tag-of [(t i64)] (-> i64)
+  (if (ty-int? t)
+      TAG-INT
+      (if (ty-flt? t)
+          TAG-DOUBLE
+          ;; Anything else is not a raw representation we can box. Refuse rather than guess a tag:
+          ;; a wrong tag is a value that reads back as the wrong type, which nothing downstream
+          ;; would catch.
+          0)))
+
+(defn box-compute-ty [(t i64)] (-> i64)
+  (if (ty-high? t)
+      TY-TOP
+      (let [tag (box-tag-of t)]
+        (if (= tag 0) TY-BOT (ty-dyn tag)))))
+
+(impl NodeOps BoxNode
+  (hdr [(self (ptr BoxNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr BoxNode))] (-> (slice u8)) "Box")
+  (is-const? [(self (ptr BoxNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr BoxNode))] (-> bool) false)
+  (is-pinned? [(self (ptr BoxNode))] (-> bool) false)
+  (binop-copy [(self (ptr BoxNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)]))
+  (compute [(self (ptr BoxNode))]
+           (-> i64)
+           (box-compute-ty (n-ty (n-in! (primitive/make-dyn NodeOps self) 1))))
+  ;; A Box is already the most ideal form of itself. The CANCELLING is Unbox's rule, not Box's —
+  ;; putting it here too would give two rules that must agree, and one of them would drift.
+  (idealize [(self (ptr BoxNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
+  (eq-extra [(self (ptr BoxNode)) (other (dyn NodeOps))] (-> bool) (= (n-op other) OP-BOX))
+  (hash-extra [(self (ptr BoxNode))] (-> i64) 197))
+
+(defn box-make [(v (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [BoxNode] (alloc/create [BoxNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.pad p) 0)
+    (n-init! d OP-BOX)
+    (n-add-def! d (None [(dyn NodeOps)]))
+    (n-add-def! d (Some v))
+    (n-set-ty! d (compute p))
+    d))
+
+;; ---------------------------------------------------------------------------
+;; UNBOX — a boxed word becomes a raw value of the representation `rep` names
+;;
+;; UNDEFINED unless the tag is PROVEN. That is what the guard exists to establish, and it is why
+;; `unbox-compute-ty` refuses to answer for a polymorphic input rather than assuming.
+(defstruct UnboxNode [(hdr NodeHdr) (rep i64)])
+
+(defn unbox-rep [(n (dyn NodeOps))] (-> i64)
+  (.rep (primitive/cast (ptr UnboxNode) (hdr n))))
+
+;; The raw type this unbox produces, given what is known about the boxed word.
+(defn unbox-compute-ty [(t i64) (rep i64)] (-> i64)
+  (if (ty-high? t)
+      TY-TOP
+      (if (not (ty-dyn? t))
+          ;; Not a dynamic value at all. Nothing to unbox, and inventing a raw type here would let
+          ;; an unproven value flow into arithmetic as if it were a number.
+          TY-BOT
+          (if (not (ty-dyn-has? t rep))
+              ;; The proven tag set does not even CONTAIN this representation, so this unbox is on a
+              ;; path that cannot be taken. TOP says "unreachable", which lets the dead branch fold.
+              TY-TOP
+              (if (ty-monomorphic? t)
+                  ;; Proven: exactly this representation.
+                  (if (= rep TAG-INT) (ty-int-bot) (if (= rep TAG-DOUBLE) (ty-flt-bot) TY-BOT))
+                  ;; Possible but not proven. The raw bottom of that representation is the honest
+                  ;; answer: the unbox is legal on the guarded path, and the guard is what narrows
+                  ;; the input so that the branch above fires instead.
+                  (if (= rep TAG-INT) (ty-int-bot) (if (= rep TAG-DOUBLE) (ty-flt-bot) TY-BOT)))))))
+
+(impl NodeOps UnboxNode
+  (hdr [(self (ptr UnboxNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr UnboxNode))] (-> (slice u8)) "Unbox")
+  (is-const? [(self (ptr UnboxNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr UnboxNode))] (-> bool) false)
+  (is-pinned? [(self (ptr UnboxNode))] (-> bool) false)
+  (binop-copy [(self (ptr UnboxNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)]))
+  (compute [(self (ptr UnboxNode))]
+           (-> i64)
+           (unbox-compute-ty (n-ty (n-in! (primitive/make-dyn NodeOps self) 1)) (.rep self)))
+  (idealize [(self (ptr UnboxNode))]
+            (-> (Option (dyn NodeOps)))
+            (unbox-idealize (primitive/make-dyn NodeOps self)))
+  (eq-extra [(self (ptr UnboxNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (if (!= (n-op other) OP-UNBOX)
+                false
+                (= (.rep self) (.rep (primitive/cast (ptr UnboxNode) (hdr other))))))
+  (hash-extra [(self (ptr UnboxNode))] (-> i64) (+ 199 (.rep self))))
+
+;; >>> THE PAIR THAT CANCELS <<<
+;;
+;; `Unbox(Box(x))` is `x`, when the representations agree. This one peephole is where an unboxed loop
+;; body comes from: JSL wraps every result in `%Box` and every operand in `%UnboxInt`, and once
+;; inlining has put a Box next to an Unbox they annihilate, leaving raw arithmetic.
+;;
+;; The representation check is not optional. `Unbox_double(Box_int(x))` is NOT `x` — it is a
+;; reinterpretation, and folding it would read an integer's bits as a double.
+(defn unbox-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [v (n-in! d 1)]
+    (if (!= (n-op v) OP-BOX)
+        (None [(dyn NodeOps)])
+        (let [inner (n-in! v 1)
+              inner-tag (box-tag-of (n-ty inner))]
+          (if (and (!= inner-tag 0) (= inner-tag (unbox-rep d)))
+              (Some inner)
+              ;; A Box of one representation unboxed as another. Not a fold — leave it alone and let
+              ;; the type system report it.
+              (None [(dyn NodeOps)]))))))
+
+(defn unbox-make [(v (dyn NodeOps)) (rep i64)] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [UnboxNode] (alloc/create [UnboxNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.rep p) rep)
+    (n-init! d OP-UNBOX)
+    (n-add-def! d (None [(dyn NodeOps)]))
+    (n-add-def! d (Some v))
+    (n-set-ty! d (compute p))
+    d))
+
+;; ---------------------------------------------------------------------------
+;; TYPETEST — the PREDICATE half of a guard
+;;
+;; "Does `v` currently carry one of `tags`?" Its answer is a boolean, so it feeds an `If` like any
+;; comparison — which is the whole point of D4: a guard is ordinary control flow.
+(defstruct TypeTestNode [(hdr NodeHdr) (tags i64)])
+
+(defn typetest-tags [(n (dyn NodeOps))] (-> i64)
+  (.tags (primitive/cast (ptr TypeTestNode) (hdr n))))
+
+;; The same shape as a range comparison, on the tag axis instead:
+;;
+;;   the value's tags are a SUBSET of the test  -> TRUE   (it must pass)
+;;   the two sets are DISJOINT                  -> FALSE  (it cannot pass)
+;;   otherwise                                  -> BOOL   (genuinely unknown; the branch stays)
+;;
+;; The first line is where a discharged TypeScript annotation cashes out: once the interprocedural
+;; fixpoint has proven a parameter is int-only, `TypeTest(x, INT)` folds TRUE, the `If` folds to one
+;; arm, and the check costs nothing.
+(defn typetest-compute-ty [(t i64) (tags i64)] (-> i64)
+  (if (ty-high? t)
+      (ty-bool-high)
+      (if (not (ty-dyn? t))
+          (ty-bool)
+          (let [vt (ty-dyn-tags t)]
+            (if (= (primitive/iand vt tags) vt)
+                (ty-true)  ; subset: must pass
+                (if (= (primitive/iand vt tags) 0)
+                    (ty-false)  ; disjoint: cannot pass
+                    (ty-bool)))))))
+
+(impl NodeOps TypeTestNode
+  (hdr [(self (ptr TypeTestNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr TypeTestNode))] (-> (slice u8)) "TypeTest")
+  (is-const? [(self (ptr TypeTestNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr TypeTestNode))] (-> bool) false)
+  (is-pinned? [(self (ptr TypeTestNode))] (-> bool) false)
+  (binop-copy [(self (ptr TypeTestNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)]))
+  (compute [(self (ptr TypeTestNode))]
+           (-> i64)
+           (typetest-compute-ty (n-ty (n-in! (primitive/make-dyn NodeOps self) 1)) (.tags self)))
+  (idealize [(self (ptr TypeTestNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
+  (eq-extra [(self (ptr TypeTestNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (if (!= (n-op other) OP-TYPETEST)
+                false
+                (= (.tags self) (.tags (primitive/cast (ptr TypeTestNode) (hdr other))))))
+  (hash-extra [(self (ptr TypeTestNode))] (-> i64) (+ 211 (.tags self))))
+
+(defn typetest-make [(v (dyn NodeOps)) (tags i64)] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [TypeTestNode] (alloc/create [TypeTestNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.tags p) tags)
+    (n-init! d OP-TYPETEST)
+    (n-add-def! d (None [(dyn NodeOps)]))
+    (n-add-def! d (Some v))
+    (n-set-ty! d (compute p))
+    d))
+
+;; ---------------------------------------------------------------------------
+;; CAST — the VALUE half of a guard  —  port of Simple's `GuardNode`
+;;
+;; Simple's Guard is the zero/non-zero special case; this is the same node generalised to any
+;; lattice point, which is what a TypeScript annotation needs.
+;;
+;; Inputs: 0 = the control edge on which the assertion holds, 1 = the value.
+;;
+;; PINNED, exactly as Simple's is: a Cast asserts something true only ON ITS EDGE, so code motion
+;; must not float it out of the guarded region. Unpin it and the narrowed value escapes to a path
+;; where the narrowing was never established.
+(defstruct CastNode [(hdr NodeHdr) (cast-ty i64)])
+
+(defn cast-ty-of [(n (dyn NodeOps))] (-> i64)
+  (.cast-ty (primitive/cast (ptr CastNode) (hdr n))))
+
+;; The JOIN of what is known and what is asserted: a Cast can only NARROW.
+;;
+;; Simple preserves the input type when the assertion has no sane answer rather than inventing one.
+;; The join does that structurally — joining with something incompatible gives the high end, which
+;; says "unreachable" rather than "some value".
+(defn cast-compute-ty [(t i64) (cast i64)] (-> i64)
+  (if (ty-high? t) TY-TOP (ty-join t cast)))
+
+;; >>> THIS IS HOW A DISCHARGED ANNOTATION DISAPPEARS <<<
+;;
+;; Simple's rule: fold when the input already `isa` the cast type. The assertion adds nothing, so the
+;; Cast becomes its input and the guard's value side costs zero.
+;;
+;; This is the single most important peephole in the TypeScript story. If it is weakened, every
+;; annotation stays as a runtime narrowing forever; if it is loosened — for instance to fire on an
+;; unanalysed input — then `ty-isa? ANY t` is true for every `t` and EVERY cast discharges itself,
+;; which is the guard mechanism erasing itself.
+(defn cast-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [v (n-in! d 1)
+        vt (n-ty v)]
+    ;; Refuse on an unanalysed input. This guard is the whole safety of the rule.
+    (if (or (ty-high? vt) (= vt TY-INVALID))
+        (None [(dyn NodeOps)])
+        (if (ty-isa? vt (cast-ty-of d))
+            (Some v)
+            (None [(dyn NodeOps)])))))
+
+(impl NodeOps CastNode
+  (hdr [(self (ptr CastNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr CastNode))] (-> (slice u8)) "Cast")
+  (is-const? [(self (ptr CastNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr CastNode))] (-> bool) false)
+  ;; PINNED: the assertion holds only on this control edge.
+  (is-pinned? [(self (ptr CastNode))] (-> bool) true)
+  (binop-copy [(self (ptr CastNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)]))
+  (compute [(self (ptr CastNode))]
+           (-> i64)
+           (cast-compute-ty (n-ty (n-in! (primitive/make-dyn NodeOps self) 1)) (.cast-ty self)))
+  (idealize [(self (ptr CastNode))]
+            (-> (Option (dyn NodeOps)))
+            (cast-idealize (primitive/make-dyn NodeOps self)))
+  (eq-extra [(self (ptr CastNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (if (!= (n-op other) OP-CAST)
+                false
+                (= (.cast-ty self) (.cast-ty (primitive/cast (ptr CastNode) (hdr other))))))
+  (hash-extra [(self (ptr CastNode))] (-> i64) (+ 223 (.cast-ty self))))
+
+(defn cast-make [(ctrl (dyn NodeOps)) (v (dyn NodeOps)) (t i64)] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [CastNode] (alloc/create [CastNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.cast-ty p) t)
+    (n-init! d OP-CAST)
+    (n-add-def! d (Some ctrl))
+    (n-add-def! d (Some v))
+    (n-set-ty! d (compute p))
+    d))
+
+;; ---------------------------------------------------------------------------
+;; THE GUARD — one entry point, so nobody assembles half of one
+;;
+;; `If(TypeTest(v, tags))`, both arms built together, and a `Cast` on the TAKEN edge. There is
+;; deliberately no way to build the pieces separately and peephole them one at a time: that is the
+;; multi-window trap, and here it would additionally leave a Cast asserting something on an edge
+;; that no longer exists.
+;;
+;; The result carries the narrowed value for the true path and the control for both, so the caller
+;; wires the merge.
+(defstruct Guard
+  [(narrowed (dyn NodeOps))  ; the value, narrowed, valid on the TRUE edge
+   (true-ctrl (dyn NodeOps))
+   (false-ctrl (dyn NodeOps))])
+
+(defn guard-narrowed [(g Guard)] (-> (dyn NodeOps))
+  (.narrowed g))
+
+(defn guard-true [(g Guard)] (-> (dyn NodeOps))
+  (.true-ctrl g))
+
+(defn guard-false [(g Guard)] (-> (dyn NodeOps))
+  (.false-ctrl g))
+
+(defn guard! [(ctrl (dyn NodeOps)) (v (dyn NodeOps)) (tags i64)] (-> Guard)
+  (let [test (typetest-make v tags)
+        iff (if-make ctrl test)
+        arms (if-arms! iff)
+        t (arms-true arms)
+        f (arms-false arms)
+        (mut g) (primitive/zeroed Guard)]
+    (set! (.narrowed (mut g)) (cast-make t v (ty-dyn tags)))
+    (set! (.true-ctrl (mut g)) t)
+    (set! (.false-ctrl (mut g)) f)
+    (load g)))

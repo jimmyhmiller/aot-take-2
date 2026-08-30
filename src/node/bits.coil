@@ -1,0 +1,244 @@
+;; ============================================================================
+
+;; BITWISE AND SHIFTS  —  port of Simple's AndNode, OrNode, XorNode, ShrNode, SarNode
+;;                        (ShlNode lives in aot.node.arith, where Add's `x+x -> x<<1` needs it)
+;; ============================================================================
+;;
+;; One struct with an operator field, because `compute` and `idealize` are shared and only the range
+;; function differs — exactly the shape `aot.node.compare` has.
+;;
+;; ## In JavaScript these are NOT the source-level operators
+;;
+;; `a & b` in source is `ToInt32(a) & ToInt32(b)`: the coercion is the semantics and it lives in
+;; JSL (`jsl/abstract/conversions.jsl` defines `BitwiseAnd` and friends exactly that way). THESE
+;; nodes are the machine operation the JSL definition bottoms out in, on operands that are already
+;; raw 32-bit integers. A node here whose operands are not proven raw is a representation error, not
+;; merely an unoptimised one.
+;;
+;; ## The range functions, from Simple
+;;
+;; Simple is deliberately weak here, and copying that weakness is the point — a range rule that is
+;; almost right is worse than one that says nothing:
+;;
+;;   AND   the only sharp one: `[0 .. mask(x) & mask(y)]`
+;;   OR    BOT
+;;   XOR   BOT
+;;   SHR   `x` if x is exactly ZERO, else BOT       (0 >>> n is 0)
+;;   SAR   with a CONSTANT shift, the exact reachable range; otherwise BOT
+;;
+;; ### `mask` — which bits a range can possibly have set
+;;
+;; Simple's `TypeInteger.mask()`: high → 0; a constant → the value itself; otherwise take
+;; `min ^ max`, find its highest set bit, and make an all-ones mask from there down, OR'd with the
+;; bits min and max agree on. Every value in `[min..max]` is under that mask.
+;;
+;; That is what makes `x & 0xFF` produce `[0..255]` rather than the integer bottom, and it is why
+;; `And` is the one operator with a real range rule.
+(module aot.node.bits)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.arith" :use *)
+(import "aot.node.phicon" :use *)
+(import "aot.type.type" :use *)
+
+(const BITS-LHS 1)
+
+(const BITS-RHS 2)
+
+;; ---------------------------------------------------------------------------
+;; `mask` — Simple's `TypeInteger.mask()`
+(defn ty-int-mask [(t i64)] (-> i64)
+  (if (ty-high? t)
+      0
+      (if (not (ty-int? t))
+          -1
+          (let [lo (ty-int-lo t)
+                hi (ty-int-hi t)]
+            (if (= lo hi)
+                lo
+                ;; The bit positions where min and max DIFFER. Everything below the highest such bit
+                ;; is reachable, so make an all-ones mask from there down and OR in the bits the two
+                ;; ends agree on.
+                (let [x (^ lo hi)
+                      ff1 (highest-one-bit x)]
+                  (primitive/ior (- (primitive/ishl ff1 1) 1) (primitive/ior lo hi))))))))
+
+;; The highest set bit of `x`, as a value; 0 for 0.
+;;
+;; `clz` counts leading zeros and returns the WIDTH for 0, so `63 - clz(x)` is the index of the
+;; highest set bit and the zero case is the only guard needed. This was a clear-the-lowest-bit loop
+;; before the primitive existed — O(popcount) where the hardware has one instruction, and
+;; `TypeInteger.mask()` sits on the constant-folding path of every `And`.
+;; The highest set bit of `x`, as a value; 0 for 0.
+;;
+;; `clz` counts leading zeros and returns the WIDTH for zero, so `63 - clz(x)` is the index of the
+;; highest set bit and the zero case is the only guard needed. This was a clear-the-lowest-bit loop
+;; before the primitive existed — O(popcount) where the hardware has one instruction, and
+;; `TypeInteger.mask()` sits on the constant-folding path of every `And`.
+(defn highest-one-bit [(x i64)] (-> i64)
+  (if (= x 0) 0 (primitive/ishl 1 (- 63 (primitive/clz x)))))
+
+;; Logical right shift.
+;;
+;; Coil selects the machine instruction from the TYPE: `ishr` on a signed integer is arithmetic, on
+;; an unsigned one it is logical. So an unsigned shift is a cast, not a bit trick.
+(defn ushr64 [(x i64) (n i64)] (-> i64)
+  (primitive/cast i64 (primitive/ishr (primitive/cast u64 x) (primitive/cast u64 n))))
+
+;; ---------------------------------------------------------------------------
+;; The family
+(defstruct BitsNode [(hdr NodeHdr) (op-kind i64) (mode i64)])
+
+(defn bits-kind [(n (dyn NodeOps))] (-> i64)
+  (.op-kind (primitive/cast (ptr BitsNode) (hdr n))))
+
+(defn bits-mode [(n (dyn NodeOps))] (-> i64)
+  (.mode (primitive/cast (ptr BitsNode) (hdr n))))
+
+(defn bits-set-mode! [(n (dyn NodeOps)) (m i64)] (-> i64)
+  (if (!= (bits-mode n) MODE-UNKNOWN)
+      (broken "bits-set-mode!: mode is one-shot and was already settled")
+      (do
+        (n-unlock! n)
+        (set! (.mode (primitive/cast (ptr BitsNode) (hdr n))) m)
+        0)))
+
+(defn bits-op-name [(kind i64)] (-> (slice u8))
+  (if (= kind OP-AND)
+      "And"
+      (if (= kind OP-OR) "Or" (if (= kind OP-XOR) "Xor" (if (= kind OP-SHR) "Shr" "Sar")))))
+
+;; The range function, per operator. Deliberately as weak as Simple's.
+(defn bits-range [(kind i64) (lt i64) (rt i64)] (-> i64)
+  (if (= kind OP-AND)
+      (let [m (primitive/iand (ty-int-mask lt) (ty-int-mask rt))]
+        ;; A negative mask means the sign bit is reachable, so no useful upper bound exists.
+        (if (< m 0) (ty-int-bot) (ty-int-range 0 m)))
+      (if (= kind OP-SHR)
+          ;; `0 >>> n` is 0. Nothing else is known without the shift count.
+          (if (and (ty-constant? lt) (= (ty-int-lo lt) 0)) (ty-int-con 0) (ty-int-bot))
+          (if (= kind OP-SAR)
+              ;; With a CONSTANT shift the reachable range is exact: an arithmetic right shift by
+              ;; `log` leaves `64-log` significant bits, sign-extended.
+              (if (and (ty-constant? rt) (ty-int? rt))
+                  (let [log (ty-int-lo rt)]
+                    (if (or (< log 0) (> log 63))
+                        (ty-int-bot)
+                        (ty-int-range (primitive/ishl -1 (- 63 log))
+                                      (- (primitive/ishl 1 (- 63 log)) 1))))
+                  (ty-int-bot))
+              ;; OR and XOR: Simple says nothing, and neither do we. A range rule that is almost
+              ;; right is worse than one that says nothing.
+              (ty-int-bot)))))
+
+(defn bits-fold [(kind i64) (a i64) (b i64)] (-> i64)
+  (if (= kind OP-AND)
+      (ty-int-con (primitive/iand a b))
+      (if (= kind OP-OR)
+          (ty-int-con (primitive/ior a b))
+          (if (= kind OP-XOR)
+              (ty-int-con (^ a b))
+              ;; A shift count outside 0..63 is undefined at the machine level, so refuse to fold
+              ;; rather than inventing the host's answer.
+              (if (or (< b 0) (> b 63))
+                  (ty-int-bot)
+                  (if (= kind OP-SHR)
+                      (ty-int-con (ushr64 a b))
+                      (ty-int-con (primitive/ishr a b))))))))
+
+(defn bits-compute-ty [(kind i64) (lt i64) (rt i64)] (-> i64)
+  (if (or (ty-high? lt) (ty-high? rt))
+      TY-TOP
+      (if (not (and (ty-int? lt) (ty-int? rt)))
+          TY-BOT
+          (if (and (ty-constant? lt) (ty-constant? rt))
+              (bits-fold kind (ty-int-lo lt) (ty-int-lo rt))
+              (bits-range kind lt rt)))))
+
+;; The identity element per operator.
+;;   x & -1 -> x      x | 0 -> x      x ^ 0 -> x      x >> 0 -> x      x >>> 0 -> x
+(defn bits-identity [(kind i64)] (-> i64)
+  (if (= kind OP-AND) -1 0))
+
+;; Are the operands interchangeable? A SHIFT is not: swapping changes the meaning entirely.
+(defn bits-commutes? [(kind i64)] (-> bool)
+  (or (= kind OP-AND) (or (= kind OP-OR) (= kind OP-XOR))))
+
+(defn bits-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [lhs (n-in! d BITS-LHS)
+        rhs (n-in! d BITS-RHS)
+        kind (bits-kind d)]
+    ;; Settle the one-shot mode before any identity fires.
+    (if (= (bits-mode d) MODE-UNKNOWN)
+        (let [m (arith-mode-of (n-ty lhs) (n-ty rhs))]
+          (if (= m MODE-UNKNOWN)
+              (None [(dyn NodeOps)])
+              (do (bits-set-mode! d m) (Some d))))
+        ;; The identity. Simple does not check the mirrored form (`-1 & x`) because the constant has
+        ;; already been sunk right by the rule below.
+        (if (and (ty-int? (n-ty rhs))
+                 (and (ty-constant? (n-ty rhs))
+                      (= (ty-int-lo (n-ty rhs)) (bits-identity kind))))
+            (Some lhs)
+            ;; Sink the constant right, so the identity above sees a canonical form.
+            (if (and (and (bits-commutes? kind) (ty-constant? (n-ty lhs)))
+                     (not (ty-constant? (n-ty rhs))))
+                (Some (n-swap12! d))
+                ;; Push a constant up through a Phi. `rotate` only for the associative three.
+                (phi-con d (bits-commutes? kind)))))))
+
+(impl NodeOps BitsNode
+  (hdr [(self (ptr BitsNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr BitsNode))] (-> (slice u8)) (bits-op-name (.op-kind self)))
+  (is-const? [(self (ptr BitsNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr BitsNode))] (-> bool) false)
+  (is-pinned? [(self (ptr BitsNode))] (-> bool) false)
+  (binop-copy [(self (ptr BitsNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (Some (bits--make (.op-kind self) lhs rhs (.mode self))))
+  (compute [(self (ptr BitsNode))]
+           (-> i64)
+           (let [d (primitive/make-dyn NodeOps self)]
+             (bits-compute-ty (.op-kind self) (n-ty (n-in! d BITS-LHS)) (n-ty (n-in! d BITS-RHS)))))
+  (idealize [(self (ptr BitsNode))]
+            (-> (Option (dyn NodeOps)))
+            (bits-idealize (primitive/make-dyn NodeOps self)))
+  (eq-extra [(self (ptr BitsNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (if (!= (n-op other) (.op-kind self))
+                false
+                (and (= (.op-kind self) (.op-kind (primitive/cast (ptr BitsNode) (hdr other))))
+                     (= (.mode self) (.mode (primitive/cast (ptr BitsNode) (hdr other)))))))
+  (hash-extra [(self (ptr BitsNode))] (-> i64) (+ (* (.op-kind self) 227) (* (.mode self) 31))))
+
+(defn bits--make [(kind i64) (lhs (dyn NodeOps)) (rhs (dyn NodeOps)) (mode i64)] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [BitsNode] (alloc/create [BitsNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.op-kind p) kind)
+    (set! (.mode p) mode)
+    (n-init! d kind)
+    (n-add-def! d (None [(dyn NodeOps)]))
+    (n-add-def! d (Some lhs))
+    (n-add-def! d (Some rhs))
+    (n-set-ty! d (compute p))
+    d))
+
+(defn and-make [(a (dyn NodeOps)) (b (dyn NodeOps))] (-> (dyn NodeOps))
+  (bits--make OP-AND a b MODE-UNKNOWN))
+
+(defn or-make [(a (dyn NodeOps)) (b (dyn NodeOps))] (-> (dyn NodeOps))
+  (bits--make OP-OR a b MODE-UNKNOWN))
+
+(defn xor-make [(a (dyn NodeOps)) (b (dyn NodeOps))] (-> (dyn NodeOps))
+  (bits--make OP-XOR a b MODE-UNKNOWN))
+
+(defn shr-make [(a (dyn NodeOps)) (b (dyn NodeOps))] (-> (dyn NodeOps))
+  (bits--make OP-SHR a b MODE-UNKNOWN))
+
+(defn sar-make [(a (dyn NodeOps)) (b (dyn NodeOps))] (-> (dyn NodeOps))
+  (bits--make OP-SAR a b MODE-UNKNOWN))
