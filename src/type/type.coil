@@ -35,7 +35,7 @@
   (TXNil)  ; high/choice null
   ;; --- scalars ---
   (TInt [(lo i64) (hi i64)])  ; inclusive range; lo==hi is a constant
-  (TFlt [(sz i64) (con f64)])  ; Simple's encoding: -64/-32 high, 0 CONSTANT (value in con), 32/64 low
+  (TFlt [(sz i64) (bits i64)])  ; -64/-32 high, 0 CONSTANT (IEEE-754 bits), 32/64 low
   ;; --- pointers ---
   (TPtr [(nilable bool) (to i64)])
   (TMemPtr [(nilable bool) (strct i64)])
@@ -74,6 +74,11 @@
 (defstruct TyTable
   [(kinds (ArrayList TyKind))
    (kids (ArrayList i64))
+   ;; Canonical, unbounded function-index sets.  A TFunPtr stores an id into these arrays rather
+   ;; than a machine-word bitset, so function 64 cannot alias function 0.
+   (fidx-offs (ArrayList i64))
+   (fidx-lens (ArrayList i64))
+   (fidx-members (ArrayList i64))
    (chain (ArrayList i64))
    (index (HashMap i64 i64))
    (booted bool)])
@@ -88,12 +93,18 @@
         (let [a (alloc/malloc-allocator)]
           (set! (.kinds t) (al-new [TyKind] a))
           (set! (.kids t) (al-new [i64] a))
+          (set! (.fidx-offs t) (al-new [i64] a))
+          (set! (.fidx-lens t) (al-new [i64] a))
+          (set! (.fidx-members t) (al-new [i64] a))
           (set! (.chain t) (al-new [i64] a))
           (set! (.index t) (hm-new-scalar [i64 i64] a))
           (set! (.booted t) true)
           ;; Slot 0 is TY-INVALID and is never handed out.
           (push! (field t kinds) (TBot))
           (push! (field t chain) 0)
+          ;; Set id zero is the empty set.
+          (push! [i64] (mut (.fidx-offs t)) 0)
+          (push! [i64] (mut (.fidx-lens t)) 0)
           ;; The simple types, in the order their constants declare.
           (ty-intern (TBot))
           (ty-intern (TTop))
@@ -124,7 +135,7 @@
     (TNil [] 0x104)
     (TXNil [] 0x105)
     (TInt [lo hi] (^ (* lo 1000003) (* hi 31)))
-    (TFlt [sz con] (^ (* sz 7919) (primitive/cast i64 con)))
+    (TFlt [sz bits] (^ (* sz 7919) bits))
     (TPtr [nilable to] (^ (if nilable 17 19) (* to 131)))
     (TMemPtr [nilable strct] (^ (if nilable 23 29) (* strct 137)))
     (TFunPtr [sig fidx] (^ (* sig 139) (* fidx 149)))
@@ -145,7 +156,9 @@
     (TNil [] (match b (TNil [] true) (_ false)))
     (TXNil [] (match b (TXNil [] true) (_ false)))
     (TInt [lo hi] (match b (TInt [l2 h2] (and (= lo l2) (= hi h2))) (_ false)))
-    (TFlt [sz con] (match b (TFlt [s2 c2] (and (= sz s2) (primitive/fcmp-eq con c2))) (_ false)))
+    ;; Float constants are identities of their IEEE-754 encodings, not numeric equality.  This
+    ;; keeps +0 and -0 distinct and makes a repeated same-payload NaN intern normally.
+    (TFlt [sz bits] (match b (TFlt [s2 b2] (and (= sz s2) (= bits b2))) (_ false)))
     (TPtr [nl to] (match b (TPtr [n2 t2] (and (= nl n2) (= to t2))) (_ false)))
     (TMemPtr [nl s] (match b (TMemPtr [n2 s2] (and (= nl n2) (= s s2))) (_ false)))
     (TFunPtr [sg fx] (match b (TFunPtr [g2 x2] (and (= sg g2) (= fx x2))) (_ false)))
@@ -234,13 +247,13 @@
     ;; A dynamic type is high exactly when its flag says so.
     (TDyn [tags high] high)
     ;; Likewise a high float: `ty-dual` negates the width tag.
-    (TFlt [sz con] (< sz 0))
+    (TFlt [sz bits] (< sz 0))
     (_ false)))
 
 (defn ty-constant? [(t i64)] (-> bool)
   (match (ty-kind t)
     (TInt [lo hi] (= lo hi))
-    (TFlt [sz c] (= sz 0))
+    (TFlt [sz bits] (= sz 0))
     (TNil [] true)
     (_ false)))
 
@@ -265,7 +278,7 @@
     ;; negating the width tag rather than adding a second field.
     ;; A CONSTANT float is SELF-DUAL — it sits on the centreline. Everything else flips its width
     ;; sign, which is exactly Simple's `_isConstant() ? this : new TypeFloat(-_sz, 0)`.
-    (TFlt [sz con] (if (= sz 0) (ty-intern (TFlt 0 con)) (ty-intern (TFlt (- 0 sz) 0.0))))
+    (TFlt [sz bits] (if (= sz 0) (ty-intern (TFlt 0 bits)) (ty-intern (TFlt (- 0 sz) 0))))
     ;; The dynamic axis duals by flipping the high/low flag and KEEPING the set. That is why the flag
     ;; exists: a pure set with complement-duality has no centreline, so nothing could be `high`.
     (TDyn [tags high] (ty-intern (TDyn tags (not high))))
@@ -314,14 +327,35 @@
             ;; here: these two are raw machine representations, and merging them silently would let
             ;; an unboxed int flow where a double is expected.
             (_ TY-BOT)))
-    ;; Two floats meet to the same width when the widths agree and both are the non-constant form;
-    ;; two different constants meet to the non-constant float of that width; anything else is BOT.
-    (TFlt [asz acon]
+    ;; Simple's TypeFloat.xmeet orders the five points by width/highness, with a special test for
+    ;; whether a constant is exactly representable as f32.  Identity was already rejected by the
+    ;; caller, so equal-bit constants never enter this path.
+    (TFlt [asz abits]
           (match (ty-kind b)
-            (TFlt [bsz bcon]
-                  (if (and (= asz bsz) (primitive/fcmp-eq acon bcon))
-                      (ty-intern (TFlt asz acon))
-                      (ty-intern (TFlt 0 0.0))))
+            (TFlt [bsz bbits]
+                  (let [i0sz (if (< asz bsz) asz bsz)
+                        i0bits (if (< asz bsz) abits bbits)
+                        i1sz (if (< asz bsz) bsz asz)
+                        i1bits (if (< asz bsz) bbits abits)]
+                    (if (= i1sz 64)
+                        (ty-intern (TFlt 64 0))
+                        (if (= i0sz -64)
+                            (ty-intern (TFlt i1sz i1bits))
+                            (if (= i1sz 32)
+                                (if (and (= i0sz 0) (not (flt--bits-f32? i0bits)))
+                                    (ty-intern (TFlt 64 0))
+                                    (ty-intern (TFlt 32 0)))
+                                (if (!= i1sz 0)
+                                    (ty-intern (TFlt i1sz i1bits))
+                                    (if (= i0sz -32)
+                                        (if (flt--bits-f32? i1bits)
+                                            (ty-intern (TFlt 0 i1bits))
+                                            (ty-intern (TFlt 64 0)))
+                                        ;; Both are unequal constants.
+                                        (if (and (flt--bits-f32? i0bits)
+                                                 (flt--bits-f32? i1bits))
+                                            (ty-intern (TFlt 32 0))
+                                            (ty-intern (TFlt 64 0))))))))))
             (_ TY-BOT)))
     ;; Nil meets its own dual back to nil, exactly as control does.
     (TNil [] (match (ty-kind b) (TXNil [] TY-NIL) (_ TY-BOT)))
@@ -389,13 +423,27 @@
 ;; Float constructors
 ;;
 ;; Simple's `TypeFloat._sz` encoding, ported exactly:  -64 high flt · -32 high f32 · 0 CONSTANT
-;; (the value lives in `con`) · 32 low f32 · 64 low flt.  `isHigh` is `sz < 0`; a CONSTANT is
+;; (the value lives in `bits`) · 32 low f32 · 64 low flt.  `isHigh` is `sz < 0`; a CONSTANT is
 ;; SELF-DUAL, because it sits on the lattice centreline.
 (defn ty-flt [(sz i64)] (-> i64)
-  (do (ty-boot!) (ty-intern (TFlt sz 0.0))))
+  (do (ty-boot!) (ty-intern (TFlt sz 0))))
+
+(defn flt--bits [(v f64)] (-> i64)
+  (let [p (primitive/alloc-stack f64)]
+    (set! p v)
+    (load (primitive/cast (ptr i64) p))))
+
+(defn flt--from-bits [(bits i64)] (-> f64)
+  (let [p (primitive/alloc-stack i64)]
+    (set! p bits)
+    (load (primitive/cast (ptr f64) p))))
+
+(defn flt--bits-f32? [(bits i64)] (-> bool)
+  (let [v (flt--from-bits bits)]
+    (primitive/fcmp-eq v (primitive/cast f64 (primitive/cast f32 v)))))
 
 (defn ty-flt-con [(v f64)] (-> i64)
-  (do (ty-boot!) (ty-intern (TFlt 0 v))))
+  (do (ty-boot!) (ty-intern (TFlt 0 (flt--bits v)))))
 
 (defn ty-flt-bot [] (-> i64)
   (ty-flt 64))
@@ -407,7 +455,7 @@
   (match (ty-kind t) (TInt [lo hi] true) (_ false)))
 
 (defn ty-flt? [(t i64)] (-> bool)
-  (match (ty-kind t) (TFlt [sz con] true) (_ false)))
+  (match (ty-kind t) (TFlt [sz bits] true) (_ false)))
 
 ;; The integer bounds, for a type that is an int range. Panics otherwise — a caller that has not
 ;; checked `ty-int?` is asking a question with no answer.
@@ -418,7 +466,22 @@
   (match (ty-kind t) (TInt [lo hi] hi) (_ (panic "ty-int-hi: not an integer type"))))
 
 (defn ty-flt-value [(t i64)] (-> f64)
-  (match (ty-kind t) (TFlt [sz con] con) (_ (do (panic "ty-flt-value: not a float type") 0.0))))
+  (match (ty-kind t)
+    (TFlt [sz bits] (flt--from-bits bits))
+    (_ (do (panic "ty-flt-value: not a float type") 0.0))))
+
+;; ECMAScript ToBoolean for the constant kinds represented on the raw lattice.  Both signed zeros
+;; compare equal to 0.0, and NaN is the sole float unequal to itself.
+(defn ty-js-falsy-constant? [(t i64)] (-> bool)
+  (if (not (ty-constant? t))
+      false
+      (match (ty-kind t)
+        (TNil [] true)
+        (TInt [lo hi] (= lo 0))
+        (TFlt [sz bits]
+              (let [v (flt--from-bits bits)]
+                (or (primitive/fcmp-eq v 0.0) (not (primitive/fcmp-eq v v)))))
+        (_ false))))
 
 ;; ---------------------------------------------------------------------------
 ;; Tuples — what a MULTI node produces
@@ -575,15 +638,42 @@
 ;; ---------------------------------------------------------------------------
 ;; Function pointers
 ;;
-;; `sig` is a tuple type — member 0 is the return, members 1.. are the arguments. `fidx` is a SET of
-;; function indices, held as a bitset.
+;; `sig` is a tuple type — member 0 is the return, members 1.. are the arguments. `fidxs` is an
+;; opaque id for a canonical set in the side table above.  Simple uses an unbounded integer-array
+;; bitset; this flat canonical representation has the same no-machine-word-limit property.
 ;;
 ;; The set is the whole point, and it is what the closed-world assumption buys. A call site whose set
 ;; is a SINGLETON is a direct call with no dispatch at all; a set of two is a guarded pair; the full
 ;; set is the generic path. An open world would make this axis useless, which is one concrete place
 ;; the closed-world decision pays for itself.
-(defn ty-funptr [(sig i64) (fidx i64)] (-> i64)
-  (do (ty-boot!) (ty-intern (TFunPtr sig fidx))))
+(defn fidx-set-single [(fidx i64)] (-> i64)
+  (do
+    (ty-boot!)
+    (let [t (ty-table)
+          cnt (len (.fidx-lens t))
+          (mut i) 1
+          (mut found) 0]
+      (loop (if (>= (load i) cnt)
+                (break 0)
+                (let [off (get (.fidx-offs t) (load i))]
+                  (if (and (= (get (.fidx-lens t) (load i)) 1)
+                           (= (get (.fidx-members t) off) fidx))
+                      (do (set! (mut found) (load i)) (break 0))
+                      (do (set! (mut i) (+ (load i) 1)) (continue))))))
+      (if (!= (load found) 0)
+          (load found)
+          (let [id (len (.fidx-lens t))
+                off (len (.fidx-members t))]
+            (push! [i64] (mut (.fidx-offs t)) off)
+            (push! [i64] (mut (.fidx-lens t)) 1)
+            (push! [i64] (mut (.fidx-members t)) fidx)
+            id)))))
+
+(defn ty-funptr [(sig i64) (fidxs i64)] (-> i64)
+  (do (ty-boot!) (ty-intern (TFunPtr sig fidxs))))
+
+(defn ty-funptr-singleton [(sig i64) (fidx i64)] (-> i64)
+  (ty-funptr sig (fidx-set-single fidx)))
 
 (defn ty-funptr? [(t i64)] (-> bool)
   (match (ty-kind t) (TFunPtr [sig fidx] true) (_ false)))
@@ -594,27 +684,16 @@
 (defn ty-funptr-fidxs [(t i64)] (-> i64)
   (match (ty-kind t) (TFunPtr [sig fidx] fidx) (_ (panic "ty-funptr-fidxs: not a function pointer"))))
 
-;; Exactly one function index — a DIRECT call. `x & (x-1)` clears the lowest set bit; if nothing
-;; remains and x was non-zero, x had exactly one bit.
+;; Exactly one function index — a DIRECT call.
 (defn ty-funptr-single? [(t i64)] (-> bool)
-  (let [f (ty-funptr-fidxs t)]
-    (and (!= f 0) (= (primitive/iand f (- f 1)) 0))))
+  (= (get (.fidx-lens (ty-table)) (ty-funptr-fidxs t)) 1))
 
 ;; The one index in a singleton set, as a bit position.
 (defn ty-funptr-the-fidx [(t i64)] (-> i64)
-  (let [f (ty-funptr-fidxs t)
-        (mut i) 0
-        (mut x) f]
+  (let [set-id (ty-funptr-fidxs t)]
     (if (not (ty-funptr-single? t))
         (do (panic "ty-funptr-the-fidx: the function-index set is not a singleton") 0)
-        (do
-          (loop (if (!= (primitive/iand (load x) 1) 0)
-                    (break 0)
-                    (do
-                      (set! (mut x) (primitive/ishr (load x) 1))
-                      (set! (mut i) (+ (load i) 1))
-                      (continue))))
-          (load i)))))
+        (get (.fidx-members (ty-table)) (get (.fidx-offs (ty-table)) set-id)))))
 
 ;; The signature's return type and argument count.
 (defn ty-sig-ret [(sig i64)] (-> i64)
