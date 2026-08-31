@@ -84,12 +84,21 @@
 ;;
 ;; SCAFFOLD: signatures and the protocol above are final; bodies hard-error. Filled in at S2.
 (module aot.node.scope)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
+(import "coil.arraylist" :use *)
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.type.type" :use *)
 
 ;; Fixed slots. Everything from SCOPE-VAR0 up is a variable.
 (const SCOPE-CTRL 0)
+
 (const SCOPE-MEM 1)
+
 (const SCOPE-VAR0 2)
 
 ;; A tracked binding. Array-of-structs because the parser touches all of these together.
@@ -101,16 +110,92 @@
    (fref bool)  ; a forward reference, not yet resolved
    (uninit bool)])  ; parser-only definite-assignment marker; the type carries the real state
 
+;; Final Simple stores parser metadata on ScopeNode itself. Keeping it here—not in a second name
+;; map owned by lowering—is what makes the Scope the one authoritative SSA environment.
+(defstruct ScopeNode
+  [(hdr NodeHdr)
+   (vars (ArrayList Var))
+   (levels (ArrayList i64))
+   (guards (ArrayList (dyn NodeOps)))])
+
+(defn scope-node [(s (dyn NodeOps))] (-> (ptr ScopeNode))
+  (if (!= (n-op s) OP-SCOPE)
+      (do
+        (panic "scope-node: node is not a Scope")
+        (primitive/cast (ptr ScopeNode) (hdr (unreachable-node))))
+      (primitive/cast (ptr ScopeNode) (hdr s))))
+
+(impl NodeOps ScopeNode
+  (hdr [(self (ptr ScopeNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr ScopeNode))] (-> (slice u8)) "Scope")
+  ;; Scope is parser state and is never optimized as program data.
+  (compute [(self (ptr ScopeNode))] (-> i64) TY-TOP)
+  (idealize [(self (ptr ScopeNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
+  ;; Distinct live environments must never GVN, even if their current bindings happen to match.
+  (eq-extra [(self (ptr ScopeNode)) (other (dyn NodeOps))] (-> bool) false)
+  (hash-extra [(self (ptr ScopeNode))] (-> i64) (.nid (.hdr self)))
+  (is-const? [(self (ptr ScopeNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr ScopeNode))] (-> bool) true)
+  (is-pinned? [(self (ptr ScopeNode))] (-> bool) true)
+  (binop-copy [(self (ptr ScopeNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)])))
+
+(defn scope-var-count [(s (dyn NodeOps))] (-> i64)
+  (len (.vars (scope-node s))))
+
+(defn scope-var [(s (dyn NodeOps)) (i i64)] (-> Var)
+  (get (.vars (scope-node s)) i))
+
+(defn scope-var-new [(name (slice u8))
+                     (idx i64)
+                     (declared i64)
+                     (final bool)
+                     (fref bool)
+                     (uninit bool)] (-> Var)
+  (let [(mut v) (primitive/zeroed Var)]
+    (set! (.name (mut v)) name)
+    (set! (.idx (mut v)) idx)
+    (set! (.declared (mut v)) declared)
+    (set! (.final (mut v)) final)
+    (set! (.fref (mut v)) fref)
+    (set! (.uninit (mut v)) uninit)
+    (load v)))
+
+(defn scope-find [(s (dyn NodeOps)) (name (slice u8))] (-> i64)
+  (let [(mut i) (- (scope-var-count s) 1)]
+    (loop (if (< (load i) 0)
+              (break -1)
+              (let [v (scope-var s (load i))]
+                (if (= (.name v) name)
+                    (break (load i))
+                    (do (set! (mut i) (- (load i) 1)) (continue))))))))
+
 (defn scope-make [] (-> (dyn NodeOps))
-  (do (unimplemented "scope-make" "S2 — src/node/scope.coil") (unreachable-node)))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [ScopeNode] (alloc/create [ScopeNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.vars p) (al-new [Var] a))
+    (set! (.levels p) (al-new [i64] a))
+    (set! (.guards p) (al-new [(dyn NodeOps)] a))
+    (n-init! d OP-SCOPE)
+    d))
 
 ;; ---------------------------------------------------------------------------
 ;; Lexical nesting
 (defn scope-push! [(s (dyn NodeOps))] (-> i64)
-  (do (unimplemented "scope-push!" "S2 — src/node/scope.coil") 0))
+  (push! [i64] (mut (.levels (scope-node s))) (n-nins s)))
 
 (defn scope-pop! [(s (dyn NodeOps))] (-> i64)
-  (do (unimplemented "scope-pop!" "S2 — src/node/scope.coil") 0))
+  (match (pop! (mut (.levels (scope-node s))))
+    (None [] (broken "scope-pop!: no lexical scope"))
+    (Some [base]
+          (do
+            (n-pop-until! s base)
+            (loop (if (<= (scope-var-count s) (- base SCOPE-VAR0))
+                      (break 0)
+                      (do (pop! (mut (.vars (scope-node s)))) (continue))))
+            0))))
 
 ;; ---------------------------------------------------------------------------
 ;; Bindings
@@ -119,24 +204,85 @@
                      (declared i64)
                      (final bool)
                      (init (dyn NodeOps))] (-> i64)
-  (do (unimplemented "scope-define!" "S2 — src/node/scope.coil") 0))
+  (let [p (scope-node s)
+        nlevels (len (.levels p))
+        base
+          (if (= nlevels 0)
+              SCOPE-VAR0
+              (get (.levels p) (- nlevels 1)))
+        (mut i) (- (n-nins s) 1)]
+    (loop (if (< (load i) base)
+              (break 0)
+              (let [v (scope-var s (- (load i) SCOPE-VAR0))]
+                (if (= (.name v) name)
+                    (broken "scope-define!: duplicate binding in lexical scope")
+                    (do (set! (mut i) (- (load i) 1)) (continue))))))
+    (let [idx (n-nins s)]
+      (push! [Var] (mut (.vars p)) (scope-var-new name idx declared final false false))
+      (n-add-def! s (Some init))
+      idx)))
+
+;; Resolve one lazy loop sentinel. The first read or write creates the Phi in the loop-head Scope;
+;; nested loop sentinels recurse outward exactly as final Simple's `update(var,null)` does.
+(defn scope-resolve-slot! [(s (dyn NodeOps)) (idx i64)] (-> (dyn NodeOps))
+  (let [old (n-in! s idx)]
+    (if (!= (n-op old) OP-SCOPE)
+        old
+        (let [head old
+              v
+                (if (= idx SCOPE-MEM)
+                    (scope-var-new "$mem" SCOPE-MEM TY-BOT false false false)
+                    (scope-var s (- idx SCOPE-VAR0)))
+              declared (.declared v)
+              name (.name v)
+              current (n-in! head idx)]
+          (if (and (= (n-op current) OP-PHI)
+                   (n-same? (phi-region current) (scope-ctrl head)))
+              (do (n-set-def! s idx (Some current)) current)
+              (let [incoming (scope-resolve-slot! head idx)
+                    p (phi-make (scope-ctrl head) declared name)]
+                (phi-add-value! p incoming)
+                (phi-open! p)
+                (n-set-def! head idx (Some p))
+                (n-set-def! s idx (Some p))
+                p))))))
+
+;; Follow lazy sentinels without materializing a Phi. Loop finalization uses this for slots that
+;; were never touched in the body: their exit value is exactly the pre-loop definition.
+(defn scope-entry-value [(s (dyn NodeOps)) (idx i64)] (-> (dyn NodeOps))
+  (let [n (n-in! s idx)]
+    (if (= (n-op n) OP-SCOPE) (scope-entry-value n idx) n)))
+
+(defn scope-final-value [(n (dyn NodeOps)) (idx i64)] (-> (dyn NodeOps))
+  (if (= (n-op n) OP-SCOPE) (scope-entry-value n idx) n))
 
 ;; Read a binding. Reading through a loop SENTINEL is what creates the lazy Phi.
 (defn scope-lookup [(s (dyn NodeOps)) (name (slice u8))] (-> (Option (dyn NodeOps)))
-  (do (unimplemented "scope-lookup" "S2 — src/node/scope.coil") (None)))
+  (let [i (scope-find s name)]
+    (if (< i 0)
+        (None [(dyn NodeOps)])
+        (Some (scope-resolve-slot! s (+ SCOPE-VAR0 i))))))
 
 (defn scope-update! [(s (dyn NodeOps)) (name (slice u8)) (v (dyn NodeOps))] (-> i64)
-  (do (unimplemented "scope-update!" "S2 — src/node/scope.coil") 0))
+  (let [i (scope-find s name)]
+    (if (< i 0)
+        (broken "scope-update!: unknown binding")
+        (let [meta (scope-var s i)]
+          (if (.final meta)
+              (broken "scope-update!: assignment to final binding")
+              (do
+                (scope-resolve-slot! s (+ SCOPE-VAR0 i))
+                (n-set-def! s (+ SCOPE-VAR0 i) (Some v))))))))
 
 (defn scope-ctrl [(s (dyn NodeOps))] (-> (dyn NodeOps))
-  (do (unimplemented "scope-ctrl" "S2 — src/node/scope.coil") (unreachable-node)))
+  (n-in! s SCOPE-CTRL))
 
 (defn scope-set-ctrl! [(s (dyn NodeOps)) (c (dyn NodeOps))] (-> i64)
-  (do (unimplemented "scope-set-ctrl!" "S2 — src/node/scope.coil") 0))
+  (n-set-def! s SCOPE-CTRL (Some c)))
 
 ;; Memory is an ordinary slot, so it gets the lazy-Phi machinery for free.
 (defn scope-mem [(s (dyn NodeOps))] (-> (dyn NodeOps))
-  (do (unimplemented "scope-mem" "S2 — src/node/scope.coil") (unreachable-node)))
+  (scope-resolve-slot! s SCOPE-MEM))
 
 ;; ---------------------------------------------------------------------------
 ;; Duplication and merging
@@ -144,24 +290,138 @@
 ;; Duplicate for a branch or a loop body. When `for-loop`, non-final slots get the SENTINEL that
 ;; triggers lazy Phi creation on first read.
 (defn scope-dup [(s (dyn NodeOps)) (for-loop bool)] (-> (dyn NodeOps))
-  (do (unimplemented "scope-dup" "S2 — src/node/scope.coil") (unreachable-node)))
+  (let [d (scope-make)
+        src (scope-node s)
+        dst (scope-node d)]
+    (al-for [v (.vars src)] (push! [Var] (mut (.vars dst)) v))
+    (al-for [level (.levels src)] (push! [i64] (mut (.levels dst)) level))
+    (al-for [guard (.guards src)]
+            (do
+              (if (= (n-op guard) OP-CPROJ) 0 (n-keep! guard))
+              (push! [(dyn NodeOps)] (mut (.guards dst)) guard)))
+    (n-add-def! d (Some (scope-ctrl s)))
+    (let [(mut i) SCOPE-MEM]
+      (loop (if (>= (load i) (n-nins s))
+                (break 0)
+                (let [meta
+                        (if (= (load i) SCOPE-MEM)
+                            (scope-var-new "$mem" SCOPE-MEM TY-BOT false false false)
+                            (scope-var s (- (load i) SCOPE-VAR0)))
+                      lazy (and for-loop (not (.final meta)))]
+                  (n-add-def! d (Some (if lazy s (n-in! s (load i)))))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    d))
 
 ;; Build the Region and create a Phi only where the two scopes disagree.
 (defn scope-merge! [(a (dyn NodeOps)) (b (dyn NodeOps))] (-> (dyn NodeOps))
-  (do (unimplemented "scope-merge!" "S2 — src/node/scope.coil") (unreachable-node)))
+  (if (!= (n-nins a) (n-nins b))
+      (do (panic "scope-merge!: declarations are unbalanced") a)
+      (let [r (region-make)]
+        (region-add-path! r (scope-ctrl a))
+        (region-add-path! r (scope-ctrl b))
+        (scope-set-ctrl! a r)
+        (let [(mut i) SCOPE-MEM]
+          (loop (if (>= (load i) (n-nins a))
+                    (break 0)
+                    (let [lhs (scope-resolve-slot! a (load i))
+                          rhs (scope-resolve-slot! b (load i))]
+                      (if (n-same? lhs rhs)
+                          0
+                          (let [meta
+                                  (if (= (load i) SCOPE-MEM)
+                                      (scope-var-new "$mem" SCOPE-MEM TY-BOT false false false)
+                                      (scope-var a (- (load i) SCOPE-VAR0)))
+                                declared (.declared meta)
+                                name (.name meta)
+                                p (phi-make r declared name)]
+                            (phi-add-value! p lhs)
+                            (phi-add-value! p rhs)
+                            (n-set-def! a (load i) (Some p))))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue)))))
+        (n-kill! b)
+        a)))
 
 ;; Finalize Loop control and every materialized Phi back edge as one operation, kill the back-edge
 ;; scope, then remove useless Phis. No caller may observe or optimize the intermediate state.
 (defn scope-end-loop! [(entry (dyn NodeOps)) (back (dyn NodeOps)) (exit (dyn NodeOps))] (-> i64)
-  (do (unimplemented "scope-end-loop!" "S2 — src/node/scope.coil") 0))
+  (let [head (scope-ctrl entry)]
+    (if (!= (n-op head) OP-LOOP)
+        (broken "scope-end-loop!: entry control is not a Loop")
+        (do
+          ;; Final Simple's order is control first, then every open Phi without an intervening
+          ;; peephole. Phi's null final input keeps this short window unobservable to optimization.
+          (loop-close! head (scope-ctrl back))
+          (let [(mut i) SCOPE-MEM]
+            (loop (if (>= (load i) (n-nins entry))
+                      (break 0)
+                      (let [raw (n-in! entry (load i))
+                            n (scope-final-value raw (load i))]
+                        (if (not (n-same? raw n))
+                            (n-set-def! entry (load i) (Some n))
+                            0)
+                        (if (and (= (n-op n) OP-PHI) (phi-in-progress? n))
+                            (phi-close! n (scope-resolve-slot! back (load i)))
+                            0)
+                        (if (n-same? (n-in! exit (load i)) entry)
+                            (n-set-def! exit (load i) (Some n))
+                            0)
+                        (set! (mut i) (+ (load i) 1))
+                        (continue)))))
+          (n-kill! back)
+          0))))
 
 ;; ---------------------------------------------------------------------------
 ;; Guards — lexical narrowing on a tested edge
+(defn scope-replace-binding! [(s (dyn NodeOps)) (old (dyn NodeOps)) (fresh (dyn NodeOps))] (-> i64)
+  (let [(mut i) SCOPE-VAR0]
+    (loop (if (>= (load i) (n-nins s))
+              (break 0)
+              (do
+                (if (n-same? (n-in! s (load i)) old)
+                    (n-set-def! s (load i) (Some fresh))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
 (defn scope-add-guards! [(s (dyn NodeOps))
                          (ctrl (dyn NodeOps))
                          (pred (dyn NodeOps))
                          (invert bool)] (-> i64)
-  (do (unimplemented "scope-add-guards!" "S2 — src/node/scope.coil") 0))
+  (if (!= (n-op ctrl) OP-CPROJ)
+      (broken "scope-add-guards!: control is not an If projection")
+      (let [truthy
+              (if invert
+                  (!= (cproj-idx ctrl) IF-TRUE-IDX)
+                  (= (cproj-idx ctrl) IF-TRUE-IDX))
+            narrowed (cast-make ctrl pred (truthiness-refine-ty (n-ty pred) truthy))]
+        (push! [(dyn NodeOps)] (mut (.guards (scope-node s))) ctrl)
+        (if (n-same? narrowed pred)
+            0
+            (do
+              (n-keep! pred)
+              (n-keep! narrowed)
+              (push! [(dyn NodeOps)] (mut (.guards (scope-node s))) pred)
+              (push! [(dyn NodeOps)] (mut (.guards (scope-node s))) narrowed)
+              (scope-replace-binding! s pred narrowed)
+              0)))))
 
 (defn scope-remove-guards! [(s (dyn NodeOps)) (ctrl (dyn NodeOps))] (-> i64)
-  (do (unimplemented "scope-remove-guards!" "S2 — src/node/scope.coil") 0))
+  (let [(mut done) false]
+    (loop (if (load done)
+              (break 0)
+              (match (pop! (mut (.guards (scope-node s))))
+                (None [] (broken "scope-remove-guards!: marker not found"))
+                (Some [top]
+                      (if (n-same? top ctrl)
+                          (set! (mut done) true)
+                          (match (pop! (mut (.guards (scope-node s))))
+                            (None [] (broken "scope-remove-guards!: guard pair is incomplete"))
+                            (Some [pred]
+                                  (do
+                                    (scope-replace-binding! s top pred)
+                                    (n-unkeep! top)
+                                    (n-unkeep! pred)
+                                    0))))))))
+    0))

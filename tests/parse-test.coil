@@ -1,14 +1,129 @@
-;; SCAFFOLD SUITE: parse.
+;; The first TypeScript frontend vertical slice: thin syntax, hoisted function headers, and direct
 
-;;
-;; Empty on purpose, and it must STAY named here so the gap is visible in `coil test --list`
-;; rather than being absent. A suite that does not exist cannot be noticed as missing.
-;;
-;; See docs/LAYOUT.md for what this area owns and which build step fills it in.
-(module aot.tests.parse)
+;; lowering into the ordinary call/arithmetic sea of nodes.
+(module aot.tests.parser)
 (import "coil.assert" :use *)
+(import "aot.node.boot" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.codegen.iterpeeps" :use *)
+(import "aot.codegen.opto" :use *)
+(import "aot.verify" :use *)
+(import "aot.type.type" :use *)
+(import "aot.parse.parser" :use *)
+(import "aot.jsl.lower" :use *)
 
-(deftest parse_suite_is_a_placeholder
-         ;; Deliberately trivial. When the first real test lands here, DELETE this one — a placeholder
-         ;; left beside real tests inflates the count and makes coverage look better than it is.
-         (assert true))
+(defn parser-test-return-named [(stop (dyn NodeOps)) (name (slice u8))] (-> (dyn NodeOps))
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (n-nins stop))
+              (break (unreachable-node))
+              (let [ret (n-in! stop (load i))
+                    fun
+                      (match (arena-node (return-fun-nid ret))
+                        (Some [f] f)
+                        (None [] (unreachable-node)))]
+                (if (= (fun-name fun) name)
+                    (break ret)
+                    (do (set! (mut i) (+ (load i) 1)) (continue))))))))
+
+(defn parser-test-boxed-int [(n (dyn NodeOps))] (-> i64)
+  (do
+    (assert-eq (n-op n) OP-BOX)
+    (con-ty-of (n-in! n 1))))
+
+(deftest typed_functions_parse_to_a_verified_lazy_call_graph
+         (boot! 73)
+         (let [stop
+                 (parse-program "function sub(a: number, b: number): number { return a - b; }
+             function main(): number { return sub(5, 3); }")
+               sub-ret (parser-test-return-named stop "sub")
+               main-ret (parser-test-return-named stop "main")]
+           (assert-eq (n-op stop) OP-STOP)
+           (assert-eq (n-nins stop) 2)
+           (assert-eq (n-op (n-in! sub-ret RETURN-VALUE)) OP-PROJ)
+           (assert-eq (n-op (n-in! main-ret RETURN-VALUE)) OP-PROJ)
+           (let [end (n-in! (n-in! main-ret RETURN-VALUE) 0)
+                 linked-call (n-in! end 0)]
+             (assert-eq (n-op linked-call) OP-CALL)
+             (assert-eq (call-nargs linked-call) 2)
+             (assert-eq (parser-test-boxed-int (call-arg linked-call 0)) (ty-int-con 5))
+             (assert-eq (parser-test-boxed-int (call-arg linked-call 1)) (ty-int-con 3))
+             (assert (not (call-linked? linked-call
+                                        (match (arena-node (return-fun-nid sub-ret))
+                                          (Some [f] f)
+                                          (None [] (unreachable-node)))))))
+           (assert-eq (verify-all) VERR-OK)))
+
+(deftest parsed_subtraction_crosses_the_jsl_semantic_call_boundary
+         (boot! 74)
+         (let [stop (parse-program "function main(): number { return 9 - 4; }")
+               ret (parser-test-return-named stop "main")
+               value-proj (n-in! ret RETURN-VALUE)
+               end (n-in! value-proj 0)
+               semantic-call (n-in! end 0)]
+           (assert-eq (n-op semantic-call) OP-CALL)
+           (assert-eq (n-op (call-arg semantic-call 0)) OP-BOX)
+           (assert-eq (n-op (call-arg semantic-call 1)) OP-BOX)
+           (assert (not (call-linked? semantic-call (jsl-graph-of "JsSub"))))
+           (assert-eq (verify-all) VERR-OK)))
+
+(deftest addition_and_multiplication_preserve_precedence_across_nested_jsl_calls
+         (boot! 75)
+         (let [stop (parse-program "function main(): number { return 2 + 3 * 4; }")
+               ret (parser-test-return-named stop "main")
+               add-end (n-in! (n-in! ret RETURN-VALUE) 0)
+               add-call (n-in! add-end 0)
+               mul-end (n-in! (call-arg add-call 1) 0)
+               mul-call (n-in! mul-end 0)]
+           (assert (not (call-linked? add-call (jsl-graph-of "JsAdd"))))
+           (assert (not (call-linked? mul-call (jsl-graph-of "JsMul"))))
+           (assert-eq (parser-test-boxed-int (call-arg add-call 0)) (ty-int-con 2))
+           (assert-eq (parser-test-boxed-int (call-arg mul-call 0)) (ty-int-con 3))
+           (assert-eq (parser-test-boxed-int (call-arg mul-call 1)) (ty-int-con 4))
+           (assert-eq (verify-all) VERR-OK)
+           (assert (> (opto-run!) 0))
+           (assert-eq (parser-test-boxed-int (n-in! ret RETURN-VALUE)) (ty-int-con 14))
+           (assert-eq (verify-all) VERR-OK)))
+
+(deftest a_single_jsl_arithmetic_call_is_monotone_through_lazy_linking
+         (boot! 76)
+         (let [stop (parse-program "function main(): number { return 2 + 3; }")
+               ret (parser-test-return-named stop "main")]
+           ;; This is the smallest graph where CallEnd is visited before its Return link. The
+           ;; unresolved optimistic result must remain TOP until linking supplies evidence.
+           (assert (> (opto-run!) 0))
+           (assert-eq (parser-test-boxed-int (n-in! ret RETURN-VALUE)) (ty-int-con 5))
+           (assert-eq (verify-all) VERR-OK)))
+
+(deftest closed_world_arguments_specialize_across_user_and_jsl_calls
+         (boot! 77)
+         (let [stop
+                 (parse-program "function scale(a: number, b: number): number { return a + b * 4; }
+             function main(): number { return scale(2, 3); }")
+               scale-ret (parser-test-return-named stop "scale")
+               main-ret (parser-test-return-named stop "main")
+               scale-fun
+                 (match (arena-node (return-fun-nid scale-ret))
+                   (Some [f] f)
+                   (None [] (unreachable-node)))
+               user-end (n-in! (n-in! main-ret RETURN-VALUE) 0)
+               user-call (n-in! user-end 0)]
+           ;; Before Opto the source call is lazy and the annotation has manufactured no raw-int
+           ;; representation: JavaScript parameters enter as dynamic values.
+           (assert-eq (n-op user-call) OP-CALL)
+           (assert (ty-dyn? (n-ty (match (fun-parm scale-fun 0)
+                                    (Some [p] p)
+                                    (None [] (unreachable-node))))))
+           (assert-eq (verify-all) VERR-OK)
+           (assert (> (opto-run!) 0))
+           ;; Closed-world constants sharpen the Parms; JSL unboxing becomes justified and the
+           ;; entire user-call/JSL-call chain specializes to the boxed JavaScript number 14.
+           ;; Inlining may replace and collect main's original Return; Stop's live program exit is
+           ;; authoritative after ownership-preserving Return forwarding.
+           (assert-eq (parser-test-boxed-int (n-in! (n-in! stop 0) RETURN-VALUE))
+                      (ty-int-con 14))
+           (assert (live-unboxes-proven?))
+           (assert-eq (verify-all) VERR-OK)))

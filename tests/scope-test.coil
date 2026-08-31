@@ -1,14 +1,125 @@
-;; SCAFFOLD SUITE: scope.
+;; ScopeNode: parser-time SSA construction, following final Simple's ScopeNode tests and recipes.
 
-;;
-;; Empty on purpose, and it must STAY named here so the gap is visible in `coil test --list`
-;; rather than being absent. A suite that does not exist cannot be noticed as missing.
-;;
-;; See docs/LAYOUT.md for what this area owns and which build step fills it in.
 (module aot.tests.scope)
 (import "coil.assert" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.boot" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.tests.support" :use *)
+(import "aot.type.type" :use *)
 
-(deftest scope_suite_is_a_placeholder
-         ;; Deliberately trivial. When the first real test lands here, DELETE this one — a placeholder
-         ;; left beside real tests inflates the count and makes coverage look better than it is.
-         (assert true))
+(defn test-scope [(ctrl (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [s (scope-make)]
+    (n-add-def! s (Some ctrl))
+    (n-add-def! s (Some (con-make TY-BOT)))
+    (scope-push! s)
+    s))
+
+(defn required-binding [(s (dyn NodeOps)) (name (slice u8))] (-> (dyn NodeOps))
+  (match (scope-lookup s name)
+    (Some [v] v)
+    (None [] (do (panic "required-binding: missing test binding") (unreachable-node)))))
+
+(deftest scope_bindings_are_graph_edges_and_updates_replace_the_definition
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               s (test-scope (cproj-make st 0 "entry"))
+               one (con-int 1)
+               two (con-int 2)]
+           (assert-eq (scope-define! s "x" (ty-int-bot) false one) SCOPE-VAR0)
+           (assert (n-same? (required-binding s "x") one))
+           (scope-update! s "x" two)
+           (assert (n-same? (required-binding s "x") two))
+           ;; Scope is a real use, so its live binding keeps the definition alive.
+           (assert (n-same? (n-in! s SCOPE-VAR0) two))))
+
+(deftest lexical_shadowing_restores_the_outer_binding_on_pop
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               s (test-scope (cproj-make st 0 "entry"))
+               outer (con-int 10)
+               inner (con-int 20)]
+           (scope-define! s "x" (ty-int-bot) false outer)
+           (scope-push! s)
+           (scope-define! s "x" (ty-int-bot) false inner)
+           (assert (n-same? (required-binding s "x") inner))
+           (scope-pop! s)
+           (assert (n-same? (required-binding s "x") outer))))
+
+(deftest branch_merge_creates_a_phi_only_for_a_changed_binding
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               entry (cproj-make st 0 "entry")
+               arms (fresh-arms entry)
+               left (test-scope (arms-true arms))
+               unchanged (con-int 7)]
+           (scope-define! left "x" (ty-int-bot) false (con-int 0))
+           (scope-define! left "same" (ty-int-bot) false unchanged)
+           (let [right (scope-dup left false)]
+             (scope-set-ctrl! right (arms-false arms))
+             (scope-update! left "x" (con-int 1))
+             (scope-update! right "x" (con-int 2))
+             (let [merged (scope-merge! left right)
+                   x (required-binding merged "x")]
+               (assert-eq (n-op (scope-ctrl merged)) OP-REGION)
+               (assert-eq (n-op x) OP-PHI)
+               (assert (n-same? (phi-region x) (scope-ctrl merged)))
+               (assert (n-same? (required-binding merged "same") unchanged))))))
+
+(deftest loop_phis_are_lazy_and_close_after_the_control_backedge
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               base (test-scope (cproj-make st 0 "entry"))]
+           (scope-define! base "x" (ty-int-bot) false (con-int 0))
+           (scope-define! base "untouched" (ty-int-bot) false (con-int 9))
+           (let [head base
+                 loop-node (loop-make (scope-ctrl base))]
+             (scope-set-ctrl! head loop-node)
+             ;; Final Simple retains the loop-head Scope across killing the backedge Scope.
+             (n-keep! head)
+             (let [body (scope-dup head true)]
+               ;; Duplication alone creates no Phi.
+               (assert-eq (n-op (n-in! body SCOPE-VAR0)) OP-SCOPE)
+               (assert-eq (n-op (n-in! body (+ SCOPE-VAR0 1))) OP-SCOPE)
+               (let [arms (fresh-arms loop-node)
+                     exit (scope-dup body false)]
+                 (scope-set-ctrl! body (arms-true arms))
+                 (scope-set-ctrl! exit (arms-false arms))
+                 (scope-update! body "x" (con-int 1))
+                 (let [xphi (required-binding head "x")]
+                   (assert-eq (n-op xphi) OP-PHI)
+                   (assert (phi-in-progress? xphi))
+                   ;; The untouched binding still has only its sentinel until loop finalization.
+                   (assert-eq (n-op (n-in! body (+ SCOPE-VAR0 1))) OP-SCOPE)
+                   (scope-end-loop! head body exit)
+                   (assert (not (loop-in-progress? loop-node)))
+                   (assert (not (phi-in-progress? xphi)))
+                   (assert (n-same? (required-binding exit "x") xphi))
+                   ;; A never-touched slot must resolve to its entry definition, not materialize a new open
+                   ;; Phi after the Loop has already closed.
+                   (let [untouched (required-binding exit "untouched")]
+                     (assert-eq (n-op untouched) OP-CON)
+                     (assert-eq (con-ty-of untouched) (ty-int-con 9)))
+                   (n-unkeep! head)
+                   (n-kill! head)))))))
+
+(deftest guards_install_a_branch_local_cast_and_restore_the_original_binding
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               entry (cproj-make st 0 "entry")
+               value (con-make (ty-dyn (+ TAG-NULL TAG-OBJECT)))
+               iff (if-make entry value)
+               arms (if-arms! iff)
+               s (test-scope (arms-true arms))]
+           (scope-define! s "value" (ty-dyn (+ TAG-NULL TAG-OBJECT)) false value)
+           (scope-add-guards! s (arms-true arms) value false)
+           (let [narrowed (required-binding s "value")]
+             (assert-eq (n-op narrowed) OP-CAST)
+             (assert-eq (cast-ty-of narrowed) (ty-dyn TAG-OBJECT)))
+           (scope-remove-guards! s (arms-true arms))
+           (assert (n-same? (required-binding s "value") value))))

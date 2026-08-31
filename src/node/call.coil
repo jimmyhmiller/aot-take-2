@@ -337,13 +337,18 @@
           (match (fun-ret f)
             (Some [ret]
                   (let [rt (n-ty ret)]
-                    (if (and (ty-tuple? rt) (> (ty-tuple-len rt) RETURN-VALUE))
-                        (let [actual (ty-tuple-at rt RETURN-VALUE)
-                              declared (ty-sig-ret (fun-sig f))]
-                          (if (and (!= actual declared) (ty-isa? actual declared))
-                              (do (fun-set-sig! f (fun--sig-with-ret (fun-sig f) actual)) (Some f))
-                              (fun--maybe-collapse f)))
-                        (fun--maybe-collapse f))))
+                    ;; Return can finish folding one worklist turn before its Fun. Its arena slot
+                    ;; remains addressable for ownership metadata, but TY-INVALID is not a lattice
+                    ;; value and must not be inspected as one; proceed directly to Fun collapse.
+                    (if (= rt TY-INVALID)
+                        (fun--maybe-collapse f)
+                        (if (and (ty-tuple? rt) (> (ty-tuple-len rt) RETURN-VALUE))
+                            (let [actual (ty-tuple-at rt RETURN-VALUE)
+                                  declared (ty-sig-ret (fun-sig f))]
+                              (if (and (!= actual declared) (ty-isa? actual declared))
+                                  (do (fun-set-sig! f (fun--sig-with-ret (fun-sig f) actual)) (Some f))
+                                  (fun--maybe-collapse f)))
+                            (fun--maybe-collapse f)))))
             (None [] (fun--maybe-collapse f))))))
 
 ;; >>> THE COLLAPSE THAT IS INLINING <<<
@@ -390,15 +395,15 @@
   (idealize [(self (ptr FunNode))]
             (-> (Option (dyn NodeOps)))
             (fun-idealize (primitive/make-dyn NodeOps self)))
-  ;; Never equal while callers are unknown, for the same reason an in-progress Region is not: two
-  ;; half-known functions are not interchangeable.
+  ;; Function control identities never GVN. Final Simple carries the closed-world fidx in the
+  ;; function signature, which distinguishes equal-shaped functions and inline clones. Our fidx
+  ;; currently lives on FunPtr, so nid is the equivalent identity until compunit moves it onto Fun.
+  ;; Comparing only the value signature incorrectly merges JsAdd/JsMul/JsSub after their Start
+  ;; hooks close, because their control edges and tuple signatures are otherwise identical.
   (eq-extra [(self (ptr FunNode)) (other (dyn NodeOps))]
             (-> bool)
-            (if (!= (n-op other) OP-FUN)
-                false
-                (and (not (fun-unknown-callers? (primitive/make-dyn NodeOps self)))
-                     (= (.sig self) (fun-sig other)))))
-  (hash-extra [(self (ptr FunNode))] (-> i64) (^ 173 (* (.sig self) 179))))
+            (do self other false))
+  (hash-extra [(self (ptr FunNode))] (-> i64) (.nid (.hdr self))))
 
 (impl CFGOps FunNode
   (cfg-node [(self (ptr FunNode))] (-> (dyn NodeOps)) (primitive/make-dyn NodeOps self))
@@ -474,34 +479,66 @@
     (None [] TY-TOP)
     (Some [f]
           (if (!= (n-op f) OP-FUN)
-              TY-TOP
+              ;; The Fun has collapsed during inlining but this Parm has not yet taken its turn.
+              ;; Preserve the aligned argument type until `parm-idealize` replaces the Parm; TOP
+              ;; here would widen an SCCP-sharpened parameter in that intentional transient.
+              (match (n-in p 1)
+                (Some [v]
+                      (if (= (n-ty v) TY-INVALID)
+                          (parm-declared p)
+                          (ty-join (n-ty v) (parm-declared p))))
+                (None [] TY-TOP))
               (if (parm-in-progress? p)
                   ;; Unknown callers: the parameter could be anything the annotation allows.
                   (parm-declared p)
-                  ;; Otherwise the meet over LIVE callers, joined with the declared type.
-                  (let [cnt (n-nins p)
-                        (mut i) 1
-                        (mut t) TY-TOP]
-                    (loop (if (>= (load i) cnt)
-                              (break 0)
-                              (do
-                                (match (n-in f (load i))
-                                  (Some [caller]
-                                        (do
-                                          (n-add-dep! caller p)
-                                          (if (or (= (n-ty caller) TY-XCTRL)
-                                                  (= (n-ty caller) TY-TOP))
-                                              0
-                                              (match (n-in p (load i))
-                                                (Some [v]
-                                                      (set! (mut t)
-                                                            (ty-meet (load t) (n-ty v))))
-                                                (None [] 0)))))
-                                  (None [] 0))
-                                (set! (mut i) (+ (load i) 1))
-                                (continue))))
-                    ;; `constrain`: never wider than the annotation.
-                    (ty-join (load t) (parm-declared p))))))))
+                  ;; During trivial inlining the Fun's sole control input has already been
+                  ;; rewritten from Call to caller control. It can still be provisionally TOP
+                  ;; under SCCP, but the Parm's aligned value is concrete and is about to replace
+                  ;; the Parm through the ordinary single-input Phi rule. Final Simple gets this
+                  ;; from Parm inheriting Phi.compute while Fun is folding; spell it out here
+                  ;; because Coil's Parm compute owns its call-aware live-path filtering.
+                  (if (fun-folding? f)
+                      (match (n-in p 1)
+                        (Some [v]
+                              (if (= (n-ty v) TY-INVALID)
+                                  (parm-declared p)
+                                  (ty-join (n-ty v) (parm-declared p))))
+                        (None [] TY-TOP))
+                      ;; Otherwise the meet over LIVE callers, joined with the declared type.
+                      (let [cnt (n-nins p)
+                            (mut i) 1
+                            (mut t) TY-TOP]
+                        (loop (if (>= (load i) cnt)
+                                  (break 0)
+                                  (do
+                                    (match (n-in f (load i))
+                                      (Some [caller]
+                                            (do
+                                              (n-add-dep! caller p)
+                                              (if (or (= (n-ty caller) TY-XCTRL)
+                                                      (= (n-ty caller) TY-TOP))
+                                                  0
+                                                  (match (n-in p (load i))
+                                                    (Some [v]
+                                                          (if (= (n-ty v) TY-INVALID)
+                                                              0
+                                                              (set! (mut t)
+                                                                    (ty-meet (load t) (n-ty v)))))
+                                                    (None [] 0)))))
+                                      (None [] 0))
+                                    (set! (mut i) (+ (load i) 1))
+                                    (continue))))
+                        ;; `constrain`: never wider than the annotation. During inlining a Call can
+                        ;; disappear one worklist turn before this Parm idealizes to its aligned
+                        ;; argument. With no remaining live Call control, the fresh meet is TOP; keep
+                        ;; the already-proven type for that transient instead of widening back to the
+                        ;; declaration and violating the pessimistic monotonicity contract.
+                        (let [constrained (ty-join (load t) (parm-declared p))
+                              old (n-ty p)]
+                          (if (and (= (load t) TY-TOP)
+                                   (and (!= old TY-INVALID) (ty-isa? old constrained)))
+                              old
+                              constrained)))))))))
 
 (defn parm-idealize [(p (dyn NodeOps))] (-> (Option (dyn NodeOps)))
   (match (n-in p 0)
@@ -763,8 +800,14 @@
                     (if (cend-folding? e)
                         (match (n-in e 1)
                           (Some [ret]
-                                (cend--state-with-declared-ret (n-ty ret)
-                                                               (ty-sig-ret (ty-funptr-sig ft))))
+                                ;; Return can be collected one worklist turn before CallEnd's
+                                ;; projections finish forwarding. TY-INVALID is a transient graph
+                                ;; state, not lattice evidence; retain the last monotone CallEnd
+                                ;; answer until ordinary folding removes the edge.
+                                (if (= (n-ty ret) TY-INVALID)
+                                    (n-ty e)
+                                    (cend--state-with-declared-ret (n-ty ret)
+                                                                   (ty-sig-ret (ty-funptr-sig ft)))))
                           (None [] (ty-tuple-of3 TY-XCTRL TY-TOP TY-TOP)))
                         ;; Otherwise meet the full state tuples from every linked Return.
                         (cend--linked-state e (ty-sig-ret (ty-funptr-sig ft))))))))))
@@ -777,8 +820,11 @@
                     (ty-join (ty-tuple-at state RETURN-VALUE) declared))
       (ty-tuple-of3 TY-XCTRL TY-TOP TY-TOP)))
 
-;; Meet every linked Return's full `(control, memory, value)` state. With no links yet, retain a
-;; conservative reachable continuation and the declared result.
+;; Meet every linked Return's full `(control, memory, value)` state. Before Opto, a missing target
+;; may still be linked later, so retain the declared result. During and after Opto, `pesi-ty` is the
+;; phase-independent marker that reset-to-top has run; an unresolved call then contributes TOP,
+;; exactly as final Simple's `phase >= Opto` branch requires. Returning the declared result during
+;; Opto is non-monotone when the newly linked Return is still TOP.
 (defn cend--linked-state [(e (dyn NodeOps)) (declared i64)] (-> i64)
   (let [cnt (n-nins e)
         (mut i) 1
@@ -799,8 +845,16 @@
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
     (if (load any)
-        (cend--state-with-declared-ret (load state) declared)
-        (ty-tuple-of3 TY-CTRL TY-TOP declared))))
+        ;; Final Simple preserves a reachable continuation when every linked Return is only
+        ;; provisionally unreachable during Opto. Otherwise CallEnd moves CTRL -> XCTRL, tears
+        ;; down the caller, and may later need to widen when argument evidence reaches the callee.
+        (if (and (!= (n-pesi-ty e) TY-INVALID)
+                 (= (ty-tuple-at (load state) RETURN-CTRL) TY-XCTRL))
+            (ty-tuple-of3 TY-CTRL TY-TOP TY-TOP)
+            (cend--state-with-declared-ret (load state) declared))
+        (if (!= (n-pesi-ty e) TY-INVALID)
+            (ty-tuple-of3 TY-CTRL TY-TOP TY-TOP)
+            (ty-tuple-of3 TY-CTRL TY-TOP declared)))))
 
 (impl NodeOps CallEndNode
   (hdr [(self (ptr CallEndNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
@@ -880,7 +934,11 @@
                                     ;; The caller passes fewer arguments than the callee declares.
                                     ;; That is an arity error, not something to paper over with a
                                     ;; default: link nothing and let the type check report it.
-                                    (n-add-def! u (None [(dyn NodeOps)]))))
+                                    (n-add-def! u (None [(dyn NodeOps)])))
+                                ;; `n-add-def!` maintains edges but intentionally does not schedule.
+                                ;; Linking changes this Phi's meet, so SCCP must revisit it now;
+                                ;; its users are queued when the resulting type sharpens.
+                                (code-add! u))
                               0))
                     (None [] 0))
                   (set! (mut i) (+ (load i) 1))
@@ -1133,7 +1191,17 @@
                 (break 0)
                 (do
                   (match (n-out fun (load i))
-                    (Some [u] (if (= (n-op u) OP-PARM) (code-add-outputs! u) 0))
+                    (Some [u]
+                          (if (= (n-op u) OP-PARM)
+                              (do
+                                ;; Queue the changing Phi itself as well as its users. Relying on
+                                ;; the generic Fun-output enqueue is insufficient when that entry
+                                ;; was already present before the inline worklist interrupts the
+                                ;; ordinary worklist; the sparse set would otherwise consume the
+                                ;; old entry and never revisit the now-folding Parm.
+                                (code-add! u)
+                                (code-add-outputs! u))
+                              0))
                     (None [] 0))
                   (set! (mut i) (+ (load i) 1))
                   (continue)))))

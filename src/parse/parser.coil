@@ -22,19 +22,438 @@
 ;; TypeScript annotations are parsed by `aot.parse.tstype` and attached as DECLARED types. Declared
 ;; is not proven — see `aot.codegen.opto`.
 ;;
-;; SCAFFOLD: signatures are final; bodies hard-error. Filled in at S2.
+;; The admitted vertical slice is intentionally narrow and complete: named function declarations,
+;; number-annotated parameters/returns, integer literals, parameter reads, calls, parentheses, and
+;; `+`, `-`, and `*`. Parsing first produces a THIN syntax tree, then lowering constructs SSA directly. This
+;; is the required JavaScript divergence from final Simple's one-pass parser: declarations are
+;; hoisted, so every Fun header exists before any body is lowered. The semantic graph remains the
+;; only typed IR; syntax nodes carry spans and grammar shape, never inferred types.
 (module aot.parse.parser)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.type.type" :use *)
+(import "aot.jsl.lower" :use *)
+(import "aot.parse.lexer" :use *)
+
+(const SX-NUMBER 1)
+
+(const SX-NAME 2)
+
+(const SX-ADD 3)
+
+(const SX-SUB 4)
+
+(const SX-MUL 5)
+
+(const SX-CALL 6)
+
+(defstruct SyntaxExpr
+  [(kind i64)
+   (lo i64)
+   (hi i64)
+   (number i64)
+   (name (slice u8))
+   (left i64)
+   (right i64)
+   (args (ArrayList i64))])
+
+(defstruct SyntaxFun
+  [(name (slice u8))
+   (params (ArrayList (slice u8)))
+   (body i64)
+   (lo i64)
+   (hi i64)
+   (fun-nid i64)])
+
+(defstruct ParserState
+  [(exprs (ArrayList SyntaxExpr))
+   (funs (ArrayList SyntaxFun))
+   (current-fun i64)
+   (current-ctrl i64)
+   (booted bool)])
+
+(defn parser-state [] (-> (ptr ParserState))
+  (primitive/alloc-static ParserState))
+
+(defn parser-reset! [] (-> i64)
+  (let [p (parser-state)]
+    (if (not (.booted p))
+        (do
+          (set! (.exprs p) (al-new [SyntaxExpr] (alloc/malloc-allocator)))
+          (set! (.funs p) (al-new [SyntaxFun] (alloc/malloc-allocator)))
+          (set! (.booted p) true)
+          0)
+        (do
+          (al-clear! [SyntaxExpr] (mut (.exprs p)))
+          (al-clear! [SyntaxFun] (mut (.funs p)))
+          0))))
+
+(defn parse-fail [(what (slice u8)) (t Token)] (-> i64)
+  (do (panic-i what (.start t)) 0))
+
+(defn take-token [] (-> Token)
+  (lex-next! false))
+
+(defn peek-token [] (-> Token)
+  (lex-peek false))
+
+(defn take-is [(text (slice u8))] (-> bool)
+  (if (token-is (peek-token) text) (do (take-token) true) false))
+
+(defn require-token [(text (slice u8))] (-> Token)
+  (let [t (take-token)]
+    (if (token-is t text)
+        t
+        (do (parse-fail "parser: expected token at byte" t) t))))
+
+(defn require-ident [] (-> Token)
+  (let [t (take-token)]
+    (if (= (.kind t) TOK-IDENT)
+        t
+        (do (parse-fail "parser: expected identifier at byte" t) t))))
+
+(defn syntax-expr-new [(kind i64) (lo i64) (hi i64)] (-> SyntaxExpr)
+  (let [(mut x) (primitive/zeroed SyntaxExpr)]
+    (set! (.kind (mut x)) kind)
+    (set! (.lo (mut x)) lo)
+    (set! (.hi (mut x)) hi)
+    (load x)))
+
+(defn syntax-add! [(x SyntaxExpr)] (-> i64)
+  (do
+    (push! [SyntaxExpr] (mut (.exprs (parser-state))) x)
+    (len (.exprs (parser-state)))))
+
+(defn syntax-at [(id i64)] (-> SyntaxExpr)
+  (get (.exprs (parser-state)) (- id 1)))
+
+(defn parse-number-value [(t Token)] (-> i64)
+  (let [text (token-text t)
+        (mut i) 0
+        (mut n) 0]
+    (loop (if (>= (load i) (len text))
+              (break 0)
+              (do
+                (set! (mut n) (+ (* (load n) 10) (- (cast i64 (get text (load i))) 48)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load n)))
+
+(defn parse-syntax-primary [] (-> i64)
+  (let [t (take-token)]
+    (if (= (.kind t) TOK-NUMBER)
+        (let [(mut x) (syntax-expr-new SX-NUMBER (.start t) (.end t))]
+          (set! (.number (mut x)) (parse-number-value t))
+          (syntax-add! (load x)))
+        (if (= (.kind t) TOK-IDENT)
+            (let [(mut x) (syntax-expr-new SX-NAME (.start t) (.end t))]
+              (set! (.name (mut x)) (token-text t))
+              (syntax-add! (load x)))
+            (if (token-is t "(")
+                (let [x (parse-syntax-add)] (do (require-token ")") x))
+                (do
+                  ;; Strings and object literals are lexically recognized but not admitted until
+                  ;; their runtime representations and memory nodes exist. Refusal is immediate.
+                  (parse-fail "parser: primary is outside the admitted subset at byte" t)
+                  0))))))
+
+(defn parse-syntax-postfix [] (-> i64)
+  (let [(mut base) (parse-syntax-primary)]
+    (loop (if (not (take-is "("))
+              (break 0)
+              (let [(mut args) (al-new [i64] (alloc/malloc-allocator))]
+                (if (not (take-is ")"))
+                    (loop (do
+                            (push! [i64] (mut args) (parse-syntax-add))
+                            (if (take-is ",")
+                                (continue)
+                                (break (do (require-token ")") 0)))))
+                    0)
+                (let [callee (syntax-at (load base))
+                      close (peek-token)
+                      (mut x) (syntax-expr-new SX-CALL (.lo callee) (.start close))]
+                  (if (!= (.kind callee) SX-NAME)
+                      (parse-fail "parser: only named calls are admitted at byte" close)
+                      0)
+                  (set! (.name (mut x)) (.name callee))
+                  (set! (.args (mut x)) (load args))
+                  (set! (mut base) (syntax-add! (load x)))
+                  (continue)))))
+    (load base)))
+
+(defn parse-syntax-mul [] (-> i64)
+  (let [(mut lhs) (parse-syntax-postfix)]
+    (loop (if (not (take-is "*"))
+              (break 0)
+              (let [rhs (parse-syntax-postfix)
+                    l (syntax-at (load lhs))
+                    r (syntax-at rhs)
+                    (mut x) (syntax-expr-new SX-MUL (.lo l) (.hi r))]
+                (set! (.left (mut x)) (load lhs))
+                (set! (.right (mut x)) rhs)
+                (set! (mut lhs) (syntax-add! (load x)))
+                (continue))))
+    (load lhs)))
+
+(defn parse-syntax-add [] (-> i64)
+  (let [(mut lhs) (parse-syntax-mul)]
+    (loop (let [t (peek-token)]
+            (if (not (or (token-is t "+") (token-is t "-")))
+                (break 0)
+                (do
+                  (take-token)
+                  (let [rhs (parse-syntax-mul)
+                        l (syntax-at (load lhs))
+                        r (syntax-at rhs)
+                        kind (if (token-is t "+") SX-ADD SX-SUB)
+                        (mut x) (syntax-expr-new kind (.lo l) (.hi r))]
+                    (set! (.left (mut x)) (load lhs))
+                    (set! (.right (mut x)) rhs)
+                    (set! (mut lhs) (syntax-add! (load x)))
+                    (continue))))))
+    (load lhs)))
+
+(defn parse-number-annotation [] (-> i64)
+  (do
+    (require-token ":")
+    (let [t (require-ident)]
+      (if (not (token-is t "number"))
+          (parse-fail "parser: only the number annotation is admitted at byte" t)
+          0))))
+
+(defn parse-syntax-function! [] (-> i64)
+  (let [open (require-token "function")
+        name (require-ident)
+        (mut params) (al-new [(slice u8)] (alloc/malloc-allocator))]
+    (require-token "(")
+    (if (not (take-is ")"))
+        (loop (let [p (require-ident)]
+                (parse-number-annotation)
+                (push! [(slice u8)] (mut params) (token-text p))
+                (if (take-is ",")
+                    (continue)
+                    (break (do (require-token ")") 0)))))
+        0)
+    (parse-number-annotation)
+    (require-token "{")
+    (require-token "return")
+    (let [body (parse-syntax-add)]
+      (take-is ";")
+      (let [close (require-token "}")
+            (mut f) (primitive/zeroed SyntaxFun)]
+        (set! (.name (mut f)) (token-text name))
+        (set! (.params (mut f)) (load params))
+        (set! (.body (mut f)) body)
+        (set! (.lo (mut f)) (.start open))
+        (set! (.hi (mut f)) (.end close))
+        (push! [SyntaxFun] (mut (.funs (parser-state))) (load f))
+        (len (.funs (parser-state)))))))
+
+(defn syntax-fun-at [(i i64)] (-> SyntaxFun)
+  (get (.funs (parser-state)) i))
+
+(defn syntax-find-fun [(name (slice u8))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len (.funs (parser-state))))
+              (break -1)
+              (let [f (syntax-fun-at (load i))]
+                (if (= (.name f) name)
+                    (break (load i))
+                    (do (set! (mut i) (+ (load i) 1)) (continue))))))))
+
+(defn parser-node [(nid i64)] (-> (dyn NodeOps))
+  (match (arena-node nid) (Some [n] n) (None [] (unreachable-node))))
+
+(defn lower-name [(name (slice u8))] (-> (dyn NodeOps))
+  (let [f (syntax-fun-at (.current-fun (parser-state)))
+        (mut i) 0]
+    (loop (if (>= (load i) (len (.params f)))
+              (break (do (panic "parser: unknown parameter during lowering") (unreachable-node)))
+              (if (= (get (.params f) (load i)) name)
+                  (break (match (fun-parm (parser-node (.fun-nid f)) (load i))
+                           (Some [p] p)
+                           (None [] (unreachable-node))))
+                  (do (set! (mut i) (+ (load i) 1)) (continue)))))))
+
+;; JavaScript numeric operators are semantic calls, even in this deliberately integer-proven slice.
+;; Boxing exposes the dynamic boundary to JSL; specialization may later cancel both pairs.
+(defn lower-js-binary [(lhs (dyn NodeOps))
+                       (rhs (dyn NodeOps))
+                       (name (slice u8))] (-> (dyn NodeOps))
+  (let [target (jsl-graph-of name)
+        c (call-make (parser-node (.current-ctrl (parser-state))))]
+    ;; JavaScript values are already dynamic at every source-level boundary. JSL owns any unboxing;
+    ;; boxing again here would make the frontend silently choose an integer representation.
+    (call-add-arg! c lhs)
+    (call-add-arg! c rhs)
+    (call-set-fptr! c (funptr-make target (jsl-fidx-of name)))
+    (let [end (callend-make c)]
+      (let [ctrl (cproj-make end RETURN-CTRL "js-binary.ctrl")]
+        (set! (.current-ctrl (parser-state)) (n-nid ctrl)))
+      (proj-make end RETURN-VALUE "js-binary.value"))))
+
+(defn lower-syntax-expr [(id i64)] (-> (dyn NodeOps))
+  (let [x (syntax-at id)]
+    (if (= (.kind x) SX-NUMBER)
+        ;; A source literal is a JavaScript value. The raw integer exists only inside its Box and
+        ;; may reappear after a proven JSL Unbox cancels that Box during specialization.
+        (box-make (con-int (.number x)))
+        (if (= (.kind x) SX-NAME)
+            (lower-name (.name x))
+            (if (= (.kind x) SX-ADD)
+                (lower-js-binary (lower-syntax-expr (.left x))
+                                 (lower-syntax-expr (.right x))
+                                 "JsAdd")
+                (if (= (.kind x) SX-SUB)
+                    (lower-js-binary (lower-syntax-expr (.left x))
+                                     (lower-syntax-expr (.right x))
+                                     "JsSub")
+                    (if (= (.kind x) SX-MUL)
+                        (lower-js-binary (lower-syntax-expr (.left x))
+                                         (lower-syntax-expr (.right x))
+                                         "JsMul")
+                        (if (= (.kind x) SX-CALL)
+                            (let [target-idx (syntax-find-fun (.name x))]
+                              (if (< target-idx 0)
+                                  (do
+                                    (panic "parser: call to undeclared function")
+                                    (unreachable-node))
+                                  (let [target-syntax (syntax-fun-at target-idx)
+                                        target (parser-node (.fun-nid target-syntax))]
+                                    (if (!= (len (.args x))
+                                            (len (.params target-syntax)))
+                                        (panic "parser: call argument count mismatch")
+                                        0)
+                                    (let [c (call-make (parser-node (.current-ctrl (parser-state))))
+                                          (mut i) 0]
+                                      (loop (if (>= (load i) (len (.args x)))
+                                                (break 0)
+                                                (do
+                                                  (call-add-arg! c
+                                                                 (lower-syntax-expr (get (.args x) (load i))))
+                                                  (set! (mut i) (+ (load i) 1))
+                                                  (continue))))
+                                      (call-set-fptr! c (funptr-make target target-idx))
+                                      (let [end (callend-make c)]
+                                        (let [ctrl (cproj-make end RETURN-CTRL "call.ctrl")]
+                                          (set! (.current-ctrl (parser-state)) (n-nid ctrl)))
+                                        (proj-make end RETURN-VALUE "call.value"))))))
+                            (do
+                              (panic "parser: unknown syntax expression")
+                              (unreachable-node))))))))))
 
 (defn parse-program [(src (slice u8))] (-> (dyn NodeOps))
-  (do (unimplemented "parse-program" "S2 — src/parse/parser.coil") (unreachable-node)))
+  (do
+    (parser-reset!)
+    (jsl-lower-index! "jsl/compiler/index")
+    (lex-init! src)
+    ;; Syntax pass: collect every declaration before graph construction. This is the hoisting
+    ;; boundary; no semantic node is built while the cover grammar is still ambiguous.
+    (loop (let [t (peek-token)]
+            (if (= (.kind t) TOK-EOF)
+                (break 0)
+                (do (parse-syntax-function!) (continue)))))
+    ;; This slice has no host argument-vector lowering yet. Accepting parameters on the externally
+    ;; entered function would let a TypeScript annotation stand in for runtime JavaScript evidence.
+    (let [main-idx (syntax-find-fun "main")]
+      (if (< main-idx 0)
+          0
+          (let [main-fun (syntax-fun-at main-idx)]
+            (if (> (len (.params main-fun)) 0)
+                (panic "parser: main parameters require the JavaScript host-argument path")
+                0))))
+    (let [start (start-make (ty-int-bot))
+          stop (stop-make)
+          (mut fi) 0]
+      ;; Header pass: install all Fun/Parm nodes before lowering any call-bearing body.
+      (loop (if (>= (load fi) (len (.funs (parser-state))))
+                (break 0)
+                (let [fp (al-elem [SyntaxFun] (mut (.funs (parser-state))) (load fi))
+                      argc (len (.params fp))
+                      (mut members) (al-new [i64] (alloc/malloc-allocator))]
+                  ;; JavaScript calling convention: return and arguments are dynamic values.
+                  ;; `number` is evidence to discharge later, never a raw representation claim.
+                  (push! [i64] (mut members) (ty-dyn TAG-ANY))
+                  (let [(mut i) 0]
+                    (loop (if (>= (load i) argc)
+                              (break 0)
+                              (do
+                                (push! [i64] (mut members) (ty-dyn TAG-ANY))
+                                (set! (mut i) (+ (load i) 1))
+                                (continue)))))
+                  (let [fun (fun-make start (ty-tuple (al-slice (load members))) (.name fp))
+                        (mut i) 0]
+                    (set! (.fun-nid fp) (n-nid fun))
+                    (loop (if (>= (load i) argc)
+                              (break 0)
+                              (do
+                                ;; Headers precede bodies, so hold parameter Phis alive until every
+                                ;; body and call edge has been installed.
+                                (n-keep! (parm-make fun
+                                                    (load i)
+                                                    (ty-dyn TAG-ANY)
+                                                    (get (.params fp) (load i))))
+                                (set! (mut i) (+ (load i) 1))
+                                (continue)))))
+                  (set! (mut fi) (+ (load fi) 1))
+                  (continue))))
+      ;; Body pass: expressions lower directly to ordinary ideal nodes and linked calls.
+      (set! (mut fi) 0)
+      (loop (if (>= (load fi) (len (.funs (parser-state))))
+                (break 0)
+                (let [f (syntax-fun-at (load fi))
+                      fun (parser-node (.fun-nid f))]
+                  (set! (.current-fun (parser-state)) (load fi))
+                  (set! (.current-ctrl (parser-state)) (n-nid fun))
+                  (let [value (lower-syntax-expr (.body f))
+                        ret
+                          (return-make (parser-node (.current-ctrl (parser-state)))
+                                       (None [(dyn NodeOps)])
+                                       value
+                                       (None [(dyn NodeOps)])
+                                       (Some fun))]
+                    (fun-set-ret! fun ret)
+                    (stop-add-return! stop ret))
+                  (set! (mut fi) (+ (load fi) 1))
+                  (continue))))
+      ;; Closed world: all call edges are now known, so parameter types are driven only by them.
+      (set! (mut fi) 0)
+      (loop (if (>= (load fi) (len (.funs (parser-state))))
+                (break 0)
+                (let [f (syntax-fun-at (load fi))]
+                  ;; `main` is the externally entered program root. Internal functions close over
+                  ;; their concrete call sites; removing main's Start hook would make the entire
+                  ;; Stop-rooted program unreachable during optimistic SCCP.
+                  (if (= (.name f) "main")
+                      0
+                      (fun-drop-unknown-callers! (parser-node (.fun-nid f))))
+                  (let [fun (parser-node (.fun-nid f))
+                        (mut i) 0]
+                    (loop (if (>= (load i) (len (.params f)))
+                              (break 0)
+                              (do
+                                (match (fun-parm fun (load i))
+                                  (Some [p] (n-unkeep! p))
+                                  (None [] 0))
+                                (set! (mut i) (+ (load i) 1))
+                                (continue)))))
+                  (set! (mut fi) (+ (load fi) 1))
+                  (continue))))
+      (jsl-close-world!)
+      stop)))
 
 (defn parse-statement [] (-> (dyn NodeOps))
   (do (unimplemented "parse-statement" "S2 — src/parse/parser.coil") (unreachable-node)))
 
 (defn parse-expression [] (-> (dyn NodeOps))
-  (do (unimplemented "parse-expression" "S2 — src/parse/parser.coil") (unreachable-node)))
+  (lower-syntax-expr (parse-syntax-add)))
 
 (defn parse-if [] (-> (dyn NodeOps))
   (do (unimplemented "parse-if" "S2 — src/parse/parser.coil") (unreachable-node)))

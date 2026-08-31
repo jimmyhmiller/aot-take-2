@@ -140,7 +140,8 @@ aot-take-2/
 │   ├── index            ; load order IS the format (function indices, golden hashes)
 │   ├── intrinsics.jsl   ; the global-object surface
 │   ├── object-layouts.jsl
-│   └── abstract/ array/ string/ object/ json/ math/ number/ symbol/
+│   └── abstract/ array/ string/ object/ json/ math/ number/ symbol/ compiler/
+│       └── compiler/{add,sub,mul}.jsl ; frontend numeric operators cross dynamic JSL calls
 │       function/ array-buffer/ data-view/ typed-array/
 ├── src/
 │   ├── main.coil            ; CLI driver: compile, emit, run

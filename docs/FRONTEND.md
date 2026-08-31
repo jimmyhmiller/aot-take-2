@@ -138,6 +138,22 @@ ideal graph  ◄──── JSL definitions, lowered from jsl/index into Fun gr
 specialised graph → backend
 ```
 
+### Current arithmetic slice
+
+The implemented `number`-annotated arithmetic slice preserves the JavaScript representation
+boundary even though its accepted values are presently narrower than ECMAScript:
+
+- source literals are `Box(ConInt)`, not raw integer values;
+- user-function parameters, results and calls use `dyn`, exactly like JSL calls;
+- a `number` annotation does not change a parameter into a raw integer;
+- closed-world argument flow may prove a singleton integer tag, after which JSL's `%UnboxInt`
+  becomes justified and ordinary Box/Unbox cancellation exposes raw arithmetic;
+- backend handoff refuses a live Unbox whose dynamic input is not representation-proven.
+
+Until host argument lowering and generic numeric fallback exist, the externally entered `main`
+function admits no parameters. This is a deliberate subset boundary: accepting `main(a: number)`
+would trust the annotation as runtime evidence, which TypeScript and JavaScript do not permit.
+
 Two things join in the middle, and they join at **`Call` to a `Fun`** — nothing more exotic:
 
 - the frontend produces calls to named entry points;
