@@ -150,6 +150,10 @@ boundary even though its accepted values are presently narrower than ECMAScript:
   becomes justified and ordinary Box/Unbox cancellation exposes raw arithmetic;
 - backend handoff refuses a live Unbox whose dynamic input is not representation-proven.
 
+Parameter and return annotations are optional, so the same function grammar admits ordinary
+JavaScript declarations. Annotated and unannotated functions both use the identical `dyn` return
+and argument signature; the annotation never selects a raw representation.
+
 Externally entered `main` parameters are admitted as `dyn:any`, regardless of their TypeScript
 spelling. Programs that only select or forward those values therefore retain an honest generic
 If/Region/Phi graph. Arithmetic over them is not backend-ready yet: until generic numeric fallback

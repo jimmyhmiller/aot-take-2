@@ -57,8 +57,9 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 - The lexer/parser lower named functions, hoisted calls, integer literals, arithmetic calls,
   bindings, assignment, lexical blocks, conditional expressions, statement `if`/`else`, and basic
-  `while`. Strings, objects, classes, `for`, loop exits, exceptions, properties, closures, and most
-  expressions remain.
+  `while`. Function parameter and return annotations are optional, admitting the corresponding
+  ordinary JavaScript syntax. Strings, objects, classes, `for`, loop exits, exceptions, properties,
+  closures, and most expressions remain.
 - Scope SSA bindings, lazy Phis, branch merges, loop closure, memory binding, and guard machinery
   exist. The frontend uses binding/branch merge and atomic lazy-Phi loop closure today;
   source-level narrowing and nonlocal loop exits remain.
