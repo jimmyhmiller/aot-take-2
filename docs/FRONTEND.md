@@ -157,13 +157,22 @@ exists, its live `%UnboxInt` fails the explicit representation-proof handoff ins
 annotation.
 
 Function bodies currently admit sequential `let`/`const`, assignment, lexical blocks, expression
-statements, return, calls, arithmetic, and conditional expressions. ScopeNode is the sole lowering
-environment, so shadowing and reassignment construct SSA during parsing.
+statements, return, calls, arithmetic, conditional expressions, and statement `if`/`else`.
+Statement branches duplicate and merge ScopeNode directly, so reassigned bindings acquire Phis
+only when the arm values differ. Two returning arms join their controls and values at the function
+Return. A one-arm return remains refused until the final function-exit scope can merge early exits.
+ScopeNode is the sole lowering environment, so shadowing and reassignment construct SSA during
+parsing.
 
-The production JSL subset now admits lexical `let`, value-producing `if`, and calls between JSL
-definitions. Index loading is two-pass: every declaration receives its stable function index before
-any body lowers, then bodies resolve names across the complete table. Forward semantic references
-therefore remain legal without making function indices depend on traversal accidents.
+The production JSL subset now admits integer literals, lexical `let`, value-producing `if`, calls
+between JSL definitions, and dynamic tag predicates such as `%IsInt`. A recognized tag predicate
+installs an ordinary Cast for the tested binding on the true control edge; checked `%UnboxInt`
+therefore consumes proof from the graph instead of trusting a TypeScript annotation. The guarded
+`JsIncrementIntOrIdentity` definition demonstrates both outcomes: unknown dynamic input preserves
+its TypeTest/If/Phi fallback, while boxed integer input specializes to raw addition and re-boxing.
+Index loading is two-pass: every declaration receives its stable function index before any body
+lowers, then bodies resolve names across the complete table. Forward semantic references therefore
+remain legal without making function indices depend on traversal accidents.
 
 Two things join in the middle, and they join at **`Call` to a `Fun`** — nothing more exotic:
 

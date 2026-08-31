@@ -53,15 +53,17 @@ Phi openness follows both its Region and its final input, including the reverse-
 If folding recognizes the dominating predicate through a true-arm truthiness Cast. Same-op Phi
 pull-down covers every currently implemented eligible unary and binary scalar arity.
 
-## Unwritten frontend and JavaScript semantics
+## Partial frontend and JavaScript semantics
 
-- Lexer, parser, declarations/hoisting, TypeScript annotation parser, and source-driven function,
-  class, loop, exception and expression graph construction.
-- Scope SSA: bindings, lazy Phis, merges, loop closure, memory binding, and guard installation and
-  removal.
-- Frontend SSA integration of the implemented true/false CProj truthiness refinements.
-- JSL reader/index loader, declaration reader, primitive table, checker/refusal diagnostics,
-  lowering, and transition verification.
+- The lexer/parser lower named functions, hoisted calls, integer literals, arithmetic calls,
+  bindings, assignment, lexical blocks, conditional expressions, and statement `if`/`else`.
+  Strings, objects, classes, loops, exceptions, properties, closures, and most expressions remain.
+- Scope SSA bindings, lazy Phis, branch merges, loop closure, memory binding, and guard machinery
+  exist. The frontend uses binding/branch merge today; loop and source-level narrowing integration
+  remain.
+- JSL reading, indexed two-pass declaration/body lowering, refusal diagnostics, integer literals,
+  lexical `let`, `if`, semantic calls, tag tests, and branch-local Cast narrowing exist. The full
+  production JSL grammar and primitive surface remain.
 - `JsOp` construction and the string/object/number primitives below JSL.
 - Distinct JS32 primitive lowering for `%BitAnd/%BitOr/%BitXor/%BitNot/%Shl/%Shr/%Ushr`, including
   float-to-int32 conversion and modulo-32 counts. The implemented scalar bit/shift nodes are

@@ -141,7 +141,8 @@ aot-take-2/
 │   ├── intrinsics.jsl   ; the global-object surface
 │   ├── object-layouts.jsl
 │   └── abstract/ array/ string/ object/ json/ math/ number/ symbol/ compiler/
-│       └── compiler/{add,sub,mul}.jsl ; frontend numeric operators cross dynamic JSL calls
+│       └── compiler/{add,sub,mul,increment-int-or-identity}.jsl
+│           ; frontend numeric calls plus a guarded generic/fast-path specialization proof
 │       function/ array-buffer/ data-view/ typed-array/
 ├── src/
 │   ├── main.coil            ; CLI driver: compile, emit, run
