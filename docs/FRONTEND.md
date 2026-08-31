@@ -150,9 +150,20 @@ boundary even though its accepted values are presently narrower than ECMAScript:
   becomes justified and ordinary Box/Unbox cancellation exposes raw arithmetic;
 - backend handoff refuses a live Unbox whose dynamic input is not representation-proven.
 
-Until host argument lowering and generic numeric fallback exist, the externally entered `main`
-function admits no parameters. This is a deliberate subset boundary: accepting `main(a: number)`
-would trust the annotation as runtime evidence, which TypeScript and JavaScript do not permit.
+Externally entered `main` parameters are admitted as `dyn:any`, regardless of their TypeScript
+spelling. Programs that only select or forward those values therefore retain an honest generic
+If/Region/Phi graph. Arithmetic over them is not backend-ready yet: until generic numeric fallback
+exists, its live `%UnboxInt` fails the explicit representation-proof handoff instead of trusting the
+annotation.
+
+Function bodies currently admit sequential `let`/`const`, assignment, lexical blocks, expression
+statements, return, calls, arithmetic, and conditional expressions. ScopeNode is the sole lowering
+environment, so shadowing and reassignment construct SSA during parsing.
+
+The production JSL subset now admits lexical `let`, value-producing `if`, and calls between JSL
+definitions. Index loading is two-pass: every declaration receives its stable function index before
+any body lowers, then bodies resolve names across the complete table. Forward semantic references
+therefore remain legal without making function indices depend on traversal accidents.
 
 Two things join in the middle, and they join at **`Call` to a `Fun`** — nothing more exotic:
 

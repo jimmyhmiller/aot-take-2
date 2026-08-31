@@ -26,6 +26,7 @@
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
 (import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
 (import "aot.node.call" :use *)
 (import "aot.node.arith" :use *)
 (import "aot.node.dynamic" :use *)
@@ -62,43 +63,193 @@
     (set! (.fidx (mut g)) fidx)
     (load g)))
 
+(defstruct JslExprResult [(value (dyn NodeOps)) (ctrl (dyn NodeOps))])
+
+(defn jsl-expr-result [(value (dyn NodeOps)) (ctrl (dyn NodeOps))] (-> JslExprResult)
+  (let [(mut r) (primitive/zeroed JslExprResult)]
+    (set! (.value (mut r)) value)
+    (set! (.ctrl (mut r)) ctrl)
+    (load r)))
+
 (defn jsl-env-lookup [(params (ptr rd/Sexp))
                       (values (ArrayList (dyn NodeOps)))
+                      (local-names (ArrayList (slice u8)))
+                      (local-values (ArrayList (dyn NodeOps)))
                       (name (slice u8))] (-> (dyn NodeOps))
-  (let [(mut i) 0]
-    (loop (if (>= (load i) (rd/sexp-count params))
-              (break (do
-                       (panic "jsl-env-lookup: checker admitted an unknown name")
-                       (unreachable-node)))
-              (let [decl (rd/sexp-nth params (load i))]
-                (if (= (rd/sexp-sym (rd/sexp-nth decl 0)) name)
-                    (break (get values (load i)))
-                    (do (set! (mut i) (+ (load i) 1)) (continue))))))))
+  (let [(mut i) (- (len local-names) 1)
+        local-idx
+          (loop (if (< (load i) 0)
+                    (break -1)
+                    (if (= (get local-names (load i)) name)
+                        (break (load i))
+                        (do (set! (mut i) (- (load i) 1)) (continue)))))]
+    (if (>= local-idx 0)
+        (get local-values local-idx)
+        (do
+          (set! (mut i) 0)
+          (loop (if (>= (load i) (rd/sexp-count params))
+                    (break (do
+                             (panic "jsl-env-lookup: checker admitted an unknown name")
+                             (unreachable-node)))
+                    (let [decl (rd/sexp-nth params (load i))]
+                      (if (= (rd/sexp-sym (rd/sexp-nth decl 0)) name)
+                          (break (get values (load i)))
+                          (do (set! (mut i) (+ (load i) 1)) (continue))))))))))
+
+(defn jsl-node [(nid i64)] (-> (dyn NodeOps))
+  (match (arena-node nid) (Some [n] n) (None [] (unreachable-node))))
+
+(defn jsl-lower-call [(x (ptr rd/Sexp))
+                      (name (slice u8))
+                      (params (ptr rd/Sexp))
+                      (values (ArrayList (dyn NodeOps)))
+                      (local-names (mut (ArrayList (slice u8))))
+                      (local-values (mut (ArrayList (dyn NodeOps))))
+                      (ctrl (dyn NodeOps))] (-> JslExprResult)
+  (let [target (jsl-graph-of name)
+        c (call-make ctrl)
+        (mut ctrl-nid) (n-nid ctrl)
+        (mut i) 1]
+    (loop (if (>= (load i) (rd/sexp-count x))
+              (break 0)
+              (let [arg
+                      (jsl-lower-expr (rd/sexp-nth x (load i))
+                                      params
+                                      values
+                                      (mut local-names)
+                                      (mut local-values)
+                                      (jsl-node (load ctrl-nid)))]
+                (call-add-arg! c (.value arg))
+                (set! (mut ctrl-nid) (n-nid (.ctrl arg)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    ;; Argument evaluation is sequenced before the call control edge.
+    (n-set-def! c CALL-CTRL (Some (jsl-node (load ctrl-nid))))
+    (call-set-fptr! c (funptr-make target (jsl-fidx-of name)))
+    (let [end (callend-make c)]
+      (jsl-expr-result (proj-make end RETURN-VALUE "jsl.call.value")
+                       (cproj-make end RETURN-CTRL "jsl.call.ctrl")))))
 
 (defn jsl-lower-expr [(x (ptr rd/Sexp))
                       (params (ptr rd/Sexp))
-                      (values (ArrayList (dyn NodeOps)))] (-> (dyn NodeOps))
+                      (values (ArrayList (dyn NodeOps)))
+                      (local-names (mut (ArrayList (slice u8))))
+                      (local-values (mut (ArrayList (dyn NodeOps))))
+                      (ctrl (dyn NodeOps))] (-> JslExprResult)
   (if (rd/sexp-sym? x)
-      (jsl-env-lookup params values (rd/sexp-sym x))
+      (jsl-expr-result (jsl-env-lookup params values (load local-names) (load local-values) (rd/sexp-sym x))
+                       ctrl)
       (let [name (rd/sexp-sym (rd/sexp-nth x 0))]
-        (if (= name "%Box")
-            (n-peephole! (box-make (jsl-lower-expr (rd/sexp-nth x 1) params values)))
-            (if (= name "%UnboxInt")
-                (n-peephole! (unbox-make (jsl-lower-expr (rd/sexp-nth x 1) params values) REP-INT))
-                (if (= name "%Sub")
-                    (n-peephole! (sub-make (jsl-lower-expr (rd/sexp-nth x 1) params values)
-                                           (jsl-lower-expr (rd/sexp-nth x 2) params values)))
-                    (if (= name "%Add")
-                        (n-peephole! (add-make (jsl-lower-expr (rd/sexp-nth x 1) params values)
-                                               (jsl-lower-expr (rd/sexp-nth x 2) params values)))
-                        (if (= name "%Mul")
-                            (n-peephole! (mul-make (jsl-lower-expr (rd/sexp-nth x 1) params values)
-                                                   (jsl-lower-expr (rd/sexp-nth x 2) params values)))
-                            (do
-                              (panic "jsl-lower-expr: checker/lowerer construct drift")
-                              (unreachable-node))))))))))
+        (if (= name "let")
+            (let [bindings (rd/sexp-nth x 1)
+                  names-base (len (load local-names))
+                  values-base (len (load local-values))
+                  (mut current-ctrl-nid) (n-nid ctrl)
+                  (mut i) 0]
+              (loop (if (>= (load i) (rd/sexp-count bindings))
+                        (break 0)
+                        (let [binding (rd/sexp-nth bindings (load i))
+                              init
+                                (jsl-lower-expr (rd/sexp-nth binding 1)
+                                                params
+                                                values
+                                                (mut local-names)
+                                                (mut local-values)
+                                                (jsl-node (load current-ctrl-nid)))]
+                          (push! [(slice u8)] (mut local-names) (rd/sexp-sym (rd/sexp-nth binding 0)))
+                          (push! [(dyn NodeOps)] (mut local-values) (.value init))
+                          (set! (mut current-ctrl-nid) (n-nid (.ctrl init)))
+                          (set! (mut i) (+ (load i) 1))
+                          (continue))))
+              (let [body
+                      (jsl-lower-expr (rd/sexp-nth x 2)
+                                      params
+                                      values
+                                      (mut local-names)
+                                      (mut local-values)
+                                      (jsl-node (load current-ctrl-nid)))]
+                (loop (if (<= (len (load local-names)) names-base)
+                          (break 0)
+                          (do (pop! (mut local-names)) (continue))))
+                (loop (if (<= (len (load local-values)) values-base)
+                          (break 0)
+                          (do (pop! (mut local-values)) (continue))))
+                body))
+            (if (= name "if")
+                (let [pred
+                        (jsl-lower-expr (rd/sexp-nth x 1)
+                                        params
+                                        values
+                                        (mut local-names)
+                                        (mut local-values)
+                                        ctrl)
+                      iff (if-make (.ctrl pred) (.value pred))
+                      arms (if-arms! iff)
+                      yes
+                        (jsl-lower-expr (rd/sexp-nth x 2)
+                                        params
+                                        values
+                                        (mut local-names)
+                                        (mut local-values)
+                                        (arms-true arms))
+                      no
+                        (jsl-lower-expr (rd/sexp-nth x 3)
+                                        params
+                                        values
+                                        (mut local-names)
+                                        (mut local-values)
+                                        (arms-false arms))
+                      region (region-make)
+                      phi
+                        (phi-make region
+                                  (ty-meet (n-ty (.value yes)) (n-ty (.value no)))
+                                  "jsl.if")]
+                  (region-add-path! region (.ctrl yes))
+                  (region-add-path! region (.ctrl no))
+                  (phi-add-value! phi (.value yes))
+                  (phi-add-value! phi (.value no))
+                  (jsl-expr-result phi region))
+                (if (>= (jsl-definition-arity name) 0)
+                    (jsl-lower-call x
+                                    name
+                                    params
+                                    values
+                                    (mut local-names)
+                                    (mut local-values)
+                                    ctrl)
+                    (let [lhs
+                            (jsl-lower-expr (rd/sexp-nth x 1)
+                                            params
+                                            values
+                                            (mut local-names)
+                                            (mut local-values)
+                                            ctrl)]
+                      (if (= name "%Box")
+                          (jsl-expr-result (n-peephole! (box-make (.value lhs))) (.ctrl lhs))
+                          (if (= name "%UnboxInt")
+                              (jsl-expr-result (n-peephole! (unbox-make (.value lhs) REP-INT))
+                                               (.ctrl lhs))
+                              (let [rhs
+                                      (jsl-lower-expr (rd/sexp-nth x 2)
+                                                      params
+                                                      values
+                                                      (mut local-names)
+                                                      (mut local-values)
+                                                      (.ctrl lhs))]
+                                (if (= name "%Sub")
+                                    (jsl-expr-result (n-peephole! (sub-make (.value lhs) (.value rhs)))
+                                                     (.ctrl rhs))
+                                    (if (= name "%Add")
+                                        (jsl-expr-result (n-peephole! (add-make (.value lhs) (.value rhs)))
+                                                         (.ctrl rhs))
+                                        (if (= name "%Mul")
+                                            (jsl-expr-result (n-peephole! (mul-make (.value lhs) (.value rhs)))
+                                                             (.ctrl rhs))
+                                            (do
+                                              (panic "jsl-lower-expr: checker/lowerer construct drift")
+                                              (jsl-expr-result (unreachable-node) (.ctrl rhs))))))))))))))))
 
-(defn jsl-lower-form! [(form (ptr rd/Sexp))] (-> (dyn NodeOps))
+(defn jsl-declare-form! [(form (ptr rd/Sexp))] (-> (dyn NodeOps))
   (let [a (alloc/malloc-allocator)
         name (rd/sexp-sym (rd/sexp-nth form 1))
         params (rd/sexp-nth form 3)
@@ -114,8 +265,7 @@
                   (set! (mut i) (+ (load i) 1))
                   (continue)))))
     (let [start (start-make dyn-ty)
-          fun (fun-make start (ty-tuple (al-slice (load sig-members))) name)
-          (mut values) (al-new [(dyn NodeOps)] a)]
+          fun (fun-make start (ty-tuple (al-slice (load sig-members))) name)]
       (let [(mut i) 0]
         (loop (if (>= (load i) (rd/sexp-count params))
                   (break 0)
@@ -125,21 +275,49 @@
                                      (load i)
                                      dyn-ty
                                      (rd/sexp-sym (rd/sexp-nth decl 0)))]
-                    (push! [(dyn NodeOps)] (mut values) p)
+                    (n-keep! p)
                     (set! (mut i) (+ (load i) 1))
                     (continue)))))
-      (let [body (jsl-lower-expr (rd/sexp-nth form 6) params (load values))
-            ret
-              (return-make fun
-                           (None [(dyn NodeOps)])
-                           body
-                           (None [(dyn NodeOps)])
-                           (Some fun))]
-        (fun-set-ret! fun ret)
-        (jsl-graphs-boot!)
-        (let [fidx (len (.items (jsl-graphs)))]
-          (push! [JslGraph] (mut (.items (jsl-graphs))) (jsl-graph-new name (n-nid fun) fidx)))
-        fun))))
+      (jsl-graphs-boot!)
+      (let [fidx (len (.items (jsl-graphs)))]
+        (push! [JslGraph] (mut (.items (jsl-graphs))) (jsl-graph-new name (n-nid fun) fidx)))
+      fun)))
+
+(defn jsl-define-form! [(form (ptr rd/Sexp))] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        name (rd/sexp-sym (rd/sexp-nth form 1))
+        params (rd/sexp-nth form 3)
+        fun (jsl-graph-of name)
+        (mut values) (al-new [(dyn NodeOps)] a)
+        (mut local-names) (al-new [(slice u8)] a)
+        (mut local-values) (al-new [(dyn NodeOps)] a)]
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (rd/sexp-count params))
+                (break 0)
+                (do
+                  (match (fun-parm fun (load i))
+                    (Some [p] (do (push! [(dyn NodeOps)] (mut values) p) (n-unkeep! p)))
+                    (None [] (panic "jsl-define-form!: declared parameter is missing")))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    (let [body
+            (jsl-lower-expr (rd/sexp-nth form 6)
+                            params
+                            (load values)
+                            (mut local-names)
+                            (mut local-values)
+                            fun)
+          ret
+            (return-make (.ctrl body)
+                         (None [(dyn NodeOps)])
+                         (.value body)
+                         (None [(dyn NodeOps)])
+                         (Some fun))]
+      (fun-set-ret! fun ret)
+      fun)))
+
+(defn jsl-lower-form! [(form (ptr rd/Sexp))] (-> (dyn NodeOps))
+  (do (jsl-declare-form! form) (jsl-define-form! form)))
 
 (defn jsl-lower-unit! [(unit i64)] (-> i64)
   (do
@@ -148,7 +326,14 @@
       (loop (if (>= (load i) (jsl-form-count unit))
                 (break 0)
                 (do
-                  (jsl-lower-form! (jsl-form unit (load i)))
+                  (jsl-declare-form! (jsl-form unit (load i)))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      (set! (mut i) 0)
+      (loop (if (>= (load i) (jsl-form-count unit))
+                (break 0)
+                (do
+                  (jsl-define-form! (jsl-form unit (load i)))
                   (set! (mut i) (+ (load i) 1))
                   (continue))))
       (load i))))
@@ -188,10 +373,37 @@
     (jsl-lower-reset!)
     (let [units (jsl-load-index! path)
           (mut unit) 1]
+      ;; Check the complete table first, then declare every function before lowering any body.
+      ;; This is the JSL equivalent of JavaScript function hoisting and makes forward references
+      ;; independent of file order while preserving index order for stable fidx assignment.
       (loop (if (> (load unit) units)
                 (break 0)
                 (do
-                  (jsl-lower-unit! (load unit))
+                  (jsl-check-unit (load unit))
+                  (set! (mut unit) (+ (load unit) 1))
+                  (continue))))
+      (set! (mut unit) 1)
+      (loop (if (> (load unit) units)
+                (break 0)
+                (let [(mut i) 0]
+                  (loop (if (>= (load i) (jsl-form-count (load unit)))
+                            (break 0)
+                            (do
+                              (jsl-declare-form! (jsl-form (load unit) (load i)))
+                              (set! (mut i) (+ (load i) 1))
+                              (continue))))
+                  (set! (mut unit) (+ (load unit) 1))
+                  (continue))))
+      (set! (mut unit) 1)
+      (loop (if (> (load unit) units)
+                (break 0)
+                (let [(mut i) 0]
+                  (loop (if (>= (load i) (jsl-form-count (load unit)))
+                            (break 0)
+                            (do
+                              (jsl-define-form! (jsl-form (load unit) (load i)))
+                              (set! (mut i) (+ (load i) 1))
+                              (continue))))
                   (set! (mut unit) (+ (load unit) 1))
                   (continue))))
       units)))
