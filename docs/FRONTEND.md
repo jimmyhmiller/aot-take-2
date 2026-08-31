@@ -157,12 +157,16 @@ exists, its live `%UnboxInt` fails the explicit representation-proof handoff ins
 annotation.
 
 Function bodies currently admit sequential `let`/`const`, assignment, lexical blocks, expression
-statements, return, calls, arithmetic, conditional expressions, and statement `if`/`else`.
+statements, return, calls, arithmetic, conditional expressions, statement `if`/`else`, and basic
+`while` loops.
 Statement branches duplicate and merge ScopeNode directly, so reassigned bindings acquire Phis
 only when the arm values differ. Two returning arms join their controls and values at the function
 Return. A one-arm return remains refused until the final function-exit scope can merge early exits.
 ScopeNode is the sole lowering environment, so shadowing and reassignment construct SSA during
-parsing.
+parsing. `while` follows final Simple's atomic loop protocol: an open Loop and lazy binding Phis are
+built first, then `scope-end-loop!` installs the control backedge and every materialized Phi
+backedge without exposing an intermediate graph. `break`, `continue`, and loop-body returns remain
+outside the admitted subset.
 
 The production JSL subset now admits integer literals, lexical `let`, value-producing `if`, calls
 between JSL definitions, and dynamic tag predicates such as `%IsInt`. A recognized tag predicate

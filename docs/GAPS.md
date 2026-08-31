@@ -56,11 +56,12 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 ## Partial frontend and JavaScript semantics
 
 - The lexer/parser lower named functions, hoisted calls, integer literals, arithmetic calls,
-  bindings, assignment, lexical blocks, conditional expressions, and statement `if`/`else`.
-  Strings, objects, classes, loops, exceptions, properties, closures, and most expressions remain.
+  bindings, assignment, lexical blocks, conditional expressions, statement `if`/`else`, and basic
+  `while`. Strings, objects, classes, `for`, loop exits, exceptions, properties, closures, and most
+  expressions remain.
 - Scope SSA bindings, lazy Phis, branch merges, loop closure, memory binding, and guard machinery
-  exist. The frontend uses binding/branch merge today; loop and source-level narrowing integration
-  remain.
+  exist. The frontend uses binding/branch merge and atomic lazy-Phi loop closure today;
+  source-level narrowing and nonlocal loop exits remain.
 - JSL reading, indexed two-pass declaration/body lowering, refusal diagnostics, integer literals,
   lexical `let`, `if`, semantic calls, tag tests, and branch-local Cast narrowing exist. The full
   production JSL grammar and primitive surface remain.
