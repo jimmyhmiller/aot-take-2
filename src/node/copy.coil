@@ -1,0 +1,753 @@
+;; ============================================================================
+
+;; SELECTED-SUBGRAPH COPYING
+;;   —  the two-pass shell/edge protocol used by Simple's body cloning
+;; ============================================================================
+;;
+;; Simple never recursively copies through inputs: that cannot represent cycles and it silently
+;; turns shared nodes into duplicated trees.  It first allocates one empty shell per selected node,
+;; then copies every ordered input through the completed old-nid -> new-node map.  Inputs outside
+;; the selection remain shared.  This module follows that order exactly, including null inputs and
+;; duplicate edges.  Back-pointers which are not graph edges are repaired only after both passes.
+(module aot.node.copy)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.arith" :use *)
+(import "aot.node.bits" :use *)
+(import "aot.node.compare" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.call" :use *)
+
+(defstruct GraphCopy
+  [(map (ArrayList (Option (dyn NodeOps))))
+   (old-count i64)])
+
+(defn copy--callend-shell [(old (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [CallEndNode] (alloc/create [CallEndNode] a))
+        d (primitive/make-dyn NodeOps p)
+        op (primitive/cast (ptr CallEndNode) (hdr old))]
+    (set! (.folding p) (.folding op))
+    (set! (.decision p) (.decision op))
+    (n-init! d OP-CALLEND)
+    d))
+
+(defn copy--funptr-shell [(old (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [FunPtrNode] (alloc/create [FunPtrNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.fptr-ty p) (.fptr-ty (primitive/cast (ptr FunPtrNode) (hdr old))))
+    (n-init! d OP-FUNPTR)
+    d))
+
+;; Constructors centralize each node family's initialization.  Keep the source while a constructor
+;; temporarily uses it as a harmless operand, strip all such inputs, then restore the exact analysed
+;; types.  CallEnd and FunPtr use raw shells because their constructors have semantic side effects.
+(defn copy--constructor-shell [(old (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [op (n-op old)]
+    (case op OP-START
+          (start-make (.arg-ty (primitive/cast (ptr StartNode) (hdr old)))) OP-STOP
+          (stop-make) OP-XCTRL
+          (xctrl-make) OP-REGION
+          (region-make) OP-LOOP
+          (loop-make old) OP-IF
+          (if-make old old) OP-NEVER
+          (never-make old) OP-CPROJ
+          (cproj-make old (cproj-idx old) (.name (primitive/cast (ptr CProjNode) (hdr old)))) OP-PROJ
+          (proj-make old (proj-idx old) (.name (primitive/cast (ptr ProjNode) (hdr old)))) OP-RETURN
+          (return-make old (None [(dyn NodeOps)]) old (None [(dyn NodeOps)]) (None [(dyn NodeOps)])) OP-PHI
+          (phi-make old (phi-declared-ty old) (.name (primitive/cast (ptr PhiNode) (hdr old)))) OP-CON
+          (con-make (con-ty-of old)) OP-ADD
+          (add-make-mode old old (add-mode old)) OP-SUB
+          (sub-make-mode old old (sub-mode old)) OP-MUL
+          (mul-make-mode old old (mul-mode old)) OP-DIV
+          (div-make-mode old old (div-mode old)) OP-MINUS
+          (let [x (minus-make old)] (minus-set-mode! x (minus-mode old)) x) OP-TOFLOAT
+          (to-float-make old) OP-ROUNDF32
+          (round-f32-make old) OP-AND
+          (bits--make op old old (bits-mode old)) OP-OR
+          (bits--make op old old (bits-mode old)) OP-XOR
+          (bits--make op old old (bits-mode old)) OP-SHL
+          (shl-make old old) OP-SHR
+          (bits--make op old old (bits-mode old)) OP-SAR
+          (bits--make op old old (bits-mode old)) OP-NOT
+          (not-make old) OP-EQ
+          (cmp--make op old old (cmp-mode old)) OP-NE
+          (cmp--make op old old (cmp-mode old)) OP-LT
+          (cmp--make op old old (cmp-mode old)) OP-LE
+          (cmp--make op old old (cmp-mode old)) OP-ULT
+          (cmp--make op old old (cmp-mode old)) OP-BOX
+          (box-make old) OP-UNBOX
+          (unbox-make old (unbox-rep old)) OP-TYPETEST
+          (typetest-make old (typetest-tags old)) OP-CAST
+          (cast-make old old (cast-ty-of old)) OP-FUN
+          (fun-make old (fun-sig old) (fun-name old)) OP-PARM
+          (parm-make (n-in! old 0) (parm-idx old) (parm-declared old) (.name (primitive/cast (ptr ParmNode) (hdr old))))
+            OP-CALL
+          (call-make (call-ctrl old)) old)))
+
+(defn copy--shell [(old (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [op (n-op old)
+        fresh
+          (if (= op OP-CALLEND)
+              (copy--callend-shell old)
+              (if (= op OP-FUNPTR)
+                  (copy--funptr-shell old)
+                  (do
+                    (n-keep! old)
+                    (let [made (copy--constructor-shell old)]
+                      (if (n-same? made old)
+                          (panic-i "copy--shell: unsupported live opcode" op)
+                          0)
+                      (n-pop-until! made 0)
+                      (n-unkeep! old)
+                      made))))]
+    (n-force-ty! fresh (n-ty old))
+    (n-set-pesi-ty! fresh (n-pesi-ty old))
+    ;; Payload fields not represented by constructor arguments.
+    (if (= op OP-FUN)
+        (let [src (primitive/cast (ptr FunNode) (hdr old))
+              dst (primitive/cast (ptr FunNode) (hdr fresh))]
+          (set! (.folding dst) (.folding src))
+          (set! (.approx-size dst) (.approx-size src)))
+        0)
+    fresh))
+
+(defn graph-copy-get [(copy (ptr GraphCopy)) (old (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [id (n-nid old)]
+    (if (or (<= id 0) (>= id (.old-count copy)))
+        (None [(dyn NodeOps)])
+        (get (.map copy) id))))
+
+(defn graph-copy-free! [(copy (ptr GraphCopy))] (-> i64)
+  (do
+    (al-free! [(Option (dyn NodeOps))] (mut (.map copy)))
+    (alloc/destroy [GraphCopy] (alloc/malloc-allocator) copy)))
+
+(defn copy--mapped-edge [(copy (ptr GraphCopy)) (edge (Option (dyn NodeOps)))] (-> (Option (dyn NodeOps)))
+  (match edge
+    (None [] (None [(dyn NodeOps)]))
+    (Some [old]
+          (match (graph-copy-get copy old)
+            (Some [fresh] (Some fresh))
+            (None [] (Some old))))))
+
+;; Non-edge metadata pairs are indivisible copy units. Validate before allocating any shells so a
+;; rejected public selection cannot leave a half-built graph behind.
+(defn graph-copy-selection-valid? [(selected (slice bool))] (-> bool)
+  (let [limit (+ (arena-node-count) 1)
+        (mut id) 1
+        (mut valid) (>= (len selected) limit)]
+    (loop (if (or (not (load valid)) (>= (load id) limit))
+              (break 0)
+              (do
+                (if (get selected (load id))
+                    (match (arena-node (load id))
+                      (Some [n]
+                            (let [op (n-op n)
+                                  peer
+                                    (if (= op OP-FUN)
+                                        (fun-ret n)
+                                        (if (= op OP-RETURN)
+                                            (return-fun n)
+                                            (if (= op OP-CALL)
+                                                (call-cend n)
+                                                (if (= op OP-CALLEND)
+                                                    (if (> (n-nins n) 0)
+                                                        (n-in n 0)
+                                                        (None [(dyn NodeOps)]))
+                                                    (None [(dyn NodeOps)])))))]
+                              (match peer
+                                (Some [p]
+                                      (if (or (>= (n-nid p) (len selected))
+                                              (not (get selected (n-nid p))))
+                                          (set! (mut valid) false)
+                                          0))
+                                (None [] 0))))
+                      (None [] 0))
+                    0)
+                (set! (mut id) (+ (load id) 1))
+                (continue))))
+    (load valid)))
+
+(defn copy--repair-links! [(copy (ptr GraphCopy))] (-> i64)
+  (let [(mut id) 1]
+    (loop (if (>= (load id) (.old-count copy))
+              (break 0)
+              (do
+                (match (get (.map copy) (load id))
+                  (None [] 0)
+                  (Some [fresh]
+                        (match (arena-node (load id))
+                          (None [] (broken "copy--repair-links!: source disappeared"))
+                          (Some [old]
+                                (let [op (n-op old)]
+                                  (if (= op OP-FUN)
+                                      (match (fun-ret old)
+                                        (Some [r]
+                                              (match (graph-copy-get copy r)
+                                                (Some [nr]
+                                                      (let [size (fun-approx-size fresh)]
+                                                        (fun-set-ret! fresh nr)
+                                                        ;; Linking a copied sparse pair must not
+                                                        ;; reinterpret clone nid spacing as the
+                                                        ;; source construction span.
+                                                        (set! (.approx-size (primitive/cast (ptr FunNode)
+                                                                                            (hdr fresh)))
+                                                              size)
+                                                        0))
+                                                (None []
+                                                      (broken "graph-copy-selected: selected Fun requires its Return"))))
+                                        (None [] 0))
+                                      (if (= op OP-RETURN)
+                                          (let [src (primitive/cast (ptr ReturnNode) (hdr old))
+                                                dst (primitive/cast (ptr ReturnNode) (hdr fresh))
+                                                fid (.fun-nid src)]
+                                            (match (arena-node fid)
+                                              (Some [f]
+                                                    (match (graph-copy-get copy f)
+                                                      (Some [nf] (set! (.fun-nid dst) (n-nid nf)))
+                                                      (None []
+                                                            (broken "graph-copy-selected: selected Return requires its Fun"))))
+                                              (None [] (set! (.fun-nid dst) 0))))
+                                          (if (= op OP-CALL)
+                                              (match (call-cend old)
+                                                (Some [e]
+                                                      (match (graph-copy-get copy e)
+                                                        (Some [ne] (call-set-cend! fresh ne))
+                                                        (None []
+                                                              (broken "graph-copy-selected: selected Call requires its CallEnd"))))
+                                                (None [] 0))
+                                              (if (= op OP-CALLEND)
+                                                  (match (n-in old 0)
+                                                    (Some [old-call]
+                                                          (match (graph-copy-get copy old-call)
+                                                            (Some [_] 0)
+                                                            (None []
+                                                                  (broken "graph-copy-selected: selected CallEnd requires its Call"))))
+                                                    (None [] 0))
+                                                  0)))))))))
+                (set! (mut id) (+ (load id) 1))
+                (continue))))
+    0))
+
+;; `selected` is indexed by old nid and must cover the complete pre-copy arena.  Nodes allocated by
+;; this operation are deliberately outside that frozen range.
+(defn graph-copy-selected [(selected (slice bool))] (-> (ptr GraphCopy))
+  (let [old-count (+ (arena-node-count) 1)
+        a (alloc/malloc-allocator)
+        result (alloc/unwrap-ptr [GraphCopy] (alloc/create [GraphCopy] a))]
+    (set! (.map result) (al-new [(Option (dyn NodeOps))] a))
+    (set! (.old-count result) old-count)
+    (if (not (graph-copy-selection-valid? selected))
+        (panic "graph-copy-selected: selection is incomplete or splits a metadata pair")
+        0)
+    (let [(mut id) 0]
+      (loop (if (>= (load id) old-count)
+                (break 0)
+                (do
+                  (push! [(Option (dyn NodeOps))]
+                         (mut (.map result))
+                         (if (and (> (load id) 0) (get selected (load id)))
+                             (match (arena-node (load id))
+                               (Some [old] (Some (copy--shell old)))
+                               (None [] (None [(dyn NodeOps)])))
+                             (None [(dyn NodeOps)])))
+                  (set! (mut id) (+ (load id) 1))
+                  (continue)))))
+    ;; Phase two: exact ordered edges, remapping only selected definitions.
+    (let [(mut id) 1]
+      (loop (if (>= (load id) old-count)
+                (break 0)
+                (do
+                  (match (get (.map result) (load id))
+                    (Some [fresh]
+                          (match (arena-node (load id))
+                            (Some [old]
+                                  (let [(mut i) 0]
+                                    (loop (if (>= (load i) (n-nins old))
+                                              (break 0)
+                                              (do
+                                                (n-add-def! fresh (copy--mapped-edge result (n-in old (load i))))
+                                                (set! (mut i) (+ (load i) 1))
+                                                (continue))))))
+                            (None [] (broken "graph-copy-selected: source disappeared"))))
+                    (None [] 0))
+                  (set! (mut id) (+ (load id) 1))
+                  (continue)))))
+    (copy--repair-links! result)
+    result))
+
+;; ---------------------------------------------------------------------------
+;; Function-body cloning
+;;
+;; Simple first walks CFG inputs from Return to Fun, then walks uses down from Fun while refusing to
+;; cross a CFG/control anchor outside that set. This direction is essential: caller actuals and
+;; captured external values flow INTO the body and therefore remain shared, while every value
+;; produced from a Parm or in-body control flows out from Fun and is selected. A final backward
+;; closure over the admitted use graph retains only paths which reach controlled/CFG work and
+;; handles Phi data cycles without recursively copying arbitrary input cones.
+(defn copy--mark! [(selected (mut (ArrayList bool)))
+                   (work (mut (ArrayList (dyn NodeOps))))
+                   (n (dyn NodeOps))
+                   (limit i64)] (-> i64)
+  (let [id (n-nid n)]
+    (if (or (<= id 0) (>= id limit))
+        (panic-i "copy--mark!: node outside frozen arena" id)
+        (if (get (load selected) id)
+            0
+            (do
+              (set! (mut selected) id true)
+              (push! [(dyn NodeOps)] (mut work) n)
+              0)))))
+
+(defn copy--bool-map [(limit i64)] (-> (ArrayList bool))
+  (let [a (alloc/malloc-allocator)
+        (mut bits) (al-new [bool] a)
+        (mut id) 0]
+    (loop (if (>= (load id) limit)
+              (break 0)
+              (do
+                (push! [bool] (mut bits) false)
+                (set! (mut id) (+ (load id) 1))
+                (continue))))
+    (load bits)))
+
+(defn copy--unfolded? [(n (dyn NodeOps))] (-> bool)
+  (let [op (n-op n)]
+    (if (= op OP-CALLEND)
+        (not (cend-folding? n))
+        (if (= op OP-CALL)
+            (match (call-cend n)
+              (Some [e] (not (cend-folding? e)))
+              (None [] true))
+            (if (= op OP-FUN)
+                (not (fun-folding? n))
+                (if (= op OP-RETURN)
+                    (match (return-fun n)
+                      (Some [f] (not (fun-folding? f)))
+                      (None [] true))
+                    true))))))
+
+(defn copy--admitted? [(n (dyn NodeOps)) (cfgs (slice bool))] (-> bool)
+  (if (and (cfg? n) (not (get cfgs (n-nid n))) (copy--unfolded? n))
+      false
+      (match (if (> (n-nins n) 0) (n-in n 0) (None [(dyn NodeOps)]))
+        (Some [anchor]
+              (not (and (cfg? anchor)
+                        (not (get cfgs (n-nid anchor)))
+                        (copy--unfolded? anchor))))
+        (None [] true))))
+
+(defn fun-body-selection [(fun (dyn NodeOps))] (-> (ArrayList bool))
+  (let [limit (+ (arena-node-count) 1)
+        (mut cfgs) (copy--bool-map limit)
+        (mut candidates) (copy--bool-map limit)
+        (mut selected) (copy--bool-map limit)
+        a (alloc/malloc-allocator)
+        (mut work) (al-new [(dyn NodeOps)] a)]
+    ;; Reverse CFG walk: Return to Fun. Region/Loop have many control predecessors; every other CFG
+    ;; node has its immediate control at input 0.
+    (copy--mark! (mut cfgs) (mut work) fun limit)
+    (match (fun-ret fun)
+      (Some [ret] (copy--mark! (mut cfgs) (mut work) ret limit))
+      (None [] (broken "fun-body-selection: function has no Return")))
+    (loop (match (pop! (mut work))
+            (None [] (break 0))
+            (Some [n]
+                  (if (n-same? n fun)
+                      (continue)
+                      (let [start (if (or (= (n-op n) OP-REGION) (= (n-op n) OP-LOOP)) 1 0)
+                            stop
+                              (if (or (= (n-op n) OP-REGION) (= (n-op n) OP-LOOP))
+                                  (n-nins n)
+                                  (if (> (n-nins n) 0) 1 0))
+                            (mut i) start]
+                        (loop (if (>= (load i) stop)
+                                  (break 0)
+                                  (do
+                                    (match (n-in n (load i))
+                                      (Some [input]
+                                            (if (cfg? input)
+                                                (copy--mark! (mut cfgs) (mut work) input limit)
+                                                0))
+                                      (None [] 0))
+                                    (set! (mut i) (+ (load i) 1))
+                                    (continue))))
+                        (continue))))))
+
+    ;; Forward use closure, bounded by the CFG set above.
+    (copy--mark! (mut candidates) (mut work) fun limit)
+    (loop (match (pop! (mut work))
+            (None [] (break 0))
+            (Some [n]
+                  (let [(mut i) 0]
+                    (loop (if (>= (load i) (n-nouts n))
+                              (break 0)
+                              (do
+                                (match (n-out n (load i))
+                                  (Some [use]
+                                        (if (and (= (n-op n) OP-FUN) (= (n-op use) OP-FUNPTR))
+                                            0
+                                            (if (copy--admitted? use (al-slice (load cfgs)))
+                                                (copy--mark! (mut candidates) (mut work) use limit)
+                                                0)))
+                                  (None [] 0))
+                                (set! (mut i) (+ (load i) 1))
+                                (continue))))
+                    (continue)))))
+
+    ;; CFG and controlled nodes are live body sinks. Close backward only through already-admitted
+    ;; candidates, which keeps floating dependency chains but never enters an external producer.
+    (let [(mut id) 0]
+      (loop (if (>= (load id) limit)
+                (break 0)
+                (do
+                  (if (get (load candidates) (load id))
+                      (match (arena-node (load id))
+                        (Some [n]
+                              (if (or (cfg? n)
+                                      (and (> (n-nins n) 0)
+                                           (match (n-in n 0) (Some [_] true) (None [] false))))
+                                  (copy--mark! (mut selected) (mut work) n limit)
+                                  0))
+                        (None [] 0))
+                      0)
+                  (set! (mut id) (+ (load id) 1))
+                  (continue)))))
+    (loop (match (pop! (mut work))
+            (None [] (break 0))
+            (Some [n]
+                  (let [(mut i) 0]
+                    (loop (if (>= (load i) (n-nins n))
+                              (break 0)
+                              (do
+                                (match (n-in n (load i))
+                                  (Some [input]
+                                        (if (get (load candidates) (n-nid input))
+                                            (copy--mark! (mut selected) (mut work) input limit)
+                                            0))
+                                  (None [] 0))
+                                (set! (mut i) (+ (load i) 1))
+                                (continue))))
+                    (continue)))))
+    ;; A body-local recursive Call needs its FunPtr retargeted to the cloned Fun. External caller
+    ;; FunPtrs are deliberately absent from candidates above, so caller count cannot inflate body
+    ;; size or create dangling FunPtr clones.
+    (let [(mut id) 1]
+      (loop (if (>= (load id) limit)
+                (break 0)
+                (do
+                  (if (get (load selected) (load id))
+                      (match (arena-node (load id))
+                        (Some [n]
+                              (if (= (n-op n) OP-CALL)
+                                  (let [fptr (call-fptr n)]
+                                    (match (n-in fptr 0)
+                                      (Some [target]
+                                            (if (get (load selected) (n-nid target))
+                                                (set! (mut selected) (n-nid fptr) true)
+                                                0))
+                                      (None [] 0)))
+                                  0))
+                        (None [] 0))
+                      0)
+                  (set! (mut id) (+ (load id) 1))
+                  (continue)))))
+    (al-free! [bool] (mut cfgs))
+    (al-free! [bool] (mut candidates))
+    (al-free! [(dyn NodeOps)] (mut work))
+    (load selected)))
+
+(defn copy--sparse-mark! [(seen (mut (HashMap i64 bool)))
+                          (ids (mut (ArrayList i64)))
+                          (work (mut (ArrayList (dyn NodeOps))))
+                          (n (dyn NodeOps))] (-> i64)
+  (let [id (n-nid n)]
+    (if (hm-contains? [i64 bool] (load seen) id)
+        0
+        (do
+          (set! (mut seen) id true)
+          (push! [i64] (mut ids) id)
+          (push! [(dyn NodeOps)] (mut work) n)
+          0))))
+
+(defn copy--sparse-mark-work! [(seen (mut (HashMap i64 bool)))
+                               (work (mut (ArrayList (dyn NodeOps))))
+                               (n (dyn NodeOps))] (-> i64)
+  (let [id (n-nid n)]
+    (if (hm-contains? [i64 bool] (load seen) id)
+        0
+        (do
+          (set! (mut seen) id true)
+          (push! [(dyn NodeOps)] (mut work) n)
+          0))))
+
+(defn copy--sparse-admitted? [(n (dyn NodeOps)) (cfgs (HashMap i64 bool))] (-> bool)
+  (if (and (cfg? n) (not (hm-contains? [i64 bool] cfgs (n-nid n))) (copy--unfolded? n))
+      false
+      (match (if (> (n-nins n) 0) (n-in n 0) (None [(dyn NodeOps)]))
+        (Some [anchor]
+              (not (and (cfg? anchor)
+                        (not (hm-contains? [i64 bool] cfgs (n-nid anchor)))
+                        (copy--unfolded? anchor))))
+        (None [] true))))
+
+;; Count-only form of `fun-body-selection`. It deliberately uses sparse membership and node lists:
+;; inline candidacy is queried for many tiny functions in one large arena, so arena-sized bitmaps
+;; here would make compilation quadratic. The full bool selection is still built only when a clone
+;; is actually requested.
+(defn fun-live-body-size-impl [(fun (dyn NodeOps))] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        (mut cfgs) (hm-new-scalar [i64 bool] a)
+        (mut candidates) (hm-new-scalar [i64 bool] a)
+        (mut candidate-ids) (al-new [i64] a)
+        (mut selected) (hm-new-scalar [i64 bool] a)
+        (mut selected-ids) (al-new [i64] a)
+        (mut work) (al-new [(dyn NodeOps)] a)]
+    (copy--sparse-mark-work! (mut cfgs) (mut work) fun)
+    (match (fun-ret fun)
+      (Some [ret] (copy--sparse-mark-work! (mut cfgs) (mut work) ret))
+      (None [] (broken "fun-live-body-size-impl: function has no Return")))
+    (loop (match (pop! (mut work))
+            (None [] (break 0))
+            (Some [n]
+                  (if (n-same? n fun)
+                      (continue)
+                      (let [many (or (= (n-op n) OP-REGION) (= (n-op n) OP-LOOP))
+                            start (if many 1 0)
+                            stop (if many (n-nins n) (if (> (n-nins n) 0) 1 0))
+                            (mut i) start]
+                        (loop (if (>= (load i) stop)
+                                  (break 0)
+                                  (do
+                                    (match (n-in n (load i))
+                                      (Some [input]
+                                            (if (cfg? input)
+                                                (copy--sparse-mark-work! (mut cfgs) (mut work) input)
+                                                0))
+                                      (None [] 0))
+                                    (set! (mut i) (+ (load i) 1))
+                                    (continue))))
+                        (continue))))))
+    (copy--sparse-mark! (mut candidates) (mut candidate-ids) (mut work) fun)
+    (loop (match (pop! (mut work))
+            (None [] (break 0))
+            (Some [n]
+                  (let [(mut i) 0]
+                    (loop (if (>= (load i) (n-nouts n))
+                              (break 0)
+                              (do
+                                (match (n-out n (load i))
+                                  (Some [use]
+                                        (if (and (= (n-op n) OP-FUN) (= (n-op use) OP-FUNPTR))
+                                            0
+                                            (if (copy--sparse-admitted? use (load cfgs))
+                                                (copy--sparse-mark! (mut candidates)
+                                                                    (mut candidate-ids)
+                                                                    (mut work)
+                                                                    use)
+                                                0)))
+                                  (None [] 0))
+                                (set! (mut i) (+ (load i) 1))
+                                (continue))))
+                    (continue)))))
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (len (al-slice (load candidate-ids))))
+                (break 0)
+                (do
+                  (match (arena-node (get (load candidate-ids) (load i)))
+                    (Some [n]
+                          (if (or (cfg? n)
+                                  (and (> (n-nins n) 0)
+                                       (match (n-in n 0) (Some [_] true) (None [] false))))
+                              (copy--sparse-mark! (mut selected)
+                                                  (mut selected-ids)
+                                                  (mut work)
+                                                  n)
+                              0))
+                    (None [] 0))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    (loop (match (pop! (mut work))
+            (None [] (break 0))
+            (Some [n]
+                  (let [(mut i) 0]
+                    (loop (if (>= (load i) (n-nins n))
+                              (break 0)
+                              (do
+                                (match (n-in n (load i))
+                                  (Some [input]
+                                        (if (hm-contains? [i64 bool] (load candidates) (n-nid input))
+                                            (copy--sparse-mark! (mut selected)
+                                                                (mut selected-ids)
+                                                                (mut work)
+                                                                input)
+                                            0))
+                                  (None [] 0))
+                                (set! (mut i) (+ (load i) 1))
+                                (continue))))
+                    (continue)))))
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (len (al-slice (load selected-ids))))
+                (break 0)
+                (do
+                  (match (arena-node (get (load selected-ids) (load i)))
+                    (Some [n]
+                          (if (= (n-op n) OP-CALL)
+                              (let [fptr (call-fptr n)]
+                                (match (n-in fptr 0)
+                                  (Some [target]
+                                        (if (hm-contains? [i64 bool] (load selected) (n-nid target))
+                                            (copy--sparse-mark! (mut selected)
+                                                                (mut selected-ids)
+                                                                (mut work)
+                                                                fptr)
+                                            0))
+                                  (None [] 0)))
+                              0))
+                    (None [] 0))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    (let [answer (len (al-slice (load selected-ids)))]
+      (hm-free! [i64 bool] (mut cfgs))
+      (hm-free! [i64 bool] (mut candidates))
+      (hm-free! [i64 bool] (mut selected))
+      (al-free! [i64] (mut candidate-ids))
+      (al-free! [i64] (mut selected-ids))
+      (al-free! [(dyn NodeOps)] (mut work))
+      answer)))
+
+(defn copy-install-call-ext! [] (-> i64)
+  (do
+    (set-fun-body-size-ext! (primitive/fnptr-of fun-live-body-size-impl))
+    (set-clone-inline-ext! (primitive/fnptr-of callend-do-clone-inline!))))
+
+;; Rebuild concrete call-graph edges for calls copied inside the body. Graph edges preserve the
+;; cloned CallEnd's Return inputs. A body-local target therefore already has both cloned halves and
+;; must be left alone. An external target has only the copied Return input: remove that one edge,
+;; then let `call-link!` install both halves in lockstep.
+(defn copy--remove-return! [(end (dyn NodeOps)) (ret (dyn NodeOps))] (-> i64)
+  (let [(mut i) 1
+        (mut found) false]
+    (loop (if (or (>= (load i) (n-nins end)) (load found))
+              (break 0)
+              (do
+                (match (n-in end (load i))
+                  (Some [candidate]
+                        (if (n-same? candidate ret)
+                            (do (n-del-def! end (load i)) (set! (mut found) true) 0)
+                            0))
+                  (None [] 0))
+                (if (load found) 0 (set! (mut i) (+ (load i) 1)))
+                (continue))))
+    (if (load found)
+        0
+        (broken "copy--relink-body-calls!: cloned CallEnd lacks expected Return"))))
+
+(defn copy--relink-target! [(copy (ptr GraphCopy))
+                            (new-call (dyn NodeOps))
+                            (new-end (dyn NodeOps))
+                            (old-ret (dyn NodeOps))] (-> i64)
+  (match (return-fun old-ret)
+    (None [] 0)
+    (Some [old-fun]
+          (let [target
+                  (match (graph-copy-get copy old-fun)
+                    (Some [new-fun] new-fun)
+                    (None [] old-fun))]
+            (if (call-linked? new-call target)
+                0
+                (do
+                  (match (graph-copy-get copy old-ret)
+                    (Some [new-ret] (copy--remove-return! new-end new-ret))
+                    (None [] (copy--remove-return! new-end old-ret)))
+                  (call-link! new-call target)))))))
+
+(defn copy--relink-one-call! [(copy (ptr GraphCopy)) (old-call (dyn NodeOps))] (-> i64)
+  (match (graph-copy-get copy old-call)
+    (None [] (broken "copy--relink-one-call!: selected Call was not copied"))
+    (Some [new-call]
+          (match (call-cend old-call)
+            (None [] 0)
+            (Some [old-end]
+                  (if (cend-folding? old-end)
+                      0
+                      (match (graph-copy-get copy old-end)
+                        (None [] (broken "copy--relink-one-call!: body selected Call without its CallEnd"))
+                        (Some [new-end]
+                              (do
+                                (match (call-cend new-call)
+                                  (Some [linked-end]
+                                        (if (n-same? linked-end new-end)
+                                            0
+                                            (broken "copy--relink-one-call!: cloned Call points at the wrong CallEnd")))
+                                  (None [] (broken "copy--relink-one-call!: cloned Call has no CallEnd")))
+                                (let [(mut i) 1]
+                                  (loop (if (>= (load i) (n-nins old-end))
+                                            (break 0)
+                                            (do
+                                              (match (n-in old-end (load i))
+                                                (Some [old-ret]
+                                                      (copy--relink-target! copy new-call new-end old-ret))
+                                                (None [] 0))
+                                              (set! (mut i) (+ (load i) 1))
+                                              (continue))))
+                                  0))))))))))
+
+(defn copy--relink-body-calls! [(copy (ptr GraphCopy)) (selected (slice bool))] (-> i64)
+  (let [(mut id) 1]
+    (loop (if (>= (load id) (.old-count copy))
+              (break 0)
+              (do
+                (if (get selected (load id))
+                    (match (arena-node (load id))
+                      (Some [old]
+                            (if (= (n-op old) OP-CALL) (copy--relink-one-call! copy old) 0))
+                      (None [] 0))
+                    0)
+                (set! (mut id) (+ (load id) 1))
+                (continue))))
+    0))
+
+(defn fun-copy-body! [(fun (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [(mut selected) (fun-body-selection fun)
+        copy (graph-copy-selected (al-slice (load selected)))
+        fresh
+          (match (graph-copy-get copy fun)
+            (Some [f] f)
+            (None [] (do (broken "fun-copy-body!: Fun missing from its body copy") fun)))]
+    ;; Remove external caller paths only. A cloned body-local Call has a fresh nid outside the
+    ;; frozen source arena and must remain paired with its cloned Return/CallEnd half.
+    (let [(mut i) 1]
+      (loop (if (>= (load i) (n-nins fresh))
+                (break 0)
+                (match (n-in fresh (load i))
+                  (Some [caller]
+                        (if (and (= (n-op caller) OP-CALL) (>= (n-nid caller) (.old-count copy)))
+                            (do (set! (mut i) (+ (load i) 1)) (continue))
+                            (do (region-del-path! fresh (load i)) (continue))))
+                  (None [] (do (region-del-path! fresh (load i)) (continue)))))))
+    (copy--relink-body-calls! copy (al-slice (load selected)))
+    (al-free! [bool] (mut selected))
+    (graph-copy-free! copy)
+    fresh))
+
+;; Clone is a pre-step only: detach this call from the shared original, retarget it to a private
+;; clone with a fresh local identity, relink, then invoke the exact trivial-fold mechanism.
+(defn callend-do-clone-inline! [(e (dyn NodeOps)) (fun (dyn NodeOps))] (-> i64)
+  (let [c (cend-call e)]
+    (call-unlink! c fun)
+    (let [fresh (fun-copy-body! fun)
+          fptr (funptr-make fresh (next-inline-fidx!))]
+      (n-set-def! c (- (n-nins c) 1) (Some fptr))
+      (call-link! c fresh)
+      (callend-do-trivial-inline! e fresh)
+      0)))

@@ -26,35 +26,43 @@ coil test        # THE gate. Green is the contract; nothing is committed red.
 coil check       # typecheck every target
 ```
 
-**Green does not yet mean much.** What exists today is the graph representation, the type lattice,
-and one arithmetic node — enough to prove the representation carries a real IR, and no more. Most
-of the tree is hard-error scaffolding, and every stub dies naming itself and the build step that
-owns it.
+**Green is still a partial compiler, not a runnable one.** The ideal graph core, lattice, integer
+value nodes, control flow, calls, trivial and clone inlining, dynamic guards, graph verification,
+and Phi-constant rewriting are real and tested. The frontend, memory, evaluator and backend remain
+hard-error scaffolding or explicitly owed work; every actual stub dies naming itself and the build
+step that owns it.
 
 ## Where things are
 
 | Path | What it is |
 |---|---|
 | `src/node/` | The graph: header, dispatch trait, edges, peepholes, GVN — grouped by node family |
-| `src/type/` | The interned lattice: `meet`/`dual`/`join`/`isa`, plus the dynamic and shape axes |
-| `src/shape.coil` | Hidden classes as a transition tree, and the alias classes memory SSA needs |
+| `src/type/` | Partial interned lattice: simple types, ints, floats, arbitrary tuples, function-index sets, and dynamic tags |
+| `src/shape.coil` | Planned hidden-class transition tree; currently scaffold |
 | `src/codegen/` | The one-way phase pipeline, from peepholes through to the object file |
 | `src/parse/` | The JS/TS lexer and recursive-descent parser — straight into SSA, no AST |
 | `src/jsl/` | The reader, checker and graph lowering for JSL |
 | `jsl/` | The JavaScript runtime library, written in JSL. Already written; we compile toward it |
-| `src/verify.coil` | The graph verifier, one named code per check |
-| `src/eval.coil` | The IR interpreter, and therefore the differential oracle |
+| `src/verify.coil` | Live graph verifier for the node families implemented so far |
+| `src/eval.coil` | Planned IR interpreter and differential oracle; currently a hard-error scaffold |
 | `tests/` | One suite per area; `coil test` runs them all |
 
 ## Status
 
-Working, with tests: the `(dyn NodeOps)` node representation, node identity and bidirectional
-edges, GVN hash and equality, the lattice core (`meet`/`dual`/`join`/`isa` over the simple types
-and integer ranges), and integer `Add` with range arithmetic that widens on overflow rather than
-wrapping.
+Working, with tests: the `(dyn NodeOps)` graph engine and GVN; the interned lattice including
+integer ranges, floats, arbitrary-arity tuples, function-pointer identity sets and dynamic tags;
+integer arithmetic, bitwise and comparison nodes; control flow and Phis; Fun/Parm/Call/CallEnd with
+trivial and clone inlining; dynamic Box/Unbox/TypeTest/Cast guards; and constant push-up through
+Phis.
 
-Everything else is scaffolding with final signatures and hard-error bodies. `docs/LAYOUT.md` §7 has
-the build order.
+Property tests now generate shrinkable expression DAGs and control diamonds, checking bidirectional
+edge multiplicity, optimizer/model agreement, fixpoint closure, and Region/Phi arity. General
+object/string value representation, complete float behavior, and memory threading remain correctness
+blockers before this is a general JavaScript IR.
+
+The next front is JSL reading, checking and lowering. `HANDOFF.md` gives the fixture-first target,
+the exact prerequisites and the currently owed correctness work; `docs/LAYOUT.md` §7 has the full
+build order.
 
 ## Provenance and license
 

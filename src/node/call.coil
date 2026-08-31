@@ -52,7 +52,7 @@
 ;;     cend._folding = true
 ;;     fun._folding  = true
 ;;     fun.setDef(1, call.ctrl())   ; the Fun's control now bypasses the Call
-;;     fun.ret().setDef(3, null)    ; the Return forgets its Fun
+;;     fun.ret().setDef(3, null)    ; the Return's RPC edge is consumed
 ;;     re-queue fun, cend, and their neighbours (and the Parms' users, one layer down)
 ;;     invalidate the idepth caches en masse
 ;;
@@ -87,16 +87,22 @@
 ;;   - the body is currently too big, but cleanup might shrink it below the cap.
 ;;   - the callee is self-recursive right now — but might lose the recursive edge. `addDep(fun)`.
 ;;
-;; And what produces `-2` (never): the CallEnd is already folding; input 0 is not a Call (malformed,
-;; mid-death); the name ends in `_noInline`; or the body's approximate size already exceeds the cap.
+;; And what produces `-2` (never) in the implemented IR: the CallEnd is already folding; input 0 is
+;; not a Call (malformed, mid-death); the `_noInline` suffix; or the construction span exceeds the
+;; hard cap. A large cleaned live body is `-1`, above, because cleanup can shrink it.
 ;;
-;; ## The heuristic, in full
+;; ## The implemented heuristic
 ;;
-;;   - size cap 100 nodes; 200 for a constructor/initialiser that is not a class body;
+;;   - size cap 100 nodes, checked against both the dense Fun-through-Return construction span and
+;;     the current CFG-bounded live-body cardinality;
 ;;   - NEVER inline a self-recursive function — that is loop unrolling by another name;
 ;;   - require exactly ONE linked target with a constant, non-null function pointer;
 ;;   - require every argument's type to `isa` its formal, against the recursively upgraded formal
 ;;     so that deep mutability requirements participate before inlining.
+;;
+;; Simple additionally grants selected initializers a 200-node cap. That requires frontend
+;; initializer/class-body classification evidence that this repository does not yet have; it is
+;; recorded as a blocked difference rather than silently claimed here.
 ;;
 ;; ## Consequence for JSL — there is no JSL inlining question
 ;;
@@ -136,8 +142,8 @@
 ;;
 ;; ============================================================================
 ;; STATUS: implemented. Fun-as-Region, Parm-as-Phi, Call, CallEnd, FunPtr, linking, the tri-state
-;; decision, and trivial inlining by folding. Owed and named at the foot of this file: the CLONE
-;; path (`_inline == 2`), and memory threading through calls.
+;; decision, trivial inlining by folding, and the clone pre-step for shared bodies. Memory threading
+;; through calls waits for the memory node family.
 ;; ============================================================================
 (module aot.node.call)
 (import "coil.primitive" :as primitive)
@@ -163,6 +169,46 @@
 (const INLINE-MAX-SIZE 100)
 
 (const INLINE-MAX-SIZE-INIT 200)
+
+;; Body ownership lives in `aot.node.copy`, which imports this module. Register its cleaned-body
+;; cardinality query at boot instead of creating a cyclic import. Candidate selection must not fall
+;; back to the construction span: optimizer-created growth can make that historical number stale.
+(defstruct FunBodySizeExt [(f (fnptr c [(ref (dyn NodeOps))] i64)) (installed bool)])
+
+(defn fun-body-size-ext [] (-> (ptr FunBodySizeExt))
+  (primitive/alloc-static FunBodySizeExt))
+
+(defn set-fun-body-size-ext! [(f (fnptr c [(ref (dyn NodeOps))] i64))] (-> i64)
+  (do
+    (set! (.f (fun-body-size-ext)) f)
+    (set! (.installed (fun-body-size-ext)) true)
+    0))
+
+(defn fun-live-body-size [(fun (dyn NodeOps))] (-> i64)
+  (if (.installed (fun-body-size-ext))
+      (primitive/call-ptr (.f (fun-body-size-ext)) fun)
+      (do
+        (panic "fun-live-body-size: body-selection extension was not installed at boot")
+        0)))
+
+(defstruct CloneInlineExt
+  [(f (fnptr c [(ref (dyn NodeOps)) (ref (dyn NodeOps))] i64)) (installed bool)])
+
+(defn clone-inline-ext [] (-> (ptr CloneInlineExt))
+  (primitive/alloc-static CloneInlineExt))
+
+(defn set-clone-inline-ext! [(f (fnptr c [(ref (dyn NodeOps)) (ref (dyn NodeOps))] i64))] (-> i64)
+  (do
+    (set! (.f (clone-inline-ext)) f)
+    (set! (.installed (clone-inline-ext)) true)
+    0))
+
+(defn callend-do-clone-inline-ext! [(e (dyn NodeOps)) (fun (dyn NodeOps))] (-> i64)
+  (if (.installed (clone-inline-ext))
+      (primitive/call-ptr (.f (clone-inline-ext)) e fun)
+      (do
+        (panic "callend-do-clone-inline-ext!: graph-copy extension was not installed at boot")
+        0)))
 
 ;; Call input layout, matching Simple exactly:
 ;;   0 = control, 1 = memory, 2.. = arguments, LAST = the function pointer.
@@ -195,6 +241,23 @@
 (defn fun-name [(f (dyn NodeOps))] (-> (slice u8))
   (.name (primitive/cast (ptr FunNode) (hdr f))))
 
+(defn fun-no-inline? [(f (dyn NodeOps))] (-> bool)
+  (let [name (fun-name f)
+        suffix "_noInline"
+        n (len name)
+        sn (len suffix)
+        (mut i) 0
+        (mut same) (>= n sn)]
+    (loop (if (or (not (load same)) (>= (load i) sn))
+              (break 0)
+              (do
+                (if (!= (get name (+ (- n sn) (load i))) (get suffix (load i)))
+                    (set! (mut same) false)
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load same)))
+
 (defn fun-folding? [(f (dyn NodeOps))] (-> bool)
   (.folding (primitive/cast (ptr FunNode) (hdr f))))
 
@@ -212,7 +275,9 @@
       (do
         (n-unlock! f)
         (set! (.sig (primitive/cast (ptr FunNode) (hdr f))) sig)
+        (funptr-refresh-from-fun! f sig)
         (code-add! f)
+        (code-add-outputs! f)
         0)))
 
 (defn fun-ret [(f (dyn NodeOps))] (-> (Option (dyn NodeOps)))
@@ -221,7 +286,13 @@
 ;; Cannot build the Return and the Fun at once; one has to come first. So the link is a second step,
 ;; exactly as in Simple.
 (defn fun-set-ret! [(f (dyn NodeOps)) (ret (dyn NodeOps))] (-> i64)
-  (do (set! (.ret-nid (primitive/cast (ptr FunNode) (hdr f))) (n-nid ret)) 0))
+  (let [p (primitive/cast (ptr FunNode) (hdr f))]
+    (set! (.ret-nid p) (n-nid ret))
+    ;; Simple records the parser UID delta from Fun creation through Return creation. Node IDs are
+    ;; that same dense construction clock here, so this includes every node built while the body was
+    ;; open (including nested functions) without needing ownership metadata on every floating node.
+    (set! (.approx-size p) (+ 1 (- (n-nid ret) (n-nid f))))
+    0))
 
 ;; >>> THE UNKNOWN-CALLER HOOK <<<
 ;;
@@ -233,7 +304,7 @@
 ;; the actual callers pass. That is the moment a TypeScript annotation becomes provable.
 (defn fun-unknown-callers? [(f (dyn NodeOps))] (-> bool)
   (and (>= (n-nins f) 2)
-       (match (n-in-safe f 1) (Some [v] (= (n-op v) OP-START)) (None [] false))))
+       (match (n-in f 1) (Some [v] (= (n-op v) OP-START)) (None [] false))))
 
 ;; Simple's `FunNode.compute`: CONTROL while callers are unknown, else the meet over real callers.
 ;; The Start hook is SKIPPED in the meet — it is a hook, not a caller.
@@ -246,7 +317,7 @@
         (loop (if (>= (load i) cnt)
                   (break 0)
                   (do
-                    (match (n-in-safe f (load i))
+                    (match (n-in f (load i))
                       (Some [v]
                             (if (= (n-op v) OP-START)
                                 0
@@ -266,8 +337,8 @@
           (match (fun-ret f)
             (Some [ret]
                   (let [rt (n-ty ret)]
-                    (if (and (ty-tuple? rt) (> (ty-tuple-len rt) 1))
-                        (let [actual (ty-tuple-at rt 1)
+                    (if (and (ty-tuple? rt) (> (ty-tuple-len rt) RETURN-VALUE))
+                        (let [actual (ty-tuple-at rt RETURN-VALUE)
                               declared (ty-sig-ret (fun-sig f))]
                           (if (and (!= actual declared) (ty-isa? actual declared))
                               (do (fun-set-sig! f (fun--sig-with-ret (fun-sig f) actual)) (Some f))
@@ -292,17 +363,19 @@
 
 ;; Replace the return member of a signature tuple.
 (defn fun--sig-with-ret [(sig i64) (ret i64)] (-> i64)
-  (let [n (ty-tuple-len sig)]
-    (if (= n 1)
-        (ty-tuple-of2 ret ret)  ; no args: keep the arity, only the return matters
-        (if (= n 2)
-            (ty-tuple-of2 ret (ty-tuple-at sig 1))
-            (if (= n 3)
-                (ty-tuple-of3 ret (ty-tuple-at sig 1) (ty-tuple-at sig 2))
-                (do
-                  (unimplemented "fun--sig-with-ret: arity above 2"
-                                 "src/node/call.coil — widen with the tuple arity")
-                  sig))))))
+  (let [n (ty-tuple-len sig)
+        a (alloc/malloc-allocator)
+        (mut members) (al-new [i64] a)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break 0)
+              (do
+                (push! [i64] (mut members) (if (= (load i) 0) ret (ty-tuple-at sig (load i))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (let [answer (ty-tuple (al-slice (load members)))]
+      (al-free! [i64] (mut members))
+      answer)))
 
 (impl NodeOps FunNode
   (hdr [(self (ptr FunNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
@@ -392,12 +465,12 @@
 ;; A Parm is IN PROGRESS exactly while its Fun has unknown callers. Simple: "Always in-progress until
 ;; we run out of unknown callers."
 (defn parm-in-progress? [(p (dyn NodeOps))] (-> bool)
-  (match (n-in-safe p 0)
+  (match (n-in p 0)
     (Some [f] (if (= (n-op f) OP-FUN) (fun-unknown-callers? f) false))
     (None [] true)))
 
 (defn parm-compute [(p (dyn NodeOps))] (-> i64)
-  (match (n-in-safe p 0)
+  (match (n-in p 0)
     (None [] TY-TOP)
     (Some [f]
           (if (!= (n-op f) OP-FUN)
@@ -412,14 +485,14 @@
                     (loop (if (>= (load i) cnt)
                               (break 0)
                               (do
-                                (match (n-in-safe f (load i))
+                                (match (n-in f (load i))
                                   (Some [caller]
                                         (do
                                           (n-add-dep! caller p)
                                           (if (or (= (n-ty caller) TY-XCTRL)
                                                   (= (n-ty caller) TY-TOP))
                                               0
-                                              (match (n-in-safe p (load i))
+                                              (match (n-in p (load i))
                                                 (Some [v]
                                                       (set! (mut t)
                                                             (ty-meet (load t) (n-ty v))))
@@ -431,7 +504,7 @@
                     (ty-join (load t) (parm-declared p))))))))
 
 (defn parm-idealize [(p (dyn NodeOps))] (-> (Option (dyn NodeOps)))
-  (match (n-in-safe p 0)
+  (match (n-in p 0)
     (None [] (None [(dyn NodeOps)]))
     (Some [f]
           (if (!= (n-op f) OP-FUN)
@@ -519,7 +592,7 @@
   ;; with a Con, which would loop.
   (is-const? [(self (ptr FunPtrNode))] (-> bool) true)
   (no-const-fold? [(self (ptr FunPtrNode))] (-> bool) false)
-  (is-pinned? [(self (ptr FunPtrNode))] (-> bool) false)
+  (is-pinned? [(self (ptr FunPtrNode))] (-> bool) true)
   (binop-copy [(self (ptr FunPtrNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
               (-> (Option (dyn NodeOps)))
               (None [(dyn NodeOps)]))
@@ -532,11 +605,40 @@
                 (= (.fptr-ty self) (.fptr-ty (primitive/cast (ptr FunPtrNode) (hdr other))))))
   (hash-extra [(self (ptr FunPtrNode))] (-> i64) (* (.fptr-ty self) 181)))
 
+;; Our FunPtr has a real Fun input, so signature sharpening can update every pointer directly when
+;; `fun-set-sig!` changes the owner. This is the same cached-constant update Simple performs in
+;; FunPtr idealization, while preserving the last valid identity if the function body later dies.
+(defn funptr-refresh-from-fun! [(fun (dyn NodeOps)) (sig i64)] (-> i64)
+  (let [cnt (n-nouts fun)
+        (mut i) 0]
+    (loop (if (>= (load i) cnt)
+              (break 0)
+              (do
+                (match (n-out fun (load i))
+                  (Some [use]
+                        (if (= (n-op use) OP-FUNPTR)
+                            (let [p (primitive/cast (ptr FunPtrNode) (hdr use))
+                                  fresh (ty-funptr sig (ty-funptr-fidxs (.fptr-ty p)))]
+                              (if (= fresh (.fptr-ty p))
+                                  0
+                                  (do
+                                    (n-unlock! use)
+                                    (set! (.fptr-ty p) fresh)
+                                    (n-force-ty! use fresh)
+                                    (code-add! use)
+                                    (code-add-outputs! use)
+                                    0)))
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))
+
 (defn funptr-make [(fun (dyn NodeOps)) (fidx i64)] (-> (dyn NodeOps))
   (let [a (alloc/malloc-allocator)
         p (alloc/unwrap-ptr [FunPtrNode] (alloc/create [FunPtrNode] a))
         d (primitive/make-dyn NodeOps p)
-        t (ty-funptr-singleton (fun-sig fun) fidx)]
+        t (ty-funptr-singleton (fun-sig fun) (reserve-fidx! fidx))]
     (set! (.fptr-ty p) t)
     (n-init! d OP-FUNPTR)
     (n-add-def! d (Some fun))
@@ -581,8 +683,17 @@
            (-> i64)
            (n-ty (n-in! (primitive/make-dyn NodeOps self) CALL-CTRL)))
   (idealize [(self (ptr CallNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
-  (eq-extra [(self (ptr CallNode)) (other (dyn NodeOps))] (-> bool) (= (n-op other) OP-CALL))
-  (hash-extra [(self (ptr CallNode))] (-> i64) 191))
+  ;; Until memory SSA exists every Call carries the same null memory slot. Treating two otherwise
+  ;; identical Calls as GVN-equal would merge distinct executions and leave their `cend-nid`
+  ;; back-pointers naming different CallEnds. A stable call-site nid keeps them unique now; once
+  ;; concrete memory inputs sequence calls, structural identity can safely use those edges instead.
+  (eq-extra [(self (ptr CallNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (and (= (n-op other) OP-CALL)
+                 (= (.nid (hdr (primitive/make-dyn NodeOps self))) (n-nid other))))
+  (hash-extra [(self (ptr CallNode))]
+              (-> i64)
+              (+ 191 (.nid (hdr (primitive/make-dyn NodeOps self))))))
 
 (impl CFGOps CallNode
   (cfg-node [(self (ptr CallNode))] (-> (dyn NodeOps)) (primitive/make-dyn NodeOps self))
@@ -635,47 +746,61 @@
 (defn cend-decision [(e (dyn NodeOps))] (-> i64)
   (.decision (primitive/cast (ptr CallEndNode) (hdr e))))
 
-;; The result type: a tuple of (control, value).
+;; The result type: a tuple of (control, memory, value), matching Return projection positions.
 (defn cend-compute [(e (dyn NodeOps))] (-> i64)
-  (match (n-in-safe e 0)
-    (None [] (ty-tuple-of2 TY-XCTRL TY-TOP))
+  (match (n-in e 0)
+    (None [] (ty-tuple-of3 TY-XCTRL TY-TOP TY-TOP))
     (Some [c]
           (if (or (!= (n-op c) OP-CALL) (!= (n-ty c) TY-CTRL))
-              (ty-tuple-of2 TY-XCTRL TY-TOP)
-              (let [ft (n-ty (call-fptr c))]
+              (ty-tuple-of3 TY-XCTRL TY-TOP TY-TOP)
+              (let [fptr (call-fptr c)
+                    ft (do (n-add-dep! fptr e) (n-ty fptr))]
                 (if (not (ty-funptr? ft))
                     (if (ty-high? ft)
-                        (ty-tuple-of2 TY-XCTRL TY-TOP)
-                        (ty-tuple-of2 TY-CTRL TY-BOT))
-                    ;; While folding, take the single linked caller's return directly.
+                        (ty-tuple-of3 TY-XCTRL TY-TOP TY-TOP)
+                        (ty-tuple-of3 TY-CTRL TY-BOT TY-BOT))
+                    ;; While folding, preserve the single linked Return's entire state tuple.
                     (if (cend-folding? e)
-                        (ty-tuple-of2 TY-CTRL (cend--linked-ret-ty e (ty-sig-ret (ty-funptr-sig ft))))
-                        ;; Otherwise: the meet over linked Returns, joined with the declared return.
-                        (ty-tuple-of2 TY-CTRL
-                                      (cend--linked-ret-ty e (ty-sig-ret (ty-funptr-sig ft)))))))))))
+                        (match (n-in e 1)
+                          (Some [ret]
+                                (cend--state-with-declared-ret (n-ty ret)
+                                                               (ty-sig-ret (ty-funptr-sig ft))))
+                          (None [] (ty-tuple-of3 TY-XCTRL TY-TOP TY-TOP)))
+                        ;; Otherwise meet the full state tuples from every linked Return.
+                        (cend--linked-state e (ty-sig-ret (ty-funptr-sig ft))))))))))
 
-;; The meet over linked Returns' value members, joined with the signature's declared return. With no
-;; links yet, the declared return is the answer.
-(defn cend--linked-ret-ty [(e (dyn NodeOps)) (declared i64)] (-> i64)
+;; Preserve control and memory, and constrain only the value member by the declared return type.
+(defn cend--state-with-declared-ret [(state i64) (declared i64)] (-> i64)
+  (if (and (ty-tuple? state) (> (ty-tuple-len state) RETURN-VALUE))
+      (ty-tuple-of3 (ty-tuple-at state RETURN-CTRL)
+                    (ty-tuple-at state RETURN-MEM)
+                    (ty-join (ty-tuple-at state RETURN-VALUE) declared))
+      (ty-tuple-of3 TY-XCTRL TY-TOP TY-TOP)))
+
+;; Meet every linked Return's full `(control, memory, value)` state. With no links yet, retain a
+;; conservative reachable continuation and the declared result.
+(defn cend--linked-state [(e (dyn NodeOps)) (declared i64)] (-> i64)
   (let [cnt (n-nins e)
         (mut i) 1
-        (mut t) TY-TOP
+        (mut state) (ty-tuple-of3 TY-XCTRL TY-TOP TY-TOP)
         (mut any) false]
     (loop (if (>= (load i) cnt)
               (break 0)
               (do
-                (match (n-in-safe e (load i))
+                (match (n-in e (load i))
                   (Some [r]
                         (let [rt (n-ty r)]
-                          (if (and (ty-tuple? rt) (> (ty-tuple-len rt) 1))
+                          (if (and (ty-tuple? rt) (> (ty-tuple-len rt) RETURN-VALUE))
                               (do
                                 (set! (mut any) true)
-                                (set! (mut t) (ty-meet (load t) (ty-tuple-at rt 1))))
+                                (set! (mut state) (ty-meet (load state) rt)))
                               0)))
                   (None [] 0))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
-    (if (load any) (ty-join (load t) declared) declared)))
+    (if (load any)
+        (cend--state-with-declared-ret (load state) declared)
+        (ty-tuple-of3 TY-CTRL TY-TOP declared))))
 
 (impl NodeOps CallEndNode
   (hdr [(self (ptr CallEndNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
@@ -700,7 +825,10 @@
   (block-head? [(self (ptr CallEndNode))] (-> bool) true)
   (cfg-idom [(self (ptr CallEndNode))]
             (-> (Option (dyn NodeOps)))
-            (n-in-safe (primitive/make-dyn NodeOps self) 0))
+            (let [d (primitive/make-dyn NodeOps self)]
+              ;; While inlining, the Call edge is being folded away. The linked Return is the
+              ;; actual control predecessor and must anchor dominance until the fold completes.
+              (if (.folding self) (n-in-safe d 1) (n-in-safe d 0))))
   (cfg-idepth [(self (ptr CallEndNode))]
               (-> i64)
               (cfg-idepth-default (primitive/make-dyn NodeOps self))))
@@ -757,14 +885,81 @@
                     (None [] 0))
                   (set! (mut i) (+ (load i) 1))
                   (continue)))))
-    ;; The CallEnd gains the callee's Return.
+    ;; The CallEnd gains the callee's Return and must recompute from that new full state tuple.
     (match (call-cend c)
-      (Some [e] (match (fun-ret fun) (Some [r] (n-add-def! e (Some r))) (None [] 0)))
+      (Some [e]
+            (do
+              (match (fun-ret fun) (Some [r] (n-add-def! e (Some r))) (None [] 0))
+              (code-add! e)))
       (None [] 0))
     (invalidate-cfg!)
     (code-add! fun)
     (code-add! c)
     0))
+
+;; Remove one concrete call-graph edge, preserving the Fun/Parm positional invariant and the
+;; Return/CallEnd half of the link. Clone inlining uses this before retargeting one caller.
+(defn call-unlink! [(c (dyn NodeOps)) (fun (dyn NodeOps))] (-> i64)
+  (let [cnt (n-nins fun)
+        (mut path) -1
+        (mut i) 1]
+    (loop (if (>= (load i) cnt)
+              (break 0)
+              (do
+                (match (n-in fun (load i))
+                  (Some [caller]
+                        (if (n-same? caller c) (set! (mut path) (load i)) 0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (if (< (load path) 0)
+        (broken "call-unlink!: call is not linked to function")
+        (region-del-path! fun (load path)))
+    (match (call-cend c)
+      (Some [e]
+            (match (fun-ret fun)
+              (Some [ret]
+                    (let [(mut j) 1
+                          (mut removed) false]
+                      (loop (if (or (>= (load j) (n-nins e)) (load removed))
+                                (break 0)
+                                (do
+                                  (match (n-in e (load j))
+                                    (Some [linked]
+                                          (if (n-same? linked ret)
+                                              (do
+                                                (n-del-def! e (load j))
+                                                (set! (mut removed) true)
+                                                0)
+                                              0))
+                                    (None [] 0))
+                                  (if (load removed) 0 (set! (mut j) (+ (load j) 1)))
+                                  (continue))))
+                      (if (load removed)
+                          0
+                          (broken "call-unlink!: CallEnd has no matching Return"))))
+              (None [] (broken "call-unlink!: function has no Return"))))
+      (None [] (broken "call-unlink!: call has no CallEnd")))
+    (invalidate-cfg!)
+    (code-add! fun)
+    (code-add! c)
+    0))
+
+;; Has this concrete call-graph edge already been installed?  Fun inputs are the authoritative
+;; call graph; checking them prevents SCCP revisits from duplicating Region/Parm paths.
+(defn call-linked? [(c (dyn NodeOps)) (fun (dyn NodeOps))] (-> bool)
+  (let [cnt (n-nins fun)
+        (mut i) 1
+        (mut found) false]
+    (loop (if (or (>= (load i) cnt) (load found))
+              (break 0)
+              (do
+                (match (n-in fun (load i))
+                  (Some [x] (if (n-same? x c) (set! (mut found) true) 0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
 
 ;; ---------------------------------------------------------------------------
 ;; THE INLINE DECISION  —  Simple's `CallEndNode.maybeInline` / `inlineCandidate`
@@ -772,7 +967,7 @@
 ;; A TRI-STATE that DEFERS rather than declines:
 ;;
 ;;   INLINE-TRIVIAL ( 1)  inline now, by folding
-;;   INLINE-CLONE   ( 2)  clone the body first, then fold      (owed — see the foot of this file)
+;;   INLINE-CLONE   ( 2)  clone the body first, then fold
 ;;   INLINE-DEFER   (-1)  NOT NOW, but might become one — re-queued when the blocker changes
 ;;   INLINE-NEVER   (-2)  never; stop asking
 ;;
@@ -798,67 +993,42 @@
   (match (return-fun ret)
     (None [] INLINE-DEFER)
     (Some [fun]
-          ;; SELF-RECURSION is never inlined — that is loop unrolling by another name. But the
-          ;; recursive edge might yet disappear, so DEFER rather than refuse forever, and depend on
-          ;; the Fun so the question is reasked if its callers change.
-          (if (fun-self-recursive? fun)
-              (do (n-add-dep! fun e) INLINE-DEFER)
-              (let [fptr (call-fptr c)
-                    ft (n-ty fptr)]
-                ;; The function pointer must be a CONSTANT, non-empty, singleton set. Anything else
-                ;; may still sharpen, so depend on it and defer.
-                (if (not (and (ty-funptr? ft) (ty-funptr-single? ft)))
-                    (do (n-add-dep! fptr e) INLINE-DEFER)
-                    ;; Arguments must match the formals. `call-good-args?` depends on any that do
-                    ;; not yet.
-                    (if (not (call-good-args? c (fun-sig fun) e))
-                        INLINE-DEFER
-                        ;; SIZE. Over the hard cap: never. Under it: trivial when this is the only
-                        ;; caller, otherwise the clone path.
-                        (if (> (fun-approx-size fun) INLINE-MAX-SIZE)
-                            INLINE-NEVER
-                            (if (fun-unknown-callers? fun)
-                                (do (n-add-dep! fun e) INLINE-DEFER)
-                                (if (> (n-nins fun) 2) INLINE-CLONE INLINE-TRIVIAL))))))))))
+          (if (fun-no-inline? fun)
+              INLINE-NEVER
+              ;; SELF-RECURSION is never inlined — that is loop unrolling by another name. But the
+              ;; recursive edge might yet disappear, so DEFER rather than refuse forever, and depend on
+              ;; the Fun so the question is reasked if its callers change.
+              (if (fun-self-recursive? fun)
+                  (do (n-add-dep! fun e) INLINE-DEFER)
+                  (let [fptr (call-fptr c)
+                        ft (n-ty fptr)]
+                    ;; The function pointer must be a CONSTANT, non-empty, singleton set. Anything else
+                    ;; may still sharpen, so depend on it and defer.
+                    (if (not (and (ty-funptr? ft) (ty-funptr-single? ft)))
+                        (do (n-add-dep! fptr e) INLINE-DEFER)
+                        ;; Arguments must match the formals. `call-good-args?` depends on any that do
+                        ;; not yet.
+                        (if (not (call-good-args? c (fun-sig fun) e))
+                            INLINE-DEFER
+                            ;; SIZE. Over the hard cap: never. Under it: trivial when this is the only
+                            ;; caller, otherwise the clone path.
+                            (if (>= (fun-approx-size fun) INLINE-MAX-SIZE)
+                                INLINE-NEVER
+                                (if (>= (fun-live-body-size fun) INLINE-MAX-SIZE)
+                                    (do (n-add-dep! fun e) INLINE-DEFER)
+                                    (if (fun-unknown-callers? fun)
+                                        (do (n-add-dep! fun e) INLINE-DEFER)
+                                        (if (> (n-nins fun) 2) INLINE-CLONE INLINE-TRIVIAL))))))))))))
 
-;; The Fun a Return belongs to. Simple keeps it as the Return's fourth input; ours is the back-link
-;; the Fun holds, walked in reverse.
+;; The Fun a Return belongs to is metadata, not an input edge. Simple likewise keeps `_fun`
+;; separately from input 3, which is the RPC edge cleared during inlining.
 (defn return-fun [(ret (dyn NodeOps))] (-> (Option (dyn NodeOps)))
-  (let [cnt (n-nouts ret)
-        (mut i) 0
-        (mut found) (None [(dyn NodeOps)])]
-    (loop (if (>= (load i) cnt)
-              (break 0)
-              (do
-                (match (n-out ret (load i))
-                  (Some [u] (if (= (n-op u) OP-FUN) (set! (mut found) (Some u)) 0))
-                  (None [] 0))
-                (set! (mut i) (+ (load i) 1))
-                (continue))))
-    (match (load found)
-      (Some [f] (Some f))
-      ;; No output edge: fall back to the Fun that names this Return.
-      (None [] (arena-find-fun-by-ret (n-nid ret))))))
-
-;; Find the Fun whose recorded Return is this nid.
-(defn arena-find-fun-by-ret [(ret-nid i64)] (-> (Option (dyn NodeOps)))
-  (let [cnt (arena-node-count)
-        (mut i) 1
-        (mut found) (None [(dyn NodeOps)])]
-    (loop (if (> (load i) cnt)
-              (break 0)
-              (do
-                (match (arena-node (load i))
-                  (Some [n]
-                        (if (and (= (n-op n) OP-FUN) (not (n-dead? n)))
-                            (match (fun-ret n)
-                              (Some [r] (if (= (n-nid r) ret-nid) (set! (mut found) (Some n)) 0))
-                              (None [] 0))
-                            0))
-                  (None [] 0))
-                (set! (mut i) (+ (load i) 1))
-                (continue))))
-    (load found)))
+  (let [nid (return-fun-nid ret)]
+    (if (= nid 0)
+        (None [(dyn NodeOps)])
+        (match (arena-node nid)
+          (Some [f] (if (= (n-op f) OP-FUN) (Some f) (None [(dyn NodeOps)])))
+          (None [] (None [(dyn NodeOps)]))))))
 
 ;; Does this Fun call itself? Simple walks the Fun's caller inputs looking for one inside the Fun.
 (defn fun-self-recursive? [(f (dyn NodeOps))] (-> bool)
@@ -868,7 +1038,7 @@
     (loop (if (or (>= (load i) cnt) (load yes))
               (break 0)
               (do
-                (match (n-in-safe f (load i))
+                (match (n-in f (load i))
                   (Some [caller]
                         (if (= (n-op caller) OP-CALL)
                             (match (call-cend caller)
@@ -927,6 +1097,7 @@
 ;;     cend.folding = true
 ;;     fun.folding  = true
 ;;     fun.setDef(1, call.ctrl())    ; the Fun's control now BYPASSES the Call
+;;     fun.ret().setDef(3, null)     ; the Return's RPC edge is consumed by the inline
 ;;     re-queue fun, cend, their neighbours, and the Parms' users one layer down
 ;;     invalidate the idepth caches
 ;;
@@ -947,6 +1118,11 @@
     (fun-set-folding! fun true)
     ;; Bypass the Call: the Fun's single caller edge becomes the caller's own control.
     (n-set-def! fun 1 (Some (call-ctrl c)))
+    ;; Clear Return's RPC exactly when the call is folded into its caller. Fun ownership metadata
+    ;; remains intact.
+    (match (fun-ret fun)
+      (Some [ret] (n-set-def! ret RETURN-RPC (None [(dyn NodeOps)])))
+      (None [] 0))
     ;; Re-queue the neighbourhood, and the Parms' users one layer down.
     (code-add! fun)
     (code-add! e)
@@ -968,34 +1144,37 @@
     (invalidate-cfg!)
     0))
 
-;; Decide and ACT. Returns the decision; performs the inline when it is positive.
+;; Decide and ACT. The clone implementation lives in the graph copier, which imports this module;
+;; its boot-installed callback preserves an acyclic module graph while keeping this public contract
+;; complete for direct callers and IterPeeps alike.
 (defn callend-maybe-inline! [(e (dyn NodeOps))] (-> i64)
   (let [d (callend-inline-candidate e)]
     (if (mid-assert?)
         d  ; an expensive assert must not mutate
         (do
           (set! (.decision (primitive/cast (ptr CallEndNode) (hdr e))) d)
-          (if (= d INLINE-TRIVIAL)
+          (if (> d 0)
               (match (n-in e 1)
                 (Some [ret]
                       (match (return-fun ret)
-                        (Some [fun] (callend-do-trivial-inline! e fun))
+                        (Some [fun]
+                              (if (= d INLINE-TRIVIAL)
+                                  (callend-do-trivial-inline! e fun)
+                                  (callend-do-clone-inline-ext! e fun)))
                         (None [] 0)))
                 (None [] 0))
               0)
           d))))
 
-;; --- owed, and NOT stubs ---
-;;
 ;; THE CLONE PATH (`INLINE-CLONE`). When the callee has OTHER callers, a trivial fold would steal the
 ;; body from them. Simple first unlinks the call, copies the body (`fun.copyBody()`), builds a fresh
 ;; FunPtr over the clone with an INLINE-ONLY function index — one never written to an object file —
 ;; relinks the call to the clone, and then runs the SAME trivial inline on it. One mechanism, always;
 ;; cloning is a pre-step, not a second path.
 ;;
-;; It needs a general graph copier, which is also what the serializer and `Fun.copyBody` want, so it
-;; lands with the compilation-unit work rather than being written twice. Until then a multi-caller
-;; function reports INLINE-CLONE and is not inlined — correct, just weaker.
+;; `aot.node.copy` implements that pre-step with the same two-pass copier used by serialization and
+;; registers it here at boot. `callend-maybe-inline!` invokes the callback before returning
+;; INLINE-CLONE; IterPeeps needs no second, secret action and the module graph remains acyclic.
 ;;
 ;; MEMORY THREADING. `CALL-MEM` is a real slot carrying null. When the memory unit lands, a Call
 ;; passes the memory state in and the CallEnd projects the new one out; nothing here renumbers.

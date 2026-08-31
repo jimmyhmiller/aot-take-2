@@ -87,36 +87,375 @@
 ;; TypeScript is unsound — bivariant parameters, `any`, unchecked casts, covariant mutable arrays —
 ;; so nothing here trusts an annotation it has not proven.
 ;;
-;; SCAFFOLD: the algorithm above is final; bodies hard-error. Filled in at S1, extended at S4.
+;; STATUS: the optimistic fixed point, proof analysis, direct-call linking, numeric-mode resolution
+;; and IterPeeps handoff are implemented. Escaping and multi-target linking remain hard errors until
+;; Escape nodes and the compilation-unit function-index registry exist.
 (module aot.codegen.opto)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+(import "coil.arraylist" :use *)
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.arith" :use *)
+(import "aot.node.compare" :use *)
+(import "aot.codegen.iterpeeps" :use *)
+(import "aot.type.type" :use *)
 
 ;; Record every pessimistic type, set all types to TOP, and queue every node.
 (defn opto-reset-to-top! [] (-> i64)
-  (do (unimplemented "opto-reset-to-top!" "S1 — src/codegen/opto.coil") 0))
+  (let [cnt (arena-node-count)
+        (mut i) 1
+        (mut reset) 0]
+    (loop (if (> (load i) cnt)
+              (break 0)
+              (do
+                (match (arena-node (load i))
+                  (Some [n]
+                        (if (n-dead? n)
+                            0
+                            (do
+                              (n-set-pesi-ty! n (n-ty n))
+                              (n-force-ty! n TY-TOP)
+                              (code-add! n)
+                              (set! (mut reset) (+ (load reset) 1)))))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load reset)))
 
 ;; The optimistic fixpoint, with the monotonicity and not-worse-than-pessimistic assertions.
 (defn opto-sccp! [] (-> i64)
-  (do (unimplemented "opto-sccp!" "S1 — src/codegen/opto.coil") 0))
+  (let [(mut changed) 0]
+    (loop (match (code-work-pop!)
+            (None [] (break 0))
+            (Some [id]
+                  (match (arena-node id)
+                    (None [] (continue))
+                    (Some [n]
+                          (if (n-dead? n)
+                              (continue)
+                              (let [old (n-ty n)
+                                    fresh (compute n)]
+                                (if (= old fresh)
+                                    (continue)
+                                    (do
+                                      ;; Optimistic types start at TOP and fall toward the saved
+                                      ;; bottom-up answer, never past it.
+                                      (if (not (ty-isa? old fresh))
+                                          (panic-i "opto-sccp!: non-monotonic optimistic type; op" (n-op n))
+                                          0)
+                                      (if (and (!= (n-pesi-ty n) TY-INVALID)
+                                               (not (ty-isa? fresh (n-pesi-ty n))))
+                                          (panic-i "opto-sccp!: optimistic type fell below pessimistic type; op"
+                                                   (n-op n))
+                                          0)
+                                      (n-force-ty! n fresh)
+                                      (opto--link-node! n old fresh)
+                                      (code-add-outputs! n)
+                                      (n-move-deps-to-worklist! n)
+                                      (set! (mut changed) (+ (load changed) 1))
+                                      (continue))))))))))
+    (load changed)))
+
+;; Is this node's current type established by a closed, stable input cone?  Proof is deliberately
+;; a NODE query, never a type query: the same lattice value can be a settled result in one graph and
+;; a provisional optimistic guess in another.  This computes the greatest fixed point of locally
+;; settled nodes.  Starting live candidates at true is what admits mutually recursive SCCP cycles;
+;; repeated elimination removes any cycle that reaches an unstable or queued producer.
+(defn n-proven? [(target (dyn NodeOps))] (-> bool)
+  (let [a (alloc/malloc-allocator)
+        cnt (arena-node-count)
+        (mut proven) (al-new [bool] a)
+        (mut i) 0]
+    (loop (if (> (load i) cnt)
+              (break 0)
+              (do
+                (push! [bool] (mut proven) false)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (set-mid-assert! true)
+    (set! (mut i) 1)
+    (loop (if (> (load i) cnt)
+              (break 0)
+              (do
+                (match (arena-node (load i))
+                  (Some [n]
+                        (if (or (n-dead? n)
+                                (= (n-ty n) TY-INVALID)
+                                (= (n-ty n) TY-TOP)
+                                (code-on-worklist? (n-nid n))
+                                (!= (compute n) (n-ty n)))
+                            0
+                            (set! (mut proven) (n-nid n) true)))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (let [(mut changed) true]
+      (loop (if (not (load changed))
+                (break 0)
+                (do
+                  (set! (mut changed) false)
+                  (set! (mut i) 1)
+                  (loop (if (> (load i) cnt)
+                            (break 0)
+                            (do
+                              (if (not (get (load proven) (load i)))
+                                  0
+                                  (match (arena-node (load i))
+                                    (Some [n]
+                                          (let [nins (n-nins n)
+                                                (mut j) 0
+                                                (mut ok) true]
+                                            (loop (if (or (>= (load j) nins) (not (load ok)))
+                                                      (break 0)
+                                                      (do
+                                                        (match (n-in n (load j))
+                                                          (Some [input]
+                                                                (if (get (load proven) (n-nid input))
+                                                                    0
+                                                                    (set! (mut ok) false)))
+                                                          ;; Null control/memory/RPC slots are part of
+                                                          ;; several final node shapes and carry no
+                                                          ;; provisional producer.
+                                                          (None [] 0))
+                                                        (set! (mut j) (+ (load j) 1))
+                                                        (continue))))
+                                            (if (load ok)
+                                                0
+                                                (do
+                                                  (set! (mut proven) (load i) false)
+                                                  (set! (mut changed) true)
+                                                  0))))
+                                    (None [] 0)))
+                              (set! (mut i) (+ (load i) 1))
+                              (continue))))
+                  (continue)))))
+    (set-mid-assert! false)
+    (let [answer
+            (if (or (n-dead? target) (> (n-nid target) cnt))
+                false
+                (get (load proven) (n-nid target)))]
+      (al-free! [bool] (mut proven))
+      answer)))
+
+;; Install the concrete call edge represented by a live direct FunPtr.  Multi-target pointers need
+;; the compilation-unit function index; that owner table belongs to the forthcoming compunit unit.
+;; A FunPtr in the current live graph always retains its concrete Fun input, so direct calls are
+;; complete without inventing a second registry.
+(defn opto--link-node! [(n (dyn NodeOps)) (old i64) (fresh i64)] (-> i64)
+  (if (and (= (n-op n) OP-FUNPTR)
+           (ty-funptr? fresh)
+           (ty-funptr-single? fresh))
+      (match (n-in n 0)
+        (Some [fun]
+              (let [cnt (n-nouts n)
+                    (mut i) 0]
+                (loop (if (>= (load i) cnt)
+                          (break 0)
+                          (do
+                            (match (n-out n (load i))
+                              (Some [use]
+                                    (if (and (= (n-op use) OP-CALL)
+                                             (n-same? (call-fptr use) n)
+                                             (not (ty-high? (n-ty use)))
+                                             (not (call-linked? use fun)))
+                                        (call-link! use fun)
+                                        0))
+                              (None [] 0))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                0))
+        (None [] 0))
+      (if (and (= (n-op n) OP-CALL)
+               (ty-high? old)
+               (not (ty-high? fresh)))
+          (let [fp (call-fptr n)]
+            (if (and (ty-funptr? (n-ty fp)) (ty-funptr-single? (n-ty fp)))
+                (match (n-in fp 0)
+                  (Some [fun] (if (call-linked? n fun) 0 (call-link! n fun)))
+                  (None [] 0))
+                0))
+          0)))
 
 ;; Make one virtual call-graph edge concrete: link this call site to the functions its function
 ;; pointer names. Called from inside the fixpoint as types sharpen.
 (defn opto-link-cg! [(c (dyn NodeOps)) (tfp i64)] (-> i64)
-  (do (unimplemented "opto-link-cg!" "S4 — src/codegen/opto.coil") 0))
+  (if (or (not (ty-funptr? tfp)) (not (ty-funptr-single? tfp)))
+      0
+      (let [fp (call-fptr c)]
+        (match (n-in fp 0)
+          (Some [fun] (if (call-linked? c fun) 0 (call-link! c fun)))
+          (None [] 0)))))
 
 ;; An escaping function pointer must be treated as alive and called from Start.
 (defn opto-link-start! [] (-> i64)
   (do (unimplemented "opto-link-start!" "S4 — src/codegen/opto.coil") 0))
 
-;; Move every node whose type changed onto the peephole worklist.
+;; Hand every live node to the peephole phase after SCCP. Output-type equality is not enough to
+;; skip a node: an input can sharpen and enable idealize while the consumer's computed type remains
+;; identical. Final Simple therefore queues the full reachable graph unconditionally.
 (defn opto-move-changes-to-worklist! [] (-> i64)
-  (do (unimplemented "opto-move-changes-to-worklist!" "S1 — src/codegen/opto.coil") 0))
+  (let [cnt (arena-node-count)
+        (mut i) 1
+        (mut moved) 0]
+    (loop (if (> (load i) cnt)
+              (break 0)
+              (do
+                (match (arena-node (load i))
+                  (Some [n]
+                        (if (n-dead? n)
+                            0
+                            (do (code-add! n) (set! (mut moved) (+ (load moved) 1)))))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load moved)))
 
 ;; Resolve a recursive numeric component left at BOTTOM with no arithmetic mode selected.
 (defn opto-resolve-numeric-modes! [] (-> i64)
-  (do (unimplemented "opto-resolve-numeric-modes!" "S1 — src/codegen/opto.coil") 0))
+  (let [cnt (arena-node-count)
+        (mut i) 1
+        (mut resolved) 0]
+    (loop (if (> (load i) cnt)
+              (break 0)
+              (do
+                (match (arena-node (load i))
+                  (Some [n]
+                        (if (or (n-dead? n) (!= (opto--mode n) MODE-UNKNOWN))
+                            0
+                            (let [a (alloc/malloc-allocator)
+                                  (mut seen) (al-new [bool] a)
+                                  (mut j) 0]
+                              (loop (if (> (load j) cnt)
+                                        (break 0)
+                                        (do
+                                          (push! [bool] (mut seen) false)
+                                          (set! (mut j) (+ (load j) 1))
+                                          (continue))))
+                              (let [evidence (opto--numeric-evidence n (mut seen))]
+                                (if (= evidence 0)
+                                    0
+                                    (do
+                                      ;; Bit 2 is float evidence and wins over convertible integer
+                                      ;; evidence, exactly as in Simple.
+                                      (opto--set-mode! n
+                                                       (if (!= (primitive/iand evidence 2) 0)
+                                                           MODE-FLT
+                                                           MODE-INT))
+                                      (code-add! n)
+                                      (set! (mut resolved) (+ (load resolved) 1))))
+                                (al-free! [bool] (mut seen))))))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load resolved)))
+
+;; Numeric-mode virtual dispatch for the node families that carry Simple's one-shot `_mode`.
+;; `-1` means this node has no arithmetic mode and must not be considered a candidate.
+(defn opto--mode [(n (dyn NodeOps))] (-> i64)
+  (let [op (n-op n)]
+    (if (= op OP-ADD)
+        (add-mode n)
+        (if (= op OP-SUB)
+            (sub-mode n)
+            (if (= op OP-MUL)
+                (mul-mode n)
+                (if (= op OP-DIV)
+                    (div-mode n)
+                    (if (= op OP-MINUS)
+                        (minus-mode n)
+                        (if (or (= op OP-EQ) (= op OP-NE) (= op OP-LT) (= op OP-LE))
+                            (cmp-mode n)
+                            -1))))))))
+
+(defn opto--set-mode! [(n (dyn NodeOps)) (mode i64)] (-> i64)
+  (let [op (n-op n)]
+    (if (= op OP-ADD)
+        (add-set-mode! n mode)
+        (if (= op OP-SUB)
+            (sub-set-mode! n mode)
+            (if (= op OP-MUL)
+                (mul-set-mode! n mode)
+                (if (= op OP-DIV)
+                    (div-set-mode! n mode)
+                    (if (= op OP-MINUS)
+                        (minus-set-mode! n mode)
+                        (if (or (= op OP-EQ) (= op OP-NE) (= op OP-LT) (= op OP-LE))
+                            (cmp-set-mode! n mode)
+                            0))))))))
+
+;; Gather evidence through precisely the recursive node shapes Simple permits.  The visited bitmap
+;; makes self- and mutually-recursive Phi/Return/CallEnd components finite.
+(defn opto--numeric-evidence [(n (dyn NodeOps)) (seen (mut (ArrayList bool)))] (-> i64)
+  (if (or (n-dead? n) (get (load seen) (n-nid n)))
+      0
+      (do
+        (set! (mut seen) (n-nid n) true)
+        (let [t (n-ty n)]
+          (if (ty-flt? t)
+              2
+              (if (ty-int? t)
+                  1
+                  (let [op (n-op n)
+                        own (opto--mode n)]
+                    (if (> own 0)
+                        own
+                        (if (and (= op OP-PROJ)
+                                 (= (proj-idx n) RETURN-VALUE)
+                                 (match (n-in n 0)
+                                   (Some [multi] (= (n-op multi) OP-CALLEND))
+                                   (None [] false)))
+                            ;; A result projection has no data inputs of its own. Its evidence is in
+                            ;; each Return linked to the CallEnd it projects.
+                            (match (n-in n 0)
+                              (Some [cend]
+                                    (let [cnt (n-nins cend)
+                                          (mut i) 1
+                                          (mut evidence) 0]
+                                      (loop (if (>= (load i) cnt)
+                                                (break 0)
+                                                (do
+                                                  (match (n-in cend (load i))
+                                                    (Some [ret]
+                                                          (set! (mut evidence)
+                                                                (primitive/ior (load evidence)
+                                                                               (opto--numeric-evidence ret
+                                                                                                       (mut seen)))))
+                                                    (None [] 0))
+                                                  (set! (mut i) (+ (load i) 1))
+                                                  (continue))))
+                                      (load evidence)))
+                              (None [] 0))
+                            (if (or (= op OP-PHI)
+                                    (= op OP-PARM)
+                                    (= op OP-RETURN)
+                                    (= op OP-CALLEND)
+                                    (>= own 0))
+                                (let [cnt (n-nins n)
+                                      (mut i) 1
+                                      (mut evidence) 0]
+                                  (loop (if (>= (load i) cnt)
+                                            (break 0)
+                                            (do
+                                              (match (n-in n (load i))
+                                                (Some [input]
+                                                      (set! (mut evidence)
+                                                            (primitive/ior (load evidence)
+                                                                           (opto--numeric-evidence input (mut seen)))))
+                                                (None [] 0))
+                                              (set! (mut i) (+ (load i) 1))
+                                              (continue))))
+                                  (load evidence))
+                                0))))))))))
 
 ;; The whole pass: reset, sccp, move changes, resolve modes, re-peephole.
 (defn opto-run! [] (-> i64)
-  (do (unimplemented "opto-run!" "S1 — src/codegen/opto.coil") 0))
+  (do
+    (opto-reset-to-top!)
+    (let [changed (opto-sccp!)]
+      (opto-move-changes-to-worklist!)
+      (opto-resolve-numeric-modes!)
+      (iter-run!)
+      changed)))

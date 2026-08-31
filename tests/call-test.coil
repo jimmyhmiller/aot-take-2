@@ -1,11 +1,13 @@
 ;; Functions, calls, and inlining.
 
 ;;
-;; The claim this file exists to prove: INLINING IS NOT A PASS. It is two ordinary peepholes —
-;; Region-collapses-to-one-path and Phi-becomes-its-single-input — firing because a Fun IS a Region
-;; and a Parm IS a Phi. Nothing is cloned.
+;; The claim this file exists to prove: INLINING IS NOT A PASS. The final fold is two ordinary
+;; peepholes — Region-collapses-to-one-path and Phi-becomes-its-single-input — because a Fun IS a
+;; Region and a Parm IS a Phi. A shared body is cloned only as the pre-step that makes it private.
 (module aot.tests.call)
 (import "coil.assert" :use *)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
 (import "aot.node.boot" :use *)
 (import "aot.node.node" :use *)
 (import "aot.node.constant" :use *)
@@ -13,10 +15,12 @@
 (import "aot.node.control" :use *)
 (import "aot.node.phi" :use *)
 (import "aot.node.call" :use *)
+(import "aot.node.copy" :use *)
 (import "aot.node.cfg" :use *)
 (import "aot.codegen.iterpeeps" :use *)
 (import "aot.tests.support" :use *)
 (import "aot.type.type" :use *)
+(import "aot.verify" :use *)
 
 ;; A one-argument function `f(x) = x + 1`, with the unknown-caller hook still installed.
 ;; Returns the Fun.
@@ -26,9 +30,52 @@
         p (parm-make f 0 (ty-int-bot) "x")]
     (n-keep! p)
     (let [body (add-make p (con-int 1))
-          ret (return-make f body)]
+          ret (return-make f (None [(dyn NodeOps)]) body (None [(dyn NodeOps)]) (Some f))]
       (fun-set-ret! f ret)
       f)))
+
+(defn call-test--selection-count [(selected (slice bool))] (-> i64)
+  (let [(mut i) 1
+        (mut count) 0]
+    (loop (if (>= (load i) (len selected))
+              (break 0)
+              (do
+                (if (get selected (load i)) (set! (mut count) (+ (load count) 1)) 0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load count)))
+
+(deftest signatures_sharpen_at_arbitrary_arity
+         (let [a (alloc/malloc-allocator)
+               (mut members) (al-new [i64] a)]
+           (push! [i64] (mut members) (ty-int-bot))
+           (push! [i64] (mut members) (ty-int-con 1))
+           (push! [i64] (mut members) (ty-int-con 2))
+           (push! [i64] (mut members) (ty-int-con 3))
+           (push! [i64] (mut members) (ty-int-con 4))
+           (let [sig (ty-tuple (al-slice (load members)))
+                 sharpened (fun--sig-with-ret sig (ty-int-con 99))]
+             (assert-eq (ty-tuple-len sharpened) 5)
+             (assert-eq (ty-sig-ret sharpened) (ty-int-con 99))
+             (assert-eq (ty-sig-arg sharpened 3) (ty-int-con 4)))
+           (al-free! [i64] (mut members))))
+
+(deftest funptr_recomputes_when_its_function_signature_sharpens
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               old-sig (ty-tuple-of2 (ty-int-bot) (ty-int-bot))
+               new-sig (ty-tuple-of2 (ty-int-con 7) (ty-int-bot))
+               fun (fun-make st old-sig "sharpens")
+               fptr (funptr-make fun 41)]
+           ;; IterPeeps correctly collects unused live nodes.  Hold the value whose refreshed type
+           ;; this test observes; without a keep, the assertion is reading a deliberately killed
+           ;; node and becomes dependent on random worklist order.
+           (n-keep! fptr)
+           (assert-eq (ty-funptr-sig (n-ty fptr)) old-sig)
+           (fun-set-sig! fun new-sig)
+           (assert (code-on-worklist? (n-nid fptr)))
+           (iter-peeps!)
+           (assert-eq (ty-funptr-sig (n-ty fptr)) new-sig)))
 
 (deftest a_fun_with_unknown_callers_reports_CONTROL
          ;; While anyone might call it, a function is reachable and its parameters can be anything the
@@ -74,15 +121,17 @@
                call (call-make c)]
            (call-add-arg! call (con-int 10))
            (call-set-fptr! call (funptr-make f 0))
-           (callend-make call)
-           (let [before-fun (n-nins f)
-                 p (match (fun-parm f 0) (Some [x] x) (None [] (unreachable-node)))
-                 before-parm (n-nins p)]
-             (call-link! call f)
-             (assert-eq (n-nins f) (+ before-fun 1))
-             (assert-eq (n-nins p) (+ before-parm 1))
-             ;; And the value that arrived is the caller's actual argument.
-             (assert-eq (n-ty (n-in! p (- (n-nins p) 1))) (ty-int-con 10)))))
+           (let [e (callend-make call)]
+             (assert (not (code-on-worklist? (n-nid e))))
+             (let [before-fun (n-nins f)
+                   p (match (fun-parm f 0) (Some [x] x) (None [] (unreachable-node)))
+                   before-parm (n-nins p)]
+               (call-link! call f)
+               (assert (code-on-worklist? (n-nid e)))
+               (assert-eq (n-nins f) (+ before-fun 1))
+               (assert-eq (n-nins p) (+ before-parm 1))
+               ;; And the value that arrived is the caller's actual argument.
+               (assert-eq (n-ty (n-in! p (- (n-nins p) 1))) (ty-int-con 10))))))
 
 (deftest dropping_the_unknown_caller_hook_sharpens_every_parm
          ;; >>> THE CLOSED-WORLD MOVE. Once the complete set of callers is known, the hook goes and a
@@ -147,6 +196,29 @@
              (fun-drop-unknown-callers! f)
              (assert-eq (callend-inline-candidate e) INLINE-TRIVIAL))))
 
+(deftest a_noInline_suffix_permanently_refuses_inlining
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               sig (ty-tuple-of2 (ty-int-bot) (ty-int-bot))
+               f (fun-make st sig "fixture_noInline")
+               p (parm-make f 0 (ty-int-bot) "x")]
+           (n-keep! p)
+           (let [ret
+                   (return-make f
+                                (None [(dyn NodeOps)])
+                                p
+                                (None [(dyn NodeOps)])
+                                (Some f))
+                 call-node (call-make (cproj-make st 0 "ctrl"))]
+             (fun-set-ret! f ret)
+             (call-add-arg! call-node (con-int 3))
+             (call-set-fptr! call-node (funptr-make f 89))
+             (let [end (callend-make call-node)]
+               (call-link! call-node f)
+               (fun-drop-unknown-callers! f)
+               (assert (fun-no-inline? f))
+               (assert-eq (callend-inline-candidate end) INLINE-NEVER)))))
+
 (deftest an_argument_that_does_not_match_its_formal_defers
          ;; And registers a dependency, so the candidate is retried when the argument sharpens.
          (boot! 1)
@@ -155,7 +227,7 @@
                f (fun-make st sig "narrow")
                p (parm-make f 0 (ty-int-range 0 5) "x")]
            (n-keep! p)
-           (let [ret (return-make f p)]
+           (let [ret (return-make f (None [(dyn NodeOps)]) p (None [(dyn NodeOps)]) (Some f))]
              (fun-set-ret! f ret)
              (let [c (cproj-make st 0 "ctrl")
                    call (call-make c)]
@@ -167,8 +239,7 @@
                  (assert-eq (callend-inline-candidate e) INLINE-DEFER))))))
 
 (deftest a_function_with_several_callers_takes_the_clone_path
-         ;; A trivial fold would steal the body from the other callers, so the decision is CLONE — which is
-         ;; owed, so nothing is inlined. Correct, just weaker.
+         ;; A trivial fold would steal the body from the other callers, so the decision is CLONE.
          (boot! 1)
          (let [st (start-make (ty-int-bot))
                f (mk-inc-fun st)
@@ -187,6 +258,313 @@
              (fun-drop-unknown-callers! f)
              (assert-eq (callend-inline-candidate e1) INLINE-CLONE))))
 
+(deftest the_inline_size_cap_uses_the_function_construction_span
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               sig (ty-tuple-of2 (ty-int-bot) (ty-int-bot))
+               f (fun-make st sig "large")
+               p (parm-make f 0 (ty-int-bot) "x")
+               (mut body) (Some p)
+               (mut i) 0]
+           (n-keep! p)
+           (loop (if (>= (load i) INLINE-MAX-SIZE)
+                     (break 0)
+                     (do
+                       (set! (mut body)
+                             (Some (add-make (match (load body)
+                                               (Some [node] node)
+                                               (None [] (unreachable-node)))
+                                             (con-int 1))))
+                       (set! (mut i) (+ (load i) 1))
+                       (continue))))
+           (let [ret
+                   (return-make f
+                                (None [(dyn NodeOps)])
+                                (match (load body) (Some [node] node) (None [] (unreachable-node)))
+                                (None [(dyn NodeOps)])
+                                (Some f))]
+             (fun-set-ret! f ret)
+             (assert (>= (fun-approx-size f) INLINE-MAX-SIZE))
+             (let [call-node (call-make (cproj-make st 0 "ctrl"))]
+               (call-add-arg! call-node (con-int 3))
+               (call-set-fptr! call-node (funptr-make f 82))
+               (let [end (callend-make call-node)]
+                 (call-link! call-node f)
+                 (fun-drop-unknown-callers! f)
+                 (assert-eq (callend-inline-candidate end) INLINE-NEVER))))))
+
+(deftest the_inline_size_cap_recounts_optimizer_created_body_growth
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               sig (ty-tuple-of2 (ty-int-bot) (ty-int-bot))
+               f (fun-make st sig "grown")
+               p (parm-make f 0 (ty-int-bot) "x")
+               ret
+                 (return-make f
+                              (None [(dyn NodeOps)])
+                              p
+                              (None [(dyn NodeOps)])
+                              (Some f))]
+           (n-keep! p)
+           (fun-set-ret! f ret)
+           (assert (< (fun-approx-size f) INLINE-MAX-SIZE))
+           ;; Model optimizer-created growth after the parser construction window has closed.
+           (let [(mut body) (Some p)
+                 (mut i) 0]
+             (loop (if (>= (load i) INLINE-MAX-SIZE)
+                       (break 0)
+                       (do
+                         (set! (mut body)
+                               (Some (add-make (match (load body)
+                                                 (Some [node] node)
+                                                 (None [] (unreachable-node)))
+                                               (con-int 1))))
+                         (set! (mut i) (+ (load i) 1))
+                         (continue))))
+             (n-set-def! ret RETURN-VALUE (load body)))
+           (assert (>= (fun-live-body-size f) INLINE-MAX-SIZE))
+           (let [call-node (call-make (cproj-make st 0 "grown.ctrl"))]
+             (call-add-arg! call-node (con-int 3))
+             (call-set-fptr! call-node (funptr-make f 88))
+             (let [end (callend-make call-node)]
+               (call-link! call-node f)
+               (fun-drop-unknown-callers! f)
+               (assert-eq (callend-inline-candidate end) INLINE-DEFER)))))
+
+(deftest clone_inlining_retargets_one_caller_and_preserves_the_shared_body
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               f (mk-inc-fun st)
+               call1 (call-make (cproj-make st 0 "c1"))
+               call2 (call-make (fresh-ctrl (cproj-make st 0 "c0")))]
+           (call-add-arg! call1 (con-int 10))
+           (let [old-fptr (funptr-make f 81)]
+             (call-set-fptr! call1 old-fptr)
+             (let [old-fidx (ty-funptr-the-fidx (n-ty old-fptr))
+                   e1 (callend-make call1)]
+               (call-add-arg! call2 (con-int 20))
+               (call-set-fptr! call2 (funptr-make f 81))
+               (callend-make call2)
+               (call-link! call1 f)
+               (call-link! call2 f)
+               (fun-drop-unknown-callers! f)
+               (assert-eq (callend-inline-candidate e1) INLINE-CLONE)
+               (assert-eq (callend-maybe-inline! e1) INLINE-CLONE)
+               (let [fresh-fptr (call-fptr call1)
+                     fresh (n-in! fresh-fptr 0)]
+                 (assert (not (n-same? fresh f)))
+                 (assert (not (fun-folding? f)))
+                 (assert (fun-folding? fresh))
+                 (assert (call-linked? call2 f))
+                 (assert (not (call-linked? call1 f)))
+                 (assert-ne (ty-funptr-the-fidx (n-ty fresh-fptr))
+                            old-fidx))))))
+
+(deftest function_body_selection_stops_at_caller_arguments
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               f (mk-inc-fun st)
+               producer-fun (mk-inc-fun st)
+               producer (call-make (cproj-make st 0 "producer.ctrl"))
+               caller (call-make (fresh-ctrl (cproj-make st 0 "caller.ctrl")))]
+           (call-add-arg! producer (con-int 41))
+           (call-set-fptr! producer (funptr-make producer-fun 84))
+           (let [producer-end (callend-make producer)]
+             (call-link! producer producer-fun)
+             (fun-drop-unknown-callers! producer-fun)
+             (let [external-value (proj-make producer-end RETURN-VALUE "producer.value")]
+               (call-add-arg! caller external-value)
+               (call-set-fptr! caller (funptr-make f 83))
+               (callend-make caller)
+               (call-link! caller f)
+               (fun-drop-unknown-callers! f)
+               (let [(mut selected) (fun-body-selection f)]
+                 (assert (get (al-slice (load selected)) (n-nid f)))
+                 (assert (not (get (al-slice (load selected)) (n-nid external-value))))
+                 (assert (not (get (al-slice (load selected)) (n-nid producer-end))))
+                 (assert (not (get (al-slice (load selected)) (n-nid producer)))))))))
+
+(deftest body_copy_preserves_both_halves_of_an_internal_call_to_an_external_target
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               target (mk-inc-fun st)
+               sig (ty-tuple-of2 (ty-int-bot) (ty-int-bot))
+               outer (fun-make st sig "outer")
+               p (parm-make outer 0 (ty-int-bot) "x")
+               inner (call-make outer)]
+           (n-keep! p)
+           (call-add-arg! inner p)
+           (call-set-fptr! inner (funptr-make target 85))
+           (let [inner-end (callend-make inner)]
+             (call-link! inner target)
+             (fun-drop-unknown-callers! target)
+             (assert (not (cend-folding? inner-end)))
+             (let [inner-ctrl (cproj-make inner-end RETURN-CTRL "inner.ctrl")
+                   value (proj-make inner-end RETURN-VALUE "inner.value")
+                   ret
+                     (return-make inner-ctrl
+                                  (None [(dyn NodeOps)])
+                                  value
+                                  (None [(dyn NodeOps)])
+                                  (Some outer))]
+               (fun-set-ret! outer ret)
+               (let [fresh (fun-copy-body! outer)
+                     fresh-ret (match (fun-ret fresh) (Some [r] r) (None [] (unreachable-node)))
+                     fresh-value (n-in! fresh-ret RETURN-VALUE)
+                     fresh-end (n-in! fresh-value 0)
+                     fresh-call (n-in! fresh-end 0)
+                     target-ret (match (fun-ret target) (Some [r] r) (None [] (unreachable-node)))]
+                 (assert (not (n-same? fresh-call inner)))
+                 (assert (n-same? (n-in! fresh-end 1) target-ret))
+                 (assert (call-linked? fresh-call target))
+                 (assert (call-linked? inner target))
+                 (assert (n-same? (n-in! inner-end 1) target-ret))
+                 (assert-eq (verify-all) VERR-OK))))))
+
+(deftest function_body_selection_keeps_a_captured_external_producer_shared
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               producer-fun (mk-inc-fun st)
+               producer (call-make (cproj-make st 0 "captured.ctrl"))]
+           (call-add-arg! producer (con-int 9))
+           (call-set-fptr! producer (funptr-make producer-fun 86))
+           (let [producer-end (callend-make producer)]
+             (call-link! producer producer-fun)
+             (fun-drop-unknown-callers! producer-fun)
+             (let [captured (proj-make producer-end RETURN-VALUE "captured.value")
+                   sig (ty-tuple-of2 (ty-int-bot) (ty-int-bot))
+                   f (fun-make st sig "captures")
+                   p (parm-make f 0 (ty-int-bot) "unused")]
+               (n-keep! p)
+               (let [ret
+                       (return-make f
+                                    (None [(dyn NodeOps)])
+                                    captured
+                                    (None [(dyn NodeOps)])
+                                    (Some f))]
+                 (fun-set-ret! f ret)
+                 (let [(mut selected) (fun-body-selection f)]
+                   (assert (get (al-slice (load selected)) (n-nid f)))
+                   (assert (get (al-slice (load selected)) (n-nid ret)))
+                   (assert (not (get (al-slice (load selected)) (n-nid captured))))
+                   (assert (not (get (al-slice (load selected)) (n-nid producer-end))))
+                   (assert (not (get (al-slice (load selected)) (n-nid producer))))))))))
+
+(deftest body_copy_retains_a_body_local_recursive_caller_pair
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               sig (ty-tuple-of2 (ty-int-bot) (ty-int-bot))
+               f (fun-make st sig "recursive-copy")
+               p (parm-make f 0 (ty-int-bot) "x")
+               self-call (call-make f)
+               self-fptr (funptr-make f 87)]
+           (n-keep! p)
+           (call-add-arg! self-call p)
+           (call-set-fptr! self-call self-fptr)
+           (let [self-end (callend-make self-call)
+                 self-ctrl (cproj-make self-end RETURN-CTRL "self.ctrl")
+                 ret
+                   (return-make self-ctrl
+                                (None [(dyn NodeOps)])
+                                p
+                                (None [(dyn NodeOps)])
+                                (Some f))]
+             (fun-set-ret! f ret)
+             (call-link! self-call f)
+             (fun-drop-unknown-callers! f)
+             (let [fresh (fun-copy-body! f)
+                   fresh-call (n-in! fresh 1)
+                   fresh-end
+                     (match (call-cend fresh-call)
+                       (Some [e] e)
+                       (None [] (unreachable-node)))
+                   fresh-ret (match (fun-ret fresh) (Some [r] r) (None [] (unreachable-node)))]
+               (assert (not (n-same? fresh-call self-call)))
+               (assert (not (n-same? (call-fptr fresh-call) self-fptr)))
+               (assert (n-same? (n-in! (call-fptr fresh-call) 0) fresh))
+               (assert (call-linked? fresh-call fresh))
+               (assert (n-same? (n-in! fresh-end 1) fresh-ret))
+               (assert (call-linked? self-call f))
+               (assert (n-same? (n-in! self-end 1) ret))
+               (assert-eq (verify-all) VERR-OK)))))
+
+(deftest external_caller_function_pointers_are_not_function_body_nodes
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               f (mk-inc-fun st)
+               external-fptr (funptr-make f 91)
+               before (fun-live-body-size f)
+               (mut selected) (fun-body-selection f)]
+           (assert (not (get (al-slice (load selected)) (n-nid external-fptr))))
+           (assert-eq (call-test--selection-count (al-slice (load selected))) before)
+           (assert-eq (fun-live-body-size f) before)))
+
+(deftest sparse_and_dense_body_discovery_agree_on_a_loop_phi_cycle
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               sig (ty-tuple-of2 (ty-int-bot) (ty-int-bot))
+               f (fun-make st sig "loop-body")
+               p (parm-make f 0 (ty-int-bot) "x")
+               loop-node (loop-make f)
+               phi (phi-make loop-node (ty-int-bot) "i")
+               step (add-make phi (con-int 1))]
+           (n-keep! p)
+           (n-add-def! phi (Some p))
+           (n-add-def! phi (Some step))
+           (loop-close! loop-node loop-node)
+           (let [ret
+                   (return-make loop-node
+                                (None [(dyn NodeOps)])
+                                phi
+                                (None [(dyn NodeOps)])
+                                (Some f))]
+             (fun-set-ret! f ret)
+             (let [(mut selected) (fun-body-selection f)]
+               (assert (get (al-slice (load selected)) (n-nid loop-node)))
+               (assert (get (al-slice (load selected)) (n-nid phi)))
+               (assert (get (al-slice (load selected)) (n-nid step)))
+               (assert-eq (fun-live-body-size f)
+                          (call-test--selection-count (al-slice (load selected))))))))
+
+(deftest body_copy_treats_a_folding_call_as_data_and_does_not_relink_it
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               target (mk-inc-fun st)
+               sig (ty-tuple-of2 (ty-int-bot) (ty-int-bot))
+               f (fun-make st sig "folding-call-copy")
+               p (parm-make f 0 (ty-int-bot) "x")
+               call-node (call-make f)]
+           (n-keep! p)
+           (call-add-arg! call-node p)
+           (call-set-fptr! call-node (funptr-make target 90))
+           (let [end (callend-make call-node)]
+             (call-link! call-node target)
+             (fun-drop-unknown-callers! target)
+             (cend-set-folding! end true)
+             (let [value (proj-make end RETURN-VALUE "folding.value")
+                   ret
+                     (return-make f
+                                  (None [(dyn NodeOps)])
+                                  value
+                                  (None [(dyn NodeOps)])
+                                  (Some f))]
+               (fun-set-ret! f ret)
+               (let [(mut selected) (fun-body-selection f)]
+                 (assert (get (al-slice (load selected)) (n-nid call-node)))
+                 (assert (get (al-slice (load selected)) (n-nid end)))
+                 (assert (not (get (al-slice (load selected)) (n-nid target)))))
+               (let [fresh (fun-copy-body! f)
+                     fresh-ret (match (fun-ret fresh) (Some [r] r) (None [] (unreachable-node)))
+                     fresh-value (n-in! fresh-ret RETURN-VALUE)
+                     fresh-end (n-in! fresh-value 0)
+                     fresh-call (n-in! fresh-end 0)
+                     target-ret (match (fun-ret target) (Some [r] r) (None [] (unreachable-node)))]
+                 (assert (cend-folding? fresh-end))
+                 (assert (not (call-linked? fresh-call target)))
+                 (assert (n-same? (n-in! fresh-end 1) target-ret))
+                 (assert (call-linked? call-node target))
+                 (assert-eq (verify-all) VERR-OK))))))
+
 ;; ---------------------------------------------------------------------------
 ;; THE POINT OF THE WHOLE UNIT
 (deftest trivial_inlining_folds_the_call_away_and_clones_nothing
@@ -204,7 +582,7 @@
              (fun-drop-unknown-callers! f)
              (let [p (match (fun-parm f 0) (Some [x] x) (None [] (unreachable-node)))
                    nodes-before (arena-node-count)]
-               ;; Perform the inline. It sets two flags and rewires ONE edge; that is the whole operation.
+               ;; Perform the inline. It sets two flags, bypasses Call control, and clears Return RPC.
                (assert-eq (callend-maybe-inline! e) INLINE-TRIVIAL)
                (assert (fun-folding? f))
                ;; >>> ARGUMENT SUBSTITUTION IS PHI RULE 1. <<<
@@ -240,16 +618,26 @@
            (let [e (callend-make call)]
              (call-link! call f)
              (fun-drop-unknown-callers! f)
+             (let [before (compute-ty-of e)
+                   ret (match (n-in e 1) (Some [r] r) (None [] (unreachable-node)))
+                   rt (n-ty ret)]
+               (assert-eq (ty-tuple-at before RETURN-CTRL) (ty-tuple-at rt RETURN-CTRL))
+               (assert-eq (ty-tuple-at before RETURN-MEM) (ty-tuple-at rt RETURN-MEM))
+               (assert-eq (ty-tuple-at before RETURN-VALUE) (ty-tuple-at rt RETURN-VALUE)))
              (assert-eq (callend-maybe-inline! e) INLINE-TRIVIAL)
+             (let [ret (match (n-in e 1) (Some [r] r) (None [] (unreachable-node)))]
+               (match (n-in-safe ret RETURN-RPC)
+                 (Some [_] (assert false))
+                 (None [] (assert true))))
              ;; Create the projections AFTER folding has begun.  Eager rewiring at inline time
              ;; cannot make these pass; projection idealization through MultiNode.pcopy can.
              (let [ret (match (n-in e 1) (Some [r] r) (None [] (unreachable-node)))
                    cp (cproj-make e 0 "call.ctrl")
-                   vp (proj-make e 1 "call.result")
+                   vp (proj-make e RETURN-VALUE "call.result")
                    forwarded-ctrl (n-peephole! cp)
                    forwarded-value (n-peephole! vp)]
-               (assert (n-same? forwarded-ctrl (n-in! ret 0)))
-               (assert (n-same? forwarded-value (n-in! ret 1)))))))
+               (assert (n-same? forwarded-ctrl (n-in! ret RETURN-CTRL)))
+               (assert (n-same? forwarded-value (n-in! ret RETURN-VALUE)))))))
 
 (deftest the_fixpoint_drives_inlining_without_being_told
          ;; `iter-peeps!` pushes every CallEnd it visits onto the inline worklist, and the outer loop
@@ -271,6 +659,29 @@
              (assert (>= (iter-run!) 1))
              (assert (fun-folding? f)))))
 
+(deftest the_fixpoint_executes_clone_then_recleans_before_the_next_inline
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               f (mk-inc-fun st)
+               call1 (call-make (cproj-make st 0 "c1"))
+               call2 (call-make (fresh-ctrl (cproj-make st 0 "c0")))]
+           (call-add-arg! call1 (con-int 10))
+           (call-set-fptr! call1 (funptr-make f 91))
+           (let [e1 (callend-make call1)]
+             (call-add-arg! call2 (con-int 20))
+             (call-set-fptr! call2 (funptr-make f 91))
+             (let [e2 (callend-make call2)]
+               (n-keep! e1)
+               (n-keep! e2)
+               (call-link! call1 f)
+               (call-link! call2 f)
+               (fun-drop-unknown-callers! f)
+               (iter-seed-all!)
+               ;; First round clones one caller; cleanup runs; the remaining single caller then
+               ;; takes the ordinary trivial path in a later round.
+               (assert (>= (iter-run!) 2))
+               (assert (fun-folding? f))))))
+
 (deftest a_self_recursive_function_is_never_inlined
          ;; Inlining a function into itself is LOOP UNROLLING by another name, and unbounded. Simple
          ;; refuses it — but DEFERS rather than declining, because the recursive edge might yet disappear.
@@ -288,7 +699,7 @@
              (call-set-fptr! inner (funptr-make f 0))
              (let [ie (callend-make inner)]
                (n-keep! ie)
-               (let [ret (return-make f p)]
+               (let [ret (return-make f (None [(dyn NodeOps)]) p (None [(dyn NodeOps)]) (Some f))]
                  (fun-set-ret! f ret)
                  (call-link! inner f)
                  (fun-drop-unknown-callers! f)
@@ -296,3 +707,64 @@
                  (assert (fun-self-recursive? f))
                  ;; So the decision is DEFER — not NEVER, because the edge could still go away.
                  (assert-eq (callend-inline-candidate ie) INLINE-DEFER))))))
+
+(deftest a_high_call_result_projection_stays_attached_for_late_linking
+         ;; During optimistic SCCP an unresolved CallEnd is temporarily all-HIGH. Final Simple keeps
+         ;; its result Proj attached: later Return discovery must be able to sharpen this same node.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               c (call-make (cproj-make st 0 "ctrl"))]
+           (call-set-fptr! c (con-make TY-TOP))
+           (let [e (callend-make c)
+                 result (proj-make e RETURN-VALUE "late.result")]
+             (assert (ty-high? (compute result)))
+             (assert (match (n-peephole-opt! result)
+                       (Some [replacement] (n-same? replacement result))
+                       (None [] true)))
+             (assert (not (n-dead? result)))
+             (assert (n-same? (n-in! result 0) e)))))
+
+(deftest a_folding_callend_is_dominated_by_its_linked_return
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               fun (mk-inc-fun st)
+               call (call-make st)]
+           (call-add-arg! call (con-int 4))
+           (call-set-fptr! call (funptr-make fun 103))
+           (let [end (callend-make call)]
+             (call-link! call fun)
+             (assert (match (cfg-idom-of end)
+                       (Some [dom] (n-same? dom call))
+                       (None [] false)))
+             (cend-set-folding! end true)
+             (assert (match (cfg-idom-of end)
+                       (Some [dom]
+                             (match (fun-ret fun)
+                               (Some [ret] (n-same? dom ret))
+                               (None [] false)))
+                       (None [] false))))))
+
+(deftest null_memory_calls_remain_distinct_gvn_sites
+         ;; Before memory SSA, two calls can have identical visible operands but still denote two
+         ;; executions and own different CallEnds. They must not GVN together on their null memory.
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               fun (mk-inc-fun st)
+               fp (funptr-make fun 107)
+               arg (con-int 5)
+               first (call-make st)
+               second (call-make st)]
+           (call-add-arg! first arg)
+           (call-set-fptr! first fp)
+           (call-add-arg! second arg)
+           (call-set-fptr! second fp)
+           (let [first-end (callend-make first)
+                 second-end (callend-make second)]
+             (assert (not (n-gvn-eq? first second)))
+             (assert-ne (n-gvn-hash first) (n-gvn-hash second))
+             (assert (match (call-cend first)
+                       (Some [end] (n-same? end first-end))
+                       (None [] false)))
+             (assert (match (call-cend second)
+                       (Some [end] (n-same? end second-end))
+                       (None [] false))))))

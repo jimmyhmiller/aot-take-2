@@ -77,10 +77,9 @@
 ;; Simple creates a Phi only when a variable is actually assigned on more than one path; until then
 ;; the scope slot points at the enclosing scope. That machinery lives in `aot.node.scope`, because
 ;; ============================================================================
-;; STATUS: implemented. Rules 0-2 and the single-unique-input collapse are live and tested.
-;; The same-op pull-down (rule 3) and the null-check merges (rule 4) are recorded below as owed —
-;; they need MemOp and Guard/Cast, which belong to the memory and dynamic units. They are
-;; OPTIMISATIONS: their absence makes weaker code, never wrong code.
+;; STATUS: implemented for every live scalar node: rules 0-3 and the structural
+;; zero/truthy-Cast form of rule 4 are tested. Memory alias/clobber guards and the alternate
+;; dominance-walk null merge land with MemOp and full scope SSA respectively.
 ;; ============================================================================
 (module aot.node.phi)
 (import "coil.primitive" :as primitive)
@@ -89,6 +88,7 @@
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
 (import "aot.node.control" :use *)
+(import "aot.node.dynamic" :use *)
 (import "aot.type.type" :use *)
 
 ;; Input 0 is the Region or Loop. Inputs 1..n are the values, ONE PER PATH, positionally matched to
@@ -102,6 +102,28 @@
   (if (and (!= (n-op p) OP-PHI) (!= (n-op p) OP-MEMPHI))
       (do (panic "phi-declared-ty: not a Phi") TY-BOT)
       (.declared (primitive/cast (ptr PhiNode) (hdr p)))))
+
+;; A Phi's construction window is independent of its Region's. The parser normally fills the
+;; final Simple closes the Loop control edge before immediately filling Phi backedges. Treating only
+;; Region openness as construction state would expose that interval, so Simple also treats a null
+;; final Phi input as in progress.
+(defn phi-in-progress? [(p (dyn NodeOps))] (-> bool)
+  (let [r (phi-region p)]
+    (or (and (or (= (n-op r) OP-REGION) (= (n-op r) OP-LOOP)) (region-in-progress? r))
+        (match (n-in p (- (n-nins p) 1)) (Some [_] false) (None [] true)))))
+
+;; Simple's loop-Phi termination rule. A falling nonconstant integer range gets three progressively
+;; wider identities; on the fourth fall it jumps to the parser-declared bound. Arithmetic carries
+;; the widen stage, so a backedge cannot accidentally reset the countdown.
+(defn phi--maybe-widen [(p (dyn NodeOps)) (r (dyn NodeOps)) (newt i64)] (-> i64)
+  (let [old (n-ty p)]
+    (if (and (= (n-op r) OP-LOOP)
+             (and (ty-int? newt)
+                  (and (!= newt old)
+                       (and (not (ty-constant? newt))
+                            (or (= old TY-INVALID) (not (ty-int? old)) (<= (ty-int-widen newt) (ty-int-widen old)))))))
+        (ty-int-slightly-wider-than newt (phi-declared-ty p))
+        newt)))
 
 ;; Simple's three cases:
 ;;
@@ -119,13 +141,13 @@
 ;;   It calls `n-add-dep!` on each Region input consulted. If a control path later dies, this Phi is
 ;;   re-queued. Without that dependency the Phi keeps a stale meet forever.
 (defn phi-compute [(p (dyn NodeOps))] (-> i64)
-  (match (n-in-safe p 0)
+  (match (n-in p 0)
     (None [] TY-TOP)
     (Some [r]
           (if (or (= (n-ty r) TY-XCTRL) (= (n-ty r) TY-TOP))
               TY-TOP
               (if (or (not (or (= (n-op r) OP-REGION) (= (n-op r) OP-LOOP)))
-                      (region-in-progress? r))
+                      (phi-in-progress? p))
                   ;; In progress: report the DECLARED type. Reporting the meet here lets `i+1` fold
                   ;; to a literal and deletes the loop.
                   (phi-declared-ty p)
@@ -135,19 +157,19 @@
                     (loop (if (>= (load i) cnt)
                               (break 0)
                               (do
-                                (match (n-in-safe r (load i))
+                                (match (n-in r (load i))
                                   (Some [rc]
                                         (do
                                           (n-add-dep! rc p)
                                           (if (or (= (n-ty rc) TY-XCTRL) (= (n-ty rc) TY-TOP))
                                               0
-                                              (match (n-in-safe p (load i))
+                                              (match (n-in p (load i))
                                                 (Some [v] (set! (mut t) (ty-meet (load t) (n-ty v))))
                                                 (None [] 0)))))
                                   (None [] 0))
                                 (set! (mut i) (+ (load i) 1))
                                 (continue))))
-                    (load t)))))))
+                    (phi--maybe-widen p r (load t))))))))
 
 ;; The single DISTINCT input, ignoring self-references, or None if the inputs differ.
 ;;
@@ -157,24 +179,44 @@
 ;;
 ;; Ignoring self-references is what lets a loop Phi whose only other input is itself collapse.
 (defn phi-single-unique-input [(p (dyn NodeOps))] (-> (Option (dyn NodeOps)))
-  (let [cnt (n-nins p)
-        (mut i) 1
-        (mut found) (None [(dyn NodeOps)])
-        (mut differs) false]
-    (loop (if (or (>= (load i) cnt) (load differs))
-              (break 0)
-              (do
-                (match (n-in-safe p (load i))
-                  (Some [v]
-                        (if (n-same? v p)
-                            0  ; self-reference: ignore
-                            (match (load found)
-                              (None [] (set! (mut found) (Some v)))
-                              (Some [f] (if (n-same? f v) 0 (set! (mut differs) true))))))
-                  (None [] 0))
-                (set! (mut i) (+ (load i) 1))
-                (continue))))
-    (if (load differs) (None [(dyn NodeOps)]) (load found))))
+  (match (n-in p 0)
+    (None [] (None [(dyn NodeOps)]))
+    (Some [r]
+          ;; A Loop whose entry is dead must collapse as control first. Looking only at its backedge
+          ;; value can otherwise replace the Phi with a value from an unreachable iteration.
+          (if (and (= (n-op r) OP-LOOP)
+                   (match (n-in r 1) (Some [entry] (= (n-ty entry) TY-XCTRL)) (None [] false)))
+              (None [(dyn NodeOps)])
+              (let [cnt (n-nins p)
+                    (mut i) 1
+                    (mut found) (None [(dyn NodeOps)])
+                    (mut differs) false]
+                (loop (if (or (>= (load i) cnt) (load differs))
+                          (break 0)
+                          (do
+                            ;; A value on dead control does not participate. Register the dependency
+                            ;; so this Phi is retried if a currently-live path dies later.
+                            (match (n-in r (load i))
+                              (Some [ctrl]
+                                    (do
+                                      (n-add-dep! ctrl p)
+                                      (if (= (n-ty ctrl) TY-XCTRL)
+                                          0
+                                          (match (n-in p (load i))
+                                            (Some [v]
+                                                  (if (n-same? v p)
+                                                      0
+                                                      (match (load found)
+                                                        (None [] (set! (mut found) (Some v)))
+                                                        (Some [f]
+                                                              (if (n-same? f v)
+                                                                  0
+                                                                  (set! (mut differs) true))))))
+                                            (None [] 0)))))
+                              (None [] 0))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (if (load differs) (None [(dyn NodeOps)]) (load found)))))))
 
 ;; Does any of the Region's paths carry XCONTROL? If so the Region is about to fold, and this Phi
 ;; must not race it.
@@ -185,7 +227,7 @@
     (loop (if (or (>= (load i) cnt) (load yes))
               (break 0)
               (do
-                (match (n-in-safe r (load i))
+                (match (n-in r (load i))
                   (Some [v] (if (= (n-ty v) TY-XCTRL) (set! (mut yes) true) 0))
                   (None [] 0))
                 (set! (mut i) (+ (load i) 1))
@@ -193,13 +235,13 @@
     (load yes)))
 
 (defn phi-idealize [(p (dyn NodeOps))] (-> (Option (dyn NodeOps)))
-  (match (n-in-safe p 0)
+  (match (n-in p 0)
     ;; 0. The Region collapsed to something that is not a Region: become input 1.
     (None [] (n-in p 1))
     (Some [r]
           (if (not (or (= (n-op r) OP-REGION) (= (n-op r) OP-LOOP)))
               (n-in p 1)
-              (if (or (or (region-in-progress? r) (<= (n-nins r) 1)) (= (n-nouts p) 0))
+              (if (or (phi-in-progress? p) (<= (n-nins r) 1) (= (n-nouts p) 0))
                   (None [(dyn NodeOps)])
                   ;; 1. SINGLE UNIQUE INPUT -> become it.
                   (match (phi-single-unique-input p)
@@ -209,8 +251,145 @@
                           ;; do not race it.
                           (if (phi--region-has-dead-path? r)
                               (None [(dyn NodeOps)])
-                              ;; 3, 4: owed. See the header.
-                              (None [(dyn NodeOps)])))))))))
+                              ;; 3. Pull a matching unpinned scalar operation below the merge.
+                              (match (phi--drop-same-op p r)
+                                (Some [progress] (Some progress))
+                                ;; 4. Recover the value split by a truthiness guard.
+                                (None [] (phi--merge-zero-truthy p)))))))))))
+
+(defn phi--merge-zero-truthy [(p (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (if (!= (n-nins p) 3)
+      (None [(dyn NodeOps)])
+      (let [a (n-in! p 1)
+            b (n-in! p 2)]
+        (if (phi--zero-value? (n-ty a))
+            (match (truthiness-cast-source b)
+              (Some [source] (if (n-same? source p) (None [(dyn NodeOps)]) (Some source)))
+              (None [] (None [(dyn NodeOps)])))
+            (if (phi--zero-value? (n-ty b))
+                (match (truthiness-cast-source a)
+                  (Some [source] (if (n-same? source p) (None [(dyn NodeOps)]) (Some source)))
+                  (None [] (None [(dyn NodeOps)])))
+                (None [(dyn NodeOps)]))))))
+
+(defn phi--zero-value? [(t i64)] (-> bool)
+  (or (= t TY-NIL) (and (ty-int? t) (and (= (ty-int-lo t) 0) (= (ty-int-hi t) 0)))))
+
+;; Simple's `same_op` and `drop_same_op`, for the scalar operations present today. Memory-specific
+;; alias/clobber guards join this same routine when MemOp exists; no weaker memory rewrite is
+;; attempted in the meantime.
+(defn phi--same-op-copy-supported? [(n (dyn NodeOps))] (-> bool)
+  (let [op (n-op n)]
+    (or (= op OP-MINUS)
+        (= op OP-TOFLOAT)
+        (= op OP-ROUNDF32)
+        (= op OP-NOT)
+        (= op OP-ADD)
+        (= op OP-SUB)
+        (= op OP-MUL)
+        (= op OP-DIV)
+        (= op OP-SHL)
+        (= op OP-AND)
+        (= op OP-OR)
+        (= op OP-XOR)
+        (= op OP-SHR)
+        (= op OP-SAR)
+        (= op OP-EQ)
+        (= op OP-NE)
+        (= op OP-LT)
+        (= op OP-LE)
+        (= op OP-ULT))))
+
+(defn phi--drop-same-op [(p (dyn NodeOps)) (r (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (match (n-in p 1)
+    (None [] (None [(dyn NodeOps)]))
+    (Some [sample]
+          (if (or (and (!= (n-nins sample) 2) (!= (n-nins sample) 3))
+                  (match (n-in sample 0) (Some [_] true) (None [] false))
+                  (not (phi--same-op-copy-supported? sample)))
+              (None [(dyn NodeOps)])
+              (if (not (phi--same-op-inputs? p sample))
+                  (None [(dyn NodeOps)])
+                  (let [lhs (phi--merged-op-input p r 1)]
+                    (match (if (= (n-nins sample) 2)
+                               ;; The reconstruction hook's RHS is ignored by unary nodes.
+                               (n-binop-copy sample lhs lhs)
+                               (n-binop-copy sample lhs (phi--merged-op-input p r 2)))
+                      (None [] (None [(dyn NodeOps)]))
+                      (Some [copy]
+                            ;; Do not run the rule backwards. This matters for bitwise operators
+                            ;; whose computed range may be less precise after pulling down.
+                            (if (ty-isa? (compute copy) (phi-compute p))
+                                (Some copy)
+                                (do
+                                  (if (n-unused? copy) (n-kill! copy) 0)
+                                  (None [(dyn NodeOps)])))))))))))
+
+(defn phi--same-op-inputs? [(p (dyn NodeOps)) (sample (dyn NodeOps))] (-> bool)
+  (let [cnt (n-nins p)
+        (mut i) 1
+        (mut busy) 0
+        (mut ok) true]
+    (loop (if (or (>= (load i) cnt) (not (load ok)))
+              (break 0)
+              (do
+                (match (n-in p (load i))
+                  (None [] (set! (mut ok) false))
+                  (Some [op]
+                        (if (or (!= (n-op op) (n-op sample))
+                                (!= (n-nins op) (n-nins sample))
+                                (not (eq-extra sample op))
+                                (match (n-in op 0) (Some [_] true) (None [] false)))
+                            (set! (mut ok) false)
+                            (do
+                              (if (> (n-nouts op) 1)
+                                  (set! (mut busy) (+ (load busy) 1))
+                                  0)
+                              (if (> (load busy) 1)
+                                  (do
+                                    (phi--depend-on-other-users! p op)
+                                    (set! (mut ok) false))
+                                  0)))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load ok)))
+
+(defn phi--depend-on-other-users! [(p (dyn NodeOps)) (op (dyn NodeOps))] (-> i64)
+  (let [cnt (n-nouts op)
+        (mut i) 0]
+    (loop (if (>= (load i) cnt)
+              (break 0)
+              (do
+                (match (n-out op (load i))
+                  (Some [use] (if (n-same? use p) 0 (n-add-dep! use p)))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn phi--merged-op-input [(p (dyn NodeOps)) (r (dyn NodeOps)) (idx i64)] (-> (dyn NodeOps))
+  (let [first-op (n-in! p 1)
+        first (n-in! first-op idx)
+        cnt (n-nins p)
+        (mut i) 2
+        (mut differs) false]
+    (loop (if (or (>= (load i) cnt) (load differs))
+              (break 0)
+              (do
+                (let [op (n-in! p (load i))]
+                  (if (n-same? (n-in! op idx) first) (set! (mut i) (+ (load i) 1)) (set! (mut differs) true)))
+                (continue))))
+    (if (not (load differs))
+        first
+        (let [merged (phi-make r (phi-declared-ty p) "phi-op")
+              (mut j) 1]
+          (loop (if (>= (load j) cnt)
+                    (break 0)
+                    (do
+                      (phi-add-value! merged (n-in! (n-in! p (load j)) idx))
+                      (set! (mut j) (+ (load j) 1))
+                      (continue))))
+          (n-set-ty! merged (compute merged))
+          merged))))
 
 (impl NodeOps PhiNode
   (hdr [(self (ptr PhiNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
@@ -221,12 +400,7 @@
   ;; the engine reserved for half-built nodes.
   (no-const-fold? [(self (ptr PhiNode))]
                   (-> bool)
-                  (match (n-in (primitive/make-dyn NodeOps self) 0)
-                    (Some [r]
-                          (if (or (= (n-op r) OP-REGION) (= (n-op r) OP-LOOP))
-                              (region-in-progress? r)
-                              false))
-                    (None [] true)))
+                  (phi-in-progress? (primitive/make-dyn NodeOps self)))
   ;; PINNED: a Phi executes in its Region and code motion may not move it.
   (is-pinned? [(self (ptr PhiNode))] (-> bool) true)
   (binop-copy [(self (ptr PhiNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
@@ -239,8 +413,9 @@
   (eq-extra [(self (ptr PhiNode)) (other (dyn NodeOps))]
             (-> bool)
             ;; Open loop Phis may have identical partial inputs and different future backedges.
-            (and (not (no-const-fold? self))
-                 (or (= (n-op other) OP-PHI) (= (n-op other) OP-MEMPHI))))
+            (and (not (phi-in-progress? (primitive/make-dyn NodeOps self)))
+                 (and (or (= (n-op other) OP-PHI) (= (n-op other) OP-MEMPHI))
+                      (not (phi-in-progress? other)))))
   (hash-extra [(self (ptr PhiNode))] (-> i64) 151))
 
 ;; Build a Phi on `region` with a declared type.
@@ -265,30 +440,22 @@
 (defn phi-open! [(p (dyn NodeOps))] (-> i64)
   (n-add-def! p (None [(dyn NodeOps)])))
 
-;; Close the Phi by filling that placeholder. MUST happen BEFORE the Loop's control back edge.
-;;
-;; The order is the whole of the loop protocol. Close control first and the Phi momentarily reads
-;; its declared zero, `i+1` folds to the literal 1, the Phi loses its only other user, and the loop
-;; is deleted with no error reported.
+;; Close the Phi by filling that placeholder. Final Simple calls this immediately AFTER wiring the
+;; Loop control backedge, inside one `endLoop` operation that exposes no intervening peephole. The
+;; Phi's own null-final-input state keeps compute, folding, idealization and GVN blocked meanwhile.
 (defn phi-close! [(p (dyn NodeOps)) (v (dyn NodeOps))] (-> i64)
   (let [last (- (n-nins p) 1)]
     (match (n-in p last)
       (Some [_] (broken "phi-close!: the phi is not open"))
       (None [] (n-set-def! p last (Some v))))))
 
-;; --- owed to the memory and dynamic units, and NOT stubs ---
+;; --- owed to units that do not exist yet, and NOT stubs ---
 ;;
-;; 3. PULL THE OP DOWN THROUGH THE PHI ("same_op"): `Phi(op(a1,b1), op(a2,b2))` becomes
-;;    `op(Phi(a1,a2), Phi(b1,b2))`, creating a Phi only where the argument positions differ. Its
-;;    guards are the content of the rule and each is a bug someone had: same class, same input
-;;    count, no control input; matching alias for memory ops; a Load clobbered by a Store among its
-;;    users cannot be pulled forward; Escape and MemMerge refused outright; at most ONE input may
-;;    have other users; a ScopeNode input means an unrealised lazy Phi.
+;; Memory same-op needs matching aliases, Load-vs-Store clobber checks, and explicit Escape and
+;; MemMerge refusal. None of those node kinds exists yet; scalar same-op is implemented above.
 ;;
-;; 4. NULL-CHECK MERGES: `Phi(zero, Guard_nonzero(N))` -> `N`, and
-;;    `if (val) …; Phi(region, false=null, true=val)` -> `val` when the Region's idom is the If that
+;; The alternate NULL-CHECK form `if (val) …; Phi(region, false=null, true=val)` -> `val` fires when
+;; the Region's idom is the If that
 ;;    tested `val` — confirmed by walking the idom chain from the NULL side to check it really
 ;;    arrives through the FALSE projection. The pattern alone is not enough; the dominance has to
-;;    hold.
-;;
-;; Both are optimisations. Each gets a named test when its unit lands.
+;;    hold. The structural `Phi(zero, truthy-Cast(val))` form is implemented above.

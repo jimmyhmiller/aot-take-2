@@ -10,9 +10,12 @@
 (import "aot.node.node" :use *)
 (import "aot.node.constant" :use *)
 (import "aot.node.arith" :use *)
+(import "aot.node.compare" :use *)
 (import "aot.node.control" :use *)
 (import "aot.node.phi" :use *)
+(import "aot.node.dynamic" :use *)
 (import "aot.node.cfg" :use *)
+(import "aot.codegen.iterpeeps" :use *)
 (import "aot.tests.support" :use *)
 (import "aot.type.type" :use *)
 
@@ -25,6 +28,16 @@
            (assert (match (cfg-idom-of st) (Some [_] false) (None [] true)))
            (assert-eq (cfg-idepth-of st) 0)
            (assert (cfg-block-head-of? st))))
+
+(deftest stop_is_a_sink_block_head_below_its_deepest_cfg_input
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               ctrl (cproj-make st 0 "exit")
+               stop (stop-make)]
+           (n-add-def! stop (Some ctrl))
+           (assert (cfg-block-head-of? stop))
+           (assert-eq (cfg-idepth-of stop) (+ (cfg-idepth-of ctrl) 1))
+           (assert (match (cfg-idom-of stop) (Some [_] false) (None [] true)))))
 
 (deftest a_region_is_reachable_when_some_path_is
          ;; Seeded with XCONTROL and met upward: reachable exactly when SOME path reaching it is.
@@ -43,6 +56,20 @@
            (region-add-path! r (xctrl-make))
            (region-add-path! r (xctrl-make))
            (assert-eq (compute-ty-of r) TY-XCTRL)))
+
+(deftest iter_collapses_an_all_dead_region_without_reading_a_missing_path
+         (boot! 1)
+         (let [r (region-make)]
+           (region-add-path! r (xctrl-make))
+           (region-add-path! r (xctrl-make))
+           (let [p (phi-make r (ty-int-bot) "dead.value")]
+             (phi-add-value! p (con-int 1))
+             (phi-add-value! p (con-int 2))
+             (n-keep! p)
+             (iter-seed-all!)
+             (iter-run!)
+             (assert (n-dead? r))
+             (assert (or (n-dead? p) (ty-high? (n-ty p)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; The If lattice
@@ -93,6 +120,23 @@
          (boot! 1)
          (let [iff (if-make (xctrl-make) (con-int 1))]
            (assert-eq (n-ty iff) (ty-if-neither))))
+
+(deftest a_nested_if_recognizes_the_true_arm_truthiness_refinement
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               ctrl (cproj-make st 0 "ctrl")
+               value (con-make (ty-int-range 0 9))
+               outer (if-make ctrl value)
+               arms (if-arms! outer)
+               narrowed (truthiness-refine! (arms-true arms) value)
+               inner (if-make (arms-true arms) narrowed)]
+           ;; The inner predicate is not pointer-identical to the outer predicate, but it is the
+           ;; structurally proven nonzero Cast created for that outer true arm.
+           (assert (match (if-idealize inner)
+                     (Some [progress]
+                           (and (n-same? progress inner)
+                                (= (n-ty (n-in! inner 1)) (ty-int-con 1))))
+                     (None [] false)))))
 
 ;; ---------------------------------------------------------------------------
 ;; The MULTI window
@@ -214,6 +258,36 @@
              (n-keep! p)
              (assert (match (phi-single-unique-input p) (Some [u] (n-same? u v)) (None [] false))))))
 
+(deftest phi_uniqueness_ignores_values_on_dead_control_paths
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               live-ctrl (cproj-make st 0 "live")
+               dead-ctrl (xctrl-make)
+               r (region-make)
+               live (con-int 7)
+               dead (con-int 999)]
+           (region-add-path! r live-ctrl)
+           (region-add-path! r dead-ctrl)
+           (let [p (phi-make r (ty-int-bot) "x")]
+             (phi-add-value! p live)
+             (phi-add-value! p dead)
+             (n-keep! p)
+             (assert (match (phi-single-unique-input p)
+                       (Some [u] (n-same? u live))
+                       (None [] false))))))
+
+(deftest a_dead_entry_loop_phi_waits_for_control_to_collapse
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               l (loop-make (xctrl-make))
+               p (phi-make l (ty-int-bot) "dead.i")]
+           (phi-add-value! p (con-int 0))
+           (phi-open! p)
+           (phi-close! p (con-int 1))
+           (loop-close! l (cproj-make st 0 "back"))
+           (n-keep! p)
+           (assert (match (phi-single-unique-input p) (Some [_] false) (None [] true)))))
+
 ;; ---------------------------------------------------------------------------
 ;; The IN-PROGRESS window — the trap that deletes loops silently
 (deftest an_in_progress_region_reports_CONTROL_regardless_of_its_paths
@@ -271,8 +345,28 @@
              ;; It survives a peephole rather than folding to Con 5.
              (assert-eq (n-op (n-peephole! p)) OP-PHI))))
 
+(deftest a_phi_stays_in_progress_when_control_closes_first
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               l (loop-make (cproj-make st 0 "entry"))
+               p1 (phi-make l (ty-int-con 5) "i")
+               p2 (phi-make l (ty-int-con 5) "j")]
+           (phi-add-value! p1 (con-int 5))
+           (phi-open! p1)
+           (phi-add-value! p2 (n-in! p1 1))
+           (phi-open! p2)
+           ;; Exercise final Simple's brief endLoop intermediate state directly. Phi openness, not
+           ;; just Loop openness, must prevent compute, folding, and GVN from consuming it.
+           (loop-close! l (cproj-make st 0 "back"))
+           (assert (phi-in-progress? p1))
+           (assert-eq (compute-ty-of p1) (ty-int-con 5))
+           (assert (no-const-fold-of? p1))
+           (assert (not (n-gvn-eq? p1 p2)))
+           (n-keep! p1)
+           (assert-eq (n-op (n-peephole! p1)) OP-PHI)))
+
 (deftest a_closed_loop_phi_reports_the_meet_of_its_arms
-         ;; The full protocol, in order: make the loop, build the body, close the PHI, then close CONTROL.
+         ;; Final Simple's full order: build inside the window, close CONTROL, immediately close PHIS.
          (boot! 1)
          (let [st (start-make (ty-int-bot))
                entry (cproj-make st 0 "entry")
@@ -281,13 +375,17 @@
              (phi-add-value! p (con-int 0))
              (phi-open! p)
              (n-keep! p)
-             ;; 4. close the Phi FIRST
-             (phi-close! p (con-int 3))
-             ;; 5. only THEN close control
+             ;; 4. close control
              (loop-close! l (fresh-ctrl (cproj-make st 0 "c0")))
+             ;; 5. immediately close the Phi before any peephole runs
+             (phi-close! p (con-int 3))
              (assert (not (loop-in-progress? l)))
-             ;; Now it reports the meet of its live arms: {0} meet {3} = [0..3].
-             (assert-eq (compute-ty-of p) (ty-int-range 0 3)))))
+             ;; The live-arm meet is [0..3], and because this is a falling Loop Phi its first
+             ;; widening stage is attached immediately.
+             (let [t (compute-ty-of p)]
+               (assert-eq (ty-int-lo t) 0)
+               (assert-eq (ty-int-hi t) 3)
+               (assert-eq (ty-int-widen t) 1)))))
 
 (deftest closing_a_loop_twice_is_a_named_error_not_silent_corruption
          ;; `loop-close!` on an already-closed loop means the caller lost track of the protocol. It must
@@ -368,3 +466,158 @@
            (assert-eq (n-nins r) 3)
            ;; And the surviving first path is the If's own incoming control.
            (assert (n-same? (n-in! r 1) c))))
+
+(deftest stacked_regions_flatten_and_splice_their_phis
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               c1 (cproj-make st 0 "c1")
+               c2 (fresh-ctrl (cproj-make st 0 "c2"))
+               other (fresh-ctrl (cproj-make st 0 "other"))
+               inner (region-make)]
+           (region-add-path! inner c1)
+           (region-add-path! inner c2)
+           (let [inner-phi (phi-make inner (ty-int-bot) "inner")]
+             (phi-add-value! inner-phi (con-int 10))
+             (phi-add-value! inner-phi (con-int 20))
+             (let [outer (region-make)]
+               (region-add-path! outer inner)
+               (region-add-path! outer other)
+               (let [outer-phi (phi-make outer (ty-int-bot) "outer")]
+                 (phi-add-value! outer-phi inner-phi)
+                 (phi-add-value! outer-phi (con-int 99))
+                 (n-keep! outer-phi)
+                 (assert (match (region--flatten-stacked! outer)
+                           (Some [replacement] (n-same? replacement outer))
+                           (None [] false)))
+                 ;; The old inner-Region slot is dead. Its two paths and the matching two Phi
+                 ;; values were appended in the same order.
+                 (assert-eq (n-nins outer) 5)
+                 (assert-eq (n-nins outer-phi) 5)
+                 (assert-eq (n-ty (n-in! outer 1)) TY-XCTRL)
+                 (assert (n-same? (n-in! outer 3) c1))
+                 (assert (n-same? (n-in! outer 4) c2))
+                 (assert-eq (n-ty (n-in! outer-phi 3)) (ty-int-con 10))
+                 (assert-eq (n-ty (n-in! outer-phi 4)) (ty-int-con 20)))))))
+
+(deftest stacked_regions_refuse_to_flatten_across_a_mid_user
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               inner (region-make)]
+           (region-add-path! inner (cproj-make st 0 "c1"))
+           (region-add-path! inner (fresh-ctrl (cproj-make st 0 "c2")))
+           (let [inner-phi (phi-make inner (ty-int-bot) "inner")]
+             (phi-add-value! inner-phi (con-int 10))
+             (phi-add-value! inner-phi (con-int 20))
+             ;; This Add consumes the value between the two merges. Flattening through it would
+             ;; require distribution, which this local Region rule deliberately refuses.
+             (n-keep! (add-make inner-phi (con-int 1)))
+             (let [outer (region-make)]
+               (region-add-path! outer inner)
+               (region-add-path! outer (fresh-ctrl (cproj-make st 0 "other")))
+               (let [outer-phi (phi-make outer (ty-int-bot) "outer")]
+                 (phi-add-value! outer-phi inner-phi)
+                 (phi-add-value! outer-phi (con-int 99))
+                 (n-keep! outer-phi)
+                 (assert (match (region--flatten-stacked! outer)
+                           (Some [_] false)
+                           (None [] true)))
+                 (assert-eq (n-nins outer) 3)
+                 (assert-eq (n-nins outer-phi) 3))))))
+
+(deftest cproj_flips_an_if_of_not_and_selects_the_opposite_arm
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               ctrl (cproj-make st 0 "ctrl")
+               x (con-make (ty-int-range 0 10))
+               iff (if-make ctrl (not-make x))
+               true-arm (cproj-make iff IF-TRUE-IDX "True")
+               false-arm (cproj-make iff IF-FALSE-IDX "False")]
+           ;; Both old arms exist before asking either to idealize.
+           (n-keep! false-arm)
+           (assert (match (cproj-idealize true-arm IF-TRUE-IDX)
+                     (Some [replacement]
+                           (let [new-if (n-in! replacement 0)]
+                             (and (= (cproj-idx replacement) IF-FALSE-IDX)
+                                  (and (= (n-op new-if) OP-IF)
+                                       (n-same? (n-in! new-if 1) x)))))
+                     (None [] false)))
+           (n-unkeep! false-arm)))
+
+(deftest phi_pulls_matching_scalar_operations_below_the_merge
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               region (region-make)
+               common (con-int 10)]
+           (region-add-path! region (cproj-make st 0 "left"))
+           (region-add-path! region (fresh-ctrl (cproj-make st 0 "right")))
+           (let [left (add-make-mode (con-int 1) common MODE-INT)
+                 right (add-make-mode (con-int 2) common MODE-INT)
+                 phi (phi-make region (ty-int-bot) "sum")]
+             (phi-add-value! phi left)
+             (phi-add-value! phi right)
+             (n-keep! phi)
+             (let [before (arena-node-count)]
+               (match (phi-idealize phi)
+                 (None [] (assert false))
+                 (Some [pulled]
+                       (do
+                         ;; One merged-input Phi plus one copied Add. A capability probe must not
+                         ;; allocate and wire a second throwaway Add.
+                         (assert-eq (- (arena-node-count) before) 2)
+                         (assert-eq (n-op pulled) OP-ADD)
+                         (assert-eq (n-op (n-in! pulled ARITH-LHS)) OP-PHI)
+                         (assert (n-same? (n-in! pulled ARITH-RHS) common)))))))))
+
+(deftest phi_refuses_to_duplicate_two_operations_with_other_users
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               region (region-make)
+               common (con-int 10)]
+           (region-add-path! region (cproj-make st 0 "left"))
+           (region-add-path! region (fresh-ctrl (cproj-make st 0 "right")))
+           (let [left (add-make-mode (con-int 1) common MODE-INT)
+                 right (add-make-mode (con-int 2) common MODE-INT)
+                 phi (phi-make region (ty-int-bot) "sum")]
+             (phi-add-value! phi left)
+             (phi-add-value! phi right)
+             (n-keep! phi)
+             ;; Both candidates now have an additional real user. Pulling down would duplicate
+             ;; both operations instead of reducing the graph.
+             (n-keep! (sub-make-mode left common MODE-INT))
+             (n-keep! (sub-make-mode right common MODE-INT))
+             (assert (match (phi-idealize phi) (Some [_] false) (None [] true))))))
+
+(deftest phi_merging_zero_and_a_truthy_refinement_recovers_the_original_value
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               ctrl (cproj-make st 0 "ctrl")
+               value (con-make (ty-int-range 0 9))
+               iff (if-make ctrl value)
+               arms (if-arms! iff)
+               narrowed (truthiness-refine! (arms-true arms) value)
+               region (region-make)]
+           (region-add-path! region (arms-false arms))
+           (region-add-path! region (arms-true arms))
+           (let [phi (phi-make region (ty-int-bot) "truthy-merge")]
+             (phi-add-value! phi (con-int 0))
+             (phi-add-value! phi narrowed)
+             (n-keep! phi)
+             (assert (match (phi-idealize phi)
+                       (Some [replacement] (n-same? replacement value))
+                       (None [] false))))))
+
+(deftest phi_pulls_matching_unary_operations_below_the_merge
+         (boot! 1)
+         (let [st (start-make (ty-int-bot))
+               region (region-make)]
+           (region-add-path! region (cproj-make st 0 "left"))
+           (region-add-path! region (fresh-ctrl (cproj-make st 0 "right")))
+           (let [phi (phi-make region (ty-int-bot) "neg")]
+             (phi-add-value! phi (minus-make-mode (con-int 1) MODE-INT))
+             (phi-add-value! phi (minus-make-mode (con-int 2) MODE-INT))
+             (n-keep! phi)
+             (assert (match (phi-idealize phi)
+                       (Some [replacement]
+                             (and (= (n-op replacement) OP-MINUS)
+                                  (= (n-op (n-in! replacement 1)) OP-PHI)))
+                       (None [] false))))))

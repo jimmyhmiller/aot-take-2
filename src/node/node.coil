@@ -1,7 +1,7 @@
 ;; ============================================================================
 
 ;; THE SEA-OF-NODES GRAPH AND THE PEEPHOLE ENGINE
-;;   —  port of Simple's `node/Node.java`, in full
+;;   —  core port of Simple's `node/Node.java`
 ;; ============================================================================
 ;;
 ;; ## What a sea of nodes is
@@ -216,6 +216,7 @@
   [(nid i64)  ; dense unique id within a compilation
    (op i64)  ; OP-*
    (ty i64)  ; interned type id; TY-INVALID means "never computed"
+   (pesi-ty i64)  ; bottom-up type saved across the optimistic SCCP pass
    (hash i64)  ; 0 = not in the GVN table, so the edges may still be hacked
    (ins (ArrayList (Option (dyn NodeOps))))  ; use-def, ordered, nulls allowed
    (outs (ArrayList (Option (dyn NodeOps))))  ; def-use; a None entry is a `keep`
@@ -267,9 +268,9 @@
   ;; Pinned in the schedule: input 0 may not be changed by code motion. Phis and Projs are pinned.
   (is-pinned? [(self (ptr Self))] (-> bool))
 
-  ;; Simple's virtual `copy(lhs, rhs)`: rebuild THIS KIND of binary operator over new operands,
-  ;; preserving whatever payload it carries (an arithmetic mode, a comparison operator). `None` for
-  ;; any kind that is not a binop.
+  ;; Simple's virtual `copy(lhs, rhs)`: rebuild THIS KIND of scalar operator over new operands,
+  ;; preserving whatever payload it carries (an arithmetic mode, a comparison operator). Unary
+  ;; nodes consume `lhs` and ignore `rhs`; `None` means this kind is not reconstructible here.
   ;;
   ;; It exists so that a rewrite can be written ONCE over "some binary operator" instead of once per
   ;; kind — `phiCon` pushes a constant up through a Phi and must rebuild the operator on every arm,
@@ -293,6 +294,7 @@
    (deferred (ArrayList i64))  ; candidates that answered DEFER, retried after any inline fires
    (mid-assert bool)  ; true while an expensive assert is running: no side effects allowed
    (ctrl-version i64)  ; bumped by any control mutation; invalidates every derived table at once
+   (next-fidx i64)  ; compilation-local function identity; inline clones reserve from this space
    (booted bool)])
 
 (defn arena [] (-> (ptr NodeArena))
@@ -312,7 +314,7 @@
           (set! (.next-nid t) 1)
           (set! (.mid-assert t) false)
           (set! (.ctrl-version t) 1)
-          (set! (.ctrl-version t) 1)
+          (set! (.next-fidx t) 0)
           (set! (.booted t) true)
           ;; nid 0 is never handed out, so a zeroed header is recognisably not a node.
           (push! [(Option (dyn NodeOps))] (mut (.nodes t)) (None))
@@ -336,10 +338,27 @@
       (set! (.inline-work t) (wl-new seed))
       (set! (.deferred t) (al-new [i64] a))
       (set! (.next-nid t) 1)
+      (set! (.next-fidx t) 0)
       (set! (.mid-assert t) false)
       (push! [(Option (dyn NodeOps))] (mut (.nodes t)) (None))
       (push! [i64] (mut (.gvn-next t)) 0)
       0)))
+
+;; Function indices share one compilation-local dense namespace. Frontends may reserve explicit
+;; indices while loading a unit; clone inlining takes the next unused identity from the same source.
+(defn reserve-fidx! [(fidx i64)] (-> i64)
+  (do
+    (arena-boot!)
+    (if (< fidx 0) (panic-i "reserve-fidx!: negative function index" fidx) 0)
+    (if (>= fidx (.next-fidx (arena))) (set! (.next-fidx (arena)) (+ fidx 1)) 0)
+    fidx))
+
+(defn next-inline-fidx! [] (-> i64)
+  (do
+    (arena-boot!)
+    (let [fidx (.next-fidx (arena))]
+      (set! (.next-fidx (arena)) (+ fidx 1))
+      fidx)))
 
 (defn arena-node-count [] (-> i64)
   (do (arena-boot!) (- (.next-nid (arena)) 1)))
@@ -380,7 +399,7 @@
     (loop (if (>= (load i) cnt)
               (break 0)
               (do
-                (match (n-in-safe n (load i)) (Some [v] (code-add! v)) (None [] 0))
+                (match (n-in n (load i)) (Some [v] (code-add! v)) (None [] 0))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))))
 
@@ -406,6 +425,12 @@
 
 (defn n-ty [(n (dyn NodeOps))] (-> i64)
   (.ty (hdr n)))
+
+(defn n-pesi-ty [(n (dyn NodeOps))] (-> i64)
+  (.pesi-ty (hdr n)))
+
+(defn n-set-pesi-ty! [(n (dyn NodeOps)) (t i64)] (-> i64)
+  (do (set! (.pesi-ty (hdr n)) t) 0))
 
 (defn n-hash-of [(n (dyn NodeOps))] (-> i64)
   (.hash (hdr n)))
@@ -476,24 +501,27 @@
 ;; A node is IN the table exactly when its cached hash is non-zero. While in the table its edges are
 ;; frozen, because the hash is computed from them — so every edge mutator calls `n-unlock!` first.
 
-;; Structural hash: opcode, the input identities, and the kind's payload.
+;; Recompute the structural hash from current opcode, inputs, and payload even if a cached GVN hash
+;; exists. The verifier uses this form; ordinary lookup uses the cached wrapper below.
+(defn n-gvn-hash-current [(n (dyn NodeOps))] (-> i64)
+  (let [(mut h) (+ (* (n-op n) 1000003) 0x9e3779b9)
+        cnt (n-nins n)
+        (mut i) 0]
+    (loop (if (>= (load i) cnt)
+              (break 0)
+              (do
+                (set! (mut h)
+                      (^ (^ (* (load h) 31) (primitive/ishl (load h) 7))
+                         (match (n-in n (load i)) (Some [v] (n-nid v)) (None [] 0))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (let [x (^ (load h) (hash-extra n))]
+      ;; 0 is reserved for "not in the table" and must never be produced.
+      (if (= x 0) 0xDEADBEEF x))))
+
+;; Structural hash with the normal GVN cache fast path.
 (defn n-gvn-hash [(n (dyn NodeOps))] (-> i64)
-  (if (!= (n-hash-of n) 0)
-      (n-hash-of n)
-      (let [(mut h) (+ (* (n-op n) 1000003) 0x9e3779b9)
-            cnt (n-nins n)
-            (mut i) 0]
-        (loop (if (>= (load i) cnt)
-                  (break 0)
-                  (do
-                    (set! (mut h)
-                          (^ (^ (* (load h) 31) (primitive/ishl (load h) 7))
-                             (match (n-in-safe n (load i)) (Some [v] (n-nid v)) (None [] 0))))
-                    (set! (mut i) (+ (load i) 1))
-                    (continue))))
-        (let [x (^ (load h) (hash-extra n))]
-          ;; 0 is reserved for "not in the table" and must never be produced.
-          (if (= x 0) 0xDEADBEEF x)))))
+  (if (!= (n-hash-of n) 0) (n-hash-of n) (n-gvn-hash-current n)))
 
 ;; Two nodes are equal when they have the same opcode, the same inputs BY IDENTITY, and the kind's
 ;; own `eq-extra` agrees.
@@ -609,11 +637,24 @@
           0
           (if (n-has? (.outs (hdr dep)) watcher)
               0
-              (if (n-has? (.ins (hdr watcher)) dep)
+              (if (n-has? (.ins (hdr dep)) watcher)
                   0  ; immediate neighbour: ordinary bookkeeping already covers it
                   (do
                     (push! [(Option (dyn NodeOps))] (mut (.deps (hdr dep))) (Some watcher))
                     0))))))
+
+;; Simple's `addDepForwards`: unlike `n-add-dep!`, retain a dependency even when the watched node
+;; is an immediate INPUT of the watcher. Forward dataflow rules use this when ordinary output
+;; scheduling is intentionally insufficient. Existing outputs and duplicate dependencies are still
+;; excluded.
+(defn n-add-dep-forwards! [(dep (dyn NodeOps)) (watcher (dyn NodeOps))] (-> i64)
+  (if (.mid-assert (arena))
+      0
+      (if (or (n-has? (.deps (hdr dep)) watcher) (n-has? (.outs (hdr dep)) watcher))
+          0
+          (do
+            (push! [(Option (dyn NodeOps))] (mut (.deps (hdr dep))) (Some watcher))
+            0))))
 
 (defn n-has? [(l (ArrayList (Option (dyn NodeOps)))) (n (dyn NodeOps))] (-> bool)
   (let [cnt (len l)
@@ -730,6 +771,62 @@
                   (n-move-deps-to-worklist! n)
                   0)))))))
 
+;; Grow with null inputs through `i`, then set that slot. This is Simple's `setDefX`, used by
+;; deserialization and sparse indexed node shapes such as MemMerge.
+(defn n-set-def-x! [(n (dyn NodeOps)) (i i64) (d (Option (dyn NodeOps)))] (-> i64)
+  (do
+    (if (< i 0) (panic-i "n-set-def-x!: negative input index" i) 0)
+    (loop (if (> (n-nins n) i)
+              (break 0)
+              (do (n-add-def! n (None [(dyn NodeOps)])) (continue))))
+    (n-set-def! n i d)))
+
+;; Insert an input at `i`, preserving order and all edge multiplicities. ArrayList has no insertion
+;; primitive, so reserve one tail slot and shift the values right before installing the new edge.
+(defn n-insert-def! [(n (dyn NodeOps)) (i i64) (d (Option (dyn NodeOps)))] (-> i64)
+  (do
+    (if (or (< i 0) (> i (n-nins n)))
+        (panic-i "n-insert-def!: input index out of range" i)
+        0)
+    (n-unlock! n)
+    (let [ins_ (field (hdr n) ins)
+          old-len (len (load ins_))]
+      (push! [(Option (dyn NodeOps))] (mut ins_) (None [(dyn NodeOps)]))
+      (let [(mut j) old-len]
+        (loop (if (<= (load j) i)
+                  (break 0)
+                  (do
+                    (set! (mut ins_) (load j) (get (load ins_) (- (load j) 1)))
+                    (set! (mut j) (- (load j) 1))
+                    (continue)))))
+      (set! (mut ins_) i d)
+      (match d (Some [v] (n-add-use! v n)) (None [] 0))
+      (n-move-deps-to-worklist! n)
+      0)))
+
+;; Drop tail inputs until exactly `count` remain. Each edge is removed once; an input losing its
+;; final user is recursively collected, exactly as for `setDef` and `kill`.
+(defn n-pop-until! [(n (dyn NodeOps)) (count i64)] (-> i64)
+  (do
+    (if (or (< count 0) (> count (n-nins n)))
+        (panic-i "n-pop-until!: target input count out of range" count)
+        0)
+    (n-unlock! n)
+    (loop (if (<= (n-nins n) count)
+              (break 0)
+              (let [ins_ (field (hdr n) ins)
+                    old (get (load ins_) (- (len (load ins_)) 1))]
+                (match (pop! (mut ins_)) (Some [_] 0) (None [] 0))
+                (match old
+                  (Some [v]
+                        (if (n-del-use! v n)
+                            (n-kill! v)
+                            (code-add! v)))
+                  (None [] 0))
+                (continue))))
+    (n-move-deps-to-worklist! n)
+    0))
+
 ;; Remove input `i`, compressing in place. ORDER-PRESERVING: suitable for Region and Phi, whose
 ;; input positions are matched to each other.
 (defn n-del-def! [(n (dyn NodeOps)) (i i64)] (-> i64)
@@ -801,6 +898,43 @@
                     (continue))))
         0)))
 
+;; Kill a CFG node without swap-removing its control use. The producer's output order can encode
+;; projection order, so detach input 0 explicitly and let ordinary kill process the remaining
+;; inputs. Call only for an otherwise-unused node.
+(defn n-kill-ordered! [(n (dyn NodeOps))] (-> i64)
+  (if (not (n-unused? n))
+      (broken "n-kill-ordered!: killing a node that still has uses")
+      (match (n-in-safe n 0)
+        (Some [ctrl]
+              (do
+                (n-unlock! n)
+                (n-del-use-ordered! ctrl n)
+                (code-add! ctrl)
+                (set! (mut (.ins (hdr n))) 0 (None [(dyn NodeOps)]))
+                (n-kill! n)))
+        (None [] (n-kill! n)))))
+
+(defn n-del-use-ordered! [(def_ (dyn NodeOps)) (use_ (dyn NodeOps))] (-> i64)
+  (let [outs_ (field (hdr def_) outs)
+        cnt (len (load outs_))
+        (mut i) 0
+        (mut found) false]
+    (loop (if (or (>= (load i) cnt) (load found))
+              (break 0)
+              (do
+                (match (get (load outs_) (load i))
+                  (Some [v]
+                        (if (n-same? v use_)
+                            (do
+                              (al-remove-at! [(Option (dyn NodeOps))] (mut outs_) (load i))
+                              (set! (mut found) true)
+                              0)
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (if (load found) 0 (broken "n-del-use-ordered!: missing def-use edge"))))
+
 ;; Replace `self` with `nnn` everywhere, then kill `self`.
 ;;
 ;; Walks the outputs from the END, moving each user's edge over. Each user is unlocked first — its
@@ -871,6 +1005,7 @@
         h (hdr n)]
     (set! (.op h) opcode)
     (set! (.ty h) TY-INVALID)
+    (set! (.pesi-ty h) TY-INVALID)
     (set! (.hash h) 0)
     (set! (.ins h) (al-new [(Option (dyn NodeOps))] a))
     (set! (.outs h) (al-new [(Option (dyn NodeOps))] a))
@@ -986,7 +1121,7 @@
     (loop (if (or (>= (load i) cnt) (not (load all)))
               (break 0)
               (do
-                (match (n-in-safe n (load i))
+                (match (n-in n (load i))
                   (Some [v] (if (ty-constant? (n-ty v)) 0 (set! (mut all) false)))
                   (None [] (do (set! (mut all) false) 0)))
                 (set! (mut i) (+ (load i) 1))
@@ -1062,7 +1197,7 @@
     (loop (if (or (>= (load i) cnt) (not (load all)))
               (break 0)
               (do
-                (match (n-in-safe n (load i))
+                (match (n-in n (load i))
                   (Some [v]
                         (if (ty-constant? (n-ty v))
                             0
@@ -1078,6 +1213,69 @@
 (defn n-binop-copy [(n (dyn NodeOps)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))] (-> (Option (dyn NodeOps)))
   (binop-copy n lhs rhs))
 
+;; Walk the connected graph in Simple's order: node, inputs, outputs. Cycles and duplicate edges
+;; are visited once by nid. Return the first node accepted by `pred`, or None after full traversal.
+;; The visited state is per call, so nested and consecutive walks cannot leak marks into each other.
+(defn n-walk-find [(root (dyn NodeOps)) (pred (fnptr c [(ref (dyn NodeOps))] bool))] (-> (Option (dyn NodeOps)))
+  (let [a (alloc/malloc-allocator)
+        cnt (arena-node-count)
+        (mut seen) (al-new [bool] a)
+        (mut i) 0]
+    (loop (if (> (load i) cnt)
+              (break 0)
+              (do
+                (push! [bool] (mut seen) false)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (let [answer (n--walk-find root pred (mut seen))]
+      (al-free! [bool] (mut seen))
+      answer)))
+
+(defn n--walk-find [(n (dyn NodeOps))
+                    (pred (fnptr c [(ref (dyn NodeOps))] bool))
+                    (seen (mut (ArrayList bool)))] (-> (Option (dyn NodeOps)))
+  (if (get (load seen) (n-nid n))
+      (None [(dyn NodeOps)])
+      (do
+        (set! (mut seen) (n-nid n) true)
+        (if (primitive/call-ptr pred n)
+            (Some n)
+            (match (n--walk-edges n pred (mut seen) true)
+              (Some [found] (Some found))
+              (None [] (n--walk-edges n pred (mut seen) false)))))))
+
+(defn n--walk-edges [(n (dyn NodeOps))
+                     (pred (fnptr c [(ref (dyn NodeOps))] bool))
+                     (seen (mut (ArrayList bool)))
+                     (inputs bool)] (-> (Option (dyn NodeOps)))
+  (let [cnt (if inputs (n-nins n) (n-nouts n))
+        (mut i) 0
+        (mut answer) (None [(dyn NodeOps)])]
+    (loop (if (or (>= (load i) cnt) (match (load answer) (Some [_] true) (None [] false)))
+              (break 0)
+              (do
+                (let [edge (if inputs (n-in n (load i)) (n-out n (load i)))]
+                  (match edge
+                    (Some [next]
+                          (match (n--walk-find next pred (mut seen))
+                            (Some [found] (set! (mut answer) (Some found)))
+                            (None [] 0)))
+                    (None [] 0)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load answer)))
+
+;; Memory-producing nodes among the final opcode set. Proj and Phi additionally become memory once
+;; TypeMem exists; until then no live type can express that case.
+(defn n-is-mem? [(n (dyn NodeOps))] (-> bool)
+  (let [op (n-op n)]
+    (or (= op OP-STORE) (= op OP-MEMMERGE) (= op OP-MEMPHI))))
+
+;; Simple's default diagnostic hook. Live node kinds currently have no node-local errors; memory,
+;; parser and type-checking nodes extend this once they exist.
+(defn n-err [(n (dyn NodeOps))] (-> (Option (slice u8)))
+  (None [(slice u8)]))
+
 ;; ---------------------------------------------------------------------------
 ;; The INLINE worklist — Simple's `IterPeeps._workInline`
 ;;
@@ -1091,6 +1289,12 @@
 
 (defn code-inline-pop! [] (-> (Option i64))
   (do (arena-boot!) (wl-pop! (mut (.inline-work (arena))))))
+
+;; Is this nid already waiting for an inline decision?  The expensive IterPeeps fixpoint check
+;; needs the same membership test Simple's `progressOnList` uses: a CallEnd may still be a valid
+;; inline candidate only while it is represented on this second worklist.
+(defn code-on-inline-worklist? [(id i64)] (-> bool)
+  (do (arena-boot!) (wl-on? (.inline-work (arena)) id)))
 
 ;; Park a candidate that answered DEFER. It is retried only after some OTHER inline actually fired.
 (defn code-defer-inline! [(id i64)] (-> i64)

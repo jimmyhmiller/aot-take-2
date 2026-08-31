@@ -71,11 +71,10 @@
 ;; unconditionally, its Phis report their DECLARED types, and it is never GVN-equal to anything
 ;; (`eq` returns `!inProgress()`).
 ;;
-;; A loop body must be built AND PEEPHOLED inside that window, with every Phi closed BEFORE the
-;; control back edge is wired. Close control first and the loop is deleted with no error reported:
-;; the Phi momentarily reads its declared zero because the back-edge value has no type yet, `i+1`
-;; folds to the literal 1, the Phi loses its only other user, and the whole loop goes. Every step
-;; is locally justified.
+;; A loop body must be built AND PEEPHOLED inside that window. Final Simple's `endLoop` then closes
+;; control and immediately fills every Phi backedge as one protected operation. A Phi's independent
+;; null-final-input window prevents folding during that interval; no peephole belongs between the
+;; two mutations.
 ;;
 ;; ## Region and Phi arity are ONE invariant
 ;;
@@ -137,8 +136,8 @@
 ;; is why a dropped Return is invisible to the verifier: a Stop with fewer inputs is a structurally
 ;; valid Stop.
 ;;
-;; RETURN carries control, memory, the value, and a link to its enclosing Fun. That fourth input is
-;; what inlining nulls out.
+;; RETURN carries control, memory, the value, and RPC. Inlining nulls the RPC edge; the enclosing
+;; Fun remains separate node metadata.
 ;;
 ;; CPROJ selects one control edge out of a multi. It is a block head.
 ;;
@@ -242,10 +241,32 @@
 
 (impl CFGOps StopNode
   (cfg-node [(self (ptr StopNode))] (-> (dyn NodeOps)) (primitive/make-dyn NodeOps self))
-  ;; Stop is a block TAIL, not a head.
-  (block-head? [(self (ptr StopNode))] (-> bool) false)
+  ;; Final Simple treats Stop as the synthetic head of the sink block. It can have several Return
+  ;; predecessors, so no single immediate dominator exists.
+  (block-head? [(self (ptr StopNode))] (-> bool) true)
   (cfg-idom [(self (ptr StopNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
-  (cfg-idepth [(self (ptr StopNode))] (-> i64) 0))
+  (cfg-idepth [(self (ptr StopNode))]
+              (-> i64)
+              (let [d (primitive/make-dyn NodeOps self)
+                    cnt (n-nins d)
+                    (mut i) 0
+                    (mut depth) 0]
+                (loop (if (>= (load i) cnt)
+                          (break 0)
+                          (do
+                            (match (n-in d (load i))
+                              (Some [ret]
+                                    (match (cfg-of ret)
+                                      (Some [_]
+                                            (let [candidate (+ (cfg-idepth-of ret) 1)]
+                                              (if (> candidate (load depth))
+                                                  (set! (mut depth) candidate)
+                                                  0)))
+                                      (None [] 0)))
+                              (None [] 0))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (load depth))))
 
 ;; Drop every input that has gone dead. Reports progress only when the count changed.
 (defn stop-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
@@ -321,8 +342,8 @@
 ;; A Region is IN PROGRESS while its LAST input is null.
 ;;
 ;; While in progress it reports CONTROL unconditionally, its Phis report their DECLARED types, and
-;; it is never GVN-equal to anything. A loop body must be built AND PEEPHOLED inside that window,
-;; with every Phi closed BEFORE the control back edge is wired.
+;; it is never GVN-equal to anything. A loop body must be built AND PEEPHOLED inside that window;
+;; loop finalization then closes control and immediately fills every Phi backedge.
 (defn region-in-progress? [(r (dyn NodeOps))] (-> bool)
   (if (<= (n-nins r) 1)
       false
@@ -360,7 +381,7 @@
         (loop (if (>= (load i) cnt)
                   (break 0)
                   (do
-                    (match (n-in-safe r (load i))
+                    (match (n-in r (load i))
                       (Some [v] (set! (mut t) (ty-meet (load t) (n-ty v))))
                       (None [] 0))
                     (set! (mut i) (+ (load i) 1))
@@ -375,7 +396,7 @@
     (loop (if (or (>= (load i) cnt) (!= (load found) 0))
               (break 0)
               (do
-                (match (n-in-safe r (load i))
+                (match (n-in r (load i))
                   (Some [v] (if (= (n-ty v) TY-XCTRL) (set! (mut found) (load i)) 0))
                   (None [] 0))
                 (set! (mut i) (+ (load i) 1))
@@ -425,7 +446,10 @@
         (None [(dyn NodeOps)])
         (do
           (region-del-path! r path)
-          (if (= (n-nins r) 0) (None [(dyn NodeOps)]) (Some r))))))
+          ;; Slot zero is the reserved null control input. Reaching one input means every real path
+          ;; was dead; replace the Region immediately instead of leaving a zero-path Region whose
+          ;; next idealization would read input 1.
+          (if (= (n-nins r) 1) (Some (xctrl-make)) (Some r))))))
 
 (defn region-idealize [(r (dyn NodeOps))] (-> (Option (dyn NodeOps)))
   ;; 1. IN PROGRESS: bail before every other rule.
@@ -467,7 +491,122 @@
                           ;; and `iff.ctrl()` is ITS input 0.
                           (Some (n-in! (n-in! (n-in! r 1) 0) 0))
                           (region--collapse-fat-diamond! r))
-                      (None [(dyn NodeOps)])))))))
+                      ;; 5. FLATTEN STACKED REGIONS. Loops and Funs are excluded by requiring the
+                      ;; exact Region opcode on both sides. `region--has-mid-user?` is the safety
+                      ;; guard: a value consumed between the inner and outer merges cannot be
+                      ;; distributed correctly by this local rewrite.
+                      (region--flatten-stacked! r)))))))
+
+;; Is `p` a Phi-like node whose controlling Region is `r`?
+(defn region--phi-on? [(p (dyn NodeOps)) (r (dyn NodeOps))] (-> bool)
+  (and (phi-like? (n-op p))
+       (match (n-in p 0) (Some [pr] (n-same? pr r)) (None [] false))))
+
+;; Simple's `hasMidUser`. Every output of the inner Region must be either the outer Region itself,
+;; or a Phi whose every data user is another Phi on the outer Region. Anything else consumes a
+;; value in-between the merges. Register dependencies on the blockers so the outer Region is
+;; retried if later graph rewrites remove them.
+(defn region--has-mid-user? [(outer (dyn NodeOps)) (inner (dyn NodeOps))] (-> bool)
+  (let [cnt (n-nouts inner)
+        (mut i) 0
+        (mut found) false]
+    (loop (if (or (>= (load i) cnt) (load found))
+              (break 0)
+              (do
+                (match (n-out inner (load i))
+                  (None [] 0)
+                  (Some [use]
+                        (if (n-same? use outer)
+                            0
+                            (if (phi-like? (n-op use))
+                                (let [dcnt (n-nouts use)
+                                      (mut j) 0]
+                                  (loop (if (or (>= (load j) dcnt) (load found))
+                                            (break 0)
+                                            (do
+                                              (match (n-out use (load j))
+                                                (None [] 0)
+                                                (Some [data]
+                                                      (if (region--phi-on? data outer)
+                                                          0
+                                                          (do
+                                                            (n-add-dep! use outer)
+                                                            (n-add-dep! data outer)
+                                                            (set! (mut found) true)
+                                                            0))))
+                                              (set! (mut j) (+ (load j) 1))
+                                              (continue)))))
+                                (do
+                                  (n-add-dep! use outer)
+                                  (set! (mut found) true)
+                                  0)))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
+;; Flatten the first eligible Region input, matching Simple's rule order and doing one rewrite per
+;; visit. Outer Phis either splice the matching inner Phi's values or duplicate the outer value
+;; across every inner path. The old outer slot becomes XCtrl; the ordinary dead-path rule removes
+;; it and the matching old Phi value on the next visit.
+(defn region--flatten-stacked! [(outer (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (if (or (!= (n-op outer) OP-REGION) (<= (n-nins outer) 2))
+      (None [(dyn NodeOps)])
+      (let [cnt (n-nins outer)
+            (mut i) 1
+            (mut inner) (None [(dyn NodeOps)])]
+        (loop (if (or (>= (load i) cnt) (match (load inner) (Some [_] true) (None [] false)))
+                  (break 0)
+                  (do
+                    (match (n-in outer (load i))
+                      (Some [candidate]
+                            (if (and (= (n-op candidate) OP-REGION)
+                                     (and (> (n-nins candidate) 2)
+                                          (not (region--has-mid-user? outer candidate))))
+                                (set! (mut inner) (Some candidate))
+                                0))
+                      (None [] 0))
+                    (if (match (load inner) (Some [_] true) (None [] false))
+                        0
+                        (set! (mut i) (+ (load i) 1)))
+                    (continue))))
+        (match (load inner)
+          (None [] (None [(dyn NodeOps)]))
+          (Some [r]
+                (do
+                  (let [outcnt (n-nouts outer)
+                        (mut oi) 0]
+                    (loop (if (>= (load oi) outcnt)
+                              (break 0)
+                              (do
+                                (match (n-out outer (load oi))
+                                  (Some [phi]
+                                        (if (phi-like? (n-op phi))
+                                            (let [old (n-in! phi (load i))
+                                                  splice (region--phi-on? old r)
+                                                  (mut j) 1]
+                                              (loop (if (>= (load j) (n-nins r))
+                                                        (break 0)
+                                                        (do
+                                                          (n-add-def! phi
+                                                                      (Some (if splice
+                                                                                (n-in! old (load j))
+                                                                                old)))
+                                                          (set! (mut j) (+ (load j) 1))
+                                                          (continue))))
+                                              (code-add! phi))
+                                            0))
+                                  (None [] 0))
+                                (set! (mut oi) (+ (load oi) 1))
+                                (continue)))))
+                  (let [(mut j) 1]
+                    (loop (if (>= (load j) (n-nins r))
+                              (break 0)
+                              (do
+                                (region-add-path! outer (n-in! r (load j)))
+                                (set! (mut j) (+ (load j) 1))
+                                (continue)))))
+                  (n-set-def! outer (load i) (Some (xctrl-make)))
+                  (Some outer)))))))
 
 ;; The fat case: paths 1 and 2 are both arms of one If, and there are other paths besides. Replace
 ;; path 1 with the If's own control and drop path 2 — the If reaches here exactly once.
@@ -512,7 +651,7 @@
         (loop (if (>= (load i) cnt)
                   (break 0)
                   (do
-                    (match (n-in-safe r (load i))
+                    (match (n-in r (load i))
                       (Some [v]
                             (let [vd (cfg-idepth-of v)]
                               (if (> vd (load d)) (set! (mut d) vd) 0)))
@@ -562,7 +701,7 @@
     (loop (if (>= (load i) cnt)
               (break 0)
               (do
-                (match (n-in-safe r (load i))
+                (match (n-in r (load i))
                   (Some [v]
                         (if (ty-high? (n-ty v))
                             0
@@ -753,16 +892,15 @@
 
 ;; Build a Loop over `entry`, OPEN: input 2 is null until `loop-close!` wires the back edge.
 ;;
-;; THE PROTOCOL, and getting it wrong deletes the loop with no error reported:
+;; THE PROTOCOL:
 ;;   1. `loop-make` the loop over its entry
 ;;   2. build the body INSIDE this window
 ;;   3. peephole the body — still inside the window
-;;   4. close every Phi on this Loop
-;;   5. only THEN `loop-close!`
+;;   4. final Simple's `endLoop` calls `loop-close!`
+;;   5. it immediately closes every materialized Phi before any peephole can run
 ;;
-;; Close control first and: the Phi momentarily reads its declared zero because the back-edge value
-;; has no type yet, `i+1` folds to the literal 1, the Phi loses its only other user, and the whole
-;; loop goes. Every step locally justified.
+;; `scope-end-loop!` owns steps 4 and 5. The low-level mutation remains public for graph tests, but
+;; frontend lowering must not split finalization or expose its intermediate state.
 (defn loop-make [(entry (dyn NodeOps))] (-> (dyn NodeOps))
   (let [a (alloc/malloc-allocator)
         p (alloc/unwrap-ptr [LoopNode] (alloc/create [LoopNode] a))
@@ -833,6 +971,25 @@
 ;;
 ;; This is how a repeated bounds check or null check folds away — one dominator walk, not a dataflow
 ;; pass. `n-add-dep!` on each dominator visited, so a later change up the chain retries this.
+(defn if--true-arm-cast-source [(candidate (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (if (!= (n-op candidate) OP-CAST)
+      (None [(dyn NodeOps)])
+      (match (n-in candidate 0)
+        (None [] (None [(dyn NodeOps)]))
+        (Some [ctrl]
+              (if (or (!= (n-op ctrl) OP-CPROJ) (!= (cproj-idx ctrl) IF-TRUE-IDX))
+                  (None [(dyn NodeOps)])
+                  (match (n-in candidate 1)
+                    (None [] (None [(dyn NodeOps)]))
+                    (Some [source]
+                          (let [iff (n-in! ctrl 0)]
+                            (if (and (= (n-op iff) OP-IF)
+                                     (match (if-pred iff)
+                                       (Some [tested] (n-same? tested source))
+                                       (None [] false)))
+                                (Some source)
+                                (None [(dyn NodeOps)]))))))))))
+
 (defn if-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
   (match (if-pred d)
     (None [] (None [(dyn NodeOps)]))
@@ -855,7 +1012,10 @@
                                         (match (if-pred dm)
                                           (None [] 0)
                                           (Some [dp]
-                                                (if (n-same? dp pred)
+                                                (if (or (n-same? dp pred)
+                                                        (match (if--true-arm-cast-source pred)
+                                                          (Some [source] (n-same? dp source))
+                                                          (None [] false)))
                                                     (do
                                                       (n-set-def! d
                                                                   1
@@ -989,7 +1149,23 @@
                              (and (= (ty-tuple-len t) 2)
                                   (= (ty-tuple-at t (- 1 idx)) TY-XCTRL)))
                         (n-in m 0)
-                        (multi-pcopy m idx))))))))
+                        ;; Flip `CProj(If(Not(x)))`: rebuild the If over x with both projections
+                        ;; constructed together, then select the opposite arm. The dependency is
+                        ;; Simple's `addDep(iff.pred())`; if the predicate later becomes a Not, this
+                        ;; projection must be retried.
+                        (if (= (n-op m) OP-IF)
+                            (match (n-in m 1)
+                              (Some [pred]
+                                    (do
+                                      (n-add-dep! pred d)
+                                      (if (= (n-op pred) OP-NOT)
+                                          (let [arms (if-arms! (if-make (n-in! m 0) (n-in! pred 1)))]
+                                            (Some (if (= idx 0)
+                                                      (arms-false arms)
+                                                      (arms-true arms))))
+                                          (multi-pcopy m idx))))
+                              (None [] (multi-pcopy m idx)))
+                            (multi-pcopy m idx)))))))))
 
 (impl NodeOps CProjNode
   (hdr [(self (ptr CProjNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
@@ -1028,7 +1204,15 @@
   (hdr [(self (ptr ProjNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
   (label [(self (ptr ProjNode))] (-> (slice u8)) (.name self))
   (is-const? [(self (ptr ProjNode))] (-> bool) false)
-  (no-const-fold? [(self (ptr ProjNode))] (-> bool) false)
+  ;; Final Simple preserves a HIGH result projection from CallEnd while optimistic call-graph
+  ;; linking is still discovering Returns. Replacing it with a detached TOP Constant loses the
+  ;; edge that must sharpen later. Other Projs retain ordinary constant folding.
+  (no-const-fold? [(self (ptr ProjNode))]
+                  (-> bool)
+                  (let [d (primitive/make-dyn NodeOps self)]
+                    (match (n-in d 0)
+                      (Some [m] (and (= (n-op m) OP-CALLEND) (ty-high? (n-ty d))))
+                      (None [] false))))
   ;; PINNED: a Proj executes in its multi's block and code motion may not move it.
   (is-pinned? [(self (ptr ProjNode))] (-> bool) true)
   (binop-copy [(self (ptr ProjNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
@@ -1104,9 +1288,17 @@
 ;; ---------------------------------------------------------------------------
 ;; RETURN
 ;;
-;; Control, memory, the value, and a link to the enclosing Fun. That fourth input is what inlining
-;; nulls out. Its type is the tuple of its first three inputs' types.
-(defstruct ReturnNode [(hdr NodeHdr) (pad i64)])
+;; Inputs are control, memory, value and RPC. The enclosing Fun is separate metadata, exactly as in
+;; Simple: RPC is a graph edge cleared by inlining; ownership is not.
+(const RETURN-CTRL 0)
+
+(const RETURN-MEM 1)
+
+(const RETURN-VALUE 2)
+
+(const RETURN-RPC 3)
+
+(defstruct ReturnNode [(hdr NodeHdr) (fun-nid i64)])
 
 (impl NodeOps ReturnNode
   (hdr [(self (ptr ReturnNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
@@ -1120,10 +1312,9 @@
   (compute [(self (ptr ReturnNode))]
            (-> i64)
            (let [d (primitive/make-dyn NodeOps self)]
-             (ty-tuple-of2 (match (n-in d 0) (Some [c] (n-ty c)) (None [] TY-XCTRL))
-                           (match (n-in d 1) (Some [v] (n-ty v)) (None [] TY-TOP)))))
-  ;; Simple's Return also upgrades its Fun's signature from the returned type. That arrives with the
-  ;; calls unit; there is no Fun to upgrade yet.
+             (ty-tuple-of3 (match (n-in d RETURN-CTRL) (Some [c] (n-ty c)) (None [] TY-XCTRL))
+                           (match (n-in d RETURN-MEM) (Some [m] (n-ty m)) (None [] TY-TOP))
+                           (match (n-in d RETURN-VALUE) (Some [v] (n-ty v)) (None [] TY-TOP)))))
   (idealize [(self (ptr ReturnNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
   (eq-extra [(self (ptr ReturnNode)) (other (dyn NodeOps))] (-> bool) (= (n-op other) OP-RETURN))
   (hash-extra [(self (ptr ReturnNode))] (-> i64) 149))
@@ -1139,17 +1330,26 @@
               (-> i64)
               (cfg-idepth-default (primitive/make-dyn NodeOps self))))
 
-(defn return-make [(ctrl (dyn NodeOps)) (val (dyn NodeOps))] (-> (dyn NodeOps))
+(defn return-make [(ctrl (dyn NodeOps))
+                   (mem (Option (dyn NodeOps)))
+                   (val (dyn NodeOps))
+                   (rpc (Option (dyn NodeOps)))
+                   (fun (Option (dyn NodeOps)))] (-> (dyn NodeOps))
   (let [a (alloc/malloc-allocator)
         p (alloc/unwrap-ptr [ReturnNode] (alloc/create [ReturnNode] a))
         d (primitive/make-dyn NodeOps p)]
-    (set! (.pad p) 0)
+    (set! (.fun-nid p) (match fun (Some [f] (n-nid f)) (None [] 0)))
     (n-init! d OP-RETURN)
     (n-add-def! d (Some ctrl))
+    (n-add-def! d mem)
     (n-add-def! d (Some val))
+    (n-add-def! d rpc)
     (invalidate-cfg!)
     (n-set-ty! d (compute p))
     d))
+
+(defn return-fun-nid [(ret (dyn NodeOps))] (-> i64)
+  (.fun-nid (primitive/cast (ptr ReturnNode) (hdr ret))))
 
 ;; The second half of `cfg-of`, split only because one `if` chain of that depth is unreadable.
 (defn cfg-of-more [(n (dyn NodeOps))] (-> (Option (dyn CFGOps)))
@@ -1177,7 +1377,7 @@
 ;; here. Miss it and dropping a call site from a Fun leaves every Parm one value too long, reading
 ;; the wrong caller's argument: a miscompile that typechecks cleanly.
 (defn phi-like? [(op i64)] (-> bool)
-  (or (= op OP-PHI) (or (= op OP-MEMPHI) (= op OP-PARM))))
+  (or (= op OP-PHI) (= op OP-MEMPHI) (= op OP-PARM)))
 
 ;; ---------------------------------------------------------------------------
 ;; Extending `cfg-of` across a module boundary
@@ -1221,7 +1421,7 @@
 ;; Opcodes this module does not own but which ARE control. Asking about one before the extension is
 ;; installed is a wiring bug, and it says so.
 (defn cfg--ext-owned? [(op i64)] (-> bool)
-  (or (= op OP-FUN) (or (= op OP-CALL) (= op OP-CALLEND))))
+  (or (= op OP-FUN) (= op OP-CALL) (= op OP-CALLEND)))
 
 (defn cfg-of-ext [(n (dyn NodeOps))] (-> (Option (dyn CFGOps)))
   (if (not (cfg--ext-owned? (n-op n)))

@@ -187,10 +187,11 @@ That `-1` is our own "deferred, never declined" law showing up in Simple's code:
 by a not-yet-constant function pointer, arguments that do not yet `isa` their formals, or a body
 that cleanup might still shrink, is retried rather than dropped.
 
-**The heuristic is deliberately minimal** — a size cap of 100 nodes (200 for constructors), never
-for self-recursive functions (that is loop unrolling by another name), and requiring exactly one
-linked target with a constant non-null function pointer. The precision comes from the call graph
-SCCP discovered, not from a clever cost model.
+**The heuristic is deliberately minimal** — a 100-node cap, `_noInline`, never for self-recursive
+functions (that is loop unrolling by another name), and exactly one linked target with a constant
+non-null function pointer. Simple's 200-node initializer exception waits for this frontend to
+classify initializers and distinguish class bodies. The precision comes from the call graph SCCP
+discovered, not from a clever cost model.
 
 **So there is no JSL inlining question.** A JSL definition is a `Fun`; it inlines through the same
 `CallEnd` worklist, the same tri-state, and the same fold as any user function.
@@ -199,15 +200,15 @@ SCCP discovered, not from a clever cost model.
 
 ## 4. What has to exist before any of it runs
 
-Neither half can be demonstrated today, and the missing piece is the same for both: **there is no
-control flow and there are no calls.** The graph currently has `Con` and `Add`.
+The control, call, inlining, dynamic-value and optimizer spine below is implemented and tested.
+What remains is to connect it first to one fixture JSL definition and then to source lowering.
 
 The shortest path to proving the architecture, and it needs no parser at all:
 
-1. `Start`, `Stop`, `Return`, `Region`, `If`, `Phi`, `Proj` — plus `iterpeeps` to a fixpoint.
-2. `Fun`, `Parm`, `Call`, `CallEnd`, and inlining.
-3. `src/jsl/` reader and lowering, for **one** builtin.
-4. A hand-built `Call(JsSub, con 5, con 3)` that folds to the constant `2`.
+1. ~~`Start`, `Stop`, `Return`, `Region`, `If`, `Phi`, `Proj`, and `iterpeeps`.~~ Implemented.
+2. ~~`Fun`, `Parm`, `Call`, `CallEnd`, and inlining.~~ Implemented.
+3. Implement `src/jsl/` reader and lowering for **one** fixture builtin.
+4. Make a hand-built `Call(FixtureSub, con 5, con 3)` fold to the constant `2`.
 
 Step 4 is one test, and passing it exercises the reader, the lowering, the primitive layer, `Fun`
 and `Call`, the inliner, `Box`/`Unbox` cancellation and the peephole fixpoint — the entire spine.

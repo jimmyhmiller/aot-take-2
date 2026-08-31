@@ -1,6 +1,7 @@
 ;; ============================================================================
 
-;; ARITHMETIC  —  port of Simple's ArithNode, AddNode, SubNode, MulNode, MinusNode
+;; ARITHMETIC  —  port of Simple's ArithNode, AddNode, SubNode, MulNode, DivNode,
+;; ToFloatNode, RoundF32Node and MinusNode
 ;; ============================================================================
 ;;
 ;; One file, because the peepholes are one system. Add's "sink constants right, then fold
@@ -45,17 +46,9 @@
 ;; or (add add add), but NEVER (add non add). The canonical form is what makes the later rules a
 ;; finite set of cases instead of a search.
 ;;
-;; ## Rules deliberately NOT here yet, and why that is not a stub
-;;
-;; Simple's Add also calls `phiCon`, pushing a constant up through a Phi:
-;; `((x + (phi cons)) + con)` becomes `x + (phi con+con …)`. That needs Phi, which belongs to the
-;; control-flow unit. It is an OPTIMISATION, not a semantic requirement — its absence makes worse
-;; code, never wrong code — so it is recorded as owed rather than stubbed. Same for `spine_cmp`'s
-;; Phi-aware ordering (rule 7).
-;;
-;; The distinction matters: a missing MECHANISM (no addDep, no GVN) means the thing is not what it
-;; claims to be. A missing OPTIMISATION that depends on a node kind which does not exist yet is
-;; correct-but-weaker, and visible.
+;; `phiCon` and `spine_cmp` are both live. The former pushes constants through Phis and the latter
+;; gives every Add spine a deterministic order: constants, Phis of constants, ordinary Phis, then
+;; other nodes by nid. The ordering is not cosmetic; it exposes adjacent constants to rule 6.
 ;;
 ;; ## Overflow never wraps
 ;;
@@ -140,18 +133,59 @@
         (set! (.mode (primitive/cast (ptr AddNode) (hdr n))) m)
         0)))
 
-(defn add-compute-ty [(lt i64) (rt i64)] (-> i64)
+(defn add-compute-mode [(lt i64) (rt i64) (mode i64)] (-> i64)
   (if (or (ty-high? lt) (ty-high? rt))
-      TY-TOP
-      (if (and (ty-int? lt) (ty-int? rt))
-          (let [alo (ty-int-lo lt)
-                ahi (ty-int-hi lt)
-                blo (ty-int-lo rt)
-                bhi (ty-int-hi rt)]
-            (if (or (add-overflows? alo blo) (add-overflows? ahi bhi))
-                (ty-int-bot)
-                (ty-int-range (+ alo blo) (+ ahi bhi))))
-          TY-BOT)))
+      (if (= mode MODE-INT)
+          (ty-dual (ty-int-bot))
+          (if (= mode MODE-FLT) (ty-dual (ty-flt-bot)) TY-TOP))
+      (let [m (if (= mode MODE-UNKNOWN) (arith-mode-of lt rt) mode)]
+        (if (= m MODE-INT)
+            (if (and (ty-int? lt) (ty-int? rt))
+                (let [alo (ty-int-lo lt)
+                      ahi (ty-int-hi lt)
+                      blo (ty-int-lo rt)
+                      bhi (ty-int-hi rt)]
+                  (if (or (add-overflows? alo blo) (add-overflows? ahi bhi))
+                      (ty-int-bot)
+                      (ty-int-range-wide (+ alo blo)
+                                         (+ ahi bhi)
+                                         (if (> (ty-int-widen lt) (ty-int-widen rt))
+                                             (ty-int-widen lt)
+                                             (ty-int-widen rt)))))
+                (ty-int-bot))
+            (if (= m MODE-FLT)
+                (if (and (ty-flt? lt) (ty-flt? rt))
+                    (if (and (ty-constant? lt) (ty-constant? rt))
+                        (ty-flt-con (primitive/fadd (ty-flt-value lt) (ty-flt-value rt)))
+                        (ty-meet lt rt))
+                    (ty-flt-bot))
+                TY-BOT)))))
+
+(defn add-compute-ty [(lt i64) (rt i64)] (-> i64)
+  (add-compute-mode lt rt MODE-UNKNOWN))
+
+;; Simple's `spine_cmp`: constants sort furthest right, then Phis of constants, then ordinary
+;; Phis, then all other nodes by nid. Returning true means `hi` and `lo` are out of order.
+(defn add-spine-swap? [(hi (dyn NodeOps)) (lo (dyn NodeOps)) (dep (dyn NodeOps))] (-> bool)
+  (if (ty-constant? (n-ty lo))
+      false
+      (if (ty-constant? (n-ty hi))
+          true
+          (if (and (= (n-op lo) OP-PHI) (ty-high? (n-ty (n-in! lo 0))))
+              false
+              (if (and (= (n-op hi) OP-PHI) (ty-high? (n-ty (n-in! hi 0))))
+                  false
+                  (match (pcon lo dep)
+                    (Some [_] false)
+                    (None []
+                          (match (pcon hi dep)
+                            (Some [_] true)
+                            (None []
+                                  (if (and (= (n-op lo) OP-PHI) (!= (n-op hi) OP-PHI))
+                                      true
+                                      (if (and (= (n-op hi) OP-PHI) (!= (n-op lo) OP-PHI))
+                                          false
+                                          (> (n-nid lo) (n-nid hi)))))))))))))
 
 (defn add-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
   (let [lhs (n-in! d ARITH-LHS)
@@ -162,30 +196,65 @@
           (if (= m MODE-UNKNOWN)
               (None [(dyn NodeOps)])
               (do (add-set-mode! d m) (Some d))))
-        (if (int-con-is? (n-ty rhs) 0)
-            ;; 1. x + 0 -> x
-            (Some lhs)
-            (if (and (n-same? lhs rhs) (= (add-mode d) MODE-INT))
-                ;; 2. x + x -> x << 1, integer mode only
-                (Some (shl-make lhs (con-int 1)))
-                (if (and (!= (n-op lhs) OP-ADD) (= (n-op rhs) OP-ADD))
-                    ;; 3. non-add + add -> swap, building a left spine
-                    (Some (n-swap12! d))
-                    (if (= (n-op lhs) OP-ADD)
-                        ;; 6. (x + c1) + c2 -> x + (c1 + c2)
-                        ;;
-                        ;; The dependency is the point: if `c1` is not constant today but becomes
-                        ;; one later, this rewrite becomes available and must be retried.
-                        (let [c1 (n-in! lhs ARITH-RHS)]
-                          (n-add-dep! c1 d)
-                          (if (and (ty-constant? (n-ty c1)) (ty-constant? (n-ty rhs)))
-                              (Some (add-make (n-in! lhs ARITH-LHS)
-                                              (n-peephole! (add-make c1 rhs))))
-                              ;; 7. Push a constant up through a Phi. `rotate` is true: Add is
-                              ;; associative, so the left side may itself be an Add wrapping the Phi.
-                              (phi-con d true)))
-                        ;; Same rule with no Add on the left to rotate through.
-                        (phi-con d true))))))))
+        (if (and (= (add-mode d) MODE-FLT) (ty-int? (n-ty lhs)))
+            (Some (add-make-mode (to-float-make lhs) rhs MODE-FLT))
+            (if (and (= (add-mode d) MODE-FLT) (ty-int? (n-ty rhs)))
+                (Some (add-make-mode lhs (to-float-make rhs) MODE-FLT))
+                ;; IEEE addition is not associative. Direct Phi-arm distribution is safe because
+                ;; each execution still performs exactly one Add, but every spine rotation,
+                ;; reassociation, and constant regrouping below is integer-only.
+                (if (= (add-mode d) MODE-FLT)
+                    (phi-con d false)
+                    (if (int-con-is? (n-ty rhs) 0)
+                        ;; 1. x + 0 -> x
+                        (Some lhs)
+                        (if (and (n-same? lhs rhs) (= (add-mode d) MODE-INT))
+                            ;; 2. x + x -> x << 1, integer mode only
+                            (Some (shl-make lhs (con-int 1)))
+                            (if (and (!= (n-op lhs) OP-ADD) (= (n-op rhs) OP-ADD))
+                                ;; 3. non-add + add -> swap, building a left spine
+                                (Some (n-swap12! d))
+                                (if (= (n-op rhs) OP-MINUS)
+                                    ;; 4. x + (-y) -> x - y
+                                    (Some (sub-make-mode lhs (n-in! rhs ARITH-LHS) (add-mode d)))
+                                    (if (= (n-op rhs) OP-ADD)
+                                        ;; 5. x + (y + z) -> (x + y) + z
+                                        (Some (add-make-mode (n-peephole! (add-make-mode lhs
+                                                                                         (n-in! rhs ARITH-LHS)
+                                                                                         (add-mode d)))
+                                                             (n-in! rhs ARITH-RHS)
+                                                             (add-mode d)))
+                                        (if (!= (n-op lhs) OP-ADD)
+                                            (if (add-spine-swap? lhs rhs d)
+                                                (Some (n-swap12! d))
+                                                (phi-con d true))
+                                            ;; Now only (add add non) remains.
+                                            (if (and (>= (n-nins lhs) 2)
+                                                     (n-same? (n-in! lhs ARITH-LHS) lhs))
+                                                (None [(dyn NodeOps)])
+                                                (let [c1 (n-in! lhs ARITH-RHS)]
+                                                  ;; 6. (x + c1) + c2 -> x + (c1 + c2). The dependency is
+                                                  ;; load-bearing: c1 may become constant later.
+                                                  (n-add-dep! c1 d)
+                                                  (if (and (ty-constant? (n-ty c1))
+                                                           (ty-constant? (n-ty rhs)))
+                                                      (Some (add-make-mode (n-in! lhs ARITH-LHS)
+                                                                           (n-peephole! (add-make-mode c1
+                                                                                                       rhs
+                                                                                                       (add-mode d)))
+                                                                           (add-mode d)))
+                                                      (match (phi-con d true)
+                                                        (Some [x] (Some x))
+                                                        (None []
+                                                              ;; 7. ((x + hi) + lo) -> ((x + lo) + hi)
+                                                              (if (add-spine-swap? c1 rhs d)
+                                                                  (Some (add-make-mode (n-peephole! (add-make-mode (n-in! lhs
+                                                                                                                          ARITH-LHS)
+                                                                                                                   rhs
+                                                                                                                   (add-mode d)))
+                                                                                       c1
+                                                                                       (add-mode d)))
+                                                                  (None [(dyn NodeOps)])))))))))))))))))))
 
 (impl NodeOps AddNode
   (hdr [(self (ptr AddNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
@@ -201,7 +270,9 @@
   (compute [(self (ptr AddNode))]
            (-> i64)
            (let [d (primitive/make-dyn NodeOps self)]
-             (add-compute-ty (n-ty (n-in! d ARITH-LHS)) (n-ty (n-in! d ARITH-RHS)))))
+             (add-compute-mode (n-ty (n-in! d ARITH-LHS))
+                               (n-ty (n-in! d ARITH-RHS))
+                               (.mode self))))
   (idealize [(self (ptr AddNode))]
             (-> (Option (dyn NodeOps)))
             (add-idealize (primitive/make-dyn NodeOps self)))
@@ -242,18 +313,36 @@
 ;; The range of a difference is [alo-bhi .. ahi-blo] — the LOW bound uses the other side's HIGH.
 ;; Getting that backwards produces a range that excludes reachable values, which is unsound in the
 ;; direction that matters: the optimiser would believe something false.
-(defn sub-compute-ty [(lt i64) (rt i64)] (-> i64)
+(defn sub-compute-mode [(lt i64) (rt i64) (mode i64)] (-> i64)
   (if (or (ty-high? lt) (ty-high? rt))
-      TY-TOP
-      (if (and (ty-int? lt) (ty-int? rt))
-          (let [alo (ty-int-lo lt)
-                ahi (ty-int-hi lt)
-                blo (ty-int-lo rt)
-                bhi (ty-int-hi rt)]
-            (if (or (sub-overflows? alo bhi) (sub-overflows? ahi blo))
-                (ty-int-bot)
-                (ty-int-range (- alo bhi) (- ahi blo))))
-          TY-BOT)))
+      (if (= mode MODE-INT)
+          (ty-dual (ty-int-bot))
+          (if (= mode MODE-FLT) (ty-dual (ty-flt-bot)) TY-TOP))
+      (let [m (if (= mode MODE-UNKNOWN) (arith-mode-of lt rt) mode)]
+        (if (= m MODE-INT)
+            (if (and (ty-int? lt) (ty-int? rt))
+                (let [alo (ty-int-lo lt)
+                      ahi (ty-int-hi lt)
+                      blo (ty-int-lo rt)
+                      bhi (ty-int-hi rt)]
+                  (if (or (sub-overflows? alo bhi) (sub-overflows? ahi blo))
+                      (ty-int-bot)
+                      (ty-int-range-wide (- alo bhi)
+                                         (- ahi blo)
+                                         (if (> (ty-int-widen lt) (ty-int-widen rt))
+                                             (ty-int-widen lt)
+                                             (ty-int-widen rt)))))
+                (ty-int-bot))
+            (if (= m MODE-FLT)
+                (if (and (ty-flt? lt) (ty-flt? rt))
+                    (if (and (ty-constant? lt) (ty-constant? rt))
+                        (ty-flt-con (primitive/fsub (ty-flt-value lt) (ty-flt-value rt)))
+                        (ty-meet lt rt))
+                    (ty-flt-bot))
+                TY-BOT)))))
+
+(defn sub-compute-ty [(lt i64) (rt i64)] (-> i64)
+  (sub-compute-mode lt rt MODE-UNKNOWN))
 
 (defn sub-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
   (let [lhs (n-in! d ARITH-LHS)
@@ -263,13 +352,26 @@
           (if (= m MODE-UNKNOWN)
               (None [(dyn NodeOps)])
               (do (sub-set-mode! d m) (Some d))))
-        (if (int-con-is? (n-ty rhs) 0)
-            ;; x - 0 -> x
-            (Some lhs)
-            ;; x - x -> 0. Integer mode ONLY: for floats this is false when x is NaN.
-            (if (and (n-same? lhs rhs) (= (sub-mode d) MODE-INT))
-                (Some (con-int 0))
-                (None [(dyn NodeOps)]))))))
+        (if (and (= (sub-mode d) MODE-FLT) (ty-int? (n-ty lhs)))
+            (Some (sub-make-mode (to-float-make lhs) rhs MODE-FLT))
+            (if (and (= (sub-mode d) MODE-FLT) (ty-int? (n-ty rhs)))
+                (Some (sub-make-mode lhs (to-float-make rhs) MODE-FLT))
+                (if (int-con-is? (n-ty rhs) 0)
+                    ;; x - 0 -> x
+                    (Some lhs)
+                    ;; x - x -> 0. Integer mode ONLY: for floats this is false when x is NaN.
+                    (if (and (n-same? lhs rhs) (= (sub-mode d) MODE-INT))
+                        (Some (con-int 0))
+                        ;; Simple applies these after the arithmetic mode is settled.  They are valid
+                        ;; for both integer and IEEE arithmetic: neither rewrite changes evaluation
+                        ;; order, and negation preserves NaN and signed-zero behavior.
+                        (if (= (n-op rhs) OP-MINUS)
+                            ;; x - (-y) -> x + y
+                            (Some (add-make-mode lhs (n-in! rhs 1) (sub-mode d)))
+                            (if (and (= (sub-mode d) MODE-INT) (= (n-op lhs) OP-MINUS))
+                                ;; (-x) - y -> -(x + y)
+                                (Some (minus-make (n-peephole! (add-make-mode (n-in! lhs 1) rhs (sub-mode d)))))
+                                (None [(dyn NodeOps)]))))))))))
 
 (impl NodeOps SubNode
   (hdr [(self (ptr SubNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
@@ -283,7 +385,9 @@
   (compute [(self (ptr SubNode))]
            (-> i64)
            (let [d (primitive/make-dyn NodeOps self)]
-             (sub-compute-ty (n-ty (n-in! d ARITH-LHS)) (n-ty (n-in! d ARITH-RHS)))))
+             (sub-compute-mode (n-ty (n-in! d ARITH-LHS))
+                               (n-ty (n-in! d ARITH-RHS))
+                               (.mode self))))
   (idealize [(self (ptr SubNode))]
             (-> (Option (dyn NodeOps)))
             (sub-idealize (primitive/make-dyn NodeOps self)))
@@ -325,16 +429,50 @@
 ;; products, and the sign cases are exactly where an off-by-one becomes an UNSOUND range — so the
 ;; honest answer for a non-constant pair is the integer bottom until that is written and tested
 ;; properly. Widening is always safe; narrowing wrongly is not.
-(defn mul-compute-ty [(lt i64) (rt i64)] (-> i64)
+(defn mul-compute-mode [(lt i64) (rt i64) (mode i64)] (-> i64)
   (if (or (ty-high? lt) (ty-high? rt))
-      TY-TOP
-      (if (and (ty-int? lt) (ty-int? rt))
-          (if (and (ty-constant? lt) (ty-constant? rt))
-              (let [a (ty-int-lo lt)
-                    b (ty-int-lo rt)]
-                (if (mul-overflows? a b) (ty-int-bot) (ty-int-con (* a b))))
-              (ty-int-bot))
-          TY-BOT)))
+      (if (= mode MODE-INT)
+          (ty-dual (ty-int-bot))
+          (if (= mode MODE-FLT) (ty-dual (ty-flt-bot)) TY-TOP))
+      (let [m (if (= mode MODE-UNKNOWN) (arith-mode-of lt rt) mode)]
+        (if (= m MODE-INT)
+            (if (and (ty-int? lt) (ty-int? rt))
+                (if (and (ty-constant? lt) (ty-constant? rt))
+                    (let [a (ty-int-lo lt)
+                          b (ty-int-lo rt)]
+                      (if (mul-overflows? a b) (ty-int-bot) (ty-int-con (* a b))))
+                    (ty-int-bot))
+                (ty-int-bot))
+            (if (= m MODE-FLT)
+                (if (and (ty-flt? lt) (ty-flt? rt))
+                    (if (and (ty-constant? lt) (ty-constant? rt))
+                        (ty-flt-con (primitive/fmul (ty-flt-value lt) (ty-flt-value rt)))
+                        (ty-meet lt rt))
+                    (ty-flt-bot))
+                TY-BOT)))))
+
+(defn mul-compute-ty [(lt i64) (rt i64)] (-> i64)
+  (mul-compute-mode lt rt MODE-UNKNOWN))
+
+(defn mul--constant-int-idealize [(d (dyn NodeOps)) (lhs (dyn NodeOps)) (c i64)] (-> (Option (dyn NodeOps)))
+  (if (= c 1)
+      (Some lhs)
+      (if (= c 0)
+          (Some (con-int 0))
+          ;; Simple lowers the three profitable constant shapes before instruction selection:
+          ;; 2^n, 2^n+1 and 2^n-1.  Require a positive power candidate; in particular, zero is not
+          ;; a power of two and must never reach `ctz`.
+          (if (and (> c 0) (= (primitive/iand c (- c 1)) 0))
+              (Some (shl-make lhs (con-int (primitive/ctz c))))
+              (let [below (- c 1)
+                    above (+ c 1)]
+                (if (and (> below 0) (= (primitive/iand below (- below 1)) 0))
+                    (Some (add-make (n-peephole! (shl-make lhs (con-int (primitive/ctz below))))
+                                    lhs))
+                    (if (and (> above 0) (= (primitive/iand above (- above 1)) 0))
+                        (Some (sub-make (n-peephole! (shl-make lhs (con-int (primitive/ctz above))))
+                                        lhs))
+                        (phi-con d true))))))))
 
 (defn mul-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
   (let [lhs (n-in! d ARITH-LHS)
@@ -344,13 +482,22 @@
           (if (= m MODE-UNKNOWN)
               (None [(dyn NodeOps)])
               (do (mul-set-mode! d m) (Some d))))
-        (if (int-con-is? (n-ty rhs) 1)
-            ;; x * 1 -> x
-            (Some lhs)
-            ;; Sink the constant to the RHS so the rule above sees a canonical form.
-            (if (and (ty-constant? (n-ty lhs)) (not (ty-constant? (n-ty rhs))))
-                (Some (n-swap12! d))
-                (None [(dyn NodeOps)]))))))
+        (if (and (= (mul-mode d) MODE-FLT) (ty-int? (n-ty lhs)))
+            (Some (mul-make-mode (to-float-make lhs) rhs MODE-FLT))
+            (if (and (= (mul-mode d) MODE-FLT) (ty-int? (n-ty rhs)))
+                (Some (mul-make-mode lhs (to-float-make rhs) MODE-FLT))
+                ;; Sink the constant to the RHS so every constant rule below sees one canonical form.
+                (if (and (ty-constant? (n-ty lhs)) (not (ty-constant? (n-ty rhs))))
+                    (Some (n-swap12! d))
+                    (if (and (= (mul-mode d) MODE-INT)
+                             (and (ty-int? (n-ty rhs)) (ty-constant? (n-ty rhs))))
+                        (mul--constant-int-idealize d lhs (ty-int-lo (n-ty rhs)))
+                        (if (and (= (mul-mode d) MODE-FLT) (ty-flt? (n-ty rhs)))
+                            (if (and (ty-constant? (n-ty rhs))
+                                     (primitive/fcmp-eq (ty-flt-value (n-ty rhs)) 1.0))
+                                (Some lhs)
+                                (phi-con d false))
+                            (phi-con d true)))))))))
 
 (impl NodeOps MulNode
   (hdr [(self (ptr MulNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
@@ -364,7 +511,9 @@
   (compute [(self (ptr MulNode))]
            (-> i64)
            (let [d (primitive/make-dyn NodeOps self)]
-             (mul-compute-ty (n-ty (n-in! d ARITH-LHS)) (n-ty (n-in! d ARITH-RHS)))))
+             (mul-compute-mode (n-ty (n-in! d ARITH-LHS))
+                               (n-ty (n-in! d ARITH-RHS))
+                               (.mode self))))
   (idealize [(self (ptr MulNode))]
             (-> (Option (dyn NodeOps)))
             (mul-idealize (primitive/make-dyn NodeOps self)))
@@ -388,6 +537,122 @@
     d))
 
 ;; ---------------------------------------------------------------------------
+;; Div
+;;
+;; Simple's DivNode applies its own rules before the shared ArithNode rules, in this order:
+;; integer division by one returns the dividend; float division by one does the same; division by
+;; any other float constant becomes multiplication by its reciprocal; only then does shared
+;; arithmetic settle the mode or convert a mixed integer operand with ToFloat. Integer constant
+;; division by zero is defined as zero by Simple's ideal graph evaluator. Float division keeps IEEE
+;; semantics, including infinities and NaN.
+(defstruct DivNode [(hdr NodeHdr) (mode i64)])
+
+(defn div-mode [(n (dyn NodeOps))] (-> i64)
+  (.mode (primitive/cast (ptr DivNode) (hdr n))))
+
+(defn div-set-mode! [(n (dyn NodeOps)) (m i64)] (-> i64)
+  (if (!= (div-mode n) MODE-UNKNOWN)
+      (broken "div-set-mode!: mode is one-shot and was already settled")
+      (do
+        (n-unlock! n)
+        (set! (.mode (primitive/cast (ptr DivNode) (hdr n))) m)
+        0)))
+
+(defn div-compute-ty [(lt i64) (rt i64) (mode i64)] (-> i64)
+  (if (or (ty-high? lt) (ty-high? rt))
+      (if (= mode MODE-INT)
+          (ty-dual (ty-int-bot))
+          (if (= mode MODE-FLT) (ty-dual (ty-flt-bot)) TY-TOP))
+      (let [m (if (= mode MODE-UNKNOWN) (arith-mode-of lt rt) mode)]
+        (if (= m MODE-INT)
+            (if (and (ty-int? lt) (ty-int? rt))
+                (if (and (ty-constant? lt) (ty-constant? rt))
+                    (let [x (ty-int-lo lt)
+                          y (ty-int-lo rt)]
+                      (if (= y 0)
+                          (ty-int-con 0)
+                          ;; Coil and Java both define this two's-complement quotient as INT-MIN;
+                          ;; spell it out so no host division trap can leak into constant folding.
+                          (if (and (= x INT-MIN) (= y -1))
+                              (ty-int-con INT-MIN)
+                              (ty-int-con (/ x y)))))
+                    (ty-int-bot))
+                (ty-int-bot))
+            (if (= m MODE-FLT)
+                (if (and (ty-flt? lt) (ty-flt? rt))
+                    (if (and (ty-constant? lt) (ty-constant? rt))
+                        (ty-flt-con (primitive/fdiv (ty-flt-value lt) (ty-flt-value rt)))
+                        (ty-meet lt rt))
+                    (ty-flt-bot))
+                TY-BOT)))))
+
+(defn div-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [lhs (n-in! d ARITH-LHS)
+        rhs (n-in! d ARITH-RHS)
+        lt (n-ty lhs)
+        rt (n-ty rhs)
+        mode (div-mode d)]
+    (if (and (= mode MODE-INT) (int-con-is? rt 1))
+        (Some lhs)
+        (if (and (= mode MODE-FLT)
+                 (and (ty-flt? rt)
+                      (and (ty-constant? rt)
+                           (primitive/fcmp-eq (ty-flt-value rt) 1.0))))
+            (Some lhs)
+            ;; Do not replace IEEE division by multiplication with a pre-rounded reciprocal. For
+            ;; example, 3/10 differs from 3*(1/10). Simple may make this optimization for its source
+            ;; language; JavaScript requires the independently rounded division result.
+            (if (= mode MODE-UNKNOWN)
+                (let [m (arith-mode-of lt rt)]
+                  (if (= m MODE-UNKNOWN)
+                      (None [(dyn NodeOps)])
+                      (do (div-set-mode! d m) (Some d))))
+                (if (= mode MODE-FLT)
+                    (if (ty-int? lt)
+                        (Some (div-make-mode (to-float-make lhs) rhs MODE-FLT))
+                        (if (ty-int? rt)
+                            (Some (div-make-mode lhs (to-float-make rhs) MODE-FLT))
+                            (None [(dyn NodeOps)])))
+                    (None [(dyn NodeOps)])))))))
+
+(impl NodeOps DivNode
+  (hdr [(self (ptr DivNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr DivNode))] (-> (slice u8)) "Div")
+  (is-const? [(self (ptr DivNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr DivNode))] (-> bool) false)
+  (is-pinned? [(self (ptr DivNode))] (-> bool) false)
+  (binop-copy [(self (ptr DivNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (Some (div-make-mode lhs rhs (.mode self))))
+  (compute [(self (ptr DivNode))]
+           (-> i64)
+           (let [d (primitive/make-dyn NodeOps self)]
+             (div-compute-ty (n-ty (n-in! d ARITH-LHS))
+                             (n-ty (n-in! d ARITH-RHS))
+                             (.mode self))))
+  (idealize [(self (ptr DivNode))]
+            (-> (Option (dyn NodeOps)))
+            (div-idealize (primitive/make-dyn NodeOps self)))
+  (eq-extra [(self (ptr DivNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (if (!= (n-op other) OP-DIV)
+                false
+                (= (.mode self) (.mode (primitive/cast (ptr DivNode) (hdr other))))))
+  (hash-extra [(self (ptr DivNode))] (-> i64) (+ 23 (* (.mode self) 31))))
+
+(defn div-make [(lhs (dyn NodeOps)) (rhs (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [DivNode] (alloc/create [DivNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.mode p) MODE-UNKNOWN)
+    (n-init! d OP-DIV)
+    (n-add-def! d (None [(dyn NodeOps)]))
+    (n-add-def! d (Some lhs))
+    (n-add-def! d (Some rhs))
+    (n-set-ty! d (compute d))
+    d))
+
+;; ---------------------------------------------------------------------------
 ;; Shl — needed by Add's `x + x -> x << 1`
 (defstruct ShlNode [(hdr NodeHdr) (pad i64)])
 
@@ -395,18 +660,44 @@
   (if (or (ty-high? lt) (ty-high? rt))
       TY-TOP
       (if (and (ty-int? lt) (ty-int? rt))
-          (if (and (ty-constant? lt) (ty-constant? rt))
-              (let [v (ty-int-lo lt)
-                    s (ty-int-lo rt)]
-                ;; A shift count outside 0..63 is undefined at the machine level, so refuse to fold
-                ;; rather than inventing the host's answer.
-                (if (or (< s 0) (> s 63))
-                    (ty-int-bot)
-                    (if (mul-overflows? v (primitive/ishl 1 s))
-                        (ty-int-bot)
-                        (ty-int-con (primitive/ishl v s)))))
-              (ty-int-bot))
+          (if (and (ty-constant? rt) (not (ty-high? lt)))
+              (let [s (primitive/iand (ty-int-lo rt) 63)
+                    lo (ty-int-lo lt)
+                    hi (ty-int-hi lt)
+                    slo (primitive/ishl lo s)
+                    shi (primitive/ishl hi s)]
+                ;; Simple sharpens a whole range when shifting both endpoints back recovers them
+                ;; exactly. Machine i64 shift counts are modulo 64.
+                (if (and (= (primitive/ishr slo s) lo) (= (primitive/ishr shi s) hi))
+                    (ty-int-range-wide slo shi (ty-int-widen lt))
+                    (ty-int-bot)))
+              (if (int-con-is? lt 0) (ty-int-con 0) (ty-int-bot)))
           TY-BOT)))
+
+(defn shl-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [lhs (n-in! d ARITH-LHS)
+        rhs (n-in! d ARITH-RHS)
+        rt (n-ty rhs)]
+    (if (not (and (ty-int? rt) (ty-constant? rt)))
+        (None [(dyn NodeOps)])
+        (let [s (primitive/iand (ty-int-lo rt) 63)]
+          (if (= s 0)
+              (Some lhs)
+              ;; (x + c) << s -> (x << s) + (c << s), when the displaced constant remains a
+              ;; compact signed 32-bit immediate. Register a dependency because Add may only
+              ;; acquire its canonical RHS constant after another peephole fires.
+              (if (= (n-op lhs) OP-ADD)
+                  (do
+                    (n-add-dep! lhs d)
+                    (let [c (n-ty (n-in! lhs ARITH-RHS))]
+                      (if (and (ty-int? c) (ty-constant? c))
+                          (let [shifted (primitive/ishl (ty-int-lo c) s)]
+                            (if (and (>= shifted -2147483648) (<= shifted 2147483647))
+                                (Some (add-make (n-peephole! (shl-make (n-in! lhs ARITH-LHS) rhs))
+                                                (con-int shifted)))
+                                (None [(dyn NodeOps)])))
+                          (None [(dyn NodeOps)]))))
+                  (None [(dyn NodeOps)])))))))
 
 (impl NodeOps ShlNode
   (hdr [(self (ptr ShlNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
@@ -416,18 +707,14 @@
   (is-pinned? [(self (ptr ShlNode))] (-> bool) false)
   (binop-copy [(self (ptr ShlNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
               (-> (Option (dyn NodeOps)))
-              (None [(dyn NodeOps)]))
+              (Some (shl-make lhs rhs)))
   (compute [(self (ptr ShlNode))]
            (-> i64)
            (let [d (primitive/make-dyn NodeOps self)]
              (shl-compute-ty (n-ty (n-in! d ARITH-LHS)) (n-ty (n-in! d ARITH-RHS)))))
   (idealize [(self (ptr ShlNode))]
             (-> (Option (dyn NodeOps)))
-            (let [d (primitive/make-dyn NodeOps self)]
-              ;; x << 0 -> x
-              (if (int-con-is? (n-ty (n-in! d ARITH-RHS)) 0)
-                  (Some (n-in! d ARITH-LHS))
-                  (None [(dyn NodeOps)]))))
+            (shl-idealize (primitive/make-dyn NodeOps self)))
   (eq-extra [(self (ptr ShlNode)) (other (dyn NodeOps))] (-> bool) (= (n-op other) OP-SHL))
   (hash-extra [(self (ptr ShlNode))] (-> i64) 17))
 
@@ -447,17 +734,43 @@
 ;; Minus — unary negation
 (defstruct MinusNode [(hdr NodeHdr) (mode i64)])
 
-(defn minus-compute-ty [(t i64)] (-> i64)
+(defn minus-mode [(n (dyn NodeOps))] (-> i64)
+  (.mode (primitive/cast (ptr MinusNode) (hdr n))))
+
+(defn minus-set-mode! [(n (dyn NodeOps)) (m i64)] (-> i64)
+  (if (!= (minus-mode n) MODE-UNKNOWN)
+      (broken "minus-set-mode!: mode is one-shot and was already settled")
+      (do
+        (n-unlock! n)
+        (set! (.mode (primitive/cast (ptr MinusNode) (hdr n))) m)
+        0)))
+
+(defn minus-compute-mode [(t i64) (mode i64)] (-> i64)
   (if (ty-high? t)
-      TY-TOP
-      (if (ty-int? t)
-          (let [lo (ty-int-lo t)
-                hi (ty-int-hi t)]
-            ;; Negating the minimum overflows, so the range widens rather than wrapping.
-            (if (or (= lo INT-MIN) (= hi INT-MIN))
-                (ty-int-bot)
-                (ty-int-range (- 0 hi) (- 0 lo))))
-          TY-BOT)))
+      (if (= mode MODE-INT)
+          (ty-dual (ty-int-bot))
+          (if (= mode MODE-FLT) (ty-dual (ty-flt-bot)) TY-TOP))
+      (if (= mode MODE-INT)
+          (if (ty-int? t)
+              (let [lo (ty-int-lo t)
+                    hi (ty-int-hi t)]
+                ;; Negating the minimum overflows, so the range widens rather than wrapping.
+                (if (or (= lo INT-MIN) (= hi INT-MIN))
+                    (ty-int-bot)
+                    (ty-int-range-wide (- 0 hi) (- 0 lo) (ty-int-widen t))))
+              (ty-int-bot))
+          (if (= mode MODE-FLT)
+              (if (ty-flt? t)
+                  (if (ty-constant? t)
+                      ;; Unary negation flips the IEEE sign bit. `0.0 - x` is not equivalent for
+                      ;; signed zero: it produces +0 for x=+0 instead of -0.
+                      (ty-flt-con (flt--from-bits (primitive/ixor (flt--bits (ty-flt-value t)) -9223372036854775808)))
+                      t)
+                  (ty-flt-bot))
+              TY-BOT))))
+
+(defn minus-compute-ty [(t i64)] (-> i64)
+  (minus-compute-mode t (if (ty-flt? t) MODE-FLT (if (ty-int? t) MODE-INT MODE-UNKNOWN))))
 
 (impl NodeOps MinusNode
   (hdr [(self (ptr MinusNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
@@ -467,20 +780,33 @@
   (is-pinned? [(self (ptr MinusNode))] (-> bool) false)
   (binop-copy [(self (ptr MinusNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
               (-> (Option (dyn NodeOps)))
-              (None [(dyn NodeOps)]))
+              (Some (minus-make-mode lhs (.mode self))))
   (compute [(self (ptr MinusNode))]
            (-> i64)
-           (minus-compute-ty (n-ty (n-in! (primitive/make-dyn NodeOps self) ARITH-LHS))))
+           (minus-compute-mode (n-ty (n-in! (primitive/make-dyn NodeOps self) ARITH-LHS))
+                               (.mode self)))
   (idealize [(self (ptr MinusNode))]
             (-> (Option (dyn NodeOps)))
             (let [d (primitive/make-dyn NodeOps self)
                   v (n-in! d ARITH-LHS)]
-              ;; -(-x) -> x
-              (if (= (n-op v) OP-MINUS)
-                  (Some (n-in! v ARITH-LHS))
-                  (None [(dyn NodeOps)]))))
-  (eq-extra [(self (ptr MinusNode)) (other (dyn NodeOps))] (-> bool) (= (n-op other) OP-MINUS))
-  (hash-extra [(self (ptr MinusNode))] (-> i64) 19))
+              (if (= (minus-mode d) MODE-UNKNOWN)
+                  (let [m
+                          (if (ty-flt? (n-ty v))
+                              MODE-FLT
+                              (if (ty-int? (n-ty v)) MODE-INT MODE-UNKNOWN))]
+                    (if (= m MODE-UNKNOWN)
+                        (None [(dyn NodeOps)])
+                        (do (minus-set-mode! d m) (Some d))))
+                  ;; -(-x) -> x
+                  (if (= (n-op v) OP-MINUS)
+                      (Some (n-in! v ARITH-LHS))
+                      (None [(dyn NodeOps)])))))
+  (eq-extra [(self (ptr MinusNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (if (!= (n-op other) OP-MINUS)
+                false
+                (= (.mode self) (.mode (primitive/cast (ptr MinusNode) (hdr other))))))
+  (hash-extra [(self (ptr MinusNode))] (-> i64) (+ 19 (* (.mode self) 31))))
 
 (defn minus-make [(v (dyn NodeOps))] (-> (dyn NodeOps))
   (let [a (alloc/malloc-allocator)
@@ -493,13 +819,107 @@
     (n-set-ty! d (compute d))
     d))
 
-;; --- owed to the control-flow unit (S2), and NOT stubs ---
+(defn minus-make-mode [(v (dyn NodeOps)) (m i64)] (-> (dyn NodeOps))
+  (let [d (minus-make v)]
+    (if (= m MODE-UNKNOWN) 0 (minus-set-mode! d m))
+    d))
+
+;; ---------------------------------------------------------------------------
+;; ToFloat
 ;;
-;;   phiCon     push a constant up through a Phi. Needs Phi.
-;;   spine_cmp  the Phi-aware spine ordering behind Add's rule 7.
+;; Simple's ToFloatNode has no idealization rules. Its compute order is: high input becomes high
+;; F64; NIL becomes +0.0; an integer constant becomes the corresponding float constant; every
+;; other analysed input becomes F64. It is a representation conversion, not JavaScript ToNumber.
+(defstruct ToFloatNode [(hdr NodeHdr) (pad i64)])
+
+(defn to-float-compute-ty [(t i64)] (-> i64)
+  (if (ty-high? t)
+      (ty-dual (ty-flt-bot))
+      (if (= t TY-NIL)
+          (ty-flt-con 0.0)
+          (if (and (ty-int? t) (ty-constant? t))
+              (ty-flt-con (primitive/cast f64 (ty-int-lo t)))
+              (ty-flt-bot)))))
+
+(impl NodeOps ToFloatNode
+  (hdr [(self (ptr ToFloatNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr ToFloatNode))] (-> (slice u8)) "ToFloat")
+  (is-const? [(self (ptr ToFloatNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr ToFloatNode))] (-> bool) false)
+  (is-pinned? [(self (ptr ToFloatNode))] (-> bool) false)
+  (binop-copy [(self (ptr ToFloatNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (Some (to-float-make lhs)))
+  (compute [(self (ptr ToFloatNode))]
+           (-> i64)
+           (to-float-compute-ty (n-ty (n-in! (primitive/make-dyn NodeOps self) ARITH-LHS))))
+  (idealize [(self (ptr ToFloatNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
+  (eq-extra [(self (ptr ToFloatNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (= (n-op other) OP-TOFLOAT))
+  (hash-extra [(self (ptr ToFloatNode))] (-> i64) 29))
+
+(defn to-float-make [(v (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [ToFloatNode] (alloc/create [ToFloatNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.pad p) 0)
+    (n-init! d OP-TOFLOAT)
+    (n-add-def! d (None [(dyn NodeOps)]))
+    (n-add-def! d (Some v))
+    (n-set-ty! d (compute d))
+    d))
+
+;; ---------------------------------------------------------------------------
+;; RoundF32
 ;;
-;; Both are optimisations. Their absence produces weaker code, never wrong code, and each gets a
-;; named test when Phi lands.
+;; Simple first rounds a constant through the host f32 representation and returns that exact f64
+;; value as a float constant. Otherwise it preserves the input type. Its sole idealization removes
+;; the node when the input is already a nonconstant F32 value (`_sz == 32`).
+(defstruct RoundF32Node [(hdr NodeHdr) (pad i64)])
+
+(defn round-f32-compute-ty [(t i64)] (-> i64)
+  (if (and (ty-flt? t) (ty-constant? t))
+      (ty-flt-con (primitive/cast f64 (primitive/cast f32 (ty-flt-value t))))
+      t))
+
+(impl NodeOps RoundF32Node
+  (hdr [(self (ptr RoundF32Node))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr RoundF32Node))] (-> (slice u8)) "RoundF32")
+  (is-const? [(self (ptr RoundF32Node))] (-> bool) false)
+  (no-const-fold? [(self (ptr RoundF32Node))] (-> bool) false)
+  (is-pinned? [(self (ptr RoundF32Node))] (-> bool) false)
+  (binop-copy [(self (ptr RoundF32Node)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (Some (round-f32-make lhs)))
+  (compute [(self (ptr RoundF32Node))]
+           (-> i64)
+           (round-f32-compute-ty (n-ty (n-in! (primitive/make-dyn NodeOps self) ARITH-LHS))))
+  (idealize [(self (ptr RoundF32Node))]
+            (-> (Option (dyn NodeOps)))
+            (let [d (primitive/make-dyn NodeOps self)
+                  lhs (n-in! d ARITH-LHS)
+                  t (n-ty lhs)]
+              (if (and (ty-flt? t) (= (ty-flt-size t) 32))
+                  (Some lhs)
+                  (None [(dyn NodeOps)]))))
+  (eq-extra [(self (ptr RoundF32Node)) (other (dyn NodeOps))]
+            (-> bool)
+            (= (n-op other) OP-ROUNDF32))
+  (hash-extra [(self (ptr RoundF32Node))] (-> i64) 31))
+
+(defn round-f32-make [(v (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [RoundF32Node] (alloc/create [RoundF32Node] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.pad p) 0)
+    (n-init! d OP-ROUNDF32)
+    (n-add-def! d (None [(dyn NodeOps)]))
+    (n-add-def! d (Some v))
+    (n-set-ty! d (compute d))
+    d))
+
+;; `phiCon` and Phi-aware spine ordering are implemented above and have named regression tests.
 
 ;; Constructors that preserve an already-settled mode. `binop-copy` needs these: a copy that reverted
 ;; to UNKNOWN would have to re-derive the mode, and on operands that are not yet typed it would
@@ -517,4 +937,9 @@
 (defn mul-make-mode [(lhs (dyn NodeOps)) (rhs (dyn NodeOps)) (m i64)] (-> (dyn NodeOps))
   (let [d (mul-make lhs rhs)]
     (if (= m MODE-UNKNOWN) 0 (mul-set-mode! d m))
+    d))
+
+(defn div-make-mode [(lhs (dyn NodeOps)) (rhs (dyn NodeOps)) (m i64)] (-> (dyn NodeOps))
+  (let [d (div-make lhs rhs)]
+    (if (= m MODE-UNKNOWN) 0 (div-set-mode! d m))
     d))

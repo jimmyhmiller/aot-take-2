@@ -133,6 +133,7 @@ aot-take-2/
 │   ├── LAYOUT.md        ; THIS FILE — the file-by-file contract
 │   ├── DESIGN.md        ; the pipeline, the lattice, memory, the GC contract, the backend
 │   ├── DECISIONS.md     ; law: load-bearing choices with their reasoning
+│   ├── GAPS.md          ; complete inventory of absent and partial implementation
 │   ├── JSL.md           ; the runtime-library language
 │   └── JOURNAL.md       ; why something looks the way it does
 ├── jsl/                 ; the JavaScript runtime library, in JSL — already written
@@ -163,6 +164,7 @@ aot-take-2/
 │   ├── node/
 │   │   ├── node.coil        ; NodeHdr, NodeOps, edges, peephole/peepholeOpt, GVN, deps,
 │   │   │                    ;   kill/subsume, the OP-* constants, the in-progress windows
+│   │   ├── copy.coil        ; shallow shells and two-pass selected-subgraph copying
 │   │   ├── cfg.coil         ; CFGNode: idom, depth, blocks, loop depth, the loop tree
 │   │   ├── control.coil     ; Start, Stop, Region, Loop, If, Never, XCtrl, Proj, CProj, Multi
 │   │   ├── phi.coil         ; Phi and the region/phi arity invariant
@@ -226,6 +228,9 @@ aot-take-2/
 │   └── eval.coil            ; ✦ the IR interpreter — the differential oracle
 │
 ├── tests/                   ; `coil test` is THE gate
+│   ├── graph-gen.coil       ; shrinkable well-formed expression/control graph generators
+│   ├── graph-property-test.coil ; structural and optimizer properties over generated graphs
+│   ├── program-graph-test.coil ; complete Stop-rooted graph structure against Simple
 │   ├── type-test.coil  node-test.coil  peephole-test.coil  gvn-test.coil
 │   ├── scope-test.coil  loop-test.coil  mem-test.coil  shape-test.coil
 │   ├── opto-test.coil  gcm-test.coil  sched-test.coil  regalloc-test.coil
@@ -286,9 +291,11 @@ Written here because they are cheap to state and expensive to learn:
   node's whole input cone, as a fixpoint test. `ANY` is the absence of information — every other
   high type is a claim someone computed, so "is exactly `~ctrl`" proves nothing on its own.
 - **Construction has contracts.** A merge under construction reports CONTROL and its phis report
-  their declared types; a loop body is built *and peepholed* inside that window with the phis closed
-  before the control back edge. An `If` is in progress until *all* its projections exist. A region's
-  path count and every phi's value count are one invariant, changed together or not at all.
+  their declared types; a loop body is built *and peepholed* inside that window. Final Simple's
+  `endLoop` then wires the control back edge and immediately fills every materialized phi backedge
+  as one protected operation. A phi's own null final input keeps it in progress during that brief
+  interval. An `If` is in progress until *all* its projections exist. A region's path count and
+  every phi's value count are one invariant, changed together or not at all.
 - **A tool is only a tool if it can fail.** Every check reports a named code; every identity or
   coverage claim carries a counted floor saying how much it compared. Revert your fix and confirm
   the gate goes red.

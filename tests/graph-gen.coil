@@ -1,0 +1,162 @@
+;; Shrinkable generators for well-formed ideal graphs.
+
+;;
+;; These generators draw from Coil's property Source directly. The recorded choice tape is the
+;; recipe for the graph, so a failing graph shrinks by rebuilding a smaller VALID graph rather than
+;; deleting arbitrary nodes and producing malformed counterexamples.
+;;
+;; The expression generator deliberately starts with Add/Sub only. They have an obvious independent
+;; integer model and bounded leaves keep every generated result inside i64, so a property failure
+;; means graph construction or optimization disagreed with plain arithmetic — not that the model
+;; guessed at overflow. Shared operands are generated deliberately to exercise duplicate def-use
+;; edges, the case most tree-shaped random generators never produce.
+(module aot.tests.graph-gen)
+(import "coil.primitive" :as primitive)
+(import "coil.prop.source" :use [Source draw-int! draw-tag! draw-bool-p!])
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.arith" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.type.type" :use *)
+
+(defstruct GeneratedExpr [(root (dyn NodeOps)) (value i64) (nodes i64) (shared i64)])
+
+(defstruct GeneratedControl [(ctrl (dyn NodeOps)) (value (dyn NodeOps)) (diamonds i64)])
+
+(defn graph-gen-expr! [(s (ptr Source)) (depth i64)] (-> GeneratedExpr)
+  (if (or (<= depth 0) (= (draw-tag! s 4) 0))
+      (let [(mut out) (primitive/zeroed GeneratedExpr)
+            v (draw-int! s -16 16)]
+        (set! (.root (mut out)) (con-int v))
+        (set! (.value (mut out)) v)
+        (set! (.nodes (mut out)) 1)
+        (set! (.shared (mut out)) 0)
+        (load out))
+      (let [lhs (graph-gen-expr! s (- depth 1))
+            share (draw-bool-p! s 1 4)
+            rhs (graph-gen-expr! s (- depth 1))
+            rhs-root (if share (.root lhs) (.root rhs))
+            rhs-value (if share (.value lhs) (.value rhs))
+            op (draw-tag! s 2)
+            root (if (= op 0) (add-make (.root lhs) rhs-root) (sub-make (.root lhs) rhs-root))
+            value (if (= op 0) (+ (.value lhs) rhs-value) (- (.value lhs) rhs-value))
+            (mut out) (primitive/zeroed GeneratedExpr)]
+        (set! (.root (mut out)) root)
+        (set! (.value (mut out)) value)
+        (set! (.nodes (mut out))
+              (+ 1 (+ (.nodes lhs) (.nodes rhs))))
+        (set! (.shared (mut out))
+              (+ (if share 1 0) (+ (.shared lhs) (.shared rhs))))
+        (load out))))
+
+;; A chain of genuine diamonds. Every iteration builds both If arms, merges them in a Region, and
+;; attaches a matching Phi. This is a valid construction recipe by design; shrinking reduces the
+;; diamond count and the arm values without ever violating Region/Phi arity.
+(defn graph-gen-control! [(s (ptr Source)) (count i64)] (-> GeneratedControl)
+  (let [st (start-make (ty-int-bot))
+        (mut ctrl) (cproj-make st 0 "entry")
+        (mut value) (con-int (draw-int! s -16 16))
+        (mut i) 0]
+    (loop (if (>= (load i) count)
+              (break 0)
+              (let [iff (if-make (load ctrl) (con-make (ty-int-range 0 10)))
+                    arms (if-arms! iff)
+                    region (region-make)
+                    phi (phi-make region (ty-int-bot) "generated")]
+                (region-add-path! region (arms-true arms))
+                (region-add-path! region (arms-false arms))
+                (phi-add-value! phi (load value))
+                (phi-add-value! phi (con-int (draw-int! s -16 16)))
+                (set! (mut ctrl) region)
+                (set! (mut value) phi)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (let [(mut out) (primitive/zeroed GeneratedControl)]
+      (set! (.ctrl (mut out)) (load ctrl))
+      (set! (.value (mut out)) (load value))
+      (set! (.diamonds (mut out)) count)
+      (load out))))
+
+;; Count edge multiplicity, not mere membership: `x+x` owes TWO reverse edges to x.
+(defn graph-count-input [(use (dyn NodeOps)) (def (dyn NodeOps))] (-> i64)
+  (let [cnt (n-nins use)
+        (mut i) 0
+        (mut hits) 0]
+    (loop (if (>= (load i) cnt)
+              (break 0)
+              (do
+                (match (n-in-safe use (load i))
+                  (Some [v]
+                        (if (n-same? v def) (set! (mut hits) (+ (load hits) 1)) 0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load hits)))
+
+(defn graph-count-output [(def (dyn NodeOps)) (use (dyn NodeOps))] (-> i64)
+  (let [cnt (n-nouts def)
+        (mut i) 0
+        (mut hits) 0]
+    (loop (if (>= (load i) cnt)
+              (break 0)
+              (do
+                (match (n-out def (load i))
+                  (Some [v]
+                        (if (n-same? v use) (set! (mut hits) (+ (load hits) 1)) 0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load hits)))
+
+(defn graph-edges-symmetric? [] (-> bool)
+  (let [cnt (arena-node-count)
+        (mut id) 1
+        (mut ok) true]
+    (loop (if (or (> (load id) cnt) (not (load ok)))
+              (break 0)
+              (do
+                (match (arena-node (load id))
+                  (Some [n]
+                        (if (n-dead? n)
+                            0
+                            (let [icnt (n-nins n)
+                                  (mut i) 0]
+                              (loop (if (or (>= (load i) icnt) (not (load ok)))
+                                        (break 0)
+                                        (do
+                                          (match (n-in-safe n (load i))
+                                            (Some [def]
+                                                  (if (!= (graph-count-input n def)
+                                                          (graph-count-output def n))
+                                                      (set! (mut ok) false)
+                                                      0))
+                                            (None [] 0))
+                                          (set! (mut i) (+ (load i) 1))
+                                          (continue)))))))
+                  (None [] 0))
+                (set! (mut id) (+ (load id) 1))
+                (continue))))
+    (load ok)))
+
+(defn graph-phi-arities-match? [] (-> bool)
+  (let [cnt (arena-node-count)
+        (mut id) 1
+        (mut ok) true]
+    (loop (if (or (> (load id) cnt) (not (load ok)))
+              (break 0)
+              (do
+                (match (arena-node (load id))
+                  (Some [n]
+                        (if (and (not (n-dead? n)) (phi-like? (n-op n)))
+                            (match (n-in-safe n 0)
+                              (Some [region]
+                                    (if (!= (n-nins n) (n-nins region))
+                                        (set! (mut ok) false)
+                                        0))
+                              (None [] (set! (mut ok) false)))
+                            0))
+                  (None [] 0))
+                (set! (mut id) (+ (load id) 1))
+                (continue))))
+    (load ok)))
