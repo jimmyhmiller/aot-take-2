@@ -446,7 +446,9 @@
 ;; Input 0 is the Fun. Inputs 1.. are the matching argument from each caller, positionally aligned
 ;; with the Fun's inputs — which is why `region-del-path!` must count a Parm as a Phi.
 ;;
-;; `_idx` maps one-to-one onto Call input indices, so `Parm 0` reads `Call.in(CALL-ARG0 + 0)`.
+;; `_idx` maps one-to-one onto Call input indices. Slot 0 is RPC, slot 1 is memory, and source
+;; arguments begin at slot 2. Public source-argument lookup subtracts CALL-ARG0; the stored identity
+;; never uses a second numbering scheme.
 ;;
 ;; ## Why interprocedural inference is not a pass
 ;;
@@ -459,6 +461,9 @@
 (defstruct ParmNode [(hdr NodeHdr) (idx i64) (declared i64) (name (slice u8))])
 
 (defn parm-idx [(p (dyn NodeOps))] (-> i64)
+  (- (.idx (primitive/cast (ptr ParmNode) (hdr p))) CALL-ARG0))
+
+(defn parm-call-slot [(p (dyn NodeOps))] (-> i64)
   (.idx (primitive/cast (ptr ParmNode) (hdr p))))
 
 (defn parm-declared [(p (dyn NodeOps))] (-> i64)
@@ -582,11 +587,11 @@
                 (= (.idx self) (.idx (primitive/cast (ptr ParmNode) (hdr other))))))
   (hash-extra [(self (ptr ParmNode))] (-> i64) (+ 179 (.idx self))))
 
-(defn parm-make [(fun (dyn NodeOps)) (idx i64) (declared i64) (name (slice u8))] (-> (dyn NodeOps))
+(defn parm-make-slot [(fun (dyn NodeOps)) (slot i64) (declared i64) (name (slice u8))] (-> (dyn NodeOps))
   (let [a (alloc/malloc-allocator)
         p (alloc/unwrap-ptr [ParmNode] (alloc/create [ParmNode] a))
         d (primitive/make-dyn NodeOps p)]
-    (set! (.idx p) idx)
+    (set! (.idx p) slot)
     (set! (.declared p) declared)
     (set! (.name p) name)
     (n-init! d OP-PARM)
@@ -596,6 +601,12 @@
     (n-add-def! d (None [(dyn NodeOps)]))
     (n-set-ty! d declared)
     d))
+
+(defn parm-make [(fun (dyn NodeOps)) (idx i64) (declared i64) (name (slice u8))] (-> (dyn NodeOps))
+  (parm-make-slot fun (+ CALL-ARG0 idx) declared name))
+
+(defn parm-set-unknown-input! [(p (dyn NodeOps)) (v (dyn NodeOps))] (-> i64)
+  (n-set-def! p 1 (Some v)))
 
 ;; Find the Parm with this index on a Fun. There is at most one.
 (defn fun-parm [(f (dyn NodeOps)) (idx i64)] (-> (Option (dyn NodeOps)))
@@ -607,7 +618,24 @@
               (do
                 (match (n-out f (load i))
                   (Some [u]
-                        (if (and (= (n-op u) OP-PARM) (= (parm-idx u) idx))
+                        (if (and (= (n-op u) OP-PARM) (= (parm-call-slot u) (+ CALL-ARG0 idx)))
+                            (set! (mut found) (Some u))
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
+(defn fun-mem-parm [(f (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [cnt (n-nouts f)
+        (mut i) 0
+        (mut found) (None [(dyn NodeOps)])]
+    (loop (if (>= (load i) cnt)
+              (break 0)
+              (do
+                (match (n-out f (load i))
+                  (Some [u]
+                        (if (and (= (n-op u) OP-PARM) (= (parm-call-slot u) CALL-MEM))
                             (set! (mut found) (Some u))
                             0))
                   (None [] 0))
@@ -691,6 +719,9 @@
 (defn call-ctrl [(c (dyn NodeOps))] (-> (dyn NodeOps))
   (n-in! c CALL-CTRL))
 
+(defn call-mem [(c (dyn NodeOps))] (-> (dyn NodeOps))
+  (n-in! c CALL-MEM))
+
 (defn call-fptr [(c (dyn NodeOps))] (-> (dyn NodeOps))
   (n-in! c (- (n-nins c) 1)))
 
@@ -744,6 +775,20 @@
               (cfg-idepth-default (primitive/make-dyn NodeOps self))))
 
 ;; Build a call site. Arguments are appended, then the function pointer LAST.
+(defn call-make-with-mem [(ctrl (dyn NodeOps)) (mem (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [CallNode] (alloc/create [CallNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.cend-nid p) 0)
+    (n-init! d OP-CALL)
+    (n-add-def! d (Some ctrl))
+    (n-add-def! d (Some mem))
+    (invalidate-cfg!)
+    (n-set-ty! d (n-ty ctrl))
+    d))
+
+;; Legacy graph-construction entry point retained for tests that deliberately exercise incomplete
+;; calls. Production lowering uses `call-make-with-mem`; backend handoff rejects a null memory slot.
 (defn call-make [(ctrl (dyn NodeOps))] (-> (dyn NodeOps))
   (let [a (alloc/malloc-allocator)
         p (alloc/unwrap-ptr [CallNode] (alloc/create [CallNode] a))
@@ -751,7 +796,7 @@
     (set! (.cend-nid p) 0)
     (n-init! d OP-CALL)
     (n-add-def! d (Some ctrl))
-    (n-add-def! d (None [(dyn NodeOps)]))  ; memory, until the memory unit
+    (n-add-def! d (None [(dyn NodeOps)]))
     (invalidate-cfg!)
     (n-set-ty! d (n-ty ctrl))
     d))
@@ -786,16 +831,16 @@
 ;; The result type: a tuple of (control, memory, value), matching Return projection positions.
 (defn cend-compute [(e (dyn NodeOps))] (-> i64)
   (match (n-in e 0)
-    (None [] (ty-tuple-of3 TY-XCTRL TY-TOP TY-TOP))
+    (None [] (ty-tuple-of3 TY-XCTRL (ty-mem 1 TY-TOP) TY-TOP))
     (Some [c]
           (if (or (!= (n-op c) OP-CALL) (!= (n-ty c) TY-CTRL))
-              (ty-tuple-of3 TY-XCTRL TY-TOP TY-TOP)
+              (ty-tuple-of3 TY-XCTRL (ty-mem 1 TY-TOP) TY-TOP)
               (let [fptr (call-fptr c)
                     ft (do (n-add-dep! fptr e) (n-ty fptr))]
                 (if (not (ty-funptr? ft))
                     (if (ty-high? ft)
-                        (ty-tuple-of3 TY-XCTRL TY-TOP TY-TOP)
-                        (ty-tuple-of3 TY-CTRL TY-BOT TY-BOT))
+                        (ty-tuple-of3 TY-XCTRL (ty-mem 1 TY-TOP) TY-TOP)
+                        (ty-tuple-of3 TY-CTRL (ty-mem 1 TY-BOT) TY-BOT))
                     ;; While folding, preserve the single linked Return's entire state tuple.
                     (if (cend-folding? e)
                         (match (n-in e 1)
@@ -808,7 +853,7 @@
                                     (n-ty e)
                                     (cend--state-with-declared-ret (n-ty ret)
                                                                    (ty-sig-ret (ty-funptr-sig ft)))))
-                          (None [] (ty-tuple-of3 TY-XCTRL TY-TOP TY-TOP)))
+                          (None [] (ty-tuple-of3 TY-XCTRL (ty-mem 1 TY-TOP) TY-TOP)))
                         ;; Otherwise meet the full state tuples from every linked Return.
                         (cend--linked-state e (ty-sig-ret (ty-funptr-sig ft))))))))))
 
@@ -818,7 +863,7 @@
       (ty-tuple-of3 (ty-tuple-at state RETURN-CTRL)
                     (ty-tuple-at state RETURN-MEM)
                     (ty-join (ty-tuple-at state RETURN-VALUE) declared))
-      (ty-tuple-of3 TY-XCTRL TY-TOP TY-TOP)))
+      (ty-tuple-of3 TY-XCTRL (ty-mem 1 TY-TOP) TY-TOP)))
 
 ;; Meet every linked Return's full `(control, memory, value)` state. Before Opto, a missing target
 ;; may still be linked later, so retain the declared result. During and after Opto, `pesi-ty` is the
@@ -828,7 +873,7 @@
 (defn cend--linked-state [(e (dyn NodeOps)) (declared i64)] (-> i64)
   (let [cnt (n-nins e)
         (mut i) 1
-        (mut state) (ty-tuple-of3 TY-XCTRL TY-TOP TY-TOP)
+        (mut state) (ty-tuple-of3 TY-XCTRL (ty-mem 1 TY-TOP) TY-TOP)
         (mut any) false]
     (loop (if (>= (load i) cnt)
               (break 0)
@@ -850,11 +895,11 @@
         ;; down the caller, and may later need to widen when argument evidence reaches the callee.
         (if (and (!= (n-pesi-ty e) TY-INVALID)
                  (= (ty-tuple-at (load state) RETURN-CTRL) TY-XCTRL))
-            (ty-tuple-of3 TY-CTRL TY-TOP TY-TOP)
+            (ty-tuple-of3 TY-CTRL (ty-mem 1 TY-TOP) TY-TOP)
             (cend--state-with-declared-ret (load state) declared))
         (if (!= (n-pesi-ty e) TY-INVALID)
-            (ty-tuple-of3 TY-CTRL TY-TOP TY-TOP)
-            (ty-tuple-of3 TY-CTRL TY-TOP declared)))))
+            (ty-tuple-of3 TY-CTRL (ty-mem 1 TY-TOP) TY-TOP)
+            (ty-tuple-of3 TY-CTRL (ty-mem 1 TY-BOT) declared)))))
 
 (impl NodeOps CallEndNode
   (hdr [(self (ptr CallEndNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
@@ -928,9 +973,9 @@
                   (match (n-out fun (load i))
                     (Some [u]
                           (if (= (n-op u) OP-PARM)
-                              (let [idx (parm-idx u)]
-                                (if (< idx (call-nargs c))
-                                    (n-add-def! u (Some (call-arg c idx)))
+                              (let [slot (parm-call-slot u)]
+                                (if (and (>= slot CALL-MEM) (< slot (- (n-nins c) 1)))
+                                    (n-add-def! u (n-in c slot))
                                     ;; The caller passes fewer arguments than the callee declares.
                                     ;; That is an arity error, not something to paper over with a
                                     ;; default: link nothing and let the type check report it.

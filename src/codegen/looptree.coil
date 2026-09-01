@@ -1,0 +1,361 @@
+;; ============================================================================
+
+;; LOOP TREE  —  port of final Simple's `CFGNode.buildLoopTree` / `_bltWalk`
+;; ============================================================================
+;;
+;; This is a post-optimization property of the whole control graph, unlike `idepth`, which remains
+;; valid while the graph is still being built. The walk starts at each live Fun, follows control
+;; outputs, and uses the DFS active/post state to recognize a backedge. A backedge target MUST be a
+;; Loop: seeing any other active target means the supposedly structured CFG is malformed.
+;;
+;; Each CFG node names its innermost loop head. Loop heads name their parent loop head. Start is the
+;; synthetic root loop, at depth zero. While unwinding DFS, a branch that reaches two different loop
+;; trees orders them by loop-head preorder and attaches the inner tree to the outer tree. When an
+;; edge enters a Loop from outside, the source belongs to the Loop's parent, not the Loop itself.
+;;
+;; Calls-to-Funs and Returns-to-CallEnds are optimizer call-graph links, not intraprocedural control
+;; edges, and are skipped exactly as in Simple. Dead control is skipped as well.
+;;
+;; A loop whose tree still has no parent when an entering edge is examined has no exit. Final Simple
+;; calls `Loop.forceExit` at that point. `looptree-build!` names this condition with a hard error
+;; until memory SSA can build the required aligned `(control, memory, value)` Return merge; it never
+;; lies by attaching the loop to root. Finite-loop metadata is complete and is the input GCM needs.
+(module aot.codegen.looptree)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.type.type" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.node.memory" :use *)
+
+(const LT-UNSEEN 0)
+
+(const LT-ACTIVE 1)
+
+(const LT-POST 2)
+
+(defn looptree-skip-edge? [(from (dyn NodeOps)) (to (dyn NodeOps))] (-> bool)
+  (or (= (n-op to) OP-XCTRL)
+      (and (= (n-op from) OP-CALL) (= (n-op to) OP-FUN))
+      (and (= (n-op from) OP-RETURN) (= (n-op to) OP-CALLEND))))
+
+(defn looptree-live-control? [(n (dyn NodeOps))] (-> bool)
+  (and (cfg? n)
+       (and (!= (n-ty n) TY-XCTRL)
+            (!= (n-ty n) (ty-if-neither)))))
+
+(defn looptree-head-node [(head i64)] (-> (dyn NodeOps))
+  (match (arena-node head)
+    (Some [n] n)
+    (None [] (do (panic-i "looptree-head-node: missing loop head" head) (unreachable-node)))))
+
+(defn looptree-depth-head [(head i64)] (-> i64)
+  (let [n (looptree-head-node head)
+        cached (n-ltree-depth n)
+        parent (n-ltree-parent n)]
+    (if (= parent 0)
+        0
+        (if (> cached 0)
+            cached
+            (let [depth (+ 1 (looptree-depth-head parent))]
+              (do (n-set-ltree-depth! n depth) depth))))))
+
+(defn looptree-depth-of [(n (dyn NodeOps))] (-> i64)
+  (let [head (n-ltree-head n)]
+    (if (= head 0)
+        (do (panic-i "looptree-depth-of: loop tree has not been built for node" (n-nid n)) 0)
+        (looptree-depth-head head))))
+
+(defn looptree-loop-of [(n (dyn NodeOps))] (-> (dyn NodeOps))
+  (looptree-head-node (n-ltree-head n)))
+
+(defn looptree-nested? [(inner0 i64) (outer i64)] (-> bool)
+  (let [(mut inner) inner0
+        (mut found) false]
+    (loop (if (= (load inner) 0)
+              (break 0)
+              (if (= (load inner) outer)
+                  (do (set! (mut found) true) (break 0))
+                  (let [n (looptree-head-node (load inner))]
+                    (do (set! (mut inner) (n-ltree-parent n)) (continue))))))
+    (load found)))
+
+(defn looptree-reset-metadata! [] (-> i64)
+  (let [(mut id) 1
+        count (arena-node-count)]
+    (loop (if (> (load id) count)
+              (break 0)
+              (do
+                (match (arena-node (load id))
+                  (Some [n]
+                        (do
+                          (n-set-ltree-head! n 0)
+                          (n-set-ltree-parent! n 0)
+                          (n-set-ltree-depth! n 0)
+                          (n-set-cfg-pre! n 0)
+                          0))
+                  (None [] 0))
+                (set! (mut id) (+ (load id) 1))
+                (continue))))))
+
+(defn looptree-other-cproj [(exit (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (if (!= (n-op exit) OP-CPROJ)
+      (None [(dyn NodeOps)])
+      (let [iff (n-in! exit 0)
+            want (- 1 (cproj-idx exit))
+            (mut i) 0
+            (mut answer) (None [(dyn NodeOps)])]
+        (loop (if (>= (load i) (n-nouts iff))
+                  (break 0)
+                  (do
+                    (match (n-out iff (load i))
+                      (Some [u]
+                            (if (and (= (n-op u) OP-CPROJ) (= (cproj-idx u) want))
+                                (do (set! (mut answer) (Some u)) (break 0))
+                                0))
+                      (None [] 0))
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        (load answer))))
+
+;; Final Simple first proves that the loop truly lacks an exit by walking the backedge's immediate
+;; dominators to the loop head and looking for an If projection whose sibling leaves the loop tree.
+(defn looptree-has-side-exit? [(loop-head (dyn NodeOps))] (-> bool)
+  (let [(mut x) (n-in loop-head 2)
+        loop-tree (n-ltree-head loop-head)
+        (mut found) false
+        (mut guard) 0]
+    (loop (if (> (load guard) 1000000)
+              (do (broken "looptree-has-side-exit?: idom walk did not converge") (break 0))
+              (match (load x)
+                (None [] (break 0))
+                (Some [n]
+                      (if (n-same? n loop-head)
+                          (break 0)
+                          (do
+                            (if (= (n-op n) OP-CPROJ)
+                                (match (looptree-other-cproj n)
+                                  (Some [other]
+                                        (let [other-tree (n-ltree-head other)]
+                                          (if (and (!= other-tree 0)
+                                                   (and (!= other-tree loop-tree)
+                                                        (looptree-nested? loop-tree other-tree)))
+                                              (set! (mut found) true)
+                                              0)))
+                                  (None [] 0))
+                                0)
+                            (if (load found)
+                                (break 0)
+                                (do
+                                  (set! (mut x) (cfg-idom-of n))
+                                  (set! (mut guard) (+ (load guard) 1))
+                                  (continue)))))))))
+    (load found)))
+
+(defn looptree-loop-memory [(loop-head (dyn NodeOps)) (exit (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [bundle (memmerge-make)
+        top (con-make (ty-mem ALIAS-BULK TY-TOP))
+        (mut i) 0]
+    (memmerge-set-alias! bundle ALIAS-BULK top)
+    (loop (if (>= (load i) (n-nouts loop-head))
+              (break 0)
+              (do
+                (match (n-out loop-head (load i))
+                  (Some [u]
+                        (if (= (n-op u) OP-MEMPHI)
+                            (memmerge-set-alias! bundle (memphi-alias u) u)
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    ;; MemMerge input zero is the control placeholder in Simple's layout.
+    (n-set-def! bundle 0 (Some exit))
+    bundle))
+
+(defn looptree-force-exit! [(loop-head (dyn NodeOps))
+                            (fun (dyn NodeOps))
+                            (stop (dyn NodeOps))
+                            (root i64)] (-> i64)
+  (if (looptree-has-side-exit? loop-head)
+      root
+      (let [back (n-in! loop-head 2)
+            never (never-make back)
+            arms (if-arms! never)
+            stay (arms-true arms)
+            exit (arms-false arms)
+            top (con-make TY-TOP)
+            memout (looptree-loop-memory loop-head exit)
+            ret
+              (match (fun-ret fun)
+                (Some [r] r)
+                (None [] (do (panic "looptree-force-exit!: function has no Return") (unreachable-node))))]
+        (n-set-def! loop-head 2 (Some stay))
+        (n-set-ltree-head! never (n-nid loop-head))
+        (n-set-ltree-head! stay (n-nid loop-head))
+        (n-set-ltree-head! exit root)
+        (n-set-ltree-head! ret root)
+        (let [old-ctrl (n-in ret RETURN-CTRL)
+              old-mem (n-in ret RETURN-MEM)
+              old-value (n-in ret RETURN-VALUE)]
+          (if (match old-ctrl (Some [c] (!= (n-ty c) TY-XCTRL)) (None [] false))
+              (let [region (region-make)
+                    memphi (memphi-make region ALIAS-BULK TY-BOT "infinite.exit.mem")
+                    valuephi (phi-make region TY-BOT "infinite.exit.value")]
+                (region-add-path! region (match old-ctrl (Some [c] c) (None [] (unreachable-node))))
+                (memphi-add-state! memphi
+                                   (match old-mem
+                                     (Some [m] m)
+                                     (None [] (con-make (ty-mem ALIAS-BULK TY-BOT)))))
+                (phi-add-value! valuephi
+                                (match old-value (Some [v] v) (None [] (con-make TY-BOT))))
+                (region-add-path! region exit)
+                (memphi-add-state! memphi memout)
+                (phi-add-value! valuephi top)
+                (n-set-ltree-head! region root)
+                (n-set-def! ret RETURN-CTRL (Some region))
+                (n-set-def! ret RETURN-MEM (Some memphi))
+                (n-set-def! ret RETURN-VALUE (Some valuephi)))
+              (do
+                (n-set-def! ret RETURN-CTRL (Some exit))
+                (n-set-def! ret RETURN-MEM (Some memout))
+                (n-set-def! ret RETURN-VALUE (Some top))))
+          (n-force-ty! ret (compute ret))
+          (code-add-outputs! ret)
+          (code-add! stop)
+          root))))
+
+;; Recursive DFS. `pre` is returned because Coil has no reference integer; `state` is indexed by
+;; nid and is shared by every function walk.
+(defn looptree-walk! [(n (dyn NodeOps))
+                      (root i64)
+                      (fun (dyn NodeOps))
+                      (stop (dyn NodeOps))
+                      (pre0 i64)
+                      (state (mut (ArrayList i64)))] (-> i64)
+  (if (!= (n-cfg-pre n) 0)
+      pre0
+      (let [(mut pre) pre0
+            nid (n-nid n)
+            (mut oi) 0]
+        (n-set-cfg-pre! n (load pre))
+        (set! (mut pre) (+ (load pre) 1))
+        (set! (mut state) nid LT-ACTIVE)
+
+        ;; Pre-walk control users.
+        (loop (if (>= (load oi) (n-nouts n))
+                  (break 0)
+                  (do
+                    (match (n-out n (load oi))
+                      (Some [use]
+                            (if (and (looptree-live-control? use)
+                                     (not (looptree-skip-edge? n use)))
+                                (set! (mut pre) (looptree-walk! use root fun stop (load pre) (mut state)))
+                                0))
+                      (None [] 0))
+                    (set! (mut oi) (+ (load oi) 1))
+                    (continue))))
+
+        (if (= (n-op n) OP-RETURN)
+            (n-set-ltree-head! n root)
+            (let [(mut inner) 0
+                  (mut j) 0]
+              ;; Post-order: combine loop choices from every live control child.
+              (loop (if (>= (load j) (n-nouts n))
+                        (break 0)
+                        (do
+                          (match (n-out n (load j))
+                            (Some [use]
+                                  (if (or (not (looptree-live-control? use))
+                                          (looptree-skip-edge? n use))
+                                      0
+                                      (let [(mut choice) 0
+                                            use-state (get state (n-nid use))]
+                                        (if (= use-state LT-ACTIVE)
+                                            (if (!= (n-op use) OP-LOOP)
+                                                (panic-i "looptree-walk!: non-Loop control cycle" (n-nid use))
+                                                (do
+                                                  (n-set-ltree-head! use (n-nid use))
+                                                  (set! (mut choice) (n-nid use))
+                                                  0))
+                                            (do
+                                              (set! (mut choice) (n-ltree-head use))
+                                              (if (= (load choice) 0)
+                                                  (panic-i "looptree-walk!: postvisited child has no loop tree"
+                                                           (n-nid use))
+                                                  0)
+                                              ;; This edge enters the loop from outside.
+                                              (if (= (load choice) (n-nid use))
+                                                  (let [parent (n-ltree-parent use)]
+                                                    (if (= parent 0)
+                                                        (let [forced-parent
+                                                                (looptree-force-exit! use fun stop root)]
+                                                          (do
+                                                            (n-set-ltree-parent! use forced-parent)
+                                                            (set! (mut choice) forced-parent)))
+                                                        (set! (mut choice) parent)))
+                                                  0)))
+                                        (if (= (load inner) 0)
+                                            (set! (mut inner) (load choice))
+                                            (if (= (load inner) (load choice))
+                                                0
+                                                (let [a (looptree-head-node (load inner))
+                                                      b (looptree-head-node (load choice))
+                                                      a-pre (n-cfg-pre a)
+                                                      b-pre (n-cfg-pre b)
+                                                      inner-head (if (> b-pre a-pre) (load choice) (load inner))
+                                                      outer-head (if (> b-pre a-pre) (load inner) (load choice))]
+                                                  (do
+                                                    (n-set-ltree-parent! (looptree-head-node inner-head) outer-head)
+                                                    (set! (mut inner) inner-head)
+                                                    0)))))))
+                            (None [] 0))
+                          (set! (mut j) (+ (load j) 1))
+                          (continue))))
+              (if (!= (load inner) 0) (n-set-ltree-head! n (load inner)) 0)))
+
+        (set! (mut state) nid LT-POST)
+        (load pre))))
+
+;; Build loop metadata for all live functions in the arena. Start and Stop share the synthetic
+;; root tree. Functions are roots of independent intraprocedural walks, exactly as Simple's linker
+;; function list drives one `_bltWalk` per Fun.
+(defn looptree-build! [(start (dyn NodeOps)) (stop (dyn NodeOps))] (-> i64)
+  (if (!= (n-op start) OP-START)
+      (panic-i "looptree-build!: root is not Start" (n-op start))
+      (if (!= (n-op stop) OP-STOP)
+          (panic-i "looptree-build!: sink is not Stop" (n-op stop))
+          (let [a (alloc/malloc-allocator)
+                (mut state) (al-new [i64] a)
+                count (arena-node-count)
+                root (n-nid start)
+                (mut i) 0
+                (mut pre) 2]
+            (looptree-reset-metadata!)
+            (loop (if (> (load i) count)
+                      (break 0)
+                      (do
+                        (push! [i64] (mut state) LT-UNSEEN)
+                        (set! (mut i) (+ (load i) 1))
+                        (continue))))
+            (n-set-ltree-head! start root)
+            (n-set-ltree-head! stop root)
+            (n-set-cfg-pre! start 1)
+            (set! (mut state) root LT-POST)
+            (set! (mut i) 1)
+            (loop (if (> (load i) count)
+                      (break 0)
+                      (do
+                        (match (arena-node (load i))
+                          (Some [n]
+                                (if (and (= (n-op n) OP-FUN)
+                                         (not (n-dead? n)))
+                                    (set! (mut pre) (looptree-walk! n root n stop (load pre) (mut state)))
+                                    0))
+                          (None [] 0))
+                        (set! (mut i) (+ (load i) 1))
+                        (continue))))
+            0))))

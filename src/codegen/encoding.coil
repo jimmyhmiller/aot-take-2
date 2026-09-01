@@ -1,24 +1,906 @@
-;; Encoding: machine nodes to bytes, and the relocations that patch them.
+;; Machine instructions to bytes, with stable node offsets and typed fixups.
 
 ;;
-;; Two passes, because a branch displacement depends on the size of everything between it and its
-;; target, and that size can depend on displacements. Pass one assigns provisional sizes and block
-;; addresses; pass two shrinks what can be shrunk and repeats until nothing changes. Encoding
-;; before that fixpoint is how a branch ends up off by the size of the instruction that shrank.
-;;
-;; Cold blocks are laid out out-of-line, which is the only place the cold hint on a guard's slow
-;; path is consumed.
-;;
-;; SCAFFOLD: signatures are final; bodies hard-error. Filled in at S6.
+;; Final Simple lays out CFG blocks, records every instruction's start and selected size, emits in
+;; exactly that order, then patches local PC-relative references. Short-form relaxation repeats
+;; layout until sizes stop changing. AArch64 conditional branches grow monotonically from B.cond to
+;; an inverted-condition/B26 pair; keeping layout separate from emission lets that growth stabilize
+;; before bytes or typed fixups are recorded.
 (module aot.codegen.encoding)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
+(import "aot.node.cfg" :use *)
+(import "aot.node.control" :use *)
+(import "aot.codegen.codegen" :use *)
+(import "aot.codegen.machine" :use *)
+(import "aot.codegen.looptree" :use *)
+
+(const ENCODER-HANDLE 1)
+
+;; Local fixup kinds are target-independent descriptions of the bit field being patched. Keeping
+;; them here, rather than smuggling target callbacks through integers, makes relocation ownership
+;; explicit and lets the object writer distinguish local branches from symbol relocations later.
+(const ENC-FIXUP-A64-B19 1)
+
+(const ENC-FIXUP-A64-B26 2)
+
+(const ENC-FIXUP-A64-BL26 3)
+
+(defstruct EncodingState
+  [(bits (ArrayList u8))
+   (starts (ArrayList i64))
+   (lengths (ArrayList i64))
+   (fixup-kinds (ArrayList i64))
+   (fixup-sources (ArrayList i64))
+   (fixup-addends (ArrayList i64))
+   (fixup-targets (ArrayList i64))
+   (symbol-kinds (ArrayList i64))
+   (symbol-sources (ArrayList i64))
+   (symbol-addends (ArrayList i64))
+   (symbol-fidxs (ArrayList i64))
+   (symbol-names (ArrayList (slice u8)))
+   (literal-sources (ArrayList i64))
+   (literal-bits (ArrayList i64))
+   (literal-offsets (ArrayList i64))
+   (definition-sources (ArrayList i64))
+   (definition-fidxs (ArrayList i64))
+   (definition-names (ArrayList (slice u8)))
+   (definition-ends (ArrayList i64))
+   (layout-blocks (ArrayList i64))
+   (layout-jumps (ArrayList i64))
+   (laid-out bool)
+   (emitted bool)])
+
+(defn enc-state [] (-> (ptr EncodingState))
+  (primitive/alloc-static EncodingState))
+
+(defn enc-reset! [] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        state (enc-state)
+        (mut i) 0]
+    (set! (.bits state) (al-new [u8] a))
+    (set! (.starts state) (al-new [i64] a))
+    (set! (.lengths state) (al-new [i64] a))
+    (set! (.fixup-kinds state) (al-new [i64] a))
+    (set! (.fixup-sources state) (al-new [i64] a))
+    (set! (.fixup-addends state) (al-new [i64] a))
+    (set! (.fixup-targets state) (al-new [i64] a))
+    (set! (.symbol-kinds state) (al-new [i64] a))
+    (set! (.symbol-sources state) (al-new [i64] a))
+    (set! (.symbol-addends state) (al-new [i64] a))
+    (set! (.symbol-fidxs state) (al-new [i64] a))
+    (set! (.symbol-names state) (al-new [(slice u8)] a))
+    (set! (.literal-sources state) (al-new [i64] a))
+    (set! (.literal-bits state) (al-new [i64] a))
+    (set! (.literal-offsets state) (al-new [i64] a))
+    (set! (.definition-sources state) (al-new [i64] a))
+    (set! (.definition-fidxs state) (al-new [i64] a))
+    (set! (.definition-names state) (al-new [(slice u8)] a))
+    (set! (.definition-ends state) (al-new [i64] a))
+    (set! (.layout-blocks state) (al-new [i64] a))
+    (set! (.layout-jumps state) (al-new [i64] a))
+    (loop (if (> (load i) (arena-node-count))
+              (break 0)
+              (do
+                (push! [i64] (mut (.starts state)) -1)
+                (push! [i64] (mut (.lengths state)) -1)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (set! (.laid-out state) false)
+    (set! (.emitted state) false)
+    0))
+
+(defn enc-ensure-node-capacity! [(n (dyn NodeOps))] (-> i64)
+  (let [state (enc-state)]
+    (loop (if (> (len (.starts state)) (n-nid n))
+              (break 0)
+              (do
+                (push! [i64] (mut (.starts state)) -1)
+                (push! [i64] (mut (.lengths state)) -1)
+                (continue))))
+    0))
+
+(defn enc-layout-block-count [] (-> i64)
+  (len (.layout-blocks (enc-state))))
+
+(defn enc-layout-block-at [(i i64)] (-> (dyn NodeOps))
+  (if (or (< i 0) (>= i (enc-layout-block-count)))
+      (do (panic-i "enc-layout-block-at: index out of range" i) (unreachable-node))
+      (match (arena-node (get (.layout-blocks (enc-state)) i))
+        (Some [block] block)
+        (None [] (do (panic-i "enc-layout-block-at: block is missing" i) (unreachable-node))))))
+
+(defn enc-layout-jump-at [(i i64)] (-> (Option (dyn NodeOps)))
+  (if (or (< i 0) (>= i (enc-layout-block-count)))
+      (do (panic-i "enc-layout-jump-at: index out of range" i) (None [(dyn NodeOps)]))
+      (let [nid (get (.layout-jumps (enc-state)) i)]
+        (if (= nid 0) (None [(dyn NodeOps)]) (arena-node nid)))))
+
+(defn enc-add-local-fixup-at! [(encoder i64)
+                               (kind i64)
+                               (source (dyn NodeOps))
+                               (addend i64)
+                               (target (dyn NodeOps))] (-> i64)
+  (do
+    (enc-require-handle encoder)
+    (if (or (< kind ENC-FIXUP-A64-B19) (> kind ENC-FIXUP-A64-BL26))
+        (panic-i "enc-add-local-fixup!: unknown fixup kind" kind)
+        0)
+    (push! [i64] (mut (.fixup-kinds (enc-state))) kind)
+    (push! [i64] (mut (.fixup-sources (enc-state))) (n-nid source))
+    (push! [i64] (mut (.fixup-addends (enc-state))) addend)
+    (push! [i64] (mut (.fixup-targets (enc-state))) (n-nid target))
+    0))
+
+(defn enc-add-local-fixup! [(encoder i64)
+                            (kind i64)
+                            (source (dyn NodeOps))
+                            (target (dyn NodeOps))] (-> i64)
+  (enc-add-local-fixup-at! encoder kind source 0 target))
+
+(defn enc-fixup-count [] (-> i64)
+  (len (.fixup-kinds (enc-state))))
+
+(defn enc-add-symbol-fixup-at! [(encoder i64)
+                                (kind i64)
+                                (source (dyn NodeOps))
+                                (addend i64)
+                                (fidx i64)
+                                (name (slice u8))] (-> i64)
+  (do
+    (enc-require-handle encoder)
+    (if (!= kind ENC-FIXUP-A64-BL26)
+        (panic-i "enc-add-symbol-fixup!: unsupported fixup kind" kind)
+        0)
+    (push! [i64] (mut (.symbol-kinds (enc-state))) kind)
+    (push! [i64] (mut (.symbol-sources (enc-state))) (n-nid source))
+    (push! [i64] (mut (.symbol-addends (enc-state))) addend)
+    (push! [i64] (mut (.symbol-fidxs (enc-state))) fidx)
+    (push! [(slice u8)] (mut (.symbol-names (enc-state))) name)
+    0))
+
+(defn enc-add-symbol-fixup! [(encoder i64)
+                             (kind i64)
+                             (source (dyn NodeOps))
+                             (fidx i64)
+                             (name (slice u8))] (-> i64)
+  (enc-add-symbol-fixup-at! encoder kind source 0 fidx name))
+
+(defn enc-symbol-fixup-count [] (-> i64)
+  (len (.symbol-kinds (enc-state))))
+
+(defn enc-symbol-fixup-kind [(i i64)] (-> i64)
+  (get (.symbol-kinds (enc-state)) i))
+
+(defn enc-symbol-fixup-offset [(i i64)] (-> i64)
+  (match (arena-node (get (.symbol-sources (enc-state)) i))
+    (Some [source] (+ (enc-op-start source) (get (.symbol-addends (enc-state)) i)))
+    (None [] (do (panic-i "enc-symbol-fixup-offset: missing source" i) 0))))
+
+(defn enc-symbol-fixup-fidx [(i i64)] (-> i64)
+  (get (.symbol-fidxs (enc-state)) i))
+
+(defn enc-symbol-fixup-name [(i i64)] (-> (slice u8))
+  (get (.symbol-names (enc-state)) i))
+
+(defn enc-add-f64-literal! [(encoder i64) (source (dyn NodeOps)) (bits i64)] (-> i64)
+  (do
+    (enc-require-handle encoder)
+    (push! [i64] (mut (.literal-sources (enc-state))) (n-nid source))
+    (push! [i64] (mut (.literal-bits (enc-state))) bits)
+    (push! [i64] (mut (.literal-offsets (enc-state))) -1)
+    0))
+
+(defn enc-literal-count [] (-> i64)
+  (len (.literal-sources (enc-state))))
+
+(defn enc-add-definition! [(encoder i64)
+                            (source (dyn NodeOps))
+                            (fidx i64)
+                            (name (slice u8))] (-> i64)
+  (do
+    (enc-require-handle encoder)
+    (push! [i64] (mut (.definition-sources (enc-state))) (n-nid source))
+    (push! [i64] (mut (.definition-fidxs (enc-state))) fidx)
+    (push! [(slice u8)] (mut (.definition-names (enc-state))) name)
+    (push! [i64] (mut (.definition-ends (enc-state))) -1)
+    0))
+
+(defn enc-definition-count [] (-> i64)
+  (len (.definition-sources (enc-state))))
+
+(defn enc-definition-offset [(i i64)] (-> i64)
+  (match (arena-node (get (.definition-sources (enc-state)) i))
+    (Some [source] (enc-op-start source))
+    (None [] (do (panic-i "enc-definition-offset: missing source" i) 0))))
+
+(defn enc-definition-fidx [(i i64)] (-> i64)
+  (get (.definition-fidxs (enc-state)) i))
+
+(defn enc-definition-name [(i i64)] (-> (slice u8))
+  (get (.definition-names (enc-state)) i))
+
+(defn enc-end-definition! [(encoder i64)
+                            (source (dyn NodeOps))
+                            (last-instruction (dyn NodeOps))] (-> i64)
+  (let [(mut i) 0 (mut found) false]
+    (enc-require-handle encoder)
+    (loop (if (or (>= (load i) (enc-definition-count)) (load found))
+              (break 0)
+              (do
+                (match (arena-node (get (.definition-sources (enc-state)) (load i)))
+                  (Some [definition]
+                        (if (n-same? definition source)
+                            (do
+                              (set! (mut (.definition-ends (enc-state)))
+                                    (load i)
+                                    (+ (enc-op-start last-instruction)
+                                       (enc-op-length last-instruction)))
+                              (set! (mut found) true))
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    ;; Isolated instruction tests may encode a Return without first emitting its Fun. Complete
+    ;; scheduled emission registers the definition and therefore always records the explicit end.
+    0))
+
+(defn enc-definition-size [(i i64)] (-> i64)
+  (let [start (enc-definition-offset i)
+        explicit (get (.definition-ends (enc-state)) i)]
+    (if (>= explicit 0)
+        (- explicit start)
+        ;; A hand-built/object-only graph may omit Return. Bound it by the next function, or text.
+        (let [(mut j) 0 (mut end) (enc-byte-count)]
+          (loop (if (>= (load j) (enc-definition-count))
+                    (break (- (load end) start))
+                    (do
+                      (let [candidate (enc-definition-offset (load j))]
+                        (if (and (> candidate start) (< candidate (load end)))
+                            (set! (mut end) candidate)
+                            0))
+                      (set! (mut j) (+ (load j) 1))
+                      (continue))))))))
+
+(defn enc-add8! [(encoder i64) (word i64)] (-> i64)
+  (do
+    (enc-add4! encoder word)
+    (enc-add4! encoder (primitive/ishr word 32))
+    0))
+
+(defn enc-require-handle [(encoder i64)] (-> i64)
+  (if (= encoder ENCODER-HANDLE) 0 (panic-i "encoding: invalid encoder handle" encoder)))
+
+(defn enc-byte-count [] (-> i64)
+  (len (.bits (enc-state))))
+
+(defn enc-bytes [] (-> (slice u8))
+  (al-slice (.bits (enc-state))))
+
+(defn enc-byte-at [(i i64)] (-> u8)
+  (if (or (< i 0) (>= i (enc-byte-count)))
+      (do (panic-i "enc-byte-at: index out of range" i) (primitive/cast u8 0))
+      (get (.bits (enc-state)) i)))
+
+(defn enc-add1! [(encoder i64) (byte i64)] (-> i64)
+  (do
+    (enc-require-handle encoder)
+    (push! [u8] (mut (.bits (enc-state))) (primitive/cast u8 byte))
+    0))
+
+(defn enc-add4! [(encoder i64) (word i64)] (-> i64)
+  (let [(mut i) 0
+        (mut x) word]
+    (enc-require-handle encoder)
+    (loop (if (>= (load i) 4)
+              (break 0)
+              (do
+                (enc-add1! encoder (primitive/iand (load x) 255))
+                (set! (mut x) (primitive/ishr (load x) 8))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))
+
+(defn enc-read4 [(i i64)] (-> i64)
+  (if (or (< i 0) (> (+ i 4) (enc-byte-count)))
+      (panic-i "enc-read4: index out of range" i)
+      (primitive/ior (primitive/cast i64 (enc-byte-at i))
+                     (primitive/ior (primitive/ishl (primitive/cast i64 (enc-byte-at (+ i 1))) 8)
+                                    (primitive/ior (primitive/ishl (primitive/cast i64 (enc-byte-at (+ i 2))) 16)
+                                                   (primitive/ishl (primitive/cast i64 (enc-byte-at (+ i 3))) 24))))))
+
+(defn enc-patch4! [(encoder i64) (i i64) (word i64)] (-> i64)
+  (let [(mut j) 0
+        (mut x) word]
+    (enc-require-handle encoder)
+    (if (or (< i 0) (> (+ i 4) (enc-byte-count)))
+        (panic-i "enc-patch4!: index out of range" i)
+        0)
+    (loop (if (>= (load j) 4)
+              (break 0)
+              (do
+                (set! (mut (.bits (enc-state)))
+                      (+ i (load j))
+                      (primitive/cast u8 (primitive/iand (load x) 255)))
+                (set! (mut x) (primitive/ishr (load x) 8))
+                (set! (mut j) (+ (load j) 1))
+                (continue))))
+    0))
+
+(defn enc-op-start [(n (dyn NodeOps))] (-> i64)
+  (if (or (>= (n-nid n) (len (.starts (enc-state))))
+          (< (get (.starts (enc-state)) (n-nid n)) 0))
+      (panic-i "enc-op-start: node was not laid out" (n-nid n))
+      (get (.starts (enc-state)) (n-nid n))))
+
+(defn enc-op-length [(n (dyn NodeOps))] (-> i64)
+  (if (or (>= (n-nid n) (len (.lengths (enc-state))))
+          (< (get (.lengths (enc-state)) (n-nid n)) 0))
+      (panic-i "enc-op-length: node was not laid out" (n-nid n))
+      (get (.lengths (enc-state)) (n-nid n))))
+
+(defn enc-reg [(encoder i64) (n (dyn NodeOps))] (-> i64)
+  (do
+    (enc-require-handle encoder)
+    (if (< (n-reg n) 0)
+        (panic-i "enc-reg: machine value has no allocated location" (n-nid n))
+        (n-reg n))))
+
+(defn enc-ideal-op [(n (dyn NodeOps))] (-> i64)
+  (match (mach-of n) (Some [mach] (m-ideal-op mach)) (None [] (n-op n))))
+
+(defn enc-enclosing-fun [(n (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [(mut cur)
+          (if (= (n-block-nid n) 0)
+              (Some n)
+              (match (arena-node (n-block-nid n))
+                (Some [block] (Some block))
+                (None [] (None [(dyn NodeOps)]))))
+        (mut steps) 0
+        limit (+ (arena-node-count) 1)
+        (mut answer) (None [(dyn NodeOps)])]
+    (loop (if (or (>= (load steps) limit)
+                  (match (load cur) (Some [_] false) (None [] true))
+                  (match (load answer) (Some [_] true) (None [] false)))
+              (break 0)
+              (match (load cur)
+                (Some [c]
+                      (if (= (enc-ideal-op c) OP-FUN)
+                          (set! (mut answer) (Some c))
+                          (do
+                            (set! (mut cur) (cfg-idom-of c))
+                            (set! (mut steps) (+ (load steps) 1))
+                            (continue))))
+                (None [] (break 0)))))
+    (match (load answer)
+      (Some [fun] fun)
+      (None []
+            (do
+              (panic-i "enc-enclosing-fun: instruction has no owning Fun" (n-nid n))
+              (unreachable-node))))))
+
+(defn enc-stack-offset [(encoder i64) (n (dyn NodeOps)) (location i64)] (-> i64)
+  (do
+    (enc-require-handle encoder)
+    (mach-active-stack-offset (enc-enclosing-fun n) location)))
+
+(defn enc-block-tail [(block (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [count (code-schedule-count block)]
+    (if (= count 0)
+        (do (panic-i "enc-block-tail: empty block schedule" (n-nid block)) (unreachable-node))
+        (code-schedule-at block (- count 1)))))
+
+(defn enc-unique-cfg-successor [(tail (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [(mut i) 0 (mut answer) (None [(dyn NodeOps)]) (mut several) false]
+    (loop (if (or (>= (load i) (n-nouts tail)) (load several))
+              (break 0)
+              (do
+                (match (n-out tail (load i))
+                  (Some [use_]
+                        (match (cfg-of use_)
+                          (Some [_]
+                                (match (load answer)
+                                  (Some [prior]
+                                        (if (n-same? prior use_)
+                                            0
+                                            (set! (mut several) true)))
+                                  (None [] (set! (mut answer) (Some use_)))))
+                          (None [] 0)))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (if (load several) (None [(dyn NodeOps)]) (load answer))))
+
+(defn enc-layout-next-is? [(i i64) (target (dyn NodeOps))] (-> bool)
+  (and (< (+ i 1) (enc-layout-block-count))
+       (n-same? (enc-layout-block-at (+ i 1)) target)))
+
+(defn enc-layout-install-jump! [(i i64)
+                                (source (dyn NodeOps))
+                                (target (dyn NodeOps))] (-> i64)
+  (let [jump (mach-layout-make-jump source target)]
+    (enc-ensure-node-capacity! jump)
+    (set! (mut (.layout-jumps (enc-state))) i (n-nid jump))
+    0))
+
+(defn enc-layout-child-loop [(block (dyn NodeOps)) (container i64)] (-> i64)
+  (let [(mut head) (n-ltree-head block) (mut child) 0 (mut guard) 0]
+    (loop (if (or (= (load head) 0) (= (load head) container))
+              (break (load child))
+              (if (> (load guard) (arena-node-count))
+                  (do
+                    (panic-i "enc-layout-child-loop: loop-parent chain did not converge"
+                             (n-nid block))
+                    (break 0))
+                  (let [loop-head (looptree-head-node (load head))
+                        parent (n-ltree-parent loop-head)]
+                    (if (= parent container)
+                        (do (set! (mut child) (load head)) (break (load child)))
+                        (do
+                          (set! (mut head) parent)
+                          (set! (mut guard) (+ (load guard) 1))
+                          (continue)))))))
+    (load child)))
+
+(defn enc-forwards-empty-scan? [(start (dyn NodeOps)) (branch-depth i64)] (-> bool)
+  (let [(mut cur) (Some start) (mut answer) false (mut guard) 0]
+    (loop (if (or (match (load cur) (Some [_] false) (None [] true))
+                  (> (load guard) (arena-node-count)))
+              (break (load answer))
+              (match (load cur)
+                (Some [c]
+                      (if (or (!= (n-nouts c) 1)
+                              (!= (looptree-depth-of c) branch-depth))
+                          (break false)
+                          (match (enc-unique-cfg-successor c)
+                            (Some [next]
+                                  (let [op (enc-ideal-op next)]
+                                    (if (and (= op OP-LOOP)
+                                             (= (n-ltree-head next) (n-ltree-head c)))
+                                        (do (set! (mut answer) true) (break true))
+                                        (if (= op OP-REGION)
+                                            (do
+                                              (set! (mut cur) (Some next))
+                                              (set! (mut guard) (+ (load guard) 1))
+                                              (continue))
+                                            (break false)))))
+                            (None [] (break false)))))
+                (None [] (break false)))))
+    (load answer)))
+
+(defn enc-target-is-merge? [(target (dyn NodeOps))] (-> bool)
+  (match (enc-unique-cfg-successor target)
+    (Some [next] (= (enc-ideal-op next) OP-REGION))
+    (None [] false)))
+
+;; Final Simple's profile-free branch preference, in its source order. The first two rules keep a
+;; loop exit taken while an empty backedge falls through; the next pair recognizes empty backwards
+;; paths, then nonempty work, merge pressure, and finally stable CFG preorder.
+(defn enc-should-invert? [(taken (dyn NodeOps))
+                          (fall (dyn NodeOps))
+                          (branch-depth i64)] (-> bool)
+  (let [taken-depth (looptree-depth-of taken) fall-depth (looptree-depth-of fall)]
+    (if (< taken-depth branch-depth)
+        (enc-forwards-empty-scan? fall branch-depth)
+        (if (< fall-depth branch-depth)
+            (not (enc-forwards-empty-scan? taken branch-depth))
+            (if (enc-forwards-empty-scan? taken branch-depth)
+                false
+                (if (enc-forwards-empty-scan? fall branch-depth)
+                    true
+                    (if (and (> (n-nouts fall) 1) (= (n-nouts taken) 1))
+                        false
+                        (if (and (> (n-nouts taken) 1) (= (n-nouts fall) 1))
+                            true
+                            (if (enc-target-is-merge? fall)
+                                true
+                                (if (enc-target-is-merge? taken)
+                                    false
+                                    (> (n-cfg-pre taken) (n-cfg-pre fall))))))))))))
+
+(defn enc-preferred-rpo-walk! [(block (dyn NodeOps))
+                               (seen (mut (ArrayList bool)))
+                               (post (mut (ArrayList i64)))] (-> i64)
+  (if (get (load seen) (n-nid block))
+      0
+      (do
+        (set! (mut seen) (n-nid block) true)
+        (let [tail (enc-block-tail block)]
+          (if (= (enc-ideal-op tail) OP-IF)
+              (let [taken (mach-layout-branch-target tail 0)
+                    fall (mach-layout-branch-target tail 1)
+                    invert (enc-should-invert? taken fall (looptree-depth-of tail))]
+                (if invert
+                    (do
+                      (enc-preferred-rpo-walk! fall (mut seen) (mut post))
+                      (enc-preferred-rpo-walk! taken (mut seen) (mut post)))
+                    (do
+                      (enc-preferred-rpo-walk! taken (mut seen) (mut post))
+                      (enc-preferred-rpo-walk! fall (mut seen) (mut post))))
+                0)
+              (let [(mut si) 0]
+                (loop (if (>= (load si) (code-schedule-count block))
+                          (break 0)
+                          (let [n (code-schedule-at block (load si)) (mut oi) 0]
+                            (loop (if (>= (load oi) (n-nouts n))
+                                      (break 0)
+                                      (do
+                                        (match (n-out n (load oi))
+                                          (Some [use]
+                                                (if (cfg-block-head-of? use)
+                                                    (enc-preferred-rpo-walk!
+                                                      use (mut seen) (mut post))
+                                                    0))
+                                          (None [] 0))
+                                        (set! (mut oi) (+ (load oi) 1))
+                                        (continue))))
+                            (set! (mut si) (+ (load si) 1))
+                            (continue)))))))
+        (push! [i64] (mut post) (n-nid block))
+        0)))
+
+(defn enc-preferred-rpo [(blocks (ArrayList i64))] (-> (ArrayList i64))
+  (let [a (alloc/malloc-allocator)
+        (mut seen) (al-new [bool] a)
+        (mut post) (al-new [i64] a)
+        (mut rpo) (al-new [i64] a)
+        (mut i) 0]
+    (loop (if (> (load i) (arena-node-count))
+              (break 0)
+              (do
+                (push! [bool] (mut seen) false)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    ;; The first block is normally Start. Scanning unvisited original-RPO roots also covers
+    ;; independently owned functions in hand-built backend tests.
+    (set! (mut i) 0)
+    (loop (if (>= (load i) (len blocks))
+              (break 0)
+              (do
+                (match (arena-node (get blocks (load i)))
+                  (Some [block]
+                        (if (get (load seen) (n-nid block))
+                            0
+                            (let [lo (len (load post)) (mut pi) 0]
+                              (enc-preferred-rpo-walk! block (mut seen) (mut post))
+                              (set! (mut pi) (- (len (load post)) 1))
+                              (loop (if (< (load pi) lo)
+                                        (break 0)
+                                        (do
+                                          (push! [i64]
+                                                 (mut rpo)
+                                                 (get (load post) (load pi)))
+                                          (set! (mut pi) (- (load pi) 1))
+                                          (continue)))))))
+                  (None [] (panic-i "enc-preferred-rpo: missing block" (get blocks (load i)))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load rpo)))
+
+;; Final Simple gives every Loop a private RPO list and splices that list into its parent's list.
+;; This equivalent projection starts with GCM's complete RPO: directly owned blocks retain their
+;; order, while the first block belonging to a child loop recursively emits that entire child.
+;; Nested bodies therefore become contiguous without changing schedules or CFG predecessor order.
+(defn enc-layout-emit-loop! [(container i64)
+                             (blocks (ArrayList i64))
+                             (emitted (mut (ArrayList bool)))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len blocks))
+              (break 0)
+              (do
+                (match (arena-node (get blocks (load i)))
+                  (Some [block]
+                        (if (= (n-ltree-head block) container)
+                            (do
+                              (push! [i64] (mut (.layout-blocks (enc-state))) (n-nid block))
+                              (push! [i64] (mut (.layout-jumps (enc-state))) 0))
+                            (let [child (enc-layout-child-loop block container)]
+                              (if (and (!= child 0) (not (get (load emitted) child)))
+                                  (do
+                                    (set! (mut emitted) child true)
+                                    (enc-layout-emit-loop! child blocks (mut emitted)))
+                                  0))))
+                  (None [] (panic-i "enc-layout-emit-loop!: missing block" (get blocks (load i)))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))
+
+(defn enc-layout-order-blocks! [] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        (mut blocks) (al-new [i64] a)
+        (mut emitted) (al-new [bool] a)
+        (mut ci) 0
+        (mut i) 0]
+    (loop (if (>= (load ci) (code-cfg-count))
+              (break 0)
+              (let [cfg (code-cfg-at (load ci))]
+                (if (cfg-block-head-of? cfg) (push! [i64] (mut blocks) (n-nid cfg)) 0)
+                (set! (mut ci) (+ (load ci) 1))
+                (continue))))
+    (loop (if (> (load i) (arena-node-count))
+              (break 0)
+              (do
+                (push! [bool] (mut emitted) false)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (let [root
+            (if (= (len (load blocks)) 0)
+                0
+                (match (arena-node (get (load blocks) 0))
+                  (Some [first] (n-ltree-head first))
+                  (None [] (panic-i "enc-layout-order-blocks!: missing first block"
+                                    (get (load blocks) 0)))))]
+      (if (or (= (len (load blocks)) 0) (= root 0))
+        (do
+          (set! (mut ci) 0)
+          (loop (if (>= (load ci) (len (load blocks)))
+                    (break 0)
+                    (do
+                      (push! [i64] (mut (.layout-blocks (enc-state)))
+                             (get (load blocks) (load ci)))
+                      (push! [i64] (mut (.layout-jumps (enc-state))) 0)
+                      (set! (mut ci) (+ (load ci) 1))
+                      (continue)))))
+          (enc-layout-emit-loop! root (enc-preferred-rpo (load blocks)) (mut emitted))))
+    (enc-layout-block-count)))
+
+;; Final Simple first chooses a CFG order, then makes every physical fallthrough explicit: an If
+;; branches to its taken projection and falls into the other; any non-adjacent ordinary successor
+;; receives a target-owned unconditional jump. The loop-tree projection above preserves GCM RPO
+;; within each nesting level while keeping every nested loop body contiguous.
+(defn enc-build-block-layout! [] (-> i64)
+  (do
+    (enc-layout-order-blocks!)
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (enc-layout-block-count))
+                (break 0)
+                (let [block (enc-layout-block-at (load i))
+                      tail (enc-block-tail block)
+                      op (enc-ideal-op tail)]
+                  (if (= op OP-IF)
+                      (let [taken (mach-layout-branch-target tail 0)
+                            fall (mach-layout-branch-target tail 1)]
+                        (if (enc-layout-next-is? (load i) fall)
+                            (mach-layout-set-inverted! tail false)
+                            (if (enc-layout-next-is? (load i) taken)
+                                (mach-layout-set-inverted! tail true)
+                                (do
+                                  (mach-layout-set-inverted! tail false)
+                                  (enc-layout-install-jump! (load i) tail fall)))))
+                      (if (or (= op OP-RETURN)
+                              (= op OP-STOP)
+                              (= op OP-XCTRL)
+                              (mach-layout-jump? tail))
+                          0
+                          (match (enc-unique-cfg-successor tail)
+                            (Some [successor]
+                                  (if (enc-layout-next-is? (load i) successor)
+                                      0
+                                      (enc-layout-install-jump! (load i) tail successor)))
+                            (None [] 0))))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    (enc-layout-block-count)))
+
+(defn enc-layout-offsets! [] (-> i64)
+  (let [(mut cursor) 0
+        (mut ci) 0]
+    (loop (if (>= (load ci) (enc-layout-block-count))
+              (break 0)
+              (let [block (enc-layout-block-at (load ci))
+                    (mut i) 0]
+                (loop (if (>= (load i) (code-schedule-count block))
+                          (break 0)
+                          (let [n (code-schedule-at block (load i))]
+                            (match (mach-of n)
+                              (Some [mach]
+                                    (let [size (m-size mach)]
+                                      (if (< size 0)
+                                          (panic-i "enc-layout!: negative machine size" (n-nid n))
+                                          0)
+                                      (set! (mut (.starts (enc-state))) (n-nid n) (load cursor))
+                                      (set! (mut (.lengths (enc-state))) (n-nid n) size)
+                                      (set! (mut cursor) (+ (load cursor) size))))
+                              (None [] 0))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (match (enc-layout-jump-at (load ci))
+                  (Some [jump]
+                        (match (mach-of jump)
+                          (Some [mach]
+                                (let [size (m-size mach)]
+                                  (set! (mut (.starts (enc-state))) (n-nid jump) (load cursor))
+                                  (set! (mut (.lengths (enc-state))) (n-nid jump) size)
+                                  (set! (mut cursor) (+ (load cursor) size))))
+                          (None [] (panic "enc-layout!: synthetic jump is not a machine node"))))
+                  (None [] 0))
+                (set! (mut ci) (+ (load ci) 1))
+                (continue))))
+    (load cursor)))
+
+(defn enc-relax-branches! [] (-> bool)
+  (let [(mut ci) 0 (mut changed) false]
+    (loop (if (>= (load ci) (enc-layout-block-count))
+              (break (load changed))
+              (let [block (enc-layout-block-at (load ci))
+                    tail (enc-block-tail block)]
+                (if (= (enc-ideal-op tail) OP-IF)
+                    (let [target0 (mach-layout-branch-target tail 0)
+                          target1 (mach-layout-branch-target tail 1)
+                          delta0 (- (enc-op-start target0) (enc-op-start tail))
+                          delta1 (- (enc-op-start target1) (enc-op-start tail))]
+                      (if (mach-layout-relax-branch! tail delta0 delta1)
+                          (set! (mut changed) true)
+                          0))
+                    0)
+                (set! (mut ci) (+ (load ci) 1))
+                (continue))))))
 
 (defn enc-layout! [] (-> i64)
-  (do (unimplemented "enc-layout!" "S6 — src/codegen/encoding.coil") 0))
+  (do
+    (enc-reset!)
+    (enc-build-block-layout!)
+    (let [(mut size) (enc-layout-offsets!)]
+      (loop (if (enc-relax-branches!)
+                (do (set! (mut size) (enc-layout-offsets!)) (continue))
+                (break 0)))
+      (set! (.laid-out (enc-state)) true)
+      (load size))))
 
 (defn enc-emit! [] (-> i64)
-  (do (unimplemented "enc-emit!" "S6 — src/codegen/encoding.coil") 0))
+  (do
+    (if (not (.laid-out (enc-state))) (enc-layout!) 0)
+    (al-clear! [u8] (mut (.bits (enc-state))))
+    (let [(mut ci) 0]
+      (loop (if (>= (load ci) (enc-layout-block-count))
+                (break 0)
+                (let [block (enc-layout-block-at (load ci))
+                      (mut i) 0]
+                  (loop (if (>= (load i) (code-schedule-count block))
+                            (break 0)
+                            (let [n (code-schedule-at block (load i))]
+                              (match (mach-of n)
+                                (Some [mach]
+                                      (let [before (enc-byte-count)]
+                                        (if (!= before (enc-op-start n))
+                                            (panic-i "enc-emit!: emitted offset disagrees with layout"
+                                                     (n-nid n))
+                                            0)
+                                        (m-encoding mach ENCODER-HANDLE)
+                                        (if (!= (- (enc-byte-count) before) (enc-op-length n))
+                                            (panic-i "enc-emit!: machine node emitted wrong size"
+                                                     (n-nid n))
+                                            0)))
+                                (None [] 0))
+                              (set! (mut i) (+ (load i) 1))
+                              (continue))))
+                  (match (enc-layout-jump-at (load ci))
+                    (Some [jump]
+                          (match (mach-of jump)
+                            (Some [mach]
+                                  (let [before (enc-byte-count)]
+                                    (m-encoding mach ENCODER-HANDLE)
+                                    (if (!= (- (enc-byte-count) before) (enc-op-length jump))
+                                        (panic-i "enc-emit!: synthetic jump emitted wrong size"
+                                                 (n-nid jump))
+                                        0)))
+                            (None [] (panic "enc-emit!: synthetic jump is not a machine node"))))
+                    (None [] 0))
+                  (set! (mut ci) (+ (load ci) 1))
+                  (continue)))))
+    (set! (.emitted (enc-state)) true)
+    (enc-byte-count)))
 
+(defn enc-local-fixup-patch! [(i i64)] (-> i64)
+  (let [state (enc-state)
+        kind (get (.fixup-kinds state) i)
+        source-nid (get (.fixup-sources state) i)
+        source-addend (get (.fixup-addends state) i)
+        target-nid (get (.fixup-targets state) i)
+        source
+          (match (arena-node source-nid)
+            (Some [n] n)
+            (None []
+                  (do
+                    (panic-i "enc-relocate!: missing fixup source" source-nid)
+                    (unreachable-node))))
+        target
+          (match (arena-node target-nid)
+            (Some [n] n)
+            (None []
+                  (do
+                    (panic-i "enc-relocate!: missing fixup target" target-nid)
+                    (unreachable-node))))
+        at (+ (enc-op-start source) source-addend)
+        delta (- (enc-op-start target) at)
+        scaled (/ delta 4)
+        old (enc-read4 at)]
+    (if (!= (* scaled 4) delta)
+        (panic-i "enc-relocate!: AArch64 branch target is not word aligned" delta)
+        0)
+    (if (= kind ENC-FIXUP-A64-B19)
+        (if (or (< scaled -262144) (> scaled 262143))
+            (panic-i "enc-relocate!: AArch64 conditional branch is out of range" delta)
+            (enc-patch4! ENCODER-HANDLE
+                         at
+                         (primitive/ior (primitive/iand old (primitive/ixor (primitive/ishl 0x7ffff 5) -1))
+                                        (primitive/ishl (primitive/iand scaled 0x7ffff) 5))))
+        (if (or (< scaled -33554432) (> scaled 33554431))
+            (panic-i "enc-relocate!: AArch64 branch is out of range" delta)
+            (enc-patch4! ENCODER-HANDLE
+                         at
+                         (primitive/ior (primitive/iand old (primitive/ixor 0x3ffffff -1))
+                                        (primitive/iand scaled 0x3ffffff)))))
+    0))
+
+(defn enc-literal-pools! [] (-> i64)
+  (let [state (enc-state)
+        (mut i) 0]
+    ;; Assign one pool slot per distinct bit pattern, retaining NaN payloads and signed zero.
+    (loop (if (>= (load i) (enc-literal-count))
+              (break 0)
+              (let [(mut j) 0
+                    (mut prior) -1
+                    bits (get (.literal-bits state) (load i))]
+                (loop (if (>= (load j) (load i))
+                          (break 0)
+                          (do
+                            (if (and (= (load prior) -1)
+                                     (= (get (.literal-bits state) (load j)) bits))
+                                (set! (mut prior) (get (.literal-offsets state) (load j)))
+                                0)
+                            (set! (mut j) (+ (load j) 1))
+                            (continue))))
+                (if (>= (load prior) 0)
+                    (set! (mut (.literal-offsets state)) (load i) (load prior))
+                    (do
+                      (loop (if (= (& (enc-byte-count) 7) 0)
+                                (break 0)
+                                (do (enc-add1! ENCODER-HANDLE 0) (continue))))
+                      (set! (mut (.literal-offsets state)) (load i) (enc-byte-count))
+                      (enc-add8! ENCODER-HANDLE bits)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    ;; LDR (literal), 64-bit SIMD/FP: signed imm19 is scaled by four from the opcode start.
+    (set! (mut i) 0)
+    (loop (if (>= (load i) (enc-literal-count))
+              (break 0)
+              (let [source-nid (get (.literal-sources state) (load i))
+                    source
+                      (match (arena-node source-nid)
+                        (Some [n] n)
+                        (None []
+                              (do
+                                (panic-i "enc-literal-pools!: missing source" source-nid)
+                                (unreachable-node))))
+                    at (enc-op-start source)
+                    delta (- (get (.literal-offsets state) (load i)) at)
+                    scaled (/ delta 4)
+                    old (enc-read4 at)]
+                (if (or (!= (* scaled 4) delta) (< scaled -262144) (> scaled 262143))
+                    (panic-i "enc-literal-pools!: floating literal is out of range" delta)
+                    (enc-patch4! ENCODER-HANDLE
+                                 at
+                                 (primitive/ior (primitive/iand old
+                                                                (primitive/ixor (primitive/ishl 0x7ffff 5) -1))
+                                                (primitive/ishl (primitive/iand scaled 0x7ffff) 5))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))
+
+;; Local fixups are resolved here. Symbol-bearing fixups remain typed records for the object writer;
+;; they are deliberately not represented as local node ids.
 (defn enc-relocate! [] (-> i64)
-  (do (unimplemented "enc-relocate!" "S6 — src/codegen/encoding.coil") 0))
+  (if (not (.emitted (enc-state)))
+      (panic "enc-relocate!: bytes have not been emitted")
+      (let [(mut i) 0]
+        (loop (if (>= (load i) (enc-fixup-count))
+                  (break 0)
+                  (do
+                    (enc-local-fixup-patch! (load i))
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        (enc-literal-pools!))))

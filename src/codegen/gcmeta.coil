@@ -12,7 +12,19 @@
 ;;
 ;; SCAFFOLD: signatures are final; bodies hard-error. Filled in at S8.
 (module aot.codegen.gcmeta)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
 (import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.node.gc" :use *)
+(import "aot.type.type" :use *)
+(import "aot.codegen.codegen" :use *)
+(import "aot.codegen.encoding" :use *)
+(import "aot.codegen.machine" :use *)
+(import "aot.codegen.regalloc" :use *)
 
 (const SLOT-SCALAR 0)
 
@@ -20,11 +32,400 @@
 
 (const SLOT-BOXED 2)
 
+(defstruct GcMetaState
+  [(safepoint-nids (ArrayList i64))
+   (return-pcs (ArrayList i64))
+   (slot-los (ArrayList i64))
+   (slot-his (ArrayList i64))
+   (locations (ArrayList i64))
+   (kinds (ArrayList i64))
+   (ready bool)])
+
+(defn gcmeta-state [] (-> (ptr GcMetaState))
+  (primitive/alloc-static GcMetaState))
+
+(defn gcmeta-reset! [] (-> i64)
+  (let [a (alloc/malloc-allocator) state (gcmeta-state)]
+    (set! (.safepoint-nids state) (al-new [i64] a))
+    (set! (.return-pcs state) (al-new [i64] a))
+    (set! (.slot-los state) (al-new [i64] a))
+    (set! (.slot-his state) (al-new [i64] a))
+    (set! (.locations state) (al-new [i64] a))
+    (set! (.kinds state) (al-new [i64] a))
+    (set! (.ready state) true)
+    0))
+
+(defn gcmeta-ready? [] (-> bool)
+  (.ready (gcmeta-state)))
+
+(defn gc-stackmap-count [] (-> i64)
+  (if (gcmeta-ready?) (len (.safepoint-nids (gcmeta-state))) 0))
+
+(defn gcmeta-put1! [(out (mut (ArrayList u8))) (v i64)] (-> i64)
+  (do (push! [u8] (mut out) (primitive/cast u8 v)) 0))
+
+(defn gcmeta-put4! [(out (mut (ArrayList u8))) (v i64)] (-> i64)
+  (do
+    (gcmeta-put1! (mut out) v)
+    (gcmeta-put1! (mut out) (primitive/ishr v 8))
+    (gcmeta-put1! (mut out) (primitive/ishr v 16))
+    (gcmeta-put1! (mut out) (primitive/ishr v 24))
+    0))
+
+(defn gcmeta-put8! [(out (mut (ArrayList u8))) (v i64)] (-> i64)
+  (do (gcmeta-put4! (mut out) v) (gcmeta-put4! (mut out) (primitive/ishr v 32)) 0))
+
+;; One target-neutral section format is consumed by both object writers and the runtime:
+;;   magic[8] = "AOTSMAP\0", u32 version, u32 record-count;
+;;   record = u64 text-relative-return-pc, u32 slot-count, u32 reserved;
+;;   slot = u32 machine-location, u8 kind, u8[3] reserved.
+;; Fixed-width records keep parsing allocation-free and make malformed-section bounds checks exact.
+(defn gc-stackmap-bytes [] (-> (slice u8))
+  (let [a (alloc/malloc-allocator) (mut out) (al-new [u8] a) (mut i) 0]
+    (if (not (gcmeta-ready?))
+        (al-slice (load out))
+        (do
+          (gcmeta-put1! (mut out) 0x41)
+          (gcmeta-put1! (mut out) 0x4f)
+          (gcmeta-put1! (mut out) 0x54)
+          (gcmeta-put1! (mut out) 0x53)
+          (gcmeta-put1! (mut out) 0x4d)
+          (gcmeta-put1! (mut out) 0x41)
+          (gcmeta-put1! (mut out) 0x50)
+          (gcmeta-put1! (mut out) 0)
+          (gcmeta-put4! (mut out) 1)
+          (gcmeta-put4! (mut out) (gc-stackmap-count))
+          (loop (if (>= (load i) (gc-stackmap-count))
+                    (break 0)
+                    (do
+                      (gcmeta-put8! (mut out) (gc-stackmap-return-pc (load i)))
+                      (gcmeta-put4! (mut out) (gc-stackmap-slot-count (load i)))
+                      (gcmeta-put4! (mut out) 0)
+                      (let [(mut slot) 0]
+                        (loop (if (>= (load slot) (gc-stackmap-slot-count (load i)))
+                                  (break 0)
+                                  (do
+                                    (gcmeta-put4! (mut out)
+                                                  (gc-stackmap-location (load i) (load slot)))
+                                    (gcmeta-put1! (mut out)
+                                                  (gc-stackmap-kind (load i) (load slot)))
+                                    (gcmeta-put1! (mut out) 0)
+                                    (gcmeta-put1! (mut out) 0)
+                                    (gcmeta-put1! (mut out) 0)
+                                    (set! (mut slot) (+ (load slot) 1))
+                                    (continue)))))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (al-slice (load out))))))
+
+(defn gc-stackmap-safepoint-nid [(i i64)] (-> i64)
+  (get (.safepoint-nids (gcmeta-state)) i))
+
+(defn gc-stackmap-return-pc [(i i64)] (-> i64)
+  (get (.return-pcs (gcmeta-state)) i))
+
+(defn gc-stackmap-slot-count [(i i64)] (-> i64)
+  (- (get (.slot-his (gcmeta-state)) i) (get (.slot-los (gcmeta-state)) i)))
+
+(defn gc-stackmap-location [(map-index i64) (slot-index i64)] (-> i64)
+  (get (.locations (gcmeta-state))
+       (+ (get (.slot-los (gcmeta-state)) map-index) slot-index)))
+
+(defn gc-stackmap-kind [(map-index i64) (slot-index i64)] (-> i64)
+  (get (.kinds (gcmeta-state)) (+ (get (.slot-los (gcmeta-state)) map-index) slot-index)))
+
+(defn gc-safepoint-op? [(n (dyn NodeOps))] (-> bool)
+  (match (mach-of n)
+    (Some [mach]
+          (let [op (m-ideal-op mach)]
+            (or (= op OP-CALL) (= op OP-NEW) (= op OP-SAFEPOINT))))
+    (None [] false)))
+
+(defn gc-explicit-safepoint? [(n (dyn NodeOps))] (-> bool)
+  (match (mach-of n) (Some [mach] (= (m-ideal-op mach) OP-SAFEPOINT)) (None [] false)))
+
+(defn gc-schedule-position [(block (dyn NodeOps)) (needle (dyn NodeOps))] (-> i64)
+  (let [(mut i) 0 (mut answer) -1]
+    (loop (if (or (>= (load i) (code-schedule-count block)) (>= (load answer) 0))
+              (break (load answer))
+              (do
+                (if (n-same? (code-schedule-at block (load i)) needle)
+                    (set! (mut answer) (load i))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load answer)))
+
+(defn gc-block-node [(nid i64)] (-> (Option (dyn NodeOps)))
+  (if (= nid 0) (None [(dyn NodeOps)]) (arena-node nid)))
+
+(defn gc-block-dominates? [(dom (dyn NodeOps)) (block (dyn NodeOps))] (-> bool)
+  (let [(mut cur) (Some block) (mut found) false (mut guard) 0]
+    (loop (if (or (load found)
+                  (match (load cur) (Some [_] false) (None [] true)))
+              (break (load found))
+              (match (load cur)
+                (Some [n]
+                      (if (n-same? n dom)
+                          (set! (mut found) true)
+                          (if (> (load guard) (arena-node-count))
+                              (do
+                                (panic-i "gc-block-dominates?: idom chain did not converge"
+                                         (n-nid block))
+                                (set! (mut cur) (None [(dyn NodeOps)])))
+                              (do
+                                (set! (mut cur) (cfg-idom-of n))
+                                (set! (mut guard) (+ (load guard) 1))
+                                (continue)))))
+                (None [] (break false)))))
+    (load found)))
+
+(defn gc-effective-use-block [(use (dyn NodeOps)) (input i64)] (-> (Option (dyn NodeOps)))
+  (match (mach-of use)
+    (Some [mach]
+          (if (and (= (m-ideal-op mach) OP-PHI) (> input 0))
+              (match (n-in use 0)
+                (Some [region]
+                      (match (n-in region input)
+                        (Some [pred] (gc-block-node (n-block-nid pred)))
+                        (None [] (None [(dyn NodeOps)]))))
+                (None [] (None [(dyn NodeOps)])))
+              (gc-block-node (n-block-nid use))))
+    (None [] (gc-block-node (n-block-nid use)))))
+
+(defn gc-use-after-safepoint? [(sp (dyn NodeOps))
+                               (sp-block (dyn NodeOps))
+                               (value (dyn NodeOps))
+                               (use (dyn NodeOps))] (-> bool)
+  (if (n-same? use sp)
+      false
+      (let [(mut input) 0 (mut after) false]
+        (loop (if (or (>= (load input) (n-nins use)) (load after))
+                  (break (load after))
+                  (do
+                    (match (n-in use (load input))
+                      (Some [def]
+                            (if (n-same? def value)
+                                (match (gc-effective-use-block use (load input))
+                                  (Some [use-block]
+                                        (if (n-same? use-block sp-block)
+                                            (let [sp-pos (gc-schedule-position sp-block sp)
+                                                  use-pos (gc-schedule-position sp-block use)]
+                                              ;; Phi operands are consumed on the predecessor edge,
+                                              ;; after every scheduled instruction in that block.
+                                              (if (or (< use-pos 0) (> use-pos sp-pos))
+                                                  (set! (mut after) true)
+                                                  0))
+                                            (if (gc-block-dominates? sp-block use-block)
+                                                (set! (mut after) true)
+                                                0)))
+                                  (None [] 0))
+                                0))
+                      (None [] 0))
+                    (set! (mut input) (+ (load input) 1))
+                    (continue))))
+        (load after))))
+
+;; Verify R2 after selection and scheduling, when both instruction order and cross-block dominance
+;; are authoritative. Earlier uses of a live value remain legal; any same-block-later or dominated
+;; use must read the relocation projection instead of the pre-safepoint definition.
+(defn gc-verify-relocations? [] (-> bool)
+  (let [(mut ci) 0 (mut valid) true]
+    (loop (if (or (>= (load ci) (code-cfg-count)) (not (load valid)))
+              (break (load valid))
+              (let [block (code-cfg-at (load ci)) (mut si) 0]
+                (loop (if (or (>= (load si) (code-schedule-count block)) (not (load valid)))
+                          (break 0)
+                          (let [sp (code-schedule-at block (load si))]
+                            (if (gc-explicit-safepoint? sp)
+                                (let [(mut live-input) 2]
+                                  (loop (if (or (>= (load live-input) (n-nins sp))
+                                                (not (load valid)))
+                                            (break 0)
+                                            (do
+                                              (match (n-in sp (load live-input))
+                                              (Some [value]
+                                                    (let [(mut oi) 0]
+                                                      (loop (if (or (>= (load oi) (n-nouts value))
+                                                                    (not (load valid)))
+                                                                (break 0)
+                                                                (do
+                                                                  (match (n-out value (load oi))
+                                                                    (Some [use]
+                                                                          (if (gc-use-after-safepoint?
+                                                                                sp block value use)
+                                                                              (set! (mut valid) false)
+                                                                              0))
+                                                                    (None [] 0))
+                                                                  (set! (mut oi) (+ (load oi) 1))
+                                                                  (continue))))))
+                                                (None [] (set! (mut valid) false)))
+                                              (set! (mut live-input) (+ (load live-input) 1))
+                                              (continue)))))
+                                0)
+                            (set! (mut si) (+ (load si) 1))
+                            (continue))))
+                (set! (mut ci) (+ (load ci) 1))
+                (continue))))
+    (load valid)))
+
+(defn gc-live-new [(block (dyn NodeOps))] (-> (ArrayList i64))
+  (let [a (alloc/malloc-allocator) (mut live) (al-new [i64] a) (mut lrg) 0]
+    (loop (if (> (load lrg) (ra-lrg-count))
+              (break 0)
+              (do
+                (push! [i64]
+                       (mut live)
+                       (if (= (load lrg) 0) 0 (ra-liveout-nid block (load lrg))))
+                (set! (mut lrg) (+ (load lrg) 1))
+                (continue))))
+    (load live)))
+
+(defn gc-live-step! [(n (dyn NodeOps)) (live (mut (ArrayList i64)))] (-> i64)
+  (match (mach-of n)
+    (None [] 0)
+    (Some [mach]
+          (do
+            (if (!= (n-lrg n) 0) (set! (mut live) (n-lrg n) 0) 0)
+            (let [(mut i) 1]
+              (loop (if (>= (load i) (n-nins n))
+                        (break 0)
+                        (do
+                          (match (m-regmap mach (load i))
+                            (Some [_]
+                                  (match (n-in n (load i))
+                                    (Some [def]
+                                          (if (!= (n-lrg def) 0)
+                                              (set! (mut live) (n-lrg def) (n-nid def))
+                                              0))
+                                    (None [] 0)))
+                            (None [] 0))
+                          (set! (mut i) (+ (load i) 1))
+                          (continue)))))
+            0))))
+
+(defn gc-record-stackmap! [(safepoint (dyn NodeOps)) (live (ArrayList i64))] (-> i64)
+  (let [state (gcmeta-state) lo (len (.locations state)) (mut lrg) 1]
+    (push! [i64] (mut (.safepoint-nids state)) (n-nid safepoint))
+    (push! [i64]
+           (mut (.return-pcs state))
+           (+ (enc-op-start safepoint) (enc-op-length safepoint)))
+    (push! [i64] (mut (.slot-los state)) lo)
+    (loop (if (> (load lrg) (ra-lrg-count))
+              (break 0)
+              (let [nid (get live (load lrg)) kind (ra-lrg-kind (load lrg))]
+                (if (and (!= nid 0) (!= kind LRG-SCALAR))
+                    (match (arena-node nid)
+                      (Some [value]
+                            (if (< (n-reg value) 0)
+                                (panic-i "gc-record-stackmap!: live reference has no location" nid)
+                                (do
+                                  (push! [i64] (mut (.locations state)) (n-reg value))
+                                  (push! [i64]
+                                         (mut (.kinds state))
+                                         (if (= kind LRG-RAW-REF) SLOT-RAW-REF SLOT-BOXED)))))
+                      (None [] (panic-i "gc-record-stackmap!: missing live value" nid)))
+                    0)
+                (set! (mut lrg) (+ (load lrg) 1))
+                (continue))))
+    (push! [i64] (mut (.slot-his state)) (len (.locations state)))
+    0))
+
 (defn gc-place-safepoints! [] (-> i64)
   (do (unimplemented "gc-place-safepoints!" "S8 — src/codegen/gcmeta.coil") 0))
 
 (defn gc-build-stackmaps! [] (-> i64)
-  (do (unimplemented "gc-build-stackmaps!" "S8 — src/codegen/gcmeta.coil") 0))
+  (do
+    (gcmeta-reset!)
+    (let [(mut ci) 0]
+      (loop (if (>= (load ci) (code-cfg-count))
+                (break 0)
+                (let [block (code-cfg-at (load ci))
+                      (mut live) (gc-live-new block)
+                      (mut i) (- (code-schedule-count block) 1)]
+                  (loop (if (< (load i) 0)
+                            (break 0)
+                            (let [n (code-schedule-at block (load i))]
+                              (gc-live-step! n (mut live))
+                              (if (gc-safepoint-op? n) (gc-record-stackmap! n (load live)) 0)
+                              (set! (mut i) (- (load i) 1))
+                              (continue))))
+                  (set! (mut ci) (+ (load ci) 1))
+                  (continue)))))
+    (gc-stackmap-count)))
 
 (defn gc-lower-barriers! [] (-> i64)
-  (do (unimplemented "gc-lower-barriers!" "S8 — src/codegen/gcmeta.coil") 0))
+  (let [a (alloc/malloc-allocator) (mut nid) 1 (mut inserted) 0]
+    ;; Snapshot the arena bound. Newly created Barriers are results, never candidate Stores.
+    (let [limit (arena-node-count)]
+      (loop (if (> (load nid) limit)
+                (break 0)
+                (do
+                  (match (arena-node (load nid))
+                    (Some [store]
+                          (if (and (= (n-op store) OP-STORE)
+                                   (let [t (n-ty (n-in! store STORE-VAL))]
+                                     (or (ty-memptr? t) (ty-dyn? t))))
+                              (let [(mut oi) 0 (mut already) false]
+                                (loop (if (or (>= (load oi) (n-nouts store)) (load already))
+                                          (break 0)
+                                          (do
+                                            (match (n-out store (load oi))
+                                              (Some [use]
+                                                    (if (= (n-op use) OP-BARRIER)
+                                                        (set! (mut already) true)
+                                                        0))
+                                              (None [] 0))
+                                            (set! (mut oi) (+ (load oi) 1))
+                                            (continue))))
+                                (if (load already)
+                                    0
+                                    (let [(mut users) (al-new [i64] a) (mut ui) 0]
+                                      ;; Capture users before constructing the Barrier, which adds
+                                      ;; its own Store use and must remain on the pre-barrier state.
+                                      (set! (mut oi) 0)
+                                      (loop (if (>= (load oi) (n-nouts store))
+                                                (break 0)
+                                                (do
+                                                  (match (n-out store (load oi))
+                                                    (Some [use]
+                                                          (push! [i64] (mut users) (n-nid use)))
+                                                    (None [] 0))
+                                                  (set! (mut oi) (+ (load oi) 1))
+                                                  (continue))))
+                                      (let [barrier
+                                              (barrier-make (n-in! store MEM-CTRL)
+                                                            store
+                                                            (n-in! store MEM-PTR)
+                                                            (n-in! store STORE-VAL))]
+                                        (loop (if (>= (load ui) (len (load users)))
+                                                  (break 0)
+                                                  (do
+                                                    (match (arena-node (get (load users) (load ui)))
+                                                      (Some [use]
+                                                            (let [(mut input) 0]
+                                                              (loop (if (>= (load input)
+                                                                            (n-nins use))
+                                                                        (break 0)
+                                                                        (do
+                                                                          (match (n-in use
+                                                                                       (load input))
+                                                                            (Some [def]
+                                                                                  (if (n-same? def store)
+                                                                                      (n-set-def! use
+                                                                                                  (load input)
+                                                                                                  (Some barrier))
+                                                                                      0))
+                                                                            (None [] 0))
+                                                                          (set! (mut input)
+                                                                                (+ (load input) 1))
+                                                                          (continue))))))
+                                                      (None [] 0))
+                                                    (set! (mut ui) (+ (load ui) 1))
+                                                    (continue))))
+                                        (set! (mut inserted) (+ (load inserted) 1))))))
+                              0))
+                    (None [] 0))
+                  (set! (mut nid) (+ (load nid) 1))
+                  (continue)))))
+    (load inserted)))

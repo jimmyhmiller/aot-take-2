@@ -1,24 +1,225 @@
-;; Register masks and the stack-slot numbering.
-
+;; ============================================================================
+;; REGISTER MASKS  —  final-Simple semantics without a fixed bit ceiling
+;; ============================================================================
 ;;
-;; Registers are numbered densely from 0, and STACK SLOTS CONTINUE THAT NUMBERING upward from the
-;; last register. A "register" in the allocator is therefore either a real register or a spill
-;; slot, and spilling is assigning a higher-numbered register rather than a separate mechanism.
+;; Allocation uses one location namespace: physical registers first, then incoming argument and
+;; spill slots. Final Simple's fixed 128 bits are explicitly a capacity compromise. arm64 consumes
+;; locations 0..64 before stack slot zero, so copying that limit would leave only 63 stack slots.
 ;;
-;; A mask is a bitset over that numbering: which locations may hold this value.
-;;
-;; SCAFFOLD: signatures are final; bodies hard-error. Filled in at S6.
+;; A mask is therefore an immutable dynamically-sized bitset plus `stack-tail`. Explicit words can
+;; name any fixed location. `stack-tail` means every location at or above `stack-base` is allowed,
+;; faithfully representing the conceptually infinite spill mask. Operations allocate fresh masks,
+;; so machine-node constraints and LRG intersections never share mutable storage.
 (module aot.codegen.regmask)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
+(import "coil.arraylist" :use *)
 (import "aot.util.panic" :use *)
 
-(defn mask-empty [] (-> i64)
-  0)
+(const MASK-WORD-BITS 64)
 
-(defn mask-of [(reg i64)] (-> i64)
-  (do (unimplemented "mask-of" "S6 — src/codegen/regmask.coil") 0))
+(defstruct RegMask [(stack-tail i64) (stack-base i64) (words (ArrayList i64))])
 
-(defn mask-and [(a i64) (b i64)] (-> i64)
-  (do (unimplemented "mask-and" "S6 — src/codegen/regmask.coil") 0))
+(defn mask-new [(stack-tail i64) (stack-base i64)] (-> (ptr RegMask))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [RegMask] (alloc/create [RegMask] a))]
+    (set! (.words p) (al-new [i64] a))
+    (set! (.stack-tail p) stack-tail)
+    (set! (.stack-base p) stack-base)
+    p))
 
-(defn mask-size [(m i64)] (-> i64)
-  (do (unimplemented "mask-size" "S6 — src/codegen/regmask.coil") 0))
+(defn mask-empty [] (-> (ptr RegMask))
+  (mask-new 0 0))
+
+(defn mask-word [(m (ptr RegMask)) (word i64)] (-> i64)
+  (if (< word 0)
+      0
+      (if (< word (len (.words m)))
+          (get (.words m) word)
+          (if (= (.stack-tail m) 0)
+              0
+              (let [word-lo (* word MASK-WORD-BITS)
+                    base (.stack-base m)]
+                (if (>= word-lo base)
+                    -1
+                    (if (<= (+ word-lo MASK-WORD-BITS) base)
+                        0
+                        (let [(mut bit) 0
+                              (mut bits) 0]
+                          (loop (if (>= (load bit) MASK-WORD-BITS)
+                                    (break (load bits))
+                                    (do
+                                      (if (>= (+ word-lo (load bit)) base)
+                                          (set! (mut bits)
+                                                (| (load bits) (primitive/ishl 1 (load bit))))
+                                          0)
+                                      (set! (mut bit) (+ (load bit) 1))
+                                      (continue))))))))))))
+
+(defn mask--ensure-word! [(m (ptr RegMask)) (word i64)] (-> i64)
+  (loop (if (> (len (.words m)) word)
+            (break 0)
+            (let [next (len (.words m))
+                  value (mask-word m next)]
+              (do (push! [i64] (mut (.words m)) value) (continue))))))
+
+(defn mask-stack [(stack-base i64)] (-> (ptr RegMask))
+  (if (< stack-base 0)
+      (do (panic-i "mask-stack: negative stack base" stack-base) (mask-empty))
+      (let [a (alloc/malloc-allocator)
+            m (alloc/unwrap-ptr [RegMask] (alloc/create [RegMask] a))]
+        (set! (.stack-tail m) 1)
+        (set! (.stack-base m) stack-base)
+        (set! (.words m) (al-new [i64] a))
+        m)))
+
+(defn mask--set-explicit! [(m (ptr RegMask)) (reg i64)] (-> i64)
+  (let [word (/ reg MASK-WORD-BITS)
+        bit (% reg MASK-WORD-BITS)]
+    (mask--ensure-word! m word)
+    (set! (mut (.words m)) word (| (get (.words m) word) (primitive/ishl 1 bit)))))
+
+(defn mask-of [(reg i64)] (-> (ptr RegMask))
+  (if (< reg 0)
+      (do (panic-i "mask-of: negative register" reg) (mask-empty))
+      (let [m (mask-empty)]
+        (mask--set-explicit! m reg)
+        m)))
+
+(defn mask-range [(lo i64) (hi i64)] (-> (ptr RegMask))
+  (if (or (< lo 0) (< hi lo))
+      (do (panic "mask-range: invalid inclusive range") (mask-empty))
+      (let [m (mask-empty)
+            (mut reg) lo]
+        (loop (if (> (load reg) hi)
+                  (break 0)
+                  (do
+                    (mask--set-explicit! m (load reg))
+                    (set! (mut reg) (+ (load reg) 1))
+                    (continue))))
+        m)))
+
+(defn mask-test [(m (ptr RegMask)) (reg i64)] (-> bool)
+  (if (< reg 0)
+      false
+      (let [word (/ reg MASK-WORD-BITS)
+            bit (% reg MASK-WORD-BITS)]
+        (if (< word (len (.words m)))
+            (!= (& (get (.words m) word) (primitive/ishl 1 bit)) 0)
+            (and (!= (.stack-tail m) 0) (>= reg (.stack-base m)))))))
+
+;; op: 0 intersection, 1 union, 2 subtraction.
+(defn mask--binary [(a (ptr RegMask)) (b (ptr RegMask)) (op i64)] (-> (ptr RegMask))
+  (let [tail
+          (if (= op 0)
+              (and (!= (.stack-tail a) 0) (!= (.stack-tail b) 0))
+              (if (= op 1)
+                  (or (!= (.stack-tail a) 0) (!= (.stack-tail b) 0))
+                  (and (!= (.stack-tail a) 0) (= (.stack-tail b) 0))))
+        base
+          (if tail
+              (if (= op 0)
+                  (if (> (.stack-base a) (.stack-base b)) (.stack-base a) (.stack-base b))
+                  (if (= op 1)
+                      (if (and (!= (.stack-tail a) 0) (!= (.stack-tail b) 0))
+                          (if (< (.stack-base a) (.stack-base b)) (.stack-base a) (.stack-base b))
+                          (if (!= (.stack-tail a) 0) (.stack-base a) (.stack-base b)))
+                      (.stack-base a)))
+              0)
+        out (mask-new (if tail 1 0) base)
+        explicit-words (if (> (len (.words a)) (len (.words b))) (len (.words a)) (len (.words b)))
+        a-bound (if (!= (.stack-tail a) 0) (+ (/ (.stack-base a) MASK-WORD-BITS) 1) 0)
+        b-bound (if (!= (.stack-tail b) 0) (+ (/ (.stack-base b) MASK-WORD-BITS) 1) 0)
+        words
+          (if (> explicit-words a-bound)
+              (if (> explicit-words b-bound) explicit-words b-bound)
+              (if (> a-bound b-bound) a-bound b-bound))
+        (mut i) 0]
+    (loop (if (>= (load i) words)
+              (break 0)
+              (let [aw (mask-word a (load i))
+                    bw (mask-word b (load i))
+                    word (if (= op 0) (& aw bw) (if (= op 1) (| aw bw) (& aw (^ bw -1))))]
+                (push! [i64] (mut (.words out)) word)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    out))
+
+(defn mask-and [(a (ptr RegMask)) (b (ptr RegMask))] (-> (ptr RegMask))
+  (mask--binary a b 0))
+
+(defn mask-or [(a (ptr RegMask)) (b (ptr RegMask))] (-> (ptr RegMask))
+  (mask--binary a b 1))
+
+(defn mask-sub [(a (ptr RegMask)) (b (ptr RegMask))] (-> (ptr RegMask))
+  (mask--binary a b 2))
+
+(defn mask-overlap? [(a (ptr RegMask)) (b (ptr RegMask))] (-> bool)
+  (let [words (if (> (len (.words a)) (len (.words b))) (len (.words a)) (len (.words b)))
+        (mut i) 0
+        (mut yes) false]
+    (loop (if (or (>= (load i) words) (load yes))
+              (break 0)
+              (do
+                (if (!= (& (mask-word a (load i)) (mask-word b (load i))) 0)
+                    (set! (mut yes) true)
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (or (load yes) (and (!= (.stack-tail a) 0) (!= (.stack-tail b) 0)))))
+
+(defn mask-empty? [(m (ptr RegMask))] (-> bool)
+  (if (!= (.stack-tail m) 0)
+      false
+      (let [(mut i) 0
+            (mut empty) true]
+        (loop (if (or (>= (load i) (len (.words m))) (not (load empty)))
+                  (break 0)
+                  (do
+                    (if (!= (get (.words m) (load i)) 0) (set! (mut empty) false) 0)
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        (load empty))))
+
+;; Infinite stack masks report -1. Pressure code intersects with the finite physical mask first.
+(defn mask-size [(m (ptr RegMask))] (-> i64)
+  (if (!= (.stack-tail m) 0)
+      -1
+      (let [(mut i) 0
+            (mut count) 0]
+        (loop (if (>= (load i) (len (.words m)))
+                  (break 0)
+                  (do
+                    (set! (mut count) (+ (load count) (primitive/popcount (get (.words m) (load i)))))
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        (load count))))
+
+(defn mask-singleton? [(m (ptr RegMask))] (-> bool)
+  (= (mask-size m) 1))
+
+(defn mask-first [(m (ptr RegMask))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len (.words m)))
+              (break (if (!= (.stack-tail m) 0) (.stack-base m) -1))
+              (let [word (get (.words m) (load i))]
+                (if (!= word 0)
+                    (break (+ (* (load i) MASK-WORD-BITS) (primitive/ctz word)))
+                    (do (set! (mut i) (+ (load i) 1)) (continue))))))))
+
+(defn mask-eq? [(a (ptr RegMask)) (b (ptr RegMask))] (-> bool)
+  (if (or (!= (.stack-tail a) (.stack-tail b))
+          (and (!= (.stack-tail a) 0) (!= (.stack-base a) (.stack-base b))))
+      false
+      (let [words (if (> (len (.words a)) (len (.words b))) (len (.words a)) (len (.words b)))
+            (mut i) 0
+            (mut same) true]
+        (loop (if (or (>= (load i) words) (not (load same)))
+                  (break 0)
+                  (do
+                    (if (!= (mask-word a (load i)) (mask-word b (load i)))
+                        (set! (mut same) false)
+                        0)
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        (load same))))

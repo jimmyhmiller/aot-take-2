@@ -10,6 +10,7 @@ port of SeaOfNodes/Simple's FINAL architecture — not its chapter sequence.
 - [README.md](README.md) — orientation and current status
 - [CLAUDE.md](CLAUDE.md) — the two absolute rules. Read before touching anything.
 - [docs/LAYOUT.md](docs/LAYOUT.md) — architecture, file-by-file map, build order S0–S8
+- [docs/BACKEND.md](docs/BACKEND.md) — final-Simple backend contracts and prerequisite producers
 
 ## Owed documents
 

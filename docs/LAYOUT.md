@@ -133,6 +133,7 @@ aot-take-2/
 │   ├── LAYOUT.md        ; THIS FILE — the file-by-file contract
 │   ├── DESIGN.md        ; the pipeline, the lattice, memory, the GC contract, the backend
 │   ├── DECISIONS.md     ; law: load-bearing choices with their reasoning
+│   ├── BACKEND.md       ; backend consumer assumptions and their ideal-graph producers
 │   ├── GAPS.md          ; complete inventory of absent and partial implementation
 │   ├── JSL.md           ; the runtime-library language
 │   └── JOURNAL.md       ; why something looks the way it does
@@ -185,8 +186,8 @@ aot-take-2/
 │   │   ├── gc.coil          ; ✦ Safepoint, Barrier, relocation projections
 │   │   └── cpus/
 │   │       ├── machnode.coil    ; MachNodeVT: regmap, outregmap, killmap, encoding, asm
-│   │       ├── arm64/  { arm64.coil, arith.coil, bits.coil, mem.coil,
-│   │       │             branch.coil, call.coil, encode.coil }
+│   │       ├── arm64/  { arm64.coil, base.coil, arith.coil, bits.coil, mem.coil,
+│   │       │             phi.coil, branch.coil, call.coil, split.coil }
 │   │       └── x86_64/ { x86_64.coil, arith.coil, bits.coil, mem.coil,
 │   │                     branch.coil, call.coil, encode.coil }
 │   │

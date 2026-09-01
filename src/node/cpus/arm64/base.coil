@@ -1,0 +1,430 @@
+;; ============================================================================
+;; ARM64 SCALAR MACHINE NODES — shared selected representation
+;; ============================================================================
+;;
+;; Final Simple's ARM port gives every instruction form a concrete MachNode subclass.  Selection
+;; constructors copy the ideal node's input array WITHOUT adding output edges; CodeGen maps those
+;; inputs recursively and rebuilds every output edge only after the complete selected graph exists.
+;; That ordering is essential for cycles and keeps the serialized ideal graph untouched.
+;;
+;; Coil does not need a Java class per encoding form.  This payload is the equivalent closed sum:
+;; `ideal-op` identifies the semantic operation, `form` identifies the selected encoding form, and
+;; the remaining fields are the exact allocator/encoder contract.  It is deliberately only for
+;; unpinned single-result scalar instructions; CFG, calls, memory and multi-result nodes retain
+;; their own concrete structs because their NodeOps/CFGOps behavior differs.
+(module aot.node.cpus.arm64.base)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.codegen.machine" :use *)
+(import "aot.codegen.encoding" :use *)
+(import "aot.codegen.regmask" :use *)
+
+(const ARM64-CLASS-NONE 0)
+(const ARM64-CLASS-GPR 1)
+(const ARM64-CLASS-FPR 2)
+(const ARM64-CLASS-FLAGS 3)
+
+(const ARM64-FORM-REG 1)
+(const ARM64-FORM-IMM12 2)
+(const ARM64-FORM-CONST 3)
+(const ARM64-FORM-CONVERT 4)
+(const ARM64-FORM-LOGICAL-IMM 5)
+(const ARM64-FORM-SHIFT-IMM 6)
+(const ARM64-FORM-CMP 7)
+(const ARM64-FORM-CMP-IMM 8)
+(const ARM64-FORM-SET 9)
+(const ARM64-FORM-NOT 10)
+
+(const ARM64-X0 0)
+(const ARM64-X17 17)
+(const ARM64-X19 19)
+(const ARM64-X28 28)
+(const ARM64-D0 32)
+(const ARM64-D31 63)
+(const ARM64-FLAGS 64)
+
+(defstruct Arm64ScalarNode
+  [(hdr NodeHdr)
+   (ideal-op i64)
+   (form i64)
+   (imm i64)
+   (input-class i64)
+   (output-class i64)
+   (arity i64)
+   (result-ty i64)
+   (kill-class i64)
+   (size i64)
+   (commutative bool)
+   (clone-cheap bool)])
+
+(defn arm64-class-mask [(class i64)] (-> (Option (ptr RegMask)))
+  (if (= class ARM64-CLASS-NONE)
+      (None [(ptr RegMask)])
+      (Some (if (= class ARM64-CLASS-GPR)
+                (mask-or (mask-range ARM64-X0 ARM64-X17) (mask-range ARM64-X19 ARM64-X28))
+                (if (= class ARM64-CLASS-FPR)
+                    (mask-range ARM64-D0 ARM64-D31)
+                    (if (= class ARM64-CLASS-FLAGS)
+                        (mask-of ARM64-FLAGS)
+                        (do (panic-i "arm64-class-mask: unknown register class" class)
+                            (mask-empty))))))))
+
+(defn arm64-scalar-node [(n (dyn NodeOps))] (-> (ptr Arm64ScalarNode))
+  (if (!= (n-op n) OP-MACH-SCALAR)
+      (do (panic-i "arm64-scalar-node: node is not a selected scalar" (n-op n))
+          (primitive/cast (ptr Arm64ScalarNode) (hdr n)))
+      (primitive/cast (ptr Arm64ScalarNode) (hdr n))))
+
+(defn arm64-scalar--raw-inputs! [(dst (dyn NodeOps)) (src (dyn NodeOps))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (n-nins src))
+              (break 0)
+              (do
+                ;; Selection owns a temporarily input-only graph.  Adding def-use edges here would
+                ;; mutate the ideal graph and would duplicate edges when selection rebuilds outputs.
+                (push! [(Option (dyn NodeOps))] (mut (.ins (hdr dst))) (n-in src (load i)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn arm64-scalar-make [(src (dyn NodeOps))
+                          (ideal-op i64)
+                          (form i64)
+                          (imm i64)
+                          (input-class i64)
+                          (output-class i64)
+                          (arity i64)
+                          (commutative bool)
+                          (clone-cheap bool)]
+                         (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [Arm64ScalarNode] (alloc/create [Arm64ScalarNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.ideal-op p) ideal-op)
+    (set! (.form p) form)
+    (set! (.imm p) imm)
+    (set! (.input-class p) input-class)
+    (set! (.output-class p) output-class)
+    (set! (.arity p) arity)
+    (set! (.result-ty p) (n-ty src))
+    (set! (.kill-class p) ARM64-CLASS-NONE)
+    (set! (.size p) 4)
+    (set! (.commutative p) commutative)
+    (set! (.clone-cheap p) clone-cheap)
+    (n-init! d OP-MACH-SCALAR)
+    (arm64-scalar--raw-inputs! d src)
+    (n-force-ty! d (.result-ty p))
+    d))
+
+(defn arm64-scalar-clone [(src (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [p (arm64-scalar-node src)]
+    (let [copy (arm64-scalar-make src (.ideal-op p) (.form p) (.imm p) (.input-class p)
+                                  (.output-class p) (.arity p) (.commutative p) (.clone-cheap p))]
+      (set! (.kill-class (arm64-scalar-node copy)) (.kill-class p))
+      (set! (.size (arm64-scalar-node copy)) (.size p))
+      copy)))
+
+(defn arm64-scalar-drop-last-input! [(n (dyn NodeOps))] (-> i64)
+  (if (= (n-nins n) 0)
+      (broken "arm64-scalar-drop-last-input!: selected node has no input")
+      (match (pop! (mut (.ins (hdr n))))
+        (Some [_] 0)
+        (None [] (broken "arm64-scalar-drop-last-input!: input list changed while popping")))))
+
+(defn arm64-scalar-unary-input! [(n (dyn NodeOps)) (input (dyn NodeOps))] (-> i64)
+  (do
+    (loop (if (= (n-nins n) 0)
+              (break 0)
+              (do (pop! (mut (.ins (hdr n)))) (continue))))
+    (push! [(Option (dyn NodeOps))] (mut (.ins (hdr n))) (None [(dyn NodeOps)]))
+    (push! [(Option (dyn NodeOps))] (mut (.ins (hdr n))) (Some input))
+    0))
+
+(defn arm64-scalar-set-kill! [(n (dyn NodeOps)) (class i64)] (-> i64)
+  (do (set! (.kill-class (arm64-scalar-node n)) class) 0))
+
+(defn arm64-scalar-set-size! [(n (dyn NodeOps)) (size i64)] (-> i64)
+  (if (< size 0)
+      (panic-i "arm64-scalar-set-size!: negative instruction size" size)
+      (do (set! (.size (arm64-scalar-node n)) size) 0)))
+
+(defn arm64-scalar-op-name [(p (ptr Arm64ScalarNode))] (-> (slice u8))
+  (let [op (.ideal-op p)]
+    (case op OP-CON "mov" OP-ADD
+          (if (= (.form p) ARM64-FORM-IMM12) "addi" "add") OP-SUB
+          (if (= (.form p) ARM64-FORM-IMM12) "subi" "sub") OP-MUL
+          "mul" OP-DIV
+          "div" OP-MINUS
+          "neg" OP-TOFLOAT
+          "scvtf" OP-ROUNDF32
+          "fcvt" OP-AND
+          (if (= (.form p) ARM64-FORM-LOGICAL-IMM) "andi" "and") OP-OR
+          (if (= (.form p) ARM64-FORM-LOGICAL-IMM) "ori" "or") OP-XOR
+          (if (= (.form p) ARM64-FORM-LOGICAL-IMM) "eori" "eor") OP-SHL
+          (if (= (.form p) ARM64-FORM-SHIFT-IMM) "lsli" "lsl") OP-SHR
+          (if (= (.form p) ARM64-FORM-SHIFT-IMM) "lsri" "lsr") OP-SAR
+          (if (= (.form p) ARM64-FORM-SHIFT-IMM) "asri" "asr") OP-NOT
+          "not" OP-EQ
+          (if (= (.form p) ARM64-FORM-SET) "cset-eq" "cmp-eq") OP-NE
+          (if (= (.form p) ARM64-FORM-SET) "cset-ne" "cmp-ne") OP-LT
+          (if (= (.form p) ARM64-FORM-SET) "cset-lt" "cmp-lt") OP-LE
+          (if (= (.form p) ARM64-FORM-SET) "cset-le" "cmp-le") OP-ULT
+          (if (= (.form p) ARM64-FORM-SET) "cset-lo" "cmp-lo") "arm64-scalar")))
+
+(defn arm64-enc-gpr [(encoder i64) (n (dyn NodeOps))] (-> i64)
+  (let [reg (enc-reg encoder n)]
+    (if (or (< reg 0) (>= reg 32))
+        (panic-i "arm64 encoding: expected GPR" reg)
+        reg)))
+
+(defn arm64-enc-fpr [(encoder i64) (n (dyn NodeOps))] (-> i64)
+  (let [reg (enc-reg encoder n)]
+    (if (or (< reg ARM64-D0) (> reg ARM64-D31))
+        (panic-i "arm64 encoding: expected FPR" reg)
+        (- reg ARM64-D0))))
+
+(defn arm64-enc-r3 [(base i64) (rd i64) (rn i64) (rm i64)] (-> i64)
+  (| base (| (primitive/ishl rm 16) (| (primitive/ishl rn 5) rd))))
+
+(defn arm64-enc-r2 [(base i64) (rd i64) (rn i64)] (-> i64)
+  (| base (| (primitive/ishl rn 5) rd)))
+
+(defn arm64-const-chunk [(value i64) (hw i64)] (-> i64)
+  (& (primitive/cast i64
+       (primitive/ishr (primitive/cast u64 value) (primitive/cast u64 (* hw 16))))
+     0xffff))
+
+(defn arm64-const-insns [(value i64)] (-> i64)
+  (let [(mut hw) 0 (mut nz) 0 (mut nff) 0]
+    (loop (if (>= (load hw) 4)
+              (break 0)
+              (let [chunk (arm64-const-chunk value (load hw))]
+                (if (!= chunk 0) (set! (mut nz) (+ (load nz) 1)) 0)
+                (if (!= chunk 0xffff) (set! (mut nff) (+ (load nff) 1)) 0)
+                (set! (mut hw) (+ (load hw) 1))
+                (continue))))
+    (let [best (if (< (load nff) (load nz)) (load nff) (load nz))]
+      (if (= best 0) 1 best))))
+
+(defn arm64-encode-constant! [(encoder i64) (p (ptr Arm64ScalarNode))] (-> i64)
+  (let [d (primitive/make-dyn NodeOps p)
+        rd (if (= (.output-class p) ARM64-CLASS-FPR)
+               (arm64-enc-fpr encoder d)
+               (arm64-enc-gpr encoder d))
+        value (.imm p)
+        (mut hw) 0
+        (mut first) true
+        use-movn (< (let [(mut i) 0 (mut count) 0]
+                      (loop (if (>= (load i) 4)
+                                (break (load count))
+                                (do
+                                  (if (!= (arm64-const-chunk value (load i)) 0xffff)
+                                      (set! (mut count) (+ (load count) 1))
+                                      0)
+                                  (set! (mut i) (+ (load i) 1))
+                                  (continue)))))
+                    (let [(mut i) 0 (mut count) 0]
+                      (loop (if (>= (load i) 4)
+                                (break (load count))
+                                (do
+                                  (if (!= (arm64-const-chunk value (load i)) 0)
+                                      (set! (mut count) (+ (load count) 1))
+                                      0)
+                                  (set! (mut i) (+ (load i) 1))
+                                  (continue))))))]
+    (if (= (.output-class p) ARM64-CLASS-FPR)
+        (do
+          (enc-add4! encoder (| 0x5c000000 rd))
+          (enc-add-f64-literal! encoder d value))
+        (do
+          (loop (if (>= (load hw) 4)
+              (break 0)
+              (let [chunk (arm64-const-chunk value (load hw))
+                    useful (if use-movn (!= chunk 0xffff) (!= chunk 0))]
+                (if useful
+                    (do
+                      (enc-add4! encoder
+                                 (if (load first)
+                                     (| (if use-movn 0x92800000 0xd2800000)
+                                        (| (primitive/ishl
+                                             (if use-movn
+                                                 (& (primitive/ixor chunk -1) 0xffff)
+                                                 chunk)
+                                             5)
+                                           (| (primitive/ishl (load hw) 21) rd)))
+                                     (| 0xf2800000
+                                        (| (primitive/ishl chunk 5)
+                                           (| (primitive/ishl (load hw) 21) rd)))))
+                      (set! (mut first) false))
+                    0)
+                (set! (mut hw) (+ (load hw) 1))
+                (continue))))
+          (if (load first)
+              (enc-add4! encoder (| (if use-movn 0x92800000 0xd2800000) rd))
+              0)))
+    0))
+
+(defn arm64-condition-inverse [(op i64)] (-> i64)
+  (case op OP-EQ 1 OP-NE 0 OP-LT 10 OP-LE 12 OP-ULT 2
+        (do (panic-i "arm64-condition-inverse: unsupported comparison" op) 0)))
+
+(defn arm64-encode-scalar! [(encoder i64) (p (ptr Arm64ScalarNode))] (-> i64)
+  (let [d (primitive/make-dyn NodeOps p)
+        op (.ideal-op p)
+        form (.form p)]
+    (if (= (.size p) 0)
+        0
+        (if (= op OP-CON)
+            (arm64-encode-constant! encoder p)
+        (if (= form ARM64-FORM-SET)
+            (enc-add4! encoder
+                       (| 0x9a9f07e0
+                          (| (primitive/ishl (arm64-condition-inverse op) 12)
+                             (arm64-enc-gpr encoder d))))
+            (if (= op OP-NOT)
+                (let [rn (arm64-enc-gpr encoder (n-in! d 1))
+                      rd (arm64-enc-gpr encoder d)]
+                  (enc-add4! encoder (| 0xf100001f (primitive/ishl rn 5)))
+                  (enc-add4! encoder (| 0x9a9f17e0 rd)))
+                (if (or (= form ARM64-FORM-CMP) (= form ARM64-FORM-CMP-IMM))
+                    (if (= (.input-class p) ARM64-CLASS-FPR)
+                        (enc-add4! encoder
+                                   (arm64-enc-r3 0x1e602000
+                                                  0
+                                                  (arm64-enc-fpr encoder (n-in! d 1))
+                                                  (arm64-enc-fpr encoder (n-in! d 2))))
+                        (let [rn (arm64-enc-gpr encoder (n-in! d 1))]
+                          (enc-add4! encoder
+                                     (if (= form ARM64-FORM-CMP-IMM)
+                                         (| 0xf100001f
+                                            (| (primitive/ishl (.imm p) 10)
+                                               (primitive/ishl rn 5)))
+                                         (| 0xeb00001f
+                                            (| (primitive/ishl
+                                                 (arm64-enc-gpr encoder (n-in! d 2))
+                                                 16)
+                                               (primitive/ishl rn 5)))))))
+                    (let [float (= (.output-class p) ARM64-CLASS-FPR)
+                          rd (if float (arm64-enc-fpr encoder d) (arm64-enc-gpr encoder d))
+                          rn (if (= (.arity p) 0)
+                                 0
+                                 (if (= (.input-class p) ARM64-CLASS-FPR)
+                                     (arm64-enc-fpr encoder (n-in! d 1))
+                                     (arm64-enc-gpr encoder (n-in! d 1))))]
+                      (if (= op OP-MINUS)
+                          (enc-add4! encoder
+                                     (if float
+                                         (arm64-enc-r2 0x1e614000 rd rn)
+                                         (| 0xcb0003e0
+                                            (| (primitive/ishl rn 16) rd))))
+                          (if (= form ARM64-FORM-IMM12)
+                                  (enc-add4! encoder
+                                     (arm64-enc-r2
+                                       (| (if (= op OP-ADD) 0x91000000 0xd1000000)
+                                          (primitive/ishl (.imm p) 10))
+                                       rd
+                                       rn))
+                              (if (= form ARM64-FORM-LOGICAL-IMM)
+                              (enc-add4! encoder
+                                         (arm64-enc-r2
+                                           (| (case op OP-AND 0x92000000 OP-OR 0xb2000000
+                                                    OP-XOR 0xd2000000 0)
+                                              (primitive/ishl (.imm p) 10))
+                                           rd
+                                           rn))
+                                  (if (= form ARM64-FORM-SHIFT-IMM)
+                                      (let [shift (.imm p)]
+                                    (enc-add4! encoder
+                                               (arm64-enc-r2
+                                                 (case op
+                                                   OP-SHL
+                                                   (| 0xd3400000
+                                                      (| (primitive/ishl (- 64 shift) 16)
+                                                         (primitive/ishl (- 63 shift) 10)))
+                                                   OP-SHR
+                                                   (| 0xd3400000
+                                                      (| (primitive/ishl shift 16)
+                                                         (primitive/ishl 63 10)))
+                                                   OP-SAR
+                                                   (| 0x93400000
+                                                      (| (primitive/ishl shift 16)
+                                                         (primitive/ishl 63 10)))
+                                                   0)
+                                                 rd
+                                                 rn)))
+                                      (if (= form ARM64-FORM-CONVERT)
+                                          (enc-add4! encoder
+                                                 (if (= op OP-TOFLOAT)
+                                                     (arm64-enc-r2 0x9e620000
+                                                                    rd
+                                                                    (arm64-enc-gpr encoder
+                                                                                   (n-in! d 1)))
+                                                     (arm64-enc-r2 0x1e624000 rd rn)))
+                                          (let [rm (if (= (.input-class p) ARM64-CLASS-FPR)
+                                                   (arm64-enc-fpr encoder (n-in! d 2))
+                                                   (arm64-enc-gpr encoder (n-in! d 2)))]
+                                            (enc-add4! encoder
+                                                   (arm64-enc-r3
+                                                     (if float
+                                                         (case op OP-ADD 0x1e602800 OP-SUB 0x1e603800
+                                                               OP-MUL 0x1e600800 OP-DIV 0x1e601800 0)
+                                                         (case op OP-ADD 0x8b000000 OP-SUB 0xcb000000
+                                                               OP-MUL 0x9b007c00 OP-DIV 0x9ac00c00
+                                                               OP-AND 0x8a000000
+                                                               OP-OR 0xaa000000 OP-XOR 0xca000000
+                                                               OP-SHL 0x9ac02000 OP-SHR 0x9ac02400
+                                                               OP-SAR 0x9ac02800 0))
+                                                     rd
+                                                     rn
+                                                     rm))))))))))))))
+    0))
+
+(impl NodeOps Arm64ScalarNode
+  (hdr [(self (ptr Arm64ScalarNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (compute [(self (ptr Arm64ScalarNode))] (-> i64) (.result-ty self))
+  (idealize [(self (ptr Arm64ScalarNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
+  (label [(self (ptr Arm64ScalarNode))] (-> (slice u8)) (arm64-scalar-op-name self))
+  (eq-extra [(self (ptr Arm64ScalarNode)) (other (dyn NodeOps))] (-> bool)
+            (if (!= (n-op other) OP-MACH-SCALAR)
+                false
+                (let [o (primitive/cast (ptr Arm64ScalarNode) (hdr other))]
+                  (and (= (.ideal-op self) (.ideal-op o))
+                       (and (= (.form self) (.form o)) (= (.imm self) (.imm o)))))))
+  (hash-extra [(self (ptr Arm64ScalarNode))] (-> i64)
+              (+ (* (.ideal-op self) 1009) (+ (* (.form self) 31) (.imm self))))
+  (is-const? [(self (ptr Arm64ScalarNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr Arm64ScalarNode))] (-> bool) true)
+  (is-pinned? [(self (ptr Arm64ScalarNode))] (-> bool) false)
+  (binop-copy [(self (ptr Arm64ScalarNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)])))
+
+(impl MachNode Arm64ScalarNode
+  (m-node [(self (ptr Arm64ScalarNode))] (-> (dyn NodeOps))
+          (primitive/make-dyn NodeOps self))
+  (m-ideal-op [(self (ptr Arm64ScalarNode))] (-> i64) (.ideal-op self))
+  (m-post-select! [(self (ptr Arm64ScalarNode))] (-> i64) 0)
+  (m-regmap [(self (ptr Arm64ScalarNode)) (i i64)] (-> (Option (ptr RegMask)))
+            (if (or (= i 0) (> i (.arity self)))
+                (None [(ptr RegMask)])
+                (arm64-class-mask (.input-class self))))
+  (m-outregmap [(self (ptr Arm64ScalarNode))] (-> (Option (ptr RegMask)))
+               (arm64-class-mask (.output-class self)))
+  (m-proj-outregmap [(self (ptr Arm64ScalarNode)) (idx i64)] (-> (Option (ptr RegMask)))
+                    (do (panic-i "Arm64ScalarNode has no projected result" idx) (None [(ptr RegMask)])))
+  (m-killmap [(self (ptr Arm64ScalarNode))] (-> (Option (ptr RegMask)))
+             (arm64-class-mask (.kill-class self)))
+  (m-two-address [(self (ptr Arm64ScalarNode))] (-> i64) 0)
+  (m-commutes [(self (ptr Arm64ScalarNode))] (-> bool) (.commutative self))
+  (m-clone-cheap? [(self (ptr Arm64ScalarNode))] (-> bool) (.clone-cheap self))
+  (m-clone [(self (ptr Arm64ScalarNode))] (-> (Option (dyn NodeOps)))
+           (if (.clone-cheap self)
+               (Some (arm64-scalar-clone (primitive/make-dyn NodeOps self)))
+               (None [(dyn NodeOps)])))
+  (m-size [(self (ptr Arm64ScalarNode))] (-> i64) (.size self))
+  (m-encoding [(self (ptr Arm64ScalarNode)) (encoder i64)] (-> i64)
+              (arm64-encode-scalar! encoder self))
+  (m-asm [(self (ptr Arm64ScalarNode))] (-> (slice u8)) (arm64-scalar-op-name self))
+  (m-op [(self (ptr Arm64ScalarNode))] (-> (slice u8)) (arm64-scalar-op-name self)))

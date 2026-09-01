@@ -1,10 +1,305 @@
-;; arm64 machine nodes: the call family.
-
+;; ARM64 CALL BOUNDARY
 ;;
-;; SCAFFOLD: filled in at S6. See src/node/cpus/arm64/arm64.coil.
+;; Final Simple selects Fun and Parm as zero-byte machine definitions, gives each Parm the exact
+;; incoming ABI mask, removes a constant target from a direct Call, and leaves an indirect target
+;; constrained to a GPR. CallEnd owns both the projected return mask and the kill set: all caller
+;; saves plus every outgoing stack argument slot. Return constrains its value to the signature's
+;; return register and its RPC input to LR. Safepoint is a zero-byte member of this boundary family:
+;; its relocated values remain GPR-constrained across allocation. Proj inherits its selected
+;; multi's indexed mask.
+;; Masks are cached at selection time: allocation consumes machine constraints and never
+;; reinterprets an ideal signature after rewriting begins.
 (module aot.node.cpus.arm64.call)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
+(import "coil.arraylist" :use *)
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
+(import "aot.node.cfg" :use *)
+(import "aot.node.control" :use *)
+(import "aot.type.type" :use *)
+(import "aot.codegen.machine" :use *)
+(import "aot.codegen.encoding" :use *)
+(import "aot.codegen.regmask" :use *)
+(import "aot.node.cpus.arm64.base" :use *)
+(import "aot.node.cpus.arm64.branch" :use *)
 
-(defn arm64-call-select [(n (dyn NodeOps))] (-> (dyn NodeOps))
-  (do (unimplemented "arm64-call-select" "S6 — src/node/cpus/arm64/call.coil") (unreachable-node)))
+(defstruct Arm64CallNode
+  [(hdr NodeHdr) (ideal-op i64) (result-ty i64) (block-head bool) (direct bool) (fidx i64)
+   (symbol (slice u8)) (size i64)
+   (max-arg-slot i64) (frame-adjust i64) (has-calls bool)
+   (input-masks (ArrayList (Option (ptr RegMask))))
+   (output-mask (Option (ptr RegMask)))
+   (projection-idx i64)
+   (projection-mask (Option (ptr RegMask)))
+   (kill-mask (Option (ptr RegMask)))])
+
+(defn arm64-call-node [(n (dyn NodeOps))] (-> (ptr Arm64CallNode))
+  (if (!= (n-op n) OP-MACH-CALL)
+      (do (panic-i "arm64-call-node: not a selected call-family node" (n-op n))
+          (primitive/cast (ptr Arm64CallNode) (hdr n)))
+      (primitive/cast (ptr Arm64CallNode) (hdr n))))
+
+(defn arm64-call-cfg-hook [(n (dyn NodeOps))] (-> (Option (dyn CFGOps)))
+  (if (= (n-op n) OP-MACH-CALL)
+      (let [p (arm64-call-node n)]
+        (if (or (= (.ideal-op p) OP-FUN) (= (.ideal-op p) OP-CALL)
+                (= (.ideal-op p) OP-CALLEND) (= (.ideal-op p) OP-RETURN))
+            (Some (primitive/make-dyn CFGOps p))
+            (None [(dyn CFGOps)])))
+      (arm64-cfg-install-hook n)))
+
+(defn arm64-call-alloc [(src (dyn NodeOps)) (block-head bool) (direct bool) (fidx i64) (size i64)]
+                       (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [Arm64CallNode] (alloc/create [Arm64CallNode] a))
+        d (primitive/make-dyn NodeOps p)
+        (mut i) 0]
+    (set! (.ideal-op p) (n-op src))
+    (set! (.result-ty p) (n-ty src))
+    (set! (.block-head p) block-head)
+    (set! (.direct p) direct)
+    (set! (.fidx p) fidx)
+    (set! (.symbol p) "")
+    (set! (.size p) size)
+    (set! (.max-arg-slot p) 0)
+    (set! (.frame-adjust p) 0)
+    (set! (.has-calls p) false)
+    (set! (.input-masks p) (al-new [(Option (ptr RegMask))] a))
+    (set! (.output-mask p) (None [(ptr RegMask)]))
+    (set! (.projection-idx p) -1)
+    (set! (.projection-mask p) (None [(ptr RegMask)]))
+    (set! (.kill-mask p) (None [(ptr RegMask)]))
+    (n-init! d OP-MACH-CALL)
+    (arm64-scalar--raw-inputs! d src)
+    (loop (if (>= (load i) (n-nins d))
+              (break 0)
+              (do (push! [(Option (ptr RegMask))] (mut (.input-masks p)) (None [(ptr RegMask)]))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+    (n-force-ty! d (.result-ty p))
+    d))
+
+(defn arm64-call-set-symbol! [(n (dyn NodeOps)) (symbol (slice u8))] (-> i64)
+  (do (set! (.symbol (arm64-call-node n)) symbol) 0))
+
+(defn arm64-call-set-fidx! [(n (dyn NodeOps)) (fidx i64)] (-> i64)
+  (do (set! (.fidx (arm64-call-node n)) fidx) 0))
+
+(defn arm64-call-set-input-mask! [(n (dyn NodeOps)) (i i64) (mask (ptr RegMask))] (-> i64)
+  (let [p (arm64-call-node n)]
+    (if (or (< i 0) (>= i (len (.input-masks p))))
+        (panic-i "arm64-call-set-input-mask!: input out of range" i)
+        (set! (mut (.input-masks p)) i (Some mask)))))
+
+(defn arm64-call-add-input-mask! [(n (dyn NodeOps)) (mask (ptr RegMask))] (-> i64)
+  (do (push! [(Option (ptr RegMask))] (mut (.input-masks (arm64-call-node n))) (Some mask)) 0))
+
+;; CalleeSave is a zero-byte fixed-register definition anchored at Fun and consumed by Return.
+;; The paired masks turn ABI preservation into ordinary allocator liveness/interference, exactly as
+;; in final Simple. It is created only after selection, so both edges use the normal mutating graph
+;; API rather than the raw-input protocol used while selected copies are under construction.
+(defn arm64-callee-save-make [(fun (dyn NodeOps)) (ret (dyn NodeOps)) (reg i64)]
+                              (-> (dyn NodeOps))
+  (let [save (arm64-call-alloc fun false false reg 0)
+        p (arm64-call-node save)
+        fixed (mask-of reg)]
+    (set! (.ideal-op p) OP-MACH-CALLEE-SAVE)
+    (set! (.result-ty p) TY-BOT)
+    (loop (if (= (n-nins save) 0)
+              (break 0)
+              (do (pop! (mut (.ins (hdr save)))) (continue))))
+    (n-add-def! save (Some fun))
+    (n-force-ty! save TY-BOT)
+    (arm64-call-set-output-mask! save fixed)
+    (n-add-def! ret (Some save))
+    (arm64-call-add-input-mask! ret fixed)
+    save))
+
+(defn arm64-call-set-output-mask! [(n (dyn NodeOps)) (mask (ptr RegMask))] (-> i64)
+  (do (set! (.output-mask (arm64-call-node n)) (Some mask)) 0))
+
+(defn arm64-call-set-projection-mask! [(n (dyn NodeOps)) (idx i64) (mask (ptr RegMask))] (-> i64)
+  (let [p (arm64-call-node n)]
+    (set! (.projection-idx p) idx)
+    (set! (.projection-mask p) (Some mask))
+    0))
+
+(defn arm64-call-set-kill-mask! [(n (dyn NodeOps)) (mask (ptr RegMask))] (-> i64)
+  (do (set! (.kill-mask (arm64-call-node n)) (Some mask)) 0))
+
+(defn arm64-call-drop-target! [(n (dyn NodeOps))] (-> i64)
+  (do (arm64-scalar-drop-last-input! n)
+      (pop! [(Option (ptr RegMask))] (mut (.input-masks (arm64-call-node n))))
+      0))
+
+(defn arm64-fun-set-max-arg-slot! [(fun (dyn NodeOps)) (slots i64)] (-> i64)
+  (do (set! (.max-arg-slot (arm64-call-node fun)) slots) 0))
+
+(defn arm64-fun-max-arg-slot [(fun (dyn NodeOps))] (-> i64)
+  (.max-arg-slot (arm64-call-node fun)))
+
+(defn arm64-fun-frame-adjust [(fun (dyn NodeOps))] (-> i64)
+  (.frame-adjust (arm64-call-node fun)))
+
+(defn arm64-fun-has-calls? [(fun (dyn NodeOps))] (-> bool)
+  (.has-calls (arm64-call-node fun)))
+
+(defn arm64-frame-adjust-insns [(bytes i64)] (-> i64)
+  (if (= bytes 0)
+      0
+      (+ (if (> (/ bytes 4096) 0) 1 0) (if (> (& bytes 4095) 0) 1 0))))
+
+(defn arm64-set-return-size! [(fun (dyn NodeOps)) (size i64)] (-> i64)
+  (let [(mut nid) 1]
+    (loop (if (> (load nid) (arena-node-count))
+              (break 0)
+              (do
+                (match (arena-node (load nid))
+                  (Some [n]
+                        (if (= (n-op n) OP-MACH-CALL)
+                            (let [p (arm64-call-node n)]
+                              (if (and (= (.ideal-op p) OP-RETURN)
+                                       (match (n-in n RETURN-CTRL)
+                                         (Some [owner] (n-same? owner fun))
+                                         (None [] false)))
+                                  (set! (.size p) size)
+                                  0))
+                            0))
+                  (None [] 0))
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))))
+
+;; `max-location` is one past the largest allocator location used by this function. Incoming stack
+;; argument homes are below the frame base and do not consume local frame bytes. Non-leaf frames
+;; are rounded to 16 bytes, matching final Simple's AArch64 port and AAPCS64 call alignment.
+(defn arm64-fun-finalize-frame! [(fun (dyn NodeOps)) (max-location i64) (has-calls bool)]
+                                 (-> i64)
+  (let [p (arm64-call-node fun)
+        incoming (.max-arg-slot p)
+        seen-slots (if (> (- max-location 65) incoming) (- max-location 65) incoming)
+        raw (* (- seen-slots incoming) 8)
+        adjusted (if has-calls (* (/ (+ raw 15) 16) 16) raw)]
+    (set! (.has-calls p) has-calls)
+    (set! (.frame-adjust p) adjusted)
+    (set! (.size p) (* 4 (arm64-frame-adjust-insns adjusted)))
+    (arm64-set-return-size! fun (+ 4 (* 4 (arm64-frame-adjust-insns adjusted))))
+    adjusted))
+
+(defn arm64-fun-stack-offset [(fun (dyn NodeOps)) (location i64)] (-> i64)
+  (let [p (arm64-call-node fun)
+        slot (- location 65)
+        incoming (.max-arg-slot p)
+        rotated (if (< slot incoming)
+                    (+ slot (/ (.frame-adjust p) 8))
+                    (- slot incoming))]
+    (* rotated 8)))
+
+(defn arm64-encode-sp-adjust! [(encoder i64) (bytes i64) (subtract bool)] (-> i64)
+  (let [high (/ bytes 4096)
+        low (& bytes 4095)
+        base (if subtract 0xd10003ff 0x910003ff)]
+    (if (> high 4095)
+        (panic-i "arm64-encode-sp-adjust!: frame exceeds two-immediate range" bytes)
+        0)
+    (if (> high 0)
+        (enc-add4! encoder (| base (| (primitive/ishl high 10) 0x00400000)))
+        0)
+    (if (> low 0)
+        (enc-add4! encoder (| base (primitive/ishl low 10)))
+        0)
+    0))
+
+(defn arm64-encode-call! [(encoder i64) (p (ptr Arm64CallNode))] (-> i64)
+  (let [d (primitive/make-dyn NodeOps p)
+        op (.ideal-op p)]
+    (if (= op OP-FUN)
+        (do
+          (enc-add-definition! encoder d (.fidx p) (.symbol p))
+          (arm64-encode-sp-adjust! encoder (.frame-adjust p) true))
+        (if (= (.size p) 0)
+            0
+            (if (= op OP-NEW)
+                (do
+                  ;; calloc(1,size): selection fixes the size in X1 and this instruction
+                  ;; materializes the first argument without a hidden allocator live range.
+                  (enc-add4! encoder 0xd2800020)
+                  (enc-add4! encoder 0x94000000)
+              (enc-add-symbol-fixup-at!
+                encoder ENC-FIXUP-A64-BL26 d 4 (.fidx p) (.symbol p)))
+                (if (or (= op OP-CALL) (= op OP-BARRIER))
+                    (if (.direct p)
+                        (do
+                          (enc-add4! encoder 0x94000000)
+                          (enc-add-symbol-fixup!
+                            encoder ENC-FIXUP-A64-BL26 d (.fidx p) (.symbol p)))
+                        (let [target (n-in! d (- (n-nins d) 1))
+                              rn (enc-reg encoder target)]
+                          (if (or (< rn ARM64-X0) (> rn ARM64-X28))
+                              (panic-i "arm64-encode-call!: indirect target is not a GPR" rn)
+                              (enc-add4! encoder (| 0xd63f0000 (primitive/ishl rn 5))))))
+                    (if (= op OP-RETURN)
+                        (let [fun (enc-enclosing-fun d)
+                              frame (arm64-fun-frame-adjust fun)]
+                          (arm64-encode-sp-adjust! encoder frame false)
+                          (enc-add4! encoder 0xd65f03c0)
+                          (enc-end-definition! encoder fun d))
+                        (do
+                          (panic-i "arm64-encode-call!: unsupported nonzero call-family node" op)
+                          0))))))))
+
+(impl NodeOps Arm64CallNode
+  (hdr [(self (ptr Arm64CallNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (compute [(self (ptr Arm64CallNode))] (-> i64) (.result-ty self))
+  (idealize [(self (ptr Arm64CallNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
+  (label [(self (ptr Arm64CallNode))] (-> (slice u8))
+         (if (= (.ideal-op self) OP-MACH-CALLEE-SAVE) "csave"
+             (if (= (.ideal-op self) OP-FUN) "fun"
+             (if (= (.ideal-op self) OP-PARM) "parm"
+                 (if (= (.ideal-op self) OP-CALL) (if (.direct self) "call" "callr")
+                     (if (= (.ideal-op self) OP-BARRIER) "barrier"
+                     (if (= (.ideal-op self) OP-CALLEND) "cend"
+                         (if (= (.ideal-op self) OP-RETURN) "ret"
+                             (if (= (.ideal-op self) OP-SAFEPOINT) "safepoint" "proj")))))))))
+  (eq-extra [(self (ptr Arm64CallNode)) (other (dyn NodeOps))] (-> bool)
+            (and (= (n-op other) OP-MACH-CALL)
+                 (= (.ideal-op self) (.ideal-op (arm64-call-node other)))))
+  (hash-extra [(self (ptr Arm64CallNode))] (-> i64) (+ (* (.ideal-op self) 1061) (.fidx self)))
+  (is-const? [(self (ptr Arm64CallNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr Arm64CallNode))] (-> bool) true)
+  (is-pinned? [(self (ptr Arm64CallNode))] (-> bool) true)
+  (binop-copy [(self (ptr Arm64CallNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)])))
+
+(impl CFGOps Arm64CallNode
+  (cfg-node [(self (ptr Arm64CallNode))] (-> (dyn NodeOps)) (primitive/make-dyn NodeOps self))
+  (block-head? [(self (ptr Arm64CallNode))] (-> bool) (.block-head self))
+  (cfg-idom [(self (ptr Arm64CallNode))] (-> (Option (dyn NodeOps)))
+            (let [d (primitive/make-dyn NodeOps self)]
+              (if (= (.ideal-op self) OP-FUN) (region-idom d) (n-in-safe d 0))))
+  (cfg-idepth [(self (ptr Arm64CallNode))] (-> i64)
+              (let [d (primitive/make-dyn NodeOps self)]
+                (if (= (.ideal-op self) OP-FUN) (region-idepth d) (cfg-idepth-default d)))))
+
+(impl MachNode Arm64CallNode
+  (m-node [(self (ptr Arm64CallNode))] (-> (dyn NodeOps)) (primitive/make-dyn NodeOps self))
+  (m-ideal-op [(self (ptr Arm64CallNode))] (-> i64) (.ideal-op self))
+  (m-post-select! [(self (ptr Arm64CallNode))] (-> i64) 0)
+  (m-regmap [(self (ptr Arm64CallNode)) (i i64)] (-> (Option (ptr RegMask)))
+            (if (or (< i 0) (>= i (len (.input-masks self))))
+                (None [(ptr RegMask)]) (get (.input-masks self) i)))
+  (m-outregmap [(self (ptr Arm64CallNode))] (-> (Option (ptr RegMask))) (.output-mask self))
+  (m-proj-outregmap [(self (ptr Arm64CallNode)) (idx i64)] (-> (Option (ptr RegMask)))
+                    (if (= idx (.projection-idx self))
+                        (.projection-mask self)
+                        (None [(ptr RegMask)])))
+  (m-killmap [(self (ptr Arm64CallNode))] (-> (Option (ptr RegMask))) (.kill-mask self))
+  (m-two-address [(self (ptr Arm64CallNode))] (-> i64) 0)
+  (m-commutes [(self (ptr Arm64CallNode))] (-> bool) false)
+  (m-clone-cheap? [(self (ptr Arm64CallNode))] (-> bool) false)
+  (m-clone [(self (ptr Arm64CallNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
+  (m-size [(self (ptr Arm64CallNode))] (-> i64) (.size self))
+  (m-encoding [(self (ptr Arm64CallNode)) (encoder i64)] (-> i64)
+              (arm64-encode-call! encoder self))
+  (m-asm [(self (ptr Arm64CallNode))] (-> (slice u8)) (label self))
+  (m-op [(self (ptr Arm64CallNode))] (-> (slice u8)) (label self)))

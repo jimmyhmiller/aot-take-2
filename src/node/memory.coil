@@ -79,8 +79,9 @@
 ;; It matters that it is the SAME node kind: every Phi rule then applies to memory merges with no
 ;; second implementation to keep in agreement. `BulkMemPhi` is the alias-1 case.
 ;;
-;; NEW allocates and produces a tuple: control, the pointer, and one initial memory state per class
-;; of the shape.
+;; NEW follows final Simple's two-result boundary: a fresh pointer and its private initial bulk
+;; memory. Field initialization splits that private state into precise aliases as stores are built;
+;; allocation does not pretend those stores already happened.
 ;;
 ;; READONLY marks a reference immutable, so a Store through it is a reported error rather than a
 ;; silently accepted write.
@@ -93,8 +94,14 @@
 ;;
 ;; SCAFFOLD: signatures and the rules above are final; bodies hard-error. Filled in at S3.
 (module aot.node.memory)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.type.type" :use *)
+(import "aot.shape" :use *)
 
 ;; The bulk "all memory" alias. Nothing may be forwarded through it; a Load must sharpen first.
 (const ALIAS-BULK 1)
@@ -111,48 +118,502 @@
   (mem-in [(self (ptr Self))] (-> (dyn NodeOps)))
   ;; The pointer operand — which must be an object and nothing else.
   (mem-ptr [(self (ptr Self))] (-> (dyn NodeOps)))
-  ;; Byte offset within the object, folded into the access rather than exposed as arithmetic:
-  ;; an exposed interior pointer would violate the GC contract's first rule.
-  (mem-offset [(self (ptr Self))] (-> i64)))
+  ;; Byte offset within the object. It remains an integer value, not an interior pointer; the
+  ;; machine selector folds it into the address mode without exposing a managed interior address.
+  (mem-offset [(self (ptr Self))] (-> (dyn NodeOps))))
+
+(const MEM-CTRL 0)
+
+(const MEM-STATE 1)
+
+(const MEM-PTR 2)
+
+(const MEM-OFF 3)
+
+(const STORE-VAL 4)
+
+(defstruct LoadNode [(hdr NodeHdr) (alias i64) (declared i64)])
+
+(defstruct StoreNode [(hdr NodeHdr) (alias i64) (declared i64)])
+
+(defstruct NewNode [(hdr NodeHdr) (shape i64) (object-ty i64)])
+
+(defstruct MemMergeNode [(hdr NodeHdr) (in-progress bool)])
+
+(defstruct ReadOnlyNode [(hdr NodeHdr) (pad i64)])
+
+;; Target ports register the one downcast needed for selected memory nodes. Keeping the hook here
+;; means generic GCM continues to consume MemOps without importing a CPU module or switching on a
+;; target-specific struct. It is installed before the first selected memory node is returned.
+(defstruct SelectedMemHook
+  [(get (fnptr c [(ref (dyn NodeOps))] (Option (dyn MemOps))))
+   (set bool)])
+
+(defn selected-mem-hook [] (-> (ptr SelectedMemHook))
+  (primitive/alloc-static SelectedMemHook))
+
+(defn set-selected-mem-hook! [(get (fnptr c [(ref (dyn NodeOps))] (Option (dyn MemOps))))] (-> i64)
+  (do (set! (.get (selected-mem-hook)) get) (set! (.set (selected-mem-hook)) true) 0))
 
 ;; The one place that knows which opcodes are memory accesses. Simple's `instanceof MemOpNode`.
 (defn mem-of [(n (dyn NodeOps))] (-> (Option (dyn MemOps)))
-  (do (unimplemented "mem-of" "S3 — src/node/memory.coil") (None)))
+  (if (= (n-op n) OP-LOAD)
+      (Some (primitive/make-dyn MemOps (primitive/cast (ptr LoadNode) (hdr n))))
+      (if (= (n-op n) OP-STORE)
+          (Some (primitive/make-dyn MemOps (primitive/cast (ptr StoreNode) (hdr n))))
+          (if (= (n-op n) OP-MACH-MEM)
+              (if (.set (selected-mem-hook))
+                  (primitive/call-ptr (.get (selected-mem-hook)) n)
+                  (do (panic "mem-of: selected-memory hook is not installed") (None [(dyn MemOps)])))
+              (None [(dyn MemOps)])))))
+
+(defn load-declared [(n (dyn NodeOps))] (-> i64)
+  (if (!= (n-op n) OP-LOAD)
+      (do (panic-i "load-declared: not a Load" (n-op n)) TY-BOT)
+      (.declared (primitive/cast (ptr LoadNode) (hdr n)))))
+
+(defn store-declared [(n (dyn NodeOps))] (-> i64)
+  (if (!= (n-op n) OP-STORE)
+      (do (panic-i "store-declared: not a Store" (n-op n)) TY-BOT)
+      (.declared (primitive/cast (ptr StoreNode) (hdr n)))))
+
+(defn mem-alias-of-node [(n (dyn NodeOps))] (-> i64)
+  (match (mem-of n)
+    (Some [m] (mem-alias m))
+    (None [] (do (panic-i "mem-alias-of-node: not a memory operation" (n-op n)) ALIAS-BULK))))
+
+(defn mem-effective [(mem (dyn NodeOps)) (alias i64)] (-> (dyn NodeOps))
+  (if (and (!= alias ALIAS-BULK) (= (n-op mem) OP-MEMMERGE))
+      (memmerge-alias mem alias)
+      mem))
+
+(defn mem-control-dominates? [(higher (dyn NodeOps)) (lower (dyn NodeOps))] (-> bool)
+  (let [(mut cur) (Some lower)
+        (mut answer) false
+        (mut guard) 0]
+    (loop (if (> (load guard) 1000000)
+              (do (broken "mem-control-dominates?: dominator walk did not converge") (break 0))
+              (match (load cur)
+                (None [] (break 0))
+                (Some [n]
+                      (if (n-same? n higher)
+                          (do (set! (mut answer) true) (break 0))
+                          (do
+                            (set! (mut cur) (cfg-idom-of n))
+                            (set! (mut guard) (+ (load guard) 1))
+                            (continue)))))))
+    (load answer)))
+
+(defn load-compute [(d (dyn NodeOps))] (-> i64)
+  (let [mem (mem-effective (n-in! d MEM-STATE) (.alias (primitive/cast (ptr LoadNode) (hdr d))))
+        mt (n-ty mem)
+        pt (n-ty (n-in! d MEM-PTR))
+        declared (.declared (primitive/cast (ptr LoadNode) (hdr d)))]
+    (if (or (ty-high? mt) (ty-high? pt))
+        TY-TOP
+        (if (not (ty-memptr? pt))
+            TY-BOT
+            (if (not (ty-mem? mt))
+                TY-BOT
+                (let [elem (ty-mem-elem mt)]
+                  (if (= elem TY-TOP) TY-TOP (ty-join declared elem))))))))
+
+(defn load-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [p (primitive/cast (ptr LoadNode) (hdr d))
+        alias (.alias p)
+        ptr_ (n-in! d MEM-PTR)
+        off (n-in! d MEM-OFF)
+        raw-mem (n-in! d MEM-STATE)
+        mem (mem-effective raw-mem alias)]
+    ;; Object accesses do not need control after the pointer type proves an object; nullability is
+    ;; discharged before this point by ordinary guard control.
+    (if (and (match (n-in d MEM-CTRL) (Some [_] true) (None [] false))
+             (ty-memptr? (n-ty ptr_)))
+        (do (n-set-def! d MEM-CTRL (None [(dyn NodeOps)])) (Some d))
+        (if (not (n-same? mem raw-mem))
+            (do (n-set-def! d MEM-STATE (Some mem)) (Some d))
+            (if (= alias ALIAS-BULK)
+                (None [(dyn NodeOps)])
+                (if (= (n-op mem) OP-STORE)
+                    (let [st (primitive/cast (ptr StoreNode) (hdr mem))]
+                      (if (and (= alias (.alias st))
+                               (and (n-same? ptr_ (n-in! mem MEM-PTR))
+                                    (n-same? off (n-in! mem MEM-OFF))))
+                          (Some (n-in! mem STORE-VAL))
+                          ;; Distinct alias slices cannot clobber one another.
+                          (if (!= alias (.alias st))
+                              (do (n-set-def! d MEM-STATE (Some (n-in! mem MEM-STATE))) (Some d))
+                              (None [(dyn NodeOps)]))))
+                    ;; Uplift to an equivalent load whose control dominates ours.
+                    (let [(mut i) 0
+                          (mut prior) (None [(dyn NodeOps)])]
+                      (loop (if (>= (load i) (n-nouts mem))
+                                (break 0)
+                                (do
+                                  (match (n-out mem (load i))
+                                    (Some [use]
+                                          (if (and (= (n-op use) OP-LOAD)
+                                                   (and (not (n-same? use d))
+                                                        (and (= (load-alias use) alias)
+                                                             (and (n-same? (n-in! use MEM-PTR) ptr_)
+                                                                  (n-same? (n-in! use MEM-OFF) off)))))
+                                              (match (n-in use MEM-CTRL)
+                                                (Some [higher]
+                                                      (match (n-in d MEM-CTRL)
+                                                        (Some [lower]
+                                                              (if (mem-control-dominates? higher lower)
+                                                                  (do (set! (mut prior) (Some use)) (break 0))
+                                                                  0))
+                                                        (None [] 0)))
+                                                (None [] (do (set! (mut prior) (Some use)) (break 0))))
+                                              0))
+                                    (None [] 0))
+                                  (set! (mut i) (+ (load i) 1))
+                                  (continue))))
+                      (load prior))))))))
+
+(defn load-alias [(d (dyn NodeOps))] (-> i64)
+  (.alias (primitive/cast (ptr LoadNode) (hdr d))))
+
+(defn load-sharpen-alias! [(ld (dyn NodeOps)) (alias i64)] (-> i64)
+  (if (!= (n-op ld) OP-LOAD)
+      (panic-i "load-sharpen-alias!: not a Load" (n-op ld))
+      (let [p (primitive/cast (ptr LoadNode) (hdr ld))]
+        (if (or (= (.alias p) ALIAS-BULK) (= (.alias p) alias))
+            (do (n-unlock! ld) (set! (.alias p) alias) (code-add! ld) 0)
+            (panic-i "load-sharpen-alias!: conflicting precise alias" alias)))))
+
+(impl NodeOps LoadNode
+  (hdr [(self (ptr LoadNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr LoadNode))] (-> (slice u8)) "Load")
+  (is-const? [(self (ptr LoadNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr LoadNode))] (-> bool) false)
+  (is-pinned? [(self (ptr LoadNode))] (-> bool) false)
+  (binop-copy [(self (ptr LoadNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)]))
+  (compute [(self (ptr LoadNode))] (-> i64) (load-compute (primitive/make-dyn NodeOps self)))
+  (idealize [(self (ptr LoadNode))]
+            (-> (Option (dyn NodeOps)))
+            (load-idealize (primitive/make-dyn NodeOps self)))
+  (eq-extra [(self (ptr LoadNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (if (!= (n-op other) OP-LOAD)
+                false
+                (let [o (primitive/cast (ptr LoadNode) (hdr other))]
+                  (and (= (.alias self) (.alias o)) (= (.declared self) (.declared o))))))
+  (hash-extra [(self (ptr LoadNode))] (-> i64) (^ (* (.alias self) 251) (.declared self))))
+
+(impl MemOps LoadNode
+  (mem-node [(self (ptr LoadNode))] (-> (dyn NodeOps)) (primitive/make-dyn NodeOps self))
+  (mem-alias [(self (ptr LoadNode))] (-> i64) (.alias self))
+  (mem-is-load? [(self (ptr LoadNode))] (-> bool) true)
+  (mem-in [(self (ptr LoadNode))] (-> (dyn NodeOps)) (n-in! (primitive/make-dyn NodeOps self) MEM-STATE))
+  (mem-ptr [(self (ptr LoadNode))] (-> (dyn NodeOps)) (n-in! (primitive/make-dyn NodeOps self) MEM-PTR))
+  (mem-offset [(self (ptr LoadNode))] (-> (dyn NodeOps)) (n-in! (primitive/make-dyn NodeOps self) MEM-OFF)))
+
+(defn store-compute [(d (dyn NodeOps))] (-> i64)
+  (let [p (primitive/cast (ptr StoreNode) (hdr d))
+        mt (n-ty (mem-effective (n-in! d MEM-STATE) (.alias p)))
+        pt (n-ty (n-in! d MEM-PTR))
+        vt (n-ty (n-in! d STORE-VAL))]
+    (if (or (ty-high? mt) (ty-high? pt) (ty-high? vt))
+        (ty-mem (.alias p) TY-TOP)
+        (if (or (not (ty-mem? mt)) (not (ty-memptr? pt)))
+            (ty-mem (.alias p) TY-BOT)
+            (ty-mem (.alias p) (ty-join (.declared p) vt))))))
+
+(defn store-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [p (primitive/cast (ptr StoreNode) (hdr d))
+        alias (.alias p)
+        raw-mem (n-in! d MEM-STATE)
+        mem (mem-effective raw-mem alias)]
+    (if (not (n-same? raw-mem mem))
+        (do (n-set-def! d MEM-STATE (Some mem)) (Some d))
+        (if (and (= (n-op mem) OP-STORE)
+                 (and (= alias (.alias (primitive/cast (ptr StoreNode) (hdr mem))))
+                      (and (n-same? (n-in! d MEM-PTR) (n-in! mem MEM-PTR))
+                           (n-same? (n-in! d MEM-OFF) (n-in! mem MEM-OFF)))))
+            (if (= (n-nouts mem) 1)
+                (do (n-set-def! d MEM-STATE (Some (n-in! mem MEM-STATE))) (Some d))
+                (do (n-add-dep! mem d) (None [(dyn NodeOps)])))
+            (None [(dyn NodeOps)])))))
+
+(impl NodeOps StoreNode
+  (hdr [(self (ptr StoreNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr StoreNode))] (-> (slice u8)) "Store")
+  (is-const? [(self (ptr StoreNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr StoreNode))] (-> bool) true)
+  (is-pinned? [(self (ptr StoreNode))] (-> bool) false)
+  (binop-copy [(self (ptr StoreNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)]))
+  (compute [(self (ptr StoreNode))] (-> i64) (store-compute (primitive/make-dyn NodeOps self)))
+  (idealize [(self (ptr StoreNode))]
+            (-> (Option (dyn NodeOps)))
+            (store-idealize (primitive/make-dyn NodeOps self)))
+  (eq-extra [(self (ptr StoreNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (if (!= (n-op other) OP-STORE)
+                false
+                (let [o (primitive/cast (ptr StoreNode) (hdr other))]
+                  (and (= (.alias self) (.alias o)) (= (.declared self) (.declared o))))))
+  (hash-extra [(self (ptr StoreNode))] (-> i64) (^ (* (.alias self) 257) (.declared self))))
+
+(impl MemOps StoreNode
+  (mem-node [(self (ptr StoreNode))] (-> (dyn NodeOps)) (primitive/make-dyn NodeOps self))
+  (mem-alias [(self (ptr StoreNode))] (-> i64) (.alias self))
+  (mem-is-load? [(self (ptr StoreNode))] (-> bool) false)
+  (mem-in [(self (ptr StoreNode))] (-> (dyn NodeOps)) (n-in! (primitive/make-dyn NodeOps self) MEM-STATE))
+  (mem-ptr [(self (ptr StoreNode))] (-> (dyn NodeOps)) (n-in! (primitive/make-dyn NodeOps self) MEM-PTR))
+  (mem-offset [(self (ptr StoreNode))] (-> (dyn NodeOps)) (n-in! (primitive/make-dyn NodeOps self) MEM-OFF)))
 
 ;; ---------------------------------------------------------------------------
 ;; Load / Store / New
 (defn load-make [(ctrl (dyn NodeOps))
                  (mem (dyn NodeOps))
                  (ptr_ (dyn NodeOps))
+                 (off (dyn NodeOps))
                  (alias i64)
                  (declared i64)] (-> (dyn NodeOps))
-  (do (unimplemented "load-make" "S3 — src/node/memory.coil") (unreachable-node)))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [LoadNode] (alloc/create [LoadNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.alias p) alias)
+    (set! (.declared p) declared)
+    (n-init! d OP-LOAD)
+    (n-add-def! d (Some ctrl))
+    (n-add-def! d (Some mem))
+    (n-add-def! d (Some ptr_))
+    (n-add-def! d (Some off))
+    (n-set-ty! d (compute p))
+    d))
 
 (defn store-make [(ctrl (dyn NodeOps))
                   (mem (dyn NodeOps))
                   (ptr_ (dyn NodeOps))
+                  (off (dyn NodeOps))
                   (val (dyn NodeOps))
-                  (alias i64)] (-> (dyn NodeOps))
-  (do (unimplemented "store-make" "S3 — src/node/memory.coil") (unreachable-node)))
+                  (alias i64)
+                  (declared i64)] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [StoreNode] (alloc/create [StoreNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.alias p) alias)
+    (set! (.declared p) declared)
+    (n-init! d OP-STORE)
+    (n-add-def! d (Some ctrl))
+    (n-add-def! d (Some mem))
+    (n-add-def! d (Some ptr_))
+    (n-add-def! d (Some off))
+    (n-add-def! d (Some val))
+    (n-set-ty! d (compute p))
+    d))
 
-(defn new-make [(ctrl (dyn NodeOps)) (mem (dyn NodeOps)) (shape i64)] (-> (dyn NodeOps))
-  (do (unimplemented "new-make" "S3 — src/node/memory.coil") (unreachable-node)))
+;; Final Simple's New is a two-input Multi: control and byte size. Its results are the fresh,
+;; non-null pointer at projection zero and private initial memory at projection one. It is not a
+;; public-memory transformation: stores that initialize the fresh object consume the private
+;; memory result, while the machine node still advertises allocator-call clobbers.
+;;
+;; `shape` and `object-ty` are deliberately separate. A hidden-class ID belongs to ShapeTable; a
+;; struct type belongs to TypeTable. Both happen to be integers, but substituting one namespace for
+;; the other would manufacture a pointer whose referent is unrelated to its physical layout.
+(defn new-shape [(n (dyn NodeOps))] (-> i64)
+  (if (!= (n-op n) OP-NEW)
+      (do (panic-i "new-shape: not a New" (n-op n)) 0)
+      (.shape (primitive/cast (ptr NewNode) (hdr n)))))
 
-;; Adopt a field's real alias once a forward-referenced pointer resolves.
-;; Unlocks from GVN first: the alias participates in node equality.
-(defn load-sharpen-alias! [(ld (dyn NodeOps)) (alias i64)] (-> i64)
-  (do (unimplemented "load-sharpen-alias!" "S3 — src/node/memory.coil") 0))
+(defn new-object-ty [(n (dyn NodeOps))] (-> i64)
+  (if (!= (n-op n) OP-NEW)
+      (do (panic-i "new-object-ty: not a New" (n-op n)) TY-BOT)
+      (.object-ty (primitive/cast (ptr NewNode) (hdr n)))))
+
+(defn new-size [(n (dyn NodeOps))] (-> (dyn NodeOps))
+  (if (!= (n-op n) OP-NEW)
+      (do (panic-i "new-size: not a New" (n-op n)) (unreachable-node))
+      (n-in! n 1)))
+
+(defn new-compute [(n (dyn NodeOps))] (-> i64)
+  (let [ctrl-ty (n-ty (n-in! n 0))
+        object-ty (new-object-ty n)]
+    (if (ty-high? ctrl-ty)
+        (ty-tuple-of2 TY-TOP TY-TOP)
+        (if (= ctrl-ty TY-XCTRL)
+            (ty-tuple-of2 TY-TOP TY-TOP)
+            (ty-tuple-of2 (ty-memptr false object-ty) (ty-mem ALIAS-BULK object-ty))))))
+
+(impl NodeOps NewNode
+  (hdr [(self (ptr NewNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr NewNode))] (-> (slice u8)) "New")
+  (is-const? [(self (ptr NewNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr NewNode))] (-> bool) true)
+  (is-pinned? [(self (ptr NewNode))] (-> bool) true)
+  (binop-copy [(self (ptr NewNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)]))
+  (compute [(self (ptr NewNode))]
+           (-> i64)
+           (new-compute (primitive/make-dyn NodeOps self)))
+  (idealize [(self (ptr NewNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
+  ;; Allocation is effectful and every execution returns a distinct identity. Structural equality
+  ;; must therefore be false even for equal shape, size, and control operands.
+  (eq-extra [(self (ptr NewNode)) (other (dyn NodeOps))] (-> bool) (do self other false))
+  (hash-extra [(self (ptr NewNode))] (-> i64) (+ (* (.shape self) 271) (.object-ty self))))
+
+(defn new-make [(ctrl (dyn NodeOps))
+                (size (dyn NodeOps))
+                (shape i64)
+                (object-ty i64)] (-> (dyn NodeOps))
+  (do
+    (if (not (shape-valid? shape)) (panic-i "new-make: invalid hidden-class shape" shape) 0)
+    (match (ty-kind object-ty)
+      (TStruct [_ _ _ _] 0)
+      (_ (panic "new-make: object type is not a struct")))
+    (let [a (alloc/malloc-allocator)
+          p (alloc/unwrap-ptr [NewNode] (alloc/create [NewNode] a))
+          d (primitive/make-dyn NodeOps p)]
+      (set! (.shape p) shape)
+      (set! (.object-ty p) object-ty)
+      (n-init! d OP-NEW)
+      (n-add-def! d (Some ctrl))
+      (n-add-def! d (Some size))
+      (n-set-ty! d (compute p))
+      d)))
 
 ;; ---------------------------------------------------------------------------
 ;; MemMerge / ReadOnly
+(defn memphi-make [(region (dyn NodeOps)) (alias i64) (elem i64) (name (slice u8))] (-> (dyn NodeOps))
+  (if (< alias ALIAS-BULK)
+      (do (panic-i "memphi-make: alias must be positive" alias) (unreachable-node))
+      (phi-make-op region (ty-mem alias elem) name OP-MEMPHI)))
+
+(defn memphi-alias [(p (dyn NodeOps))] (-> i64)
+  (if (!= (n-op p) OP-MEMPHI)
+      (do (panic-i "memphi-alias: not a MemPhi" (n-op p)) ALIAS-BULK)
+      (ty-mem-alias (phi-declared-ty p))))
+
+(defn memphi-add-state! [(p (dyn NodeOps)) (st (dyn NodeOps))] (-> i64)
+  (if (!= (n-op p) OP-MEMPHI)
+      (panic-i "memphi-add-state!: not a MemPhi" (n-op p))
+      (let [st-ty (n-ty st)]
+        (if (and (ty-mem? st-ty) (!= (ty-mem-alias st-ty) (memphi-alias p)))
+            (panic-i "memphi-add-state!: memory alias mismatch" (ty-mem-alias st-ty))
+            (phi-add-value! p st)))))
+
+(defn memphi-open! [(p (dyn NodeOps))] (-> i64)
+  (if (!= (n-op p) OP-MEMPHI)
+      (panic-i "memphi-open!: not a MemPhi" (n-op p))
+      (phi-open! p)))
+
+(defn memphi-close! [(p (dyn NodeOps)) (st (dyn NodeOps))] (-> i64)
+  (if (!= (n-op p) OP-MEMPHI)
+      (panic-i "memphi-close!: not a MemPhi" (n-op p))
+      (let [st-ty (n-ty st)]
+        (if (and (ty-mem? st-ty) (!= (ty-mem-alias st-ty) (memphi-alias p)))
+            (panic-i "memphi-close!: memory alias mismatch" (ty-mem-alias st-ty))
+            (phi-close! p st)))))
+
+(defn memmerge-compute [(d (dyn NodeOps))] (-> i64)
+  (match (n-in d 1)
+    (Some [mem] (if (ty-mem? (n-ty mem)) (n-ty mem) (if (ty-high? (n-ty mem)) (ty-mem 1 TY-TOP) (ty-mem 1 TY-BOT))))
+    (None [] (ty-mem 1 TY-TOP))))
+
+(defn memmerge-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [p (primitive/cast (ptr MemMergeNode) (hdr d))]
+    (if (.in-progress p)
+        (None [(dyn NodeOps)])
+        (match (n-in d 1)
+          (None [] (None [(dyn NodeOps)]))
+          (Some [default]
+                (let [(mut i) 2
+                      (mut distinct) false
+                      (mut changed) false]
+                  (loop (if (>= (load i) (n-nins d))
+                            (break 0)
+                            (do
+                              (match (n-in d (load i))
+                                (Some [v]
+                                      (if (n-same? v default)
+                                          (do
+                                            (n-set-def! d (load i) (None [(dyn NodeOps)]))
+                                            (set! (mut changed) true))
+                                          (set! (mut distinct) true)))
+                                (None [] 0))
+                              (set! (mut i) (+ (load i) 1))
+                              (continue))))
+                  (if (not (load distinct))
+                      (Some default)
+                      (if (load changed) (Some d) (None [(dyn NodeOps)])))))))))
+
+(impl NodeOps MemMergeNode
+  (hdr [(self (ptr MemMergeNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr MemMergeNode))] (-> (slice u8)) "MemMerge")
+  (is-const? [(self (ptr MemMergeNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr MemMergeNode))] (-> bool) true)
+  (is-pinned? [(self (ptr MemMergeNode))] (-> bool) true)
+  (binop-copy [(self (ptr MemMergeNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)]))
+  (compute [(self (ptr MemMergeNode))] (-> i64) (memmerge-compute (primitive/make-dyn NodeOps self)))
+  (idealize [(self (ptr MemMergeNode))]
+            (-> (Option (dyn NodeOps)))
+            (memmerge-idealize (primitive/make-dyn NodeOps self)))
+  (eq-extra [(self (ptr MemMergeNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (and (= (n-op other) OP-MEMMERGE) (not (.in-progress self))))
+  (hash-extra [(self (ptr MemMergeNode))] (-> i64) 263))
+
 (defn memmerge-make [] (-> (dyn NodeOps))
-  (do (unimplemented "memmerge-make" "S3 — src/node/memory.coil") (unreachable-node)))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [MemMergeNode] (alloc/create [MemMergeNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.in-progress p) false)
+    (n-init! d OP-MEMMERGE)
+    (n-add-def! d (None [(dyn NodeOps)]))
+    (n-add-def! d (None [(dyn NodeOps)]))
+    (n-set-ty! d (ty-mem 1 TY-TOP))
+    d))
 
 (defn memmerge-alias [(m (dyn NodeOps)) (alias i64)] (-> (dyn NodeOps))
-  (do (unimplemented "memmerge-alias" "S3 — src/node/memory.coil") (unreachable-node)))
+  (if (!= (n-op m) OP-MEMMERGE)
+      (do (panic-i "memmerge-alias: not a MemMerge" (n-op m)) (unreachable-node))
+      (match (if (< alias (n-nins m)) (n-in m alias) (None [(dyn NodeOps)]))
+        (Some [v] v)
+        (None [] (n-in! m 1)))))
 
 (defn memmerge-set-alias! [(m (dyn NodeOps)) (alias i64) (st (dyn NodeOps))] (-> i64)
-  (do (unimplemented "memmerge-set-alias!" "S3 — src/node/memory.coil") 0))
+  (if (!= (n-op m) OP-MEMMERGE)
+      (panic-i "memmerge-set-alias!: not a MemMerge" (n-op m))
+      (if (< alias 1)
+          (panic-i "memmerge-set-alias!: alias must be positive" alias)
+          (do (n-set-def-x! m alias (Some st)) (code-add! m) 0))))
+
+(impl NodeOps ReadOnlyNode
+  (hdr [(self (ptr ReadOnlyNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr ReadOnlyNode))] (-> (slice u8)) "ReadOnly")
+  (is-const? [(self (ptr ReadOnlyNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr ReadOnlyNode))] (-> bool) false)
+  (is-pinned? [(self (ptr ReadOnlyNode))] (-> bool) false)
+  (binop-copy [(self (ptr ReadOnlyNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)]))
+  (compute [(self (ptr ReadOnlyNode))]
+           (-> i64)
+           (n-ty (n-in! (primitive/make-dyn NodeOps self) 1)))
+  (idealize [(self (ptr ReadOnlyNode))]
+            (-> (Option (dyn NodeOps)))
+            (let [v (n-in! (primitive/make-dyn NodeOps self) 1)]
+              (if (= (n-op v) OP-READONLY) (Some v) (None [(dyn NodeOps)]))))
+  (eq-extra [(self (ptr ReadOnlyNode)) (other (dyn NodeOps))] (-> bool) (= (n-op other) OP-READONLY))
+  (hash-extra [(self (ptr ReadOnlyNode))] (-> i64) 269))
 
 (defn readonly-make [(v (dyn NodeOps))] (-> (dyn NodeOps))
-  (do (unimplemented "readonly-make" "S3 — src/node/memory.coil") (unreachable-node)))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [ReadOnlyNode] (alloc/create [ReadOnlyNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.pad p) 0)
+    (n-init! d OP-READONLY)
+    (n-add-def! d (None [(dyn NodeOps)]))
+    (n-add-def! d (Some v))
+    (n-set-ty! d (n-ty v))
+    d))

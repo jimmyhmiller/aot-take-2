@@ -1,18 +1,551 @@
-;; Object files: Mach-O and ELF, written byte by byte.
+;; Object files, written byte-by-byte from final encoding state.
 
 ;;
-;; Per CLAUDE.md's second rule there is no C here and no library doing this for us: the bytes are
-;; ours. `cc` is invoked as a LINKER over the object we produce, never as a compiler for our code.
-;;
-;; Beyond the minimum, this must emit multiple function symbols, internal and runtime relocations,
-;; function sizes, and the stack-map section the collector reads.
-;;
-;; SCAFFOLD: signatures are final; bodies hard-error. Filled in at S7.
+;; Final Simple constructs sections, symbols and relocations before freezing offsets. We preserve
+;; that order and never depend on host struct layout. Mach-O comes first for the arm64 host: a real
+;; MH_OBJECT with one `__TEXT,__text` section, external definitions, undefined targets, and
+;; ARM64_RELOC_BRANCH26 records. ELF follows from the same generic records.
 (module aot.codegen.objfile)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.fs" :as fs)
+(import "coil.slice" :use [slice-new])
+(import "coil.subprocess" :as subprocess)
 (import "aot.util.panic" :use *)
+(import "aot.codegen.encoding" :use *)
+(import "aot.codegen.gcmeta" :use *)
+
+(const MACHO-SEGMENT-SIZE 152)
+
+(const MACHO-SYMTAB-SIZE 24)
+
+(const MACHO-BUILD-VERSION-SIZE 24)
+
+(const MACHO-DATA-OFFSET 232)
+
+(defn obj-put1! [(out (mut (ArrayList u8))) (v i64)] (-> i64)
+  (do (push! [u8] (mut out) (primitive/cast u8 v)) 0))
+
+(defn obj-put2! [(out (mut (ArrayList u8))) (v i64)] (-> i64)
+  (do (obj-put1! (mut out) v) (obj-put1! (mut out) (primitive/ishr v 8)) 0))
+
+(defn obj-put4! [(out (mut (ArrayList u8))) (v i64)] (-> i64)
+  (do (obj-put2! (mut out) v) (obj-put2! (mut out) (primitive/ishr v 16)) 0))
+
+(defn obj-put8! [(out (mut (ArrayList u8))) (v i64)] (-> i64)
+  (do (obj-put4! (mut out) v) (obj-put4! (mut out) (primitive/ishr v 32)) 0))
+
+(defn obj-put-slice! [(out (mut (ArrayList u8))) (bytes (slice u8))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len bytes))
+              (break 0)
+              (do
+                (obj-put1! (mut out) (primitive/cast i64 (get bytes (load i))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn obj-put-name16! [(out (mut (ArrayList u8))) (name (slice u8))] (-> i64)
+  (let [(mut i) 0]
+    (if (> (len name) 16) (panic "obj-put-name16!: Mach-O name exceeds 16 bytes") 0)
+    (loop (if (>= (load i) 16)
+              (break 0)
+              (do
+                (obj-put1! (mut out)
+                           (if (< (load i) (len name))
+                               (primitive/cast i64 (get name (load i)))
+                               0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn obj-pad-to! [(out (mut (ArrayList u8))) (offset i64)] (-> i64)
+  (do
+    (if (> (len (load out)) offset) (panic-i "obj-pad-to!: offset already passed" offset) 0)
+    (loop (if (>= (len (load out)) offset)
+              (break 0)
+              (do (obj-put1! (mut out) 0) (continue))))))
+
+;; Match a call first by closed-world fidx, then by symbol for explicit platform externs.
+(defn macho-definition-for-fixup [(fixup i64)] (-> i64)
+  (let [fidx (enc-symbol-fixup-fidx fixup)
+        name (enc-symbol-fixup-name fixup)
+        (mut i) 0
+        (mut answer) -1]
+    (loop (if (or (>= (load i) (enc-definition-count)) (>= (load answer) 0))
+              (break (load answer))
+              (do
+                (if (or (and (>= fidx 0) (= (enc-definition-fidx (load i)) fidx))
+                        (= (enc-definition-name (load i)) name))
+                    (set! (mut answer) (load i))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn macho-prior-undefined-fixup [(fixup i64)] (-> i64)
+  (let [name (enc-symbol-fixup-name fixup)
+        (mut i) 0
+        (mut answer) -1]
+    (loop (if (or (>= (load i) fixup) (>= (load answer) 0))
+              (break (load answer))
+              (do
+                (if (and (< (macho-definition-for-fixup (load i)) 0)
+                         (= (enc-symbol-fixup-name (load i)) name))
+                    (set! (mut answer) (load i))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn macho-undefined-ordinal [(fixup i64)] (-> i64)
+  (let [(mut i) 0
+        (mut ordinal) 0]
+    (loop (if (>= (load i) fixup)
+              (break (load ordinal))
+              (do
+                (if (and (< (macho-definition-for-fixup (load i)) 0)
+                         (< (macho-prior-undefined-fixup (load i)) 0))
+                    (set! (mut ordinal) (+ (load ordinal) 1))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn macho-symbol-index-for-fixup [(fixup i64)] (-> i64)
+  (let [defined (macho-definition-for-fixup fixup)]
+    (if (>= defined 0)
+        defined
+        (let [prior (macho-prior-undefined-fixup fixup)]
+          (+ (enc-definition-count)
+             (macho-undefined-ordinal (if (>= prior 0) prior fixup)))))))
+
+(defn macho-undefined-count [] (-> i64)
+  (let [(mut i) 0
+        (mut count) 0]
+    (loop (if (>= (load i) (enc-symbol-fixup-count))
+              (break (load count))
+              (do
+                (if (and (< (macho-definition-for-fixup (load i)) 0)
+                         (< (macho-prior-undefined-fixup (load i)) 0))
+                    (set! (mut count) (+ (load count) 1))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn macho-put-str! [(strtab (mut (ArrayList u8))) (name (slice u8))] (-> i64)
+  (let [offset (len (load strtab))]
+    (obj-put1! (mut strtab) 95)
+    (obj-put-slice! (mut strtab) name)
+    (obj-put1! (mut strtab) 0)
+    offset))
+
+(defn macho-bytes [] (-> (slice u8))
+  (let [a (alloc/malloc-allocator)
+        (mut out) (al-new [u8] a)
+        (mut strtab) (al-new [u8] a)
+        (mut def-strx) (al-new [i64] a)
+        (mut undef-strx) (al-new [i64] a)
+        stackmaps (gc-stackmap-bytes)
+        stackmap-size (len stackmaps)
+        has-stackmaps (> stackmap-size 0)
+        nsects (if has-stackmaps 2 1)
+        segment-size (+ 72 (* 80 nsects))
+        data-offset (+ 32 (+ segment-size (+ MACHO-SYMTAB-SIZE MACHO-BUILD-VERSION-SIZE)))
+        text-size (enc-byte-count)
+        nreloc (enc-symbol-fixup-count)
+        ndefs (enc-definition-count)
+        nundef (macho-undefined-count)
+        nsyms (+ ndefs nundef)
+        stackmap-offset (obj-align-up (+ data-offset text-size) 8)
+        data-end (if has-stackmaps (+ stackmap-offset stackmap-size) (+ data-offset text-size))
+        reloff (obj-align-up data-end 4)
+        symoff (+ reloff (* nreloc 8))
+        stroff (+ symoff (* nsyms 16))
+        (mut i) 0]
+    (obj-put1! (mut strtab) 0)
+    (loop (if (>= (load i) ndefs)
+              (break 0)
+              (do
+                (push! [i64]
+                       (mut def-strx)
+                       (macho-put-str! (mut strtab) (enc-definition-name (load i))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (set! (mut i) 0)
+    (loop (if (>= (load i) (enc-symbol-fixup-count))
+              (break 0)
+              (do
+                (if (and (< (macho-definition-for-fixup (load i)) 0)
+                         (< (macho-prior-undefined-fixup (load i)) 0))
+                    (push! [i64]
+                           (mut undef-strx)
+                           (macho-put-str! (mut strtab) (enc-symbol-fixup-name (load i))))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+
+    ;; mach_header_64: arm64 MH_OBJECT with segment, symbol table and platform version.
+    (obj-put4! (mut out) 0xfeedfacf)
+    (obj-put4! (mut out) 0x0100000c)
+    (obj-put4! (mut out) 0)
+    (obj-put4! (mut out) 1)
+    (obj-put4! (mut out) 3)
+    (obj-put4! (mut out)
+               (+ segment-size (+ MACHO-SYMTAB-SIZE MACHO-BUILD-VERSION-SIZE)))
+    (obj-put4! (mut out) 0)
+    (obj-put4! (mut out) 0)
+    (obj-put4! (mut out) 0x19)
+    (obj-put4! (mut out) segment-size)
+    (obj-put-name16! (mut out) "")
+    (obj-put8! (mut out) 0)
+    (obj-put8! (mut out) (- data-end data-offset))
+    (obj-put8! (mut out) data-offset)
+    (obj-put8! (mut out) (- data-end data-offset))
+    (obj-put4! (mut out) 7)
+    (obj-put4! (mut out) 7)
+    (obj-put4! (mut out) nsects)
+    (obj-put4! (mut out) 0)
+    (obj-put-name16! (mut out) "__text")
+    (obj-put-name16! (mut out) "__TEXT")
+    (obj-put8! (mut out) 0)
+    (obj-put8! (mut out) text-size)
+    (obj-put4! (mut out) data-offset)
+    (obj-put4! (mut out) 2)
+    (obj-put4! (mut out) reloff)
+    (obj-put4! (mut out) nreloc)
+    (obj-put4! (mut out) 0x80000400)
+    (obj-put4! (mut out) 0)
+    (obj-put4! (mut out) 0)
+    (obj-put4! (mut out) 0)
+    (if has-stackmaps
+        (do
+          (obj-put-name16! (mut out) "__aot_stackmaps")
+          (obj-put-name16! (mut out) "__DATA")
+          (obj-put8! (mut out) (- stackmap-offset data-offset))
+          (obj-put8! (mut out) stackmap-size)
+          (obj-put4! (mut out) stackmap-offset)
+          (obj-put4! (mut out) 3)
+          (obj-put4! (mut out) 0)
+          (obj-put4! (mut out) 0)
+          (obj-put4! (mut out) 0)
+          (obj-put4! (mut out) 0)
+          (obj-put4! (mut out) 0)
+          (obj-put4! (mut out) 0))
+        0)
+    (obj-put4! (mut out) 2)
+    (obj-put4! (mut out) MACHO-SYMTAB-SIZE)
+    (obj-put4! (mut out) symoff)
+    (obj-put4! (mut out) nsyms)
+    (obj-put4! (mut out) stroff)
+    (obj-put4! (mut out) (len (load strtab)))
+    ;; LC_BUILD_VERSION: macOS 11.0 is the first arm64 macOS deployment target.
+    (obj-put4! (mut out) 0x32)
+    (obj-put4! (mut out) MACHO-BUILD-VERSION-SIZE)
+    (obj-put4! (mut out) 1)
+    (obj-put4! (mut out) 0x000b0000)
+    (obj-put4! (mut out) 0)
+    (obj-put4! (mut out) 0)
+    (if (!= (len (load out)) data-offset)
+        (panic-i "macho-bytes: load-command size mismatch" (len (load out)))
+        0)
+
+    (obj-put-slice! (mut out) (enc-bytes))
+    (if has-stackmaps
+        (do (obj-pad-to! (mut out) stackmap-offset) (obj-put-slice! (mut out) stackmaps))
+        0)
+    (obj-pad-to! (mut out) reloff)
+    (set! (mut i) 0)
+    (loop (if (>= (load i) nreloc)
+              (break 0)
+              (do
+                (obj-put4! (mut out) (enc-symbol-fixup-offset (load i)))
+                (obj-put4! (mut out) (| (macho-symbol-index-for-fixup (load i)) 0x2d000000))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+
+    ;; nlist_64 definitions, then deduplicated undefined targets.
+    (set! (mut i) 0)
+    (loop (if (>= (load i) ndefs)
+              (break 0)
+              (do
+                (obj-put4! (mut out) (get (load def-strx) (load i)))
+                (obj-put1! (mut out) 0x0f)
+                (obj-put1! (mut out) 1)
+                (obj-put2! (mut out) 0)
+                (obj-put8! (mut out) (enc-definition-offset (load i)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (set! (mut i) 0)
+    (let [(mut ui) 0]
+      (loop (if (>= (load i) (enc-symbol-fixup-count))
+                (break 0)
+                (do
+                  (if (and (< (macho-definition-for-fixup (load i)) 0)
+                           (< (macho-prior-undefined-fixup (load i)) 0))
+                      (do
+                        (obj-put4! (mut out) (get (load undef-strx) (load ui)))
+                        (obj-put1! (mut out) 1)
+                        (obj-put1! (mut out) 0)
+                        (obj-put2! (mut out) 0)
+                        (obj-put8! (mut out) 0)
+                        (set! (mut ui) (+ (load ui) 1)))
+                      0)
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    (obj-put-slice! (mut out) (al-slice (load strtab)))
+    (al-slice (load out))))
 
 (defn macho-write [(path (slice u8))] (-> i64)
-  (do (unimplemented "macho-write" "S7 — src/codegen/objfile.coil") 0))
+  (let [a (alloc/malloc-allocator)
+        bytes (macho-bytes)]
+    (try (try-or! (fs/write-file a path bytes) -1))))
+
+(defn obj-align-up [(v i64) (alignment i64)] (-> i64)
+  (* alignment (/ (+ v (- alignment 1)) alignment)))
+
+(defn elf-put-str! [(strtab (mut (ArrayList u8))) (name (slice u8))] (-> i64)
+  (let [offset (len (load strtab))]
+    (obj-put-slice! (mut strtab) name)
+    (obj-put1! (mut strtab) 0)
+    offset))
+
+(defn elf-symbol-index-for-fixup [(fixup i64)] (-> i64)
+  ;; Null and local .text section symbols occupy indices zero and one.
+  (+ 2 (macho-symbol-index-for-fixup fixup)))
+
+(defn elf-put-section-header! [(out (mut (ArrayList u8)))
+                               (name i64)
+                               (kind i64)
+                               (flags i64)
+                               (offset i64)
+                               (size i64)
+                               (link i64)
+                               (info i64)
+                               (alignment i64)
+                               (entsize i64)] (-> i64)
+  (do
+    (obj-put4! (mut out) name)
+    (obj-put4! (mut out) kind)
+    (obj-put8! (mut out) flags)
+    (obj-put8! (mut out) 0)
+    (obj-put8! (mut out) offset)
+    (obj-put8! (mut out) size)
+    (obj-put4! (mut out) link)
+    (obj-put4! (mut out) info)
+    (obj-put8! (mut out) alignment)
+    (obj-put8! (mut out) entsize)
+    0))
+
+(defn elf-bytes [] (-> (slice u8))
+  (let [a (alloc/malloc-allocator)
+        (mut out) (al-new [u8] a)
+        (mut strtab) (al-new [u8] a)
+        (mut shstr) (al-new [u8] a)
+        (mut def-strx) (al-new [i64] a)
+        (mut undef-strx) (al-new [i64] a)
+        stackmaps (gc-stackmap-bytes)
+        stackmap-size (len stackmaps)
+        has-stackmaps (> stackmap-size 0)
+        text-size (enc-byte-count)
+        nreloc (enc-symbol-fixup-count)
+        ndefs (enc-definition-count)
+        nundef (macho-undefined-count)
+        nsyms (+ 2 (+ ndefs nundef))
+        text-off 64
+        rela-off (obj-align-up (+ text-off text-size) 8)
+        rela-size (* nreloc 24)
+        sym-off (obj-align-up (+ rela-off rela-size) 8)
+        sym-size (* nsyms 24)
+        str-off (+ sym-off sym-size)
+        (mut i) 0]
+    (obj-put1! (mut strtab) 0)
+    (loop (if (>= (load i) ndefs)
+              (break 0)
+              (do
+                (push! [i64]
+                       (mut def-strx)
+                       (elf-put-str! (mut strtab) (enc-definition-name (load i))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (set! (mut i) 0)
+    (loop (if (>= (load i) (enc-symbol-fixup-count))
+              (break 0)
+              (do
+                (if (and (< (macho-definition-for-fixup (load i)) 0)
+                         (< (macho-prior-undefined-fixup (load i)) 0))
+                    (push! [i64]
+                           (mut undef-strx)
+                           (elf-put-str! (mut strtab) (enc-symbol-fixup-name (load i))))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (obj-put1! (mut shstr) 0)
+    (let [text-name (elf-put-str! (mut shstr) ".text")
+          rela-name (elf-put-str! (mut shstr) ".rela.text")
+          sym-name (elf-put-str! (mut shstr) ".symtab")
+          str-name (elf-put-str! (mut shstr) ".strtab")
+          stackmap-name (if has-stackmaps (elf-put-str! (mut shstr) ".aot_stackmaps") 0)
+          shstr-name (elf-put-str! (mut shstr) ".shstrtab")
+          stackmap-off (obj-align-up (+ str-off (len (load strtab))) 8)
+          shstr-off
+            (if has-stackmaps
+                (+ stackmap-off stackmap-size)
+                (+ str-off (len (load strtab))))
+          shoff (obj-align-up (+ shstr-off (len (load shstr))) 8)]
+      ;; ELF64 header, little-endian, ET_REL, EM_AARCH64.
+      (obj-put1! (mut out) 0x7f)
+      (obj-put1! (mut out) 0x45)
+      (obj-put1! (mut out) 0x4c)
+      (obj-put1! (mut out) 0x46)
+      (obj-put1! (mut out) 2)
+      (obj-put1! (mut out) 1)
+      (obj-put1! (mut out) 1)
+      (loop (if (>= (len (load out)) 16)
+                (break 0)
+                (do (obj-put1! (mut out) 0) (continue))))
+      (obj-put2! (mut out) 1)
+      (obj-put2! (mut out) 183)
+      (obj-put4! (mut out) 1)
+      (obj-put8! (mut out) 0)
+      (obj-put8! (mut out) 0)
+      (obj-put8! (mut out) shoff)
+      (obj-put4! (mut out) 0)
+      (obj-put2! (mut out) 64)
+      (obj-put2! (mut out) 0)
+      (obj-put2! (mut out) 0)
+      (obj-put2! (mut out) 64)
+      (obj-put2! (mut out) (if has-stackmaps 7 6))
+      (obj-put2! (mut out) (if has-stackmaps 6 5))
+      (obj-put-slice! (mut out) (enc-bytes))
+      (obj-pad-to! (mut out) rela-off)
+
+      ;; Elf64_Rela: r_offset, r_info=(symbol<<32)|R_AARCH64_CALL26, addend zero.
+      (set! (mut i) 0)
+      (loop (if (>= (load i) nreloc)
+                (break 0)
+                (do
+                  (obj-put8! (mut out) (enc-symbol-fixup-offset (load i)))
+                  (obj-put8! (mut out)
+                             (| (primitive/ishl (elf-symbol-index-for-fixup (load i)) 32) 283))
+                  (obj-put8! (mut out) 0)
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      (obj-pad-to! (mut out) sym-off)
+
+      ;; Null and local section symbols.
+      (loop (if (>= (len (load out)) (+ sym-off 24))
+                (break 0)
+                (do (obj-put1! (mut out) 0) (continue))))
+      (obj-put4! (mut out) 0)
+      (obj-put1! (mut out) 3)
+      (obj-put1! (mut out) 0)
+      (obj-put2! (mut out) 1)
+      (obj-put8! (mut out) 0)
+      (obj-put8! (mut out) 0)
+      (set! (mut i) 0)
+      (loop (if (>= (load i) ndefs)
+                (break 0)
+                (do
+                  (obj-put4! (mut out) (get (load def-strx) (load i)))
+                  (obj-put1! (mut out) 0x12)
+                  (obj-put1! (mut out) 0)
+                  (obj-put2! (mut out) 1)
+                  (obj-put8! (mut out) (enc-definition-offset (load i)))
+                  (obj-put8! (mut out) (enc-definition-size (load i)))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      (set! (mut i) 0)
+      (let [(mut ui) 0]
+        (loop (if (>= (load i) (enc-symbol-fixup-count))
+                  (break 0)
+                  (do
+                    (if (and (< (macho-definition-for-fixup (load i)) 0)
+                             (< (macho-prior-undefined-fixup (load i)) 0))
+                        (do
+                          (obj-put4! (mut out) (get (load undef-strx) (load ui)))
+                          (obj-put1! (mut out) 0x10)
+                          (obj-put1! (mut out) 0)
+                          (obj-put2! (mut out) 0)
+                          (obj-put8! (mut out) 0)
+                          (obj-put8! (mut out) 0)
+                          (set! (mut ui) (+ (load ui) 1)))
+                        0)
+                    (set! (mut i) (+ (load i) 1))
+                    (continue)))))
+      (obj-put-slice! (mut out) (al-slice (load strtab)))
+      (if has-stackmaps
+          (do (obj-pad-to! (mut out) stackmap-off) (obj-put-slice! (mut out) stackmaps))
+          0)
+      (obj-put-slice! (mut out) (al-slice (load shstr)))
+      (obj-pad-to! (mut out) shoff)
+      (elf-put-section-header! (mut out) 0 0 0 0 0 0 0 0 0)
+      (elf-put-section-header! (mut out) text-name 1 6 text-off text-size 0 0 4 0)
+      (elf-put-section-header! (mut out) rela-name 4 0 rela-off rela-size 3 1 8 24)
+      (elf-put-section-header! (mut out) sym-name 2 0 sym-off sym-size 4 2 8 24)
+      (elf-put-section-header! (mut out)
+                               str-name
+                               3
+                               0
+                               str-off
+                               (len (load strtab))
+                               0
+                               0
+                               1
+                               0)
+      (if has-stackmaps
+          (elf-put-section-header! (mut out)
+                                   stackmap-name
+                                   1
+                                   2
+                                   stackmap-off
+                                   stackmap-size
+                                   0
+                                   0
+                                   8
+                                   0)
+          0)
+      (elf-put-section-header! (mut out)
+                               shstr-name
+                               3
+                               0
+                               shstr-off
+                               (len (load shstr))
+                               0
+                               0
+                               1
+                               0)
+      (al-slice (load out)))))
 
 (defn elf-write [(path (slice u8))] (-> i64)
-  (do (unimplemented "elf-write" "S7 — src/codegen/objfile.coil") 0))
+  (let [a (alloc/malloc-allocator)
+        bytes (elf-bytes)]
+    (try (try-or! (fs/write-file a path bytes) -1))))
+
+(defn obj-run-process [(program (slice u8)) (args (slice (slice u8)))] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        child (primitive/alloc-stack subprocess/Child)]
+    (try (let [_
+                 (try-or! (subprocess/spawn a
+                                            child
+                                            program
+                                            args
+                                            (subprocess/inherit-stdio)
+                                            (subprocess/inherit-stdio)
+                                            (subprocess/inherit-stdio))
+                          -1)]
+           (let [code
+                   (match (subprocess/child-wait child)
+                     (Err [_] -1)
+                     (Ok [status]
+                         (match status
+                           (subprocess/Exited [exit-code] exit-code)
+                           (subprocess/Signaled [signal] (- 0 signal)))))]
+             (match (subprocess/child-close child) (Ok [_] 0) (Err [_] 0))
+             code)))))
+
+(defn macho-link! [(object (slice u8)) (output (slice u8))] (-> i64)
+  (let [args (primitive/alloc-stack (array (slice u8) 3))]
+    (set! (primitive/index args 0) object)
+    (set! (primitive/index args 1) "-o")
+    (set! (primitive/index args 2) output)
+    (obj-run-process "cc" (slice-new (primitive/index args 0) 3))))
+
+(defn run-executable! [(path (slice u8))] (-> i64)
+  (obj-run-process path (slice-new (primitive/cast (ptr (slice u8)) 0) 0)))

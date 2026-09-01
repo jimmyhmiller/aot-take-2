@@ -1,10 +1,182 @@
-;; arm64 machine nodes: the bits family.
+;; ============================================================================
 
+;; ARM64 BIT, SHIFT, BOOLEAN AND COMPARISON SELECTION
+;; ============================================================================
 ;;
-;; SCAFFOLD: filled in at S6. See src/node/cpus/arm64/arm64.coil.
+;; Final Simple selects logical immediates before register forms, shift immediates before variable
+;; shifts, and lowers a comparison to TWO machine definitions: CMP/FCMP defines FLAGS, then CSET
+;; consumes FLAGS and defines the language boolean in a GPR. Keeping that edge explicit is what
+;; lets scheduling and allocation see flag interference.
 (module aot.node.cpus.arm64.bits)
+(import "coil.primitive" :as primitive)
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.arith" :use *)
+(import "aot.node.bits" :use *)
+(import "aot.node.compare" :use *)
+(import "aot.type.type" :use *)
+(import "aot.node.cpus.arm64.base" :use *)
+
+;; A64 logical immediates are repeated, rotated runs of ones. Return the exact N:immr:imms payload.
+(defn arm64-logical-immediate [(value i64)] (-> (Option i64))
+  (if (or (= value 0) (= value -1))
+      (None [i64])
+      (let [(mut val) value
+            (mut immr) 0]
+        (loop (if (and (>= (load val) 0) (!= (& (load val) 1) 0))
+                  (break 0)
+                  (if (>= (load immr) 64)
+                      (break 0)
+                      (do
+                        (set! (mut val)
+                              (| (primitive/cast i64
+                                                 (primitive/ishr (primitive/cast u64 (load val)) 63))
+                                 (primitive/ishl (load val) 1)))
+                        (set! (mut immr) (+ (load immr) 1))
+                        (continue)))))
+        (if (>= (load immr) 64)
+            (None [i64])
+            (let [(mut size) 32
+                  (mut pattern) (load val)]
+              (loop (let [width (load size)
+                          mask (- (primitive/ishl 1 width) 1)]
+                      (if (!= (& (load pattern) mask) (primitive/ishr (load pattern) width))
+                          (break 0)
+                          (do
+                            (set! (mut pattern) (primitive/ishr (load pattern) width))
+                            (set! (mut size) (/ width 2))
+                            (continue)))))
+              (set! (mut size) (* (load size) 2))
+              (let [ones (primitive/popcount (load pattern))
+                    expected (- (primitive/ishl 1 ones) 1)]
+                (if (!= (load pattern) expected)
+                    (None [i64])
+                    (let [imms (- ones 1)]
+                      (Some (if (= (load size) 64)
+                                (| 0x1000 (| (primitive/ishl (load immr) 6) imms))
+                                (| (primitive/ishl (- 32 (load size)) 1)
+                                   (| (primitive/ishl (load immr) 6) imms))))))))))))
+
+(defn arm64-bits-rhs-constant [(n (dyn NodeOps))] (-> (Option i64))
+  (if (< (n-nins n) 3)
+      (None [i64])
+      (let [rhs (n-in! n 2)]
+        (if (and (= (n-op rhs) OP-CON)
+                 (and (ty-int? (con-ty-of rhs)) (ty-constant? (con-ty-of rhs))))
+            (Some (ty-int-lo (con-ty-of rhs)))
+            (None [i64])))))
+
+(defn arm64-bits-register [(n (dyn NodeOps)) (commutes bool)] (-> (dyn NodeOps))
+  (arm64-scalar-make n
+                     (n-op n)
+                     ARM64-FORM-REG
+                     0
+                     ARM64-CLASS-GPR
+                     ARM64-CLASS-GPR
+                     2
+                     commutes
+                     false))
+
+(defn arm64-bits-logical [(n (dyn NodeOps))] (-> (dyn NodeOps))
+  (match (arm64-bits-rhs-constant n)
+    (Some [value]
+          (match (arm64-logical-immediate value)
+            (Some [encoded]
+                  (let [m
+                          (arm64-scalar-make n
+                                             (n-op n)
+                                             ARM64-FORM-LOGICAL-IMM
+                                             encoded
+                                             ARM64-CLASS-GPR
+                                             ARM64-CLASS-GPR
+                                             1
+                                             false
+                                             false)]
+                    (arm64-scalar-drop-last-input! m)
+                    m))
+            (None [] (arm64-bits-register n true))))
+    (None [] (arm64-bits-register n true))))
+
+(defn arm64-bits-shift [(n (dyn NodeOps))] (-> (dyn NodeOps))
+  (match (arm64-bits-rhs-constant n)
+    (Some [value]
+          (if (and (> value 0) (<= value 63))
+              (let [m
+                      (arm64-scalar-make n
+                                         (n-op n)
+                                         ARM64-FORM-SHIFT-IMM
+                                         value
+                                         ARM64-CLASS-GPR
+                                         ARM64-CLASS-GPR
+                                         1
+                                         false
+                                         false)]
+                (arm64-scalar-drop-last-input! m)
+                m)
+              (arm64-bits-register n false)))
+    (None [] (arm64-bits-register n false))))
+
+(defn arm64-compare-select [(n (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [float (= (cmp-mode n) MODE-FLT)
+        cmp
+          (arm64-scalar-make n
+                             (n-op n)
+                             ARM64-FORM-CMP
+                             0
+                             (if float ARM64-CLASS-FPR ARM64-CLASS-GPR)
+                             ARM64-CLASS-FLAGS
+                             2
+                             false
+                             false)]
+    (if float
+        0
+        (match (arm64-bits-rhs-constant n)
+          (Some [value]
+                (if (and (>= value 0) (<= value 4095))
+                    (do
+                      (set! (.form (arm64-scalar-node cmp)) ARM64-FORM-CMP-IMM)
+                      (set! (.imm (arm64-scalar-node cmp)) value)
+                      (set! (.arity (arm64-scalar-node cmp)) 1)
+                      (set! (.clone-cheap (arm64-scalar-node cmp)) true)
+                      (arm64-scalar-drop-last-input! cmp))
+                    0))
+          (None [] 0)))
+    (let [set
+            (arm64-scalar-make cmp
+                               (n-op n)
+                               ARM64-FORM-SET
+                               0
+                               ARM64-CLASS-FLAGS
+                               ARM64-CLASS-GPR
+                               1
+                               false
+                               false)]
+      (arm64-scalar-unary-input! set cmp)
+      set)))
 
 (defn arm64-bits-select [(n (dyn NodeOps))] (-> (dyn NodeOps))
-  (do (unimplemented "arm64-bits-select" "S6 — src/node/cpus/arm64/bits.coil") (unreachable-node)))
+  (let [op (n-op n)]
+    (if (or (= op OP-AND) (= op OP-OR) (= op OP-XOR))
+        (arm64-bits-logical n)
+        (if (or (= op OP-SHL) (= op OP-SHR) (= op OP-SAR))
+            (arm64-bits-shift n)
+            (if (= op OP-NOT)
+                (let [m
+                        (arm64-scalar-make n
+                                           op
+                                           ARM64-FORM-NOT
+                                           0
+                                           ARM64-CLASS-GPR
+                                           ARM64-CLASS-GPR
+                                           1
+                                           false
+                                           false)]
+                  (arm64-scalar-set-kill! m ARM64-CLASS-FLAGS)
+                  (arm64-scalar-set-size! m 8)
+                  m)
+                (if (or (= op OP-EQ) (= op OP-NE) (= op OP-LT) (= op OP-LE) (= op OP-ULT))
+                    (arm64-compare-select n)
+                    (do
+                      (panic-i "arm64-bits-select: unsupported ideal opcode" op)
+                      (unreachable-node))))))))

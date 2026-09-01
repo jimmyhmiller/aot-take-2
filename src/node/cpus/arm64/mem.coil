@@ -1,10 +1,227 @@
-;; arm64 machine nodes: the mem family.
-
+;; ============================================================================
+;; ARM64 LOAD/STORE MACHINE NODES
+;; ============================================================================
 ;;
-;; SCAFFOLD: filled in at S6. See src/node/cpus/arm64/arm64.coil.
+;; Final Simple strips ReadOnly from the address, then selects one of three A64 address forms:
+;; scaled unsigned imm12, unscaled signed imm9, or a register offset. The folded constant is removed
+;; from the selected input graph so it has no live range. Memory and control inputs have no register
+;; mask; base, index and stored value do. Alias identity remains on the selected node for GCM's
+;; load/store anti-dependence walk.
 (module aot.node.cpus.arm64.mem)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.codegen.machine" :use *)
+(import "aot.codegen.encoding" :use *)
+(import "aot.codegen.regmask" :use *)
+(import "aot.type.type" :use *)
+(import "aot.node.cpus.arm64.base" :use *)
+
+(const ARM64-MEM-REG 1)
+(const ARM64-MEM-UIMM12 2)
+(const ARM64-MEM-SIMM9 3)
+
+(defstruct Arm64MemNode
+  [(hdr NodeHdr)
+   (ideal-op i64)
+   (alias i64)
+   (declared i64)
+   (form i64)
+   (offset i64)
+   (bytes i64)
+   (value-class i64)
+   (result-ty i64)
+   (offset-source (dyn NodeOps))])
+
+(defn arm64-mem-node [(n (dyn NodeOps))] (-> (ptr Arm64MemNode))
+  (if (!= (n-op n) OP-MACH-MEM)
+      (do (panic-i "arm64-mem-node: not selected memory" (n-op n))
+          (primitive/cast (ptr Arm64MemNode) (hdr n)))
+      (primitive/cast (ptr Arm64MemNode) (hdr n))))
+
+(defn arm64-mem-value-class [(t i64)] (-> i64)
+  (if (ty-flt? t) ARM64-CLASS-FPR ARM64-CLASS-GPR))
+
+(defn arm64-mem-bytes [(t i64)] (-> i64)
+  (if (ty-flt? t)
+      (if (= (ty-flt-size t) 32) 4 8)
+      8))
+
+(defn arm64-mem-constant-offset [(n (dyn NodeOps))] (-> (Option i64))
+  (let [off (n-in! n MEM-OFF)]
+    (if (and (= (n-op off) OP-CON)
+             (and (ty-int? (con-ty-of off)) (ty-constant? (con-ty-of off))))
+        (Some (ty-int-lo (con-ty-of off)))
+        (None [i64]))))
+
+(defn arm64-mem-install-hook [(n (dyn NodeOps))] (-> (Option (dyn MemOps)))
+  (if (= (n-op n) OP-MACH-MEM)
+      (Some (primitive/make-dyn MemOps (primitive/cast (ptr Arm64MemNode) (hdr n))))
+      (None [(dyn MemOps)])))
 
 (defn arm64-mem-select [(n (dyn NodeOps))] (-> (dyn NodeOps))
-  (do (unimplemented "arm64-mem-select" "S6 — src/node/cpus/arm64/mem.coil") (unreachable-node)))
+  (let [op (n-op n)]
+    (if (not (or (= op OP-LOAD) (= op OP-STORE)))
+        (do (panic-i "arm64-mem-select: unsupported ideal opcode" op) (unreachable-node))
+        (let [a (alloc/malloc-allocator)
+              p (alloc/unwrap-ptr [Arm64MemNode] (alloc/create [Arm64MemNode] a))
+              d (primitive/make-dyn NodeOps p)
+              declared (if (= op OP-LOAD) (load-declared n) (store-declared n))
+              value-ty (if (= op OP-LOAD) declared (n-ty (n-in! n STORE-VAL)))
+              bytes (arm64-mem-bytes value-ty)
+              source-off (n-in! n MEM-OFF)]
+          (set-selected-mem-hook! (primitive/fnptr-of arm64-mem-install-hook))
+          (set! (.ideal-op p) op)
+          (set! (.alias p) (mem-alias-of-node n))
+          (set! (.declared p) declared)
+          (set! (.form p) ARM64-MEM-REG)
+          (set! (.offset p) 0)
+          (set! (.bytes p) bytes)
+          (set! (.value-class p) (arm64-mem-value-class value-ty))
+          (set! (.result-ty p) (n-ty n))
+          (set! (.offset-source p) source-off)
+          (n-init! d OP-MACH-MEM)
+          (arm64-scalar--raw-inputs! d n)
+          ;; ReadOnly is a typing proof, not an address-producing machine instruction.
+          (if (= (n-op (n-in! d MEM-PTR)) OP-READONLY)
+              (set! (mut (.ins (hdr d))) MEM-PTR (Some (n-in! (n-in! d MEM-PTR) 1)))
+              0)
+          (match (arm64-mem-constant-offset n)
+            (Some [off]
+                  (if (and (>= off 0) (and (= (% off bytes) 0) (<= (/ off bytes) 4095)))
+                      (do
+                        (set! (.form p) ARM64-MEM-UIMM12)
+                        (set! (.offset p) off)
+                        (set! (mut (.ins (hdr d))) MEM-OFF (None [(dyn NodeOps)])))
+                      (if (and (>= off -256) (<= off 255))
+                          (do
+                            (set! (.form p) ARM64-MEM-SIMM9)
+                            (set! (.offset p) off)
+                            (set! (mut (.ins (hdr d))) MEM-OFF (None [(dyn NodeOps)])))
+                          0)))
+            (None [] 0))
+          (n-force-ty! d (.result-ty p))
+          d))))
+
+(defn arm64-mem-register [(encoder i64) (n (dyn NodeOps)) (class i64)] (-> i64)
+  (if (= class ARM64-CLASS-FPR)
+      (arm64-enc-fpr encoder n)
+      (arm64-enc-gpr encoder n)))
+
+(defn arm64-mem-uimm-base [(load_ bool) (class i64) (bytes i64)] (-> i64)
+  (if (= class ARM64-CLASS-FPR)
+      (if (= bytes 4)
+          (if load_ 0xbd400000 0xbd000000)
+          (if load_ 0xfd400000 0xfd000000))
+      (if (= bytes 8)
+          (if load_ 0xf9400000 0xf9000000)
+          (if (= bytes 4)
+              (if load_ 0xb9400000 0xb9000000)
+              (do (panic-i "arm64-mem-uimm-base: unsupported integer width" bytes) 0)))))
+
+(defn arm64-mem-simm-base [(load_ bool) (class i64) (bytes i64)] (-> i64)
+  (if (= class ARM64-CLASS-FPR)
+      (if (= bytes 4)
+          (if load_ 0xbc400000 0xbc000000)
+          (if load_ 0xfc400000 0xfc000000))
+      (if (= bytes 8)
+          (if load_ 0xf8400000 0xf8000000)
+          (if (= bytes 4)
+              (if load_ 0xb8400000 0xb8000000)
+              (do (panic-i "arm64-mem-simm-base: unsupported integer width" bytes) 0)))))
+
+(defn arm64-mem-reg-base [(load_ bool) (class i64) (bytes i64)] (-> i64)
+  (if (= class ARM64-CLASS-FPR)
+      (if (= bytes 4)
+          (if load_ 0xbc606800 0xbc206800)
+          (if load_ 0xfc606800 0xfc206800))
+      (if (= bytes 8)
+          (if load_ 0xf8606800 0xf8206800)
+          (if (= bytes 4)
+              (if load_ 0xb8606800 0xb8206800)
+              (do (panic-i "arm64-mem-reg-base: unsupported integer width" bytes) 0)))))
+
+(defn arm64-encode-mem! [(encoder i64) (p (ptr Arm64MemNode))] (-> i64)
+  (let [d (m-node (primitive/make-dyn MachNode p))
+        load_ (= (.ideal-op p) OP-LOAD)
+        rn (arm64-enc-gpr encoder (n-in! d MEM-PTR))
+        rt (if load_
+               (arm64-mem-register encoder d (.value-class p))
+               (arm64-mem-register encoder (n-in! d STORE-VAL) (.value-class p)))
+        form (.form p)
+        word
+          (if (= form ARM64-MEM-UIMM12)
+              (| (arm64-mem-uimm-base load_ (.value-class p) (.bytes p))
+                 (| (primitive/ishl (/ (.offset p) (.bytes p)) 10)
+                    (| (primitive/ishl rn 5) rt)))
+              (if (= form ARM64-MEM-SIMM9)
+                  (| (arm64-mem-simm-base load_ (.value-class p) (.bytes p))
+                     (| (primitive/ishl (& (.offset p) 0x1ff) 12)
+                        (| (primitive/ishl rn 5) rt)))
+                  (let [rm (arm64-enc-gpr encoder (n-in! d MEM-OFF))]
+                    (| (arm64-mem-reg-base load_ (.value-class p) (.bytes p))
+                       (| (primitive/ishl rm 16) (| (primitive/ishl rn 5) rt))))))]
+    (enc-add4! encoder word)))
+
+(impl NodeOps Arm64MemNode
+  (hdr [(self (ptr Arm64MemNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (compute [(self (ptr Arm64MemNode))] (-> i64) (.result-ty self))
+  (idealize [(self (ptr Arm64MemNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
+  (label [(self (ptr Arm64MemNode))] (-> (slice u8)) (if (= (.ideal-op self) OP-LOAD) "ldr" "str"))
+  (eq-extra [(self (ptr Arm64MemNode)) (other (dyn NodeOps))] (-> bool)
+            (if (!= (n-op other) OP-MACH-MEM)
+                false
+                (let [o (primitive/cast (ptr Arm64MemNode) (hdr other))]
+                  (and (= (.ideal-op self) (.ideal-op o))
+                       (and (= (.alias self) (.alias o))
+                            (and (= (.form self) (.form o)) (= (.offset self) (.offset o))))))))
+  (hash-extra [(self (ptr Arm64MemNode))] (-> i64)
+              (+ (* (.ideal-op self) 1031) (+ (* (.alias self) 31) (.offset self))))
+  (is-const? [(self (ptr Arm64MemNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr Arm64MemNode))] (-> bool) true)
+  (is-pinned? [(self (ptr Arm64MemNode))] (-> bool) false)
+  (binop-copy [(self (ptr Arm64MemNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)])))
+
+(impl MemOps Arm64MemNode
+  (mem-node [(self (ptr Arm64MemNode))] (-> (dyn NodeOps)) (primitive/make-dyn NodeOps self))
+  (mem-alias [(self (ptr Arm64MemNode))] (-> i64) (.alias self))
+  (mem-is-load? [(self (ptr Arm64MemNode))] (-> bool) (= (.ideal-op self) OP-LOAD))
+  (mem-in [(self (ptr Arm64MemNode))] (-> (dyn NodeOps))
+          (n-in! (primitive/make-dyn NodeOps self) MEM-STATE))
+  (mem-ptr [(self (ptr Arm64MemNode))] (-> (dyn NodeOps))
+           (n-in! (primitive/make-dyn NodeOps self) MEM-PTR))
+  (mem-offset [(self (ptr Arm64MemNode))] (-> (dyn NodeOps)) (.offset-source self)))
+
+(impl MachNode Arm64MemNode
+  (m-node [(self (ptr Arm64MemNode))] (-> (dyn NodeOps)) (primitive/make-dyn NodeOps self))
+  (m-ideal-op [(self (ptr Arm64MemNode))] (-> i64) (.ideal-op self))
+  (m-post-select! [(self (ptr Arm64MemNode))] (-> i64) 0)
+  (m-regmap [(self (ptr Arm64MemNode)) (i i64)] (-> (Option (ptr RegMask)))
+            (if (= i MEM-PTR)
+                (arm64-class-mask ARM64-CLASS-GPR)
+                (if (and (= i MEM-OFF) (= (.form self) ARM64-MEM-REG))
+                    (arm64-class-mask ARM64-CLASS-GPR)
+                    (if (and (= i STORE-VAL) (= (.ideal-op self) OP-STORE))
+                        (arm64-class-mask (.value-class self))
+                        (None [(ptr RegMask)])))))
+  (m-outregmap [(self (ptr Arm64MemNode))] (-> (Option (ptr RegMask)))
+               (if (= (.ideal-op self) OP-LOAD)
+                   (arm64-class-mask (.value-class self))
+                   (None [(ptr RegMask)])))
+  (m-proj-outregmap [(self (ptr Arm64MemNode)) (idx i64)] (-> (Option (ptr RegMask)))
+                    (do (panic-i "Arm64MemNode has no projected result" idx) (None [(ptr RegMask)])))
+  (m-killmap [(self (ptr Arm64MemNode))] (-> (Option (ptr RegMask))) (None [(ptr RegMask)]))
+  (m-two-address [(self (ptr Arm64MemNode))] (-> i64) 0)
+  (m-commutes [(self (ptr Arm64MemNode))] (-> bool) false)
+  (m-clone-cheap? [(self (ptr Arm64MemNode))] (-> bool) false)
+  (m-clone [(self (ptr Arm64MemNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
+  (m-size [(self (ptr Arm64MemNode))] (-> i64) 4)
+  (m-encoding [(self (ptr Arm64MemNode)) (encoder i64)] (-> i64)
+              (arm64-encode-mem! encoder self))
+  (m-asm [(self (ptr Arm64MemNode))] (-> (slice u8)) (if (= (.ideal-op self) OP-LOAD) "ldr" "str"))
+  (m-op [(self (ptr Arm64MemNode))] (-> (slice u8)) (if (= (.ideal-op self) OP-LOAD) "ldr" "str")))

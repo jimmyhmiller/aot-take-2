@@ -13,7 +13,7 @@ this file owns completeness.
 | Return | Concrete memory and RPC nodes/types for the final four-input shape | Slots and projection numbering are final; memory and RPC are explicit null/`TOP` inputs while Fun ownership is separate metadata |
 | Calls | Multi-target SCCP lookup and memory threading | Direct calls and clone inlining are complete; multi-target lookup awaits compilation units and memory threading awaits memory SSA |
 | Node API | Complete for every implemented node family | Includes cycle-safe two-pass selected-subgraph copy, payload preservation and Fun/Return + Call/CallEnd cross-link repair |
-| Phi | Memory-specific same-op guards and the dominance-walk null merge | Unary/binary scalar pull-down and structural zero/truthy-Cast merging are complete; memory nodes do not exist |
+| Phi | MemPhi construction, memory-specific same-op guards and the dominance-walk null merge | Unary/binary scalar pull-down and structural zero/truthy-Cast merging are complete; Load/Store/MemMerge now exist |
 | Verification | Pointer/control/safepoint/unreachable-use checks | Core edge, dead-input, Phi arity, type and GVN checks are live; the remaining checks require their node families |
 | Text IR/eval | Round-trippable graph text and IR interpreter | No durable reduced graph corpus or differential execution oracle |
 
@@ -46,9 +46,9 @@ Phi uniqueness is control-live-aware, all-dead Regions collapse directly, SCCP n
 crosses CallEnd result projections, and post-SCCP peepholes receive every live node. The verifier's
 GVN freshness check recomputes current structure. IEEE float rewrites preserve evaluation grouping
 and independently rounded division rather than inheriting Simple's integer-safe algebra.
-Calls are deliberately site-unique in GVN while their memory input is null, preventing identical
-argument lists from merging distinct effects. Memory SSA can replace that temporary identity with
-the real memory-dependence identity when it is implemented.
+Calls remain deliberately site-unique in GVN. Production parser and JSL lowering construct calls
+with bulk memory, linking aligns the callee memory parameter, and Return/CallEnd thread the result;
+the null-memory constructor remains only for focused incomplete-graph tests.
 Phi openness follows both its Region and its final input, including the reverse-close state. Nested
 If folding recognizes the dominating predicate through a true-arm truthiness Cast. Same-op Phi
 pull-down covers every currently implemented eligible unary and binary scalar arity.
@@ -75,28 +75,44 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
   lowering is live, the overflow path must box an f64 result (or numeric addition must use f64
   conservatively).
 
-## Unwritten memory, object and runtime subsystems
+## Partial memory, object and runtime subsystems
 
-- Pointer, memory, struct, shape-set, string and RPC lattice families.
-- Memory SSA nodes: Load, Store, New, MemMerge, MemPhi and ReadOnly.
-- Hidden-class transitions, inherited alias allocation and property offsets.
+- Pointer, memory and nominal struct lattice families are implemented with structural interning,
+  dual and meet. Shape-set, string and full RPC behavior remain.
+- Load, Store, MemMerge and ReadOnly nodes are implemented, including alias-aware Load-after-Store,
+  distinct-alias bypass, Store-after-Store, precise MemMerge lookup, and the `MemOps` interface.
+  MemPhi, allocation initialization and bulk call-memory threading are implemented. Full Simple
+  memory escape/finality facts and the remaining Load/Store peepholes remain.
+- Hidden-class transitions, inherited alias allocation and stable payload-relative property
+  offsets are implemented. Shape-set lattice integration and property nodes remain.
 - Named/keyed property and array access nodes.
 - Closures and captured environments.
 - Exceptional control edges.
-- Safepoints, barriers, relocation projections, stack maps and collector metadata.
+- The collector implementation and its runtime metadata consumer. Explicit relocation
+  nodes/projections, schedule- and dominance-sensitive R2 verification, post-write barriers, and
+  typed maps from allocator liveness to final call/allocation return-PC offsets exist; Mach-O and
+  ELF carry aligned stack-map sections.
 - Coil runtime allocation, collection and throw paths.
 
 ## Unwritten optimizer, backend and compilation infrastructure
 
 - Multi-target/escaping-function SCCP integration, type checking and the phase driver. Direct-call
   SCCP and node-aware proof are implemented.
-- Loop tree and infinite-loop exit handling.
-- Instruction selection for arm64 and x86-64.
-- Global code motion, anti-dependencies and block construction.
-- Local scheduling.
-- Register masks, liveness, interference, coalescing, coloring and spilling.
-- Instruction encoding and relocation.
-- Ideal-graph serialization, compilation units, dependency resolution, Mach-O and ELF output.
+- Loop-tree construction and typed infinite-loop exit insertion are implemented for the current IR.
+- Arm64 selection and ABI contracts are implemented for current ideal opcodes. The complete JS
+  semantic/runtime node surface and x86-64 selection remain.
+- GCM, memory anti-dependencies, durable local scheduling, register masks, LRG/IFG construction,
+  coalescing, colouring, splitting/spilling retries and frame finalization are implemented. Phi
+  edge copies follow final Simple's shared-LRG plus edge-Split model; cold-edge-first loop-Phi
+  splitting and legal Split coalescing have direct coverage. Safepoint-specific allocation evidence
+  and broader pressure stress coverage remain.
+- AArch64 encoding, checked local/symbol relocation, literal pools, valid Mach-O/ELF arm64 objects,
+  native Mach-O linking and a complete implemented ideal-to-native execution test are implemented.
+  Split encoding includes IFG-proved X16 scratch expansion for stack-to-stack copies. Preference-
+  aware branch inversion, iterative B19 relaxation through an inverted-condition/B26 veneer, and
+  stack-map/object metadata are implemented. Branch islands beyond B26 range and source-to-
+  executable driver coverage remain.
+- Ideal-graph serialization, compilation units and dependency resolution.
 - Assembly and ordinary IR printers. Graphviz is implemented.
 - The CLI compile/run/dump pipeline.
 

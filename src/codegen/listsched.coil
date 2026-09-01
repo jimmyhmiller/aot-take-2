@@ -1,21 +1,479 @@
 ;; Local scheduling: the order of instructions WITHIN one block.
 
 ;;
-;; GCM says which block; this says which order. The input is a dependency DAG over the block's
-;; nodes — data edges, memory anti-dependencies, call ordering, and fixed-register constraints —
-;; and the output is a linear order that respects it.
+;; Simple's final `ListScheduler.local` schedules a dependency DAG forward. It counts every
+;; block-local input edge (including duplicate operands and GCM-added anti-dependencies), seeds a
+;; ready set with nodes whose count is zero, and decrements a user's count once for every outgoing
+;; edge of the node just emitted. Phi nodes do not consume their arms in the merge block. Proj and
+;; CProj nodes are entry work, Phi nodes immediately follow, ordinary machine nodes use a pressure
+;; score, and CFG tails have the lowest score so the terminator is last.
 ;;
-;; The terminator goes last, always. Nodes that define a fixed register are placed as close to
-;; their consumer as possible, because a fixed-register live range that spans other fixed uses of
-;; the same register forces a copy the allocator cannot remove.
-;;
-;; SCAFFOLD: signatures are final; bodies hard-error. Filled in at S6.
+;; Simple stores the resulting order by rearranging the block head's `_outputs`. We cannot: this
+;; IR's `outs` is the authoritative def-use multiset. `CodeGen.schedule` is therefore the owned
+;; equivalent: a flattened order with per-block bounds.
 (module aot.codegen.listsched)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.codegen.codegen" :use *)
+(import "aot.codegen.machine" :use *)
+(import "aot.codegen.regmask" :use *)
+
+(defstruct SchedState
+  [(members (ArrayList i64))
+   (ready (ArrayList i64))
+   (bcnt (ArrayList i64))
+   (rcnt (ArrayList i64))
+   (remote-use (ArrayList bool))
+   (remote-def (ArrayList bool))
+   (single (ArrayList bool))
+   (announced (ArrayList bool))
+   (emitted (ArrayList bool))])
+
+(defn sched-state-new [] (-> SchedState)
+  (let [a (alloc/malloc-allocator)
+        (mut bcnt) (al-new [i64] a)
+        (mut rcnt) (al-new [i64] a)
+        (mut remote-use) (al-new [bool] a)
+        (mut remote-def) (al-new [bool] a)
+        (mut single) (al-new [bool] a)
+        (mut announced) (al-new [bool] a)
+        (mut emitted) (al-new [bool] a)
+        limit (+ (arena-node-count) 1)
+        (mut i) 0]
+    (loop (if (>= (load i) limit)
+              (break 0)
+              (do
+                (push! [i64] (mut bcnt) 0)
+                (push! [i64] (mut rcnt) 0)
+                (push! [bool] (mut remote-use) false)
+                (push! [bool] (mut remote-def) false)
+                (push! [bool] (mut single) false)
+                (push! [bool] (mut announced) false)
+                (push! [bool] (mut emitted) false)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (let [(mut state) (primitive/zeroed SchedState)]
+      (set! (.members (mut state)) (al-new [i64] a))
+      (set! (.ready (mut state)) (al-new [i64] a))
+      (set! (.bcnt (mut state)) (load bcnt))
+      (set! (.rcnt (mut state)) (load rcnt))
+      (set! (.remote-use (mut state)) (load remote-use))
+      (set! (.remote-def (mut state)) (load remote-def))
+      (set! (.single (mut state)) (load single))
+      (set! (.announced (mut state)) (load announced))
+      (set! (.emitted (mut state)) (load emitted))
+      (load state))))
+
+(defn sched-ideal-op [(n (dyn NodeOps))] (-> i64)
+  (match (mach-of n) (Some [m] (m-ideal-op m)) (None [] (n-op n))))
+
+(defn sched-phi? [(n (dyn NodeOps))] (-> bool)
+  (let [op (sched-ideal-op n)] (or (= op OP-PHI) (= op OP-MEMPHI))))
+
+(defn sched-member? [(n (dyn NodeOps)) (block (dyn NodeOps))] (-> bool)
+  (and (= (n-block-nid n) (n-nid block)) (or (cfg? n) (mach? n))))
+
+(defn sched-edge-register? [(def (dyn NodeOps)) (use_ (dyn NodeOps))] (-> bool)
+  (match (mach-of use_)
+    (None [] false)
+    (Some [mach]
+          (let [(mut i) 1 (mut found) false]
+            (loop (if (or (>= (load i) (n-nins use_)) (load found))
+                      (break 0)
+                      (do
+                        (match (n-in use_ (load i))
+                          (Some [input]
+                                (if (n-same? input def)
+                                    (match (m-regmap mach (load i))
+                                      (Some [_] (set! (mut found) true))
+                                      (None [] 0))
+                                    0))
+                          (None [] 0))
+                        (set! (mut i) (+ (load i) 1))
+                        (continue))))
+            (load found)))))
+
+(defn sched-output-single? [(n (dyn NodeOps))] (-> bool)
+  (match (mach-of n)
+    (None [] false)
+    (Some [mach]
+          (match (m-outregmap mach)
+            (None [] false)
+            (Some [out-mask]
+                  (let [(mut allowed) out-mask
+                        (mut oi) 0]
+                    (loop (if (>= (load oi) (n-nouts n))
+                              (break 0)
+                              (do
+                                (match (n-out n (load oi))
+                                  (Some [use_]
+                                        (match (mach-of use_)
+                                          (Some [use-mach]
+                                                (let [(mut ii) 1]
+                                                  (loop (if (>= (load ii) (n-nins use_))
+                                                            (break 0)
+                                                            (do
+                                                              (match (n-in use_ (load ii))
+                                                                (Some [input]
+                                                                      (if (n-same? input n)
+                                                                          (match (m-regmap use-mach (load ii))
+                                                                            (Some [use-mask]
+                                                                                  (set! (mut allowed)
+                                                                                        (mask-and
+                                                                                          (load allowed)
+                                                                                          use-mask)))
+                                                                            (None [] 0))
+                                                                          0))
+                                                                (None [] 0))
+                                                              (set! (mut ii) (+ (load ii) 1))
+                                                              (continue))))))
+                                          (None [] 0)))
+                                  (None [] 0))
+                                (set! (mut oi) (+ (load oi) 1))
+                                (continue))))
+                    (mask-singleton? (load allowed))))))))
+
+(defn sched-compute-flags! [(block (dyn NodeOps)) (state (mut SchedState))] (-> i64)
+  (let [(mut mi) 0]
+    (loop (if (>= (load mi) (len (.members state)))
+              (break 0)
+              (let [n (match (arena-node (get (.members state) (load mi)))
+                        (Some [x] x) (None [] (unreachable-node)))
+                    (mut remote-use) false
+                    (mut remote-def) false
+                    (mut i) 1]
+                (loop (if (>= (load i) (n-nins n))
+                          (break 0)
+                          (do
+                            (match (n-in n (load i))
+                              (Some [def]
+                                    (if (and (!= (n-block-nid def) (n-nid block))
+                                             (sched-edge-register? def n))
+                                        (set! (mut remote-use) true)
+                                        0))
+                              (None [] 0))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (set! (mut i) 0)
+                (loop (if (>= (load i) (n-nouts n))
+                          (break 0)
+                          (do
+                            (match (n-out n (load i))
+                              (Some [use_]
+                                    (if (and (!= (n-block-nid use_) (n-nid block))
+                                             (sched-edge-register? n use_))
+                                        (set! (mut remote-def) true)
+                                        0))
+                              (None [] 0))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (set! (mut (.remote-use state)) (n-nid n) (load remote-use))
+                (set! (mut (.remote-def state)) (n-nid n) (load remote-def))
+                (set! (mut (.single state)) (n-nid n) (sched-output-single? n))
+                (set! (mut mi) (+ (load mi) 1))
+                (continue))))
+    ;; Simple propagates `_single` through the input an instruction must overwrite. Iterate because
+    ;; arena order need not be definition order and two-address chains can be arbitrarily long.
+    (let [(mut changed) true (mut guard) 0]
+      (loop (if (not (load changed))
+                (break 0)
+                (do
+                  (set! (mut changed) false)
+                  (set! (mut mi) 0)
+                  (loop (if (>= (load mi) (len (.members state)))
+                            (break 0)
+                            (let [n (match (arena-node (get (.members state) (load mi)))
+                                      (Some [x] x) (None [] (unreachable-node)))]
+                              (match (mach-of n)
+                                (Some [mach]
+                                      (let [two (m-two-address mach)]
+                                        (if (and (> two 0)
+                                                 (< two (n-nins n))
+                                                 (not (get (.single state) (n-nid n))))
+                                            (match (n-in n two)
+                                              (Some [def]
+                                                    (if (get (.single state) (n-nid def))
+                                                        (do
+                                                          (set! (mut (.single state)) (n-nid n) true)
+                                                          (set! (mut changed) true))
+                                                        0))
+                                              (None [] 0))
+                                            0)))
+                                (None [] 0))
+                              (set! (mut mi) (+ (load mi) 1))
+                              (continue))))
+                  (set! (mut guard) (+ (load guard) 1))
+                  (if (and (load changed) (> (load guard) (len (.members state))))
+                      (broken "sched-compute-flags!: two-address propagation did not converge")
+                      0)
+                  (continue)))))
+    0))
+
+(defn sched-collect! [(block (dyn NodeOps)) (state (mut SchedState))] (-> i64)
+  (let [(mut id) 1]
+    (loop (if (> (load id) (arena-node-count))
+              (break 0)
+              (do
+                (match (arena-node (load id))
+                  (Some [n]
+                        (if (and (sched-member? n block) (not (n-same? n block)))
+                            (push! [i64] (mut (.members state)) (n-nid n))
+                            0))
+                  (None [] 0))
+                (set! (mut id) (+ (load id) 1))
+                (continue))))
+    (len (.members state))))
+
+(defn sched-count-inputs! [(block (dyn NodeOps)) (state (mut SchedState))] (-> i64)
+  (let [(mut mi) 0]
+    (loop (if (>= (load mi) (len (.members state)))
+              (break 0)
+              (let [n (match (arena-node (get (.members state) (load mi)))
+                        (Some [x] x) (None [] (unreachable-node)))
+                    (mut count) 0
+                    (mut i) 0]
+                (if (not (sched-phi? n))
+                    (loop (if (>= (load i) (n-nins n))
+                              (break 0)
+                              (do
+                                (match (n-in n (load i))
+                                  (Some [def]
+                                        (if (and (not (n-same? def block))
+                                                 (sched-member? def block))
+                                            (set! (mut count) (+ (load count) 1))
+                                            0))
+                                  (None [] 0))
+                                (set! (mut i) (+ (load i) 1))
+                                (continue))))
+                    0)
+                (set! (mut (.bcnt state)) (n-nid n) (load count))
+                (set! (mut mi) (+ (load mi) 1))
+                (continue))))
+    0))
+
+(defn sched-announce-ready! [(block (dyn NodeOps))
+                             (n (dyn NodeOps))
+                             (state (mut SchedState))] (-> i64)
+  (let [id (n-nid n)]
+    (if (or (get (.announced state) id)
+            (!= (get (.bcnt state) id) 0)
+            (!= (get (.rcnt state) id) 0))
+        0
+        (do
+          (set! (mut (.announced state)) id true)
+          (push! [i64] (mut (.ready state)) id)
+          ;; A definition becoming ready moves each local user edge from blocked to
+          ;; ready-but-unscheduled. Duplicate edges move independently.
+          (let [(mut i) 0]
+            (loop (if (>= (load i) (n-nouts n))
+                      (break 0)
+                      (do
+                        (match (n-out n (load i))
+                          (Some [use_]
+                                (if (and (sched-member? use_ block) (not (sched-phi? use_)))
+                                    (let [use-id (n-nid use_)
+                                          blocked (get (.bcnt state) use-id)]
+                                      (if (<= blocked 0)
+                                          (panic-i "sched-announce-ready!: blocked count underflow"
+                                                   use-id)
+                                          (do
+                                            (set! (mut (.bcnt state)) use-id (- blocked 1))
+                                            (set! (mut (.rcnt state))
+                                                  use-id
+                                                  (+ (get (.rcnt state) use-id) 1)))))
+                                    0))
+                          (None [] 0))
+                        (set! (mut i) (+ (load i) 1))
+                        (continue)))))
+          0))))
+
+(defn sched-seed-ready! [(block (dyn NodeOps)) (state (mut SchedState))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len (.members state)))
+              (break 0)
+              (let [n (match (arena-node (get (.members state) (load i)))
+                        (Some [x] x) (None [] (unreachable-node)))]
+                (sched-announce-ready! block n (mut state))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))
+
+(defn sched-opening-pressure [(n (dyn NodeOps)) (state (mut SchedState))] (-> i64)
+  (match (mach-of n)
+    (None [] 0)
+    (Some [mach]
+          (if (and (> (n-nouts n) 1) (m-clone-cheap? mach))
+              0
+              (let [(mut regular) 0
+                    (mut constrained) 0
+                    (mut tail-use) false
+                    (mut i) 0]
+                (loop (if (>= (load i) (n-nouts n))
+                          (break 0)
+                          (do
+                            (match (n-out n (load i))
+                              (Some [use_]
+                                    (if (and (< (n-nid use_) (len (.bcnt state)))
+                                             (!= (n-block-nid use_) 0))
+                                        (if (cfg? use_)
+                                            (set! (mut tail-use) true)
+                                            (if (> (get (.bcnt state) (n-nid use_)) 0)
+                                                (if (get (.single state) (n-nid n))
+                                                    (set! (mut constrained) (+ (load constrained) 1))
+                                                    (set! (mut regular) (+ (load regular) 1)))
+                                                0))
+                                        0))
+                              (None [] 0))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (if (load tail-use)
+                    10000
+                    (+ (* 10 (if (> (load regular) 2) 2 (load regular)))
+                       (* 100 (if (> (load constrained) 2) 2 (load constrained))))))))))
+
+(defn sched-closing-pressure [(n (dyn NodeOps)) (state (mut SchedState))] (-> i64)
+  (match (mach-of n)
+    (None [] 0)
+    (Some [mach]
+          (let [(mut regular) 0
+                (mut constrained) 0
+                (mut i) 1]
+            (loop (if (>= (load i) (n-nins n))
+                      (break 0)
+                      (do
+                        (match (n-in n (load i))
+                          (Some [def]
+                                (if (and (< (n-nid def) (len (.single state)))
+                                         (= (n-nouts def) 1))
+                                    (let [fixed-use
+                                            (match (m-regmap mach (load i))
+                                              (Some [mask] (mask-singleton? mask))
+                                              (None [] false))]
+                                      (if (or (get (.single state) (n-nid def)) fixed-use)
+                                          (set! (mut constrained) (+ (load constrained) 1))
+                                          (set! (mut regular) (+ (load regular) 1))))
+                                    0))
+                          (None [] 0))
+                        (set! (mut i) (+ (load i) 1))
+                        (continue))))
+            (+ (* 10 (if (> (load regular) 2) 2 (load regular)))
+               (* 100 (if (> (load constrained) 2) 2 (load constrained))))))))
+
+(defn sched-score [(n (dyn NodeOps)) (state (mut SchedState))] (-> i64)
+  (let [op (sched-ideal-op n)]
+    (if (or (= op OP-PROJ) (= op OP-CPROJ))
+        1001
+        (if (sched-phi? n)
+            1000
+            (if (cfg? n)
+                1
+                (match (mach-of n)
+                  (None [] 500)
+                  (Some [_]
+                        (let [opening (sched-opening-pressure n (mut state))]
+                          (if (> opening 990)
+                              10
+                              (+ (- (if (get (.remote-def state) (n-nid n)) 200 500) opening)
+                                 (sched-closing-pressure n (mut state))))))))))))
+
+(defn sched-ready-pop-best! [(state (mut SchedState))] (-> (dyn NodeOps))
+  (if (= (len (.ready state)) 0)
+      (do (panic "sched-ready-pop-best!: dependency cycle in local schedule")
+          (unreachable-node))
+      (let [(mut best-i) 0
+            (mut i) 1
+            first (match (arena-node (get (.ready state) 0))
+                    (Some [n] n) (None [] (unreachable-node)))
+            (mut best-score) (sched-score first (mut state))
+            (mut best-nid) (n-nid first)]
+        (loop (if (>= (load i) (len (.ready state)))
+                  (break 0)
+                  (let [candidate (match (arena-node (get (.ready state) (load i)))
+                                    (Some [n] n) (None [] (unreachable-node)))
+                        score (sched-score candidate (mut state))]
+                    (if (or (> score (load best-score))
+                            (and (= score (load best-score)) (< (n-nid candidate) (load best-nid))))
+                        (do (set! (mut best-i) (load i))
+                            (set! (mut best-score) score)
+                            (set! (mut best-nid) (n-nid candidate)))
+                        0)
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        (let [picked-id (get (.ready state) (load best-i))
+              last-i (- (len (.ready state)) 1)
+              last-id (get (.ready state) last-i)]
+          (set! (mut (.ready state)) (load best-i) last-id)
+          (match (pop! [i64] (mut (.ready state)))
+            (Some [_] 0) (None [] (do (panic "sched-ready-pop-best!: ready pop failed") 0)))
+          (match (arena-node picked-id)
+            (Some [n] n) (None [] (unreachable-node)))))))
+
+(defn sched-release-users! [(block (dyn NodeOps))
+                            (n (dyn NodeOps))
+                            (state (mut SchedState))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (n-nouts n))
+              (break 0)
+              (do
+                (match (n-out n (load i))
+                  (Some [use_]
+                        (if (and (sched-member? use_ block)
+                                 (not (sched-phi? use_))
+                                 (not (get (.emitted state) (n-nid use_))))
+                            (let [old (get (.bcnt state) (n-nid use_))]
+                              (if (<= (get (.rcnt state) (n-nid use_)) 0)
+                                  (panic-i "sched-release-users!: ready count underflow" (n-nid use_))
+                                  (do
+                                    (set! (mut (.rcnt state))
+                                          (n-nid use_)
+                                          (- (get (.rcnt state) (n-nid use_)) 1))
+                                    (if (and (= old 0) (= (get (.rcnt state) (n-nid use_)) 0))
+                                        (sched-announce-ready! block use_ (mut state))
+                                        0))))
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))
 
 (defn sched-block! [(block (dyn NodeOps))] (-> i64)
-  (do (unimplemented "sched-block!" "S6 — src/codegen/listsched.coil") 0))
+  (if (not (cfg-block-head-of? block))
+      (panic-i "sched-block!: expected a block head" (n-nid block))
+      (let [(mut state) (sched-state-new)
+            count (sched-collect! block (mut state))
+            (mut emitted-count) 0]
+        (code-schedule-begin-block! block)
+        (code-schedule-add! block block)
+        (sched-count-inputs! block (mut state))
+        (sched-compute-flags! block (mut state))
+        (sched-seed-ready! block (mut state))
+        (loop (if (>= (load emitted-count) count)
+                  (break 0)
+                  (let [n (sched-ready-pop-best! (mut state))]
+                    (if (get (.emitted state) (n-nid n))
+                        (panic-i "sched-block!: node entered ready set twice" (n-nid n))
+                        0)
+                    (set! (mut (.emitted state)) (n-nid n) true)
+                    (code-schedule-add! block n)
+                    (sched-release-users! block n (mut state))
+                    (set! (mut emitted-count) (+ (load emitted-count) 1))
+                    (continue))))
+        (code-schedule-end-block! block)
+        (+ count 1))))
 
 (defn sched-run! [] (-> i64)
-  (do (unimplemented "sched-run!" "S6 — src/codegen/listsched.coil") 0))
+  (let [(mut i) 0 (mut blocks) 0]
+    (code-schedule-reset!)
+    (loop (if (>= (load i) (code-cfg-count))
+              (break 0)
+              (let [cfg (code-cfg-at (load i))]
+                (if (cfg-block-head-of? cfg)
+                    (do (sched-block! cfg) (set! (mut blocks) (+ (load blocks) 1)))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load blocks)))

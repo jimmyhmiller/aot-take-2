@@ -6,35 +6,260 @@
 ;; node — a per-port `case` over the opcode, which is the ONE place a port is allowed to know the
 ;; whole ideal opcode set.
 ;;
-;; SCAFFOLD: the trait is final; the ports hard-error. Filled in at S6.
+;; A missing register mask is semantically different from an empty one: `None` means the edge is
+;; control/memory and has no live range; `Some(empty)` is a contradictory register constraint that
+;; forces BuildLRG to split or report an error. Collapsing those cases silently loses hard conflicts.
 (module aot.codegen.machine)
+(import "coil.primitive" :as primitive)
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
+(import "aot.codegen.regmask" :use *)
 
 (deftrait Machine [Self]
   ;; "arm64", "x86_64".
   (mach-name [(self (ptr Self))] (-> (slice u8)))
   ;; Human-readable register names, indexed by register number.
   (mach-reg-name [(self (ptr Self)) (reg i64)] (-> (slice u8)))
+  (mach-default-op-size [(self (ptr Self))] (-> i64))
   ;; Ideal node -> machine node. The port's only whole-opcode-set dispatch.
   (mach-select [(self (ptr Self)) (n (dyn NodeOps))] (-> (dyn NodeOps)))
   ;; Registers a call clobbers.
-  (mach-caller-save [(self (ptr Self))] (-> i64))
+  (mach-caller-save [(self (ptr Self))] (-> (ptr RegMask)))
   ;; Registers that are never saved: a stack pointer, a hardwired zero.
-  (mach-never-save [(self (ptr Self))] (-> i64))
+  (mach-never-save [(self (ptr Self))] (-> (ptr RegMask)))
   ;; Where argument `arg` of a call with signature `sig` must live.
-  (mach-arg-mask [(self (ptr Self)) (sig i64) (arg i64)] (-> i64))
+  (mach-arg-mask [(self (ptr Self)) (sig i64) (arg i64) (max-arg-slot i64)] (-> (ptr RegMask)))
   ;; Where a result must live.
-  (mach-ret-mask [(self (ptr Self)) (sig i64)] (-> i64))
+  (mach-ret-mask [(self (ptr Self)) (sig i64)] (-> (ptr RegMask)))
+  ;; Return-PC location, first stack-slot location, and outgoing stack area.
+  (mach-rpc [(self (ptr Self))] (-> i64))
+  (mach-max-reg [(self (ptr Self))] (-> i64))
+  (mach-max-arg-slot [(self (ptr Self)) (sig i64)] (-> i64))
   ;; A register-to-register (or slot-to-slot) copy, used by splitting.
-  (mach-split [(self (ptr Self)) (lrg i64)] (-> (dyn NodeOps))))
+  (mach-split [(self (ptr Self)) (lrg i64) (kind (slice u8)) (round i64)] (-> (dyn NodeOps)))
+  ;; Materialize one fixed-register value at function entry and consume it at Return.
+  (mach-callee-save [(self (ptr Self))
+                     (fun (dyn NodeOps))
+                     (ret (dyn NodeOps))
+                     (reg i64)] (-> (dyn NodeOps)))
+  (mach-finalize-frame [(self (ptr Self))
+                        (fun (dyn NodeOps))
+                        (max-location i64)
+                        (has-calls bool)] (-> i64))
+  (mach-stack-offset [(self (ptr Self)) (fun (dyn NodeOps)) (location i64)] (-> i64))
+  ;; An unconditional machine branch inserted during block layout.
+  (mach-jump [(self (ptr Self))] (-> (dyn NodeOps))))
 
 ;; The machine nodes themselves: what the allocator and encoder ask of them.
 (deftrait MachNode [Self]
-  (m-regmap [(self (ptr Self)) (i i64)] (-> i64))  ; mask allowed on input i
-  (m-outregmap [(self (ptr Self))] (-> i64))  ; mask allowed for the result
-  (m-killmap [(self (ptr Self))] (-> i64))  ; registers destroyed
+  (m-node [(self (ptr Self))] (-> (dyn NodeOps)))
+  ;; Ideal operation retained by this selected node. Generic scheduling uses this for Phi and
+  ;; call-boundary semantics without importing the active CPU's concrete node structs.
+  (m-ideal-op [(self (ptr Self))] (-> i64))
+  (m-post-select! [(self (ptr Self))] (-> i64))
+  (m-regmap [(self (ptr Self)) (i i64)] (-> (Option (ptr RegMask))))  ; mask allowed on input i
+  (m-outregmap [(self (ptr Self))] (-> (Option (ptr RegMask))))  ; mask allowed for the result
+  (m-proj-outregmap [(self (ptr Self)) (idx i64)] (-> (Option (ptr RegMask))))
+  (m-killmap [(self (ptr Self))] (-> (Option (ptr RegMask))))  ; registers destroyed
   (m-two-address [(self (ptr Self))] (-> i64))  ; 0, or the input the output must share
   (m-commutes [(self (ptr Self))] (-> bool))
-  (m-encoding [(self (ptr Self))] (-> i64))  ; append bytes, gather relocations
-  (m-asm [(self (ptr Self))] (-> (slice u8))))
+  ;; Constants and address materializations may be cheaper to clone than spill.
+  (m-clone-cheap? [(self (ptr Self))] (-> bool))
+  (m-clone [(self (ptr Self))] (-> (Option (dyn NodeOps))))
+  ;; Exact size after form selection; branch relaxation may ask repeatedly before encoding.
+  (m-size [(self (ptr Self))] (-> i64))
+  ;; Encoder handle owns bytes, offsets and typed relocations. The integer is an arena handle, not
+  ;; a raw pointer; this avoids a module cycle between machine nodes and the encoder implementation.
+  (m-encoding [(self (ptr Self)) (encoder i64)] (-> i64))
+  (m-asm [(self (ptr Self))] (-> (slice u8)))
+  (m-op [(self (ptr Self))] (-> (slice u8))))
+
+;; One target-owned downcast, installed by the active selector. Generic GCM, scheduling and
+;; allocation ask this boundary for machine behavior and never switch on target structs.
+(defstruct SelectedMachineHook
+  [(get (fnptr c [(ref (dyn NodeOps))] (Option (dyn MachNode))))
+   (set bool)])
+
+(defn selected-machine-hook [] (-> (ptr SelectedMachineHook))
+  (primitive/alloc-static SelectedMachineHook))
+
+(defn set-selected-machine-hook! [(get (fnptr c [(ref (dyn NodeOps))] (Option (dyn MachNode))))]
+                                  (-> i64)
+  (do (set! (.get (selected-machine-hook)) get)
+      (set! (.set (selected-machine-hook)) true)
+      0))
+
+(defn mach-of [(n (dyn NodeOps))] (-> (Option (dyn MachNode)))
+  (if (not (.set (selected-machine-hook)))
+      (None [(dyn MachNode)])
+      (primitive/call-ptr (.get (selected-machine-hook)) n)))
+
+(defn mach? [(n (dyn NodeOps))] (-> bool)
+  (match (mach-of n) (Some [_] true) (None [] false)))
+
+(defn mach-ideal-op [(n (dyn NodeOps))] (-> i64)
+  (match (mach-of n)
+    (Some [m] (m-ideal-op m))
+    (None [] (do (panic-i "mach-ideal-op: not a selected machine node" (n-op n)) 0))))
+
+;; Allocation creates target instructions after selection, so it cannot call a concrete CPU
+;; constructor directly. The selected target installs this split factory alongside its MachNode
+;; downcast hook. Control and value are passed at creation time so the concrete node can cache its
+;; result type without a target-specific bind in generic RegAlloc.
+(defstruct SelectedSplitHook
+  [(make (fnptr c [i64 i64 i64 (ref (dyn NodeOps)) (ref (dyn NodeOps))]
+                (dyn NodeOps)))
+   (set bool)])
+
+(const SPLIT-KIND-BEFORE-USE 1)
+(const SPLIT-KIND-AFTER-DEF 2)
+(const SPLIT-KIND-SELF 3)
+
+(defn selected-split-hook [] (-> (ptr SelectedSplitHook))
+  (primitive/alloc-static SelectedSplitHook))
+
+(defn set-selected-split-hook! [(make (fnptr c [i64
+                                                 i64
+                                                 i64
+                                                 (ref (dyn NodeOps))
+                                                 (ref (dyn NodeOps))]
+                                               (dyn NodeOps)))] (-> i64)
+  (do
+    (set! (.make (selected-split-hook)) make)
+    (set! (.set (selected-split-hook)) true)
+    0))
+
+(defn mach-make-split [(lrg i64)
+                       (kind i64)
+                       (round i64)
+                       (control (dyn NodeOps))
+                       (value (dyn NodeOps))] (-> (dyn NodeOps))
+  (if (not (.set (selected-split-hook)))
+      (do (panic "mach-make-split: selected target did not install a split factory")
+          (unreachable-node))
+      (primitive/call-ptr (.make (selected-split-hook)) lrg kind round control value)))
+
+;; Block layout is generic, but branch polarity, projection identity and the concrete unconditional
+;; jump are target facts. The active selector installs this boundary with its other machine hooks.
+(defstruct SelectedLayoutHook
+  [(make-jump (fnptr c [(ref (dyn NodeOps)) (ref (dyn NodeOps))] (dyn NodeOps)))
+   (set-inverted (fnptr c [(ref (dyn NodeOps)) bool] i64))
+   (branch-target (fnptr c [(ref (dyn NodeOps)) i64] (dyn NodeOps)))
+   (relax-branch (fnptr c [(ref (dyn NodeOps)) i64 i64] bool))
+   (is-jump (fnptr c [(ref (dyn NodeOps))] bool))
+   (set bool)])
+
+(defn selected-layout-hook [] (-> (ptr SelectedLayoutHook))
+  (primitive/alloc-static SelectedLayoutHook))
+
+(defn set-selected-layout-hook!
+  [(make-jump (fnptr c [(ref (dyn NodeOps)) (ref (dyn NodeOps))] (dyn NodeOps)))
+   (set-inverted (fnptr c [(ref (dyn NodeOps)) bool] i64))
+   (branch-target (fnptr c [(ref (dyn NodeOps)) i64] (dyn NodeOps)))
+   (relax-branch (fnptr c [(ref (dyn NodeOps)) i64 i64] bool))
+   (is-jump (fnptr c [(ref (dyn NodeOps))] bool))] (-> i64)
+  (let [hook (selected-layout-hook)]
+    (set! (.make-jump hook) make-jump)
+    (set! (.set-inverted hook) set-inverted)
+    (set! (.branch-target hook) branch-target)
+    (set! (.relax-branch hook) relax-branch)
+    (set! (.is-jump hook) is-jump)
+    (set! (.set hook) true)
+    0))
+
+(defn mach-layout-make-jump [(source (dyn NodeOps)) (target (dyn NodeOps))]
+                             (-> (dyn NodeOps))
+  (if (.set (selected-layout-hook))
+      (primitive/call-ptr (.make-jump (selected-layout-hook)) source target)
+      (do (panic "mach-layout-make-jump: selected target did not install layout hooks")
+          (unreachable-node))))
+
+(defn mach-layout-set-inverted! [(branch (dyn NodeOps)) (inverted bool)] (-> i64)
+  (if (.set (selected-layout-hook))
+      (primitive/call-ptr (.set-inverted (selected-layout-hook)) branch inverted)
+      (panic "mach-layout-set-inverted!: selected target did not install layout hooks")))
+
+(defn mach-layout-branch-target [(branch (dyn NodeOps)) (idx i64)] (-> (dyn NodeOps))
+  (if (.set (selected-layout-hook))
+      (primitive/call-ptr (.branch-target (selected-layout-hook)) branch idx)
+      (do (panic "mach-layout-branch-target: selected target did not install layout hooks")
+          (unreachable-node))))
+
+(defn mach-layout-relax-branch! [(branch (dyn NodeOps)) (delta0 i64) (delta1 i64)] (-> bool)
+  (if (.set (selected-layout-hook))
+      (primitive/call-ptr (.relax-branch (selected-layout-hook)) branch delta0 delta1)
+      (do (panic "mach-layout-relax-branch!: selected target did not install layout hooks") false)))
+
+(defn mach-layout-jump? [(n (dyn NodeOps))] (-> bool)
+  (if (.set (selected-layout-hook))
+      (primitive/call-ptr (.is-jump (selected-layout-hook)) n)
+      (do (panic "mach-layout-jump?: selected target did not install layout hooks") false)))
+
+;; The allocator runs after selection and remains target-independent. The selected target exposes
+;; the ABI facts and CalleeSave constructor that cannot be recovered from individual instructions.
+(defstruct SelectedAbiHook
+  [(caller-save (fnptr c [] (ptr RegMask)))
+   (never-save (fnptr c [] (ptr RegMask)))
+   (max-reg (fnptr c [] i64))
+   (callee-save (fnptr c [(ref (dyn NodeOps)) (ref (dyn NodeOps)) i64] (dyn NodeOps)))
+   (finalize-frame (fnptr c [(ref (dyn NodeOps)) i64 bool] i64))
+   (stack-offset (fnptr c [(ref (dyn NodeOps)) i64] i64))
+   (set bool)])
+
+(defn selected-abi-hook [] (-> (ptr SelectedAbiHook))
+  (primitive/alloc-static SelectedAbiHook))
+
+(defn set-selected-abi-hook! [(caller-save (fnptr c [] (ptr RegMask)))
+                              (never-save (fnptr c [] (ptr RegMask)))
+                              (max-reg (fnptr c [] i64))
+                              (callee-save
+                                (fnptr c [(ref (dyn NodeOps))
+                                          (ref (dyn NodeOps))
+                                          i64]
+                                         (dyn NodeOps)))
+                              (finalize-frame
+                                (fnptr c [(ref (dyn NodeOps)) i64 bool] i64))
+                              (stack-offset
+                                (fnptr c [(ref (dyn NodeOps)) i64] i64))] (-> i64)
+  (let [hook (selected-abi-hook)]
+    (set! (.caller-save hook) caller-save)
+    (set! (.never-save hook) never-save)
+    (set! (.max-reg hook) max-reg)
+    (set! (.callee-save hook) callee-save)
+    (set! (.finalize-frame hook) finalize-frame)
+    (set! (.stack-offset hook) stack-offset)
+    (set! (.set hook) true)
+    0))
+
+(defn mach-active-caller-save [] (-> (ptr RegMask))
+  (if (.set (selected-abi-hook))
+      (primitive/call-ptr (.caller-save (selected-abi-hook)))
+      (do (panic "mach-active-caller-save: selected target did not install ABI hooks") (mask-empty))))
+
+(defn mach-active-never-save [] (-> (ptr RegMask))
+  (if (.set (selected-abi-hook))
+      (primitive/call-ptr (.never-save (selected-abi-hook)))
+      (do (panic "mach-active-never-save: selected target did not install ABI hooks") (mask-empty))))
+
+(defn mach-active-max-reg [] (-> i64)
+  (if (.set (selected-abi-hook))
+      (primitive/call-ptr (.max-reg (selected-abi-hook)))
+      (panic "mach-active-max-reg: selected target did not install ABI hooks")))
+
+(defn mach-make-callee-save [(fun (dyn NodeOps)) (ret (dyn NodeOps)) (reg i64)]
+                             (-> (dyn NodeOps))
+  (if (.set (selected-abi-hook))
+      (primitive/call-ptr (.callee-save (selected-abi-hook)) fun ret reg)
+      (do (panic "mach-make-callee-save: selected target did not install ABI hooks")
+          (unreachable-node))))
+
+(defn mach-finalize-active-frame [(fun (dyn NodeOps)) (max-location i64) (has-calls bool)]
+                                  (-> i64)
+  (if (.set (selected-abi-hook))
+      (primitive/call-ptr (.finalize-frame (selected-abi-hook)) fun max-location has-calls)
+      (panic "mach-finalize-active-frame: selected target did not install ABI hooks")))
+
+(defn mach-active-stack-offset [(fun (dyn NodeOps)) (location i64)] (-> i64)
+  (if (.set (selected-abi-hook))
+      (primitive/call-ptr (.stack-offset (selected-abi-hook)) fun location)
+      (panic "mach-active-stack-offset: selected target did not install ABI hooks")))

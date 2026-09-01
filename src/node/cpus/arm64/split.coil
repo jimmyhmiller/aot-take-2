@@ -1,0 +1,172 @@
+;; AArch64 allocator split: register move, spill store, or reload.
+
+;;
+;; Final Simple's `SplitARM` has exactly two inputs: placement control and the value being moved.
+;; Both its use and definition accept the same SPLIT mask: every allocatable GPR/FPR plus the
+;; unbounded stack-slot tail. Coloring therefore chooses whether this instance is a register move,
+;; a store to the frame, or a reload. Encoding inspects the two assigned locations; it does not
+;; guess spill direction from the split's debug label.
+;;
+;; Simple leaves stack-to-stack ARM splits as a TODO. We complete the target contract with IP0/X16:
+;; X16 is excluded from a Split's own input/output masks and declared as its fixed kill. The IFG
+;; therefore proves no unrelated value is live in X16 at the pseudo-instruction, while ordinary
+;; instructions may still use X16 elsewhere. A stack-to-stack split expands to LDR X16; STR X16.
+(module aot.node.cpus.arm64.split)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.codegen.machine" :use *)
+(import "aot.codegen.encoding" :use *)
+(import "aot.codegen.regmask" :use *)
+(import "aot.type.type" :use *)
+
+(const ARM64-SPLIT-SCRATCH 16)  ; AAPCS64 IP0
+
+(defstruct Arm64SplitNode
+  [(hdr NodeHdr) (source-lrg i64) (kind (slice u8)) (round i64) (result-ty i64)])
+
+(defn arm64-split-node [(n (dyn NodeOps))] (-> (ptr Arm64SplitNode))
+  (if (!= (n-op n) OP-MACH-SPLIT)
+      (do
+        (panic-i "arm64-split-node: not an AArch64 split" (n-op n))
+        (primitive/cast (ptr Arm64SplitNode) (hdr n)))
+      (primitive/cast (ptr Arm64SplitNode) (hdr n))))
+
+(defn arm64-split-mask [] (-> (ptr RegMask))
+  (mask-or (mask-range 0 15)
+           (mask-or (mask-of 17)
+                    (mask-or (mask-range 19 28)
+                             (mask-or (mask-range 32 63) (mask-stack 65))))))
+
+(defn arm64-split-make [(lrg i64) (kind (slice u8)) (round i64)] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [Arm64SplitNode] (alloc/create [Arm64SplitNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.source-lrg p) lrg)
+    (set! (.kind p) kind)
+    (set! (.round p) round)
+    (set! (.result-ty p) 0)
+    (n-init! d OP-MACH-SPLIT)
+    (n-add-def! d (None [(dyn NodeOps)]))
+    (n-add-def! d (None [(dyn NodeOps)]))
+    d))
+
+(defn arm64-split-bind! [(split (dyn NodeOps))
+                         (control (dyn NodeOps))
+                         (value (dyn NodeOps))] (-> i64)
+  (let [p (arm64-split-node split)]
+    (n-set-def! split 0 (Some control))
+    (n-set-def! split 1 (Some value))
+    (set! (.result-ty p) (n-ty value))
+    (n-force-ty! split (n-ty value))
+    0))
+
+(defn arm64-split-factory [(lrg i64)
+                           (kind i64)
+                           (round i64)
+                           (control (dyn NodeOps))
+                           (value (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [split
+          (arm64-split-make lrg
+                            (if (= kind SPLIT-KIND-BEFORE-USE)
+                                "before-use"
+                                (if (= kind SPLIT-KIND-AFTER-DEF) "after-def" "self"))
+                            round)]
+    (arm64-split-bind! split control value)
+    split))
+
+(defn arm64-split-stack-word [(load_ bool) (float bool) (offset i64) (rt i64)] (-> i64)
+  (if (or (< offset 0) (!= (% offset 8) 0) (> (/ offset 8) 4095))
+      (do (panic-i "arm64 split: frame offset is not encodable" offset) 0)
+      (| (if float
+             (if load_ 0xfd400000 0xfd000000)
+             (if load_ 0xf9400000 0xf9000000))
+         (| (primitive/ishl (/ offset 8) 10)
+            (| (primitive/ishl 31 5) rt)))))
+
+(defn arm64-encode-split! [(encoder i64) (p (ptr Arm64SplitNode))] (-> i64)
+  (let [d (m-node (primitive/make-dyn MachNode p))
+        src-node (n-in! d 1)
+        src (enc-reg encoder src-node)
+        dst (enc-reg encoder d)
+        src-stack (>= src 65)
+        dst-stack (>= dst 65)
+        float (ty-flt? (n-ty d))]
+    (if (and src-stack dst-stack)
+        (let [src-offset (enc-stack-offset encoder d src)
+              dst-offset (enc-stack-offset encoder d dst)]
+          ;; Copy raw bits through IP0. This works for scalar, pointer, boxed and floating values;
+          ;; the stack-map kind remains attached to the allocated locations, not to the scratch.
+          (enc-add4! encoder
+                     (arm64-split-stack-word true false src-offset ARM64-SPLIT-SCRATCH))
+          (enc-add4! encoder
+                     (arm64-split-stack-word false false dst-offset ARM64-SPLIT-SCRATCH)))
+        (if dst-stack
+            (let [rt (if float (- src 32) src)
+                  offset (enc-stack-offset encoder d dst)]
+              (enc-add4! encoder (arm64-split-stack-word false float offset rt)))
+            (if src-stack
+                (let [rt (if float (- dst 32) dst)
+                      offset (enc-stack-offset encoder d src)]
+                  (enc-add4! encoder (arm64-split-stack-word true float offset rt)))
+                (if (and (< src 32) (< dst 32))
+                    (enc-add4! encoder
+                               (| 0xaa0003e0
+                                  (| (primitive/ishl src 16) dst)))
+                    (if (and (>= src 32) (>= dst 32))
+                        (enc-add4! encoder
+                                   (| 0x1e604000
+                                      (| (primitive/ishl (- src 32) 5) (- dst 32))))
+                        (if (< src 32)
+                            (enc-add4! encoder
+                                       (| 0x9e670000
+                                          (| (primitive/ishl src 5) (- dst 32))))
+                            (enc-add4! encoder
+                                       (| 0x9e660000
+                                          (| (primitive/ishl (- src 32) 5) dst)))))))))
+    0))
+
+(impl NodeOps Arm64SplitNode
+  (hdr [(self (ptr Arm64SplitNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (compute [(self (ptr Arm64SplitNode))] (-> i64) (.result-ty self))
+  (idealize [(self (ptr Arm64SplitNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
+  (label [(self (ptr Arm64SplitNode))] (-> (slice u8)) "split")
+  (eq-extra [(self (ptr Arm64SplitNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (do self other false))
+  (hash-extra [(self (ptr Arm64SplitNode))] (-> i64) (+ (* (.source-lrg self) 31) (.round self)))
+  (is-const? [(self (ptr Arm64SplitNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr Arm64SplitNode))] (-> bool) true)
+  (is-pinned? [(self (ptr Arm64SplitNode))] (-> bool) false)
+  (binop-copy [(self (ptr Arm64SplitNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)])))
+
+(impl MachNode Arm64SplitNode
+  (m-node [(self (ptr Arm64SplitNode))] (-> (dyn NodeOps))
+          (primitive/make-dyn NodeOps self))
+  (m-ideal-op [(self (ptr Arm64SplitNode))] (-> i64) OP-BARRIER)
+  (m-post-select! [(self (ptr Arm64SplitNode))] (-> i64) 0)
+  (m-regmap [(self (ptr Arm64SplitNode)) (i i64)] (-> (Option (ptr RegMask)))
+            (if (= i 1) (Some (arm64-split-mask)) (None [(ptr RegMask)])))
+  (m-outregmap [(self (ptr Arm64SplitNode))] (-> (Option (ptr RegMask)))
+               (Some (arm64-split-mask)))
+  (m-proj-outregmap [(self (ptr Arm64SplitNode)) (idx i64)] (-> (Option (ptr RegMask)))
+                    (do
+                      (panic-i "Arm64SplitNode has no projected result" idx)
+                      (None [(ptr RegMask)])))
+  (m-killmap [(self (ptr Arm64SplitNode))] (-> (Option (ptr RegMask)))
+             (do self (Some (mask-of ARM64-SPLIT-SCRATCH))))
+  (m-two-address [(self (ptr Arm64SplitNode))] (-> i64) 0)
+  (m-commutes [(self (ptr Arm64SplitNode))] (-> bool) false)
+  (m-clone-cheap? [(self (ptr Arm64SplitNode))] (-> bool) false)
+  (m-clone [(self (ptr Arm64SplitNode))] (-> (Option (dyn NodeOps)))
+           (None [(dyn NodeOps)]))
+  (m-size [(self (ptr Arm64SplitNode))] (-> i64)
+          (let [d (primitive/make-dyn NodeOps self)]
+            (if (and (>= (n-reg (n-in! d 1)) 65) (>= (n-reg d) 65)) 8 4)))
+  (m-encoding [(self (ptr Arm64SplitNode)) (encoder i64)] (-> i64)
+              (arm64-encode-split! encoder self))
+  (m-asm [(self (ptr Arm64SplitNode))] (-> (slice u8)) "mov")
+  (m-op [(self (ptr Arm64SplitNode))] (-> (slice u8)) "mov"))

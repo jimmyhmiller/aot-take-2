@@ -1,10 +1,331 @@
-;; arm64 machine nodes: the branch family.
+;; ============================================================================
 
+;; ARM64 CONDITIONAL BRANCHES AND CONTROL PROJECTIONS
+;; ============================================================================
 ;;
-;; SCAFFOLD: filled in at S6. See src/node/cpus/arm64/arm64.coil.
+;; Final Simple's BranchARM bypasses SetARM after selection: CSET is needed when a comparison is a
+;; language value, but a branch consumes FLAGS directly. We construct that final edge immediately.
+;; A non-comparison predicate receives an explicit compare-against-zero FLAGS producer. Never keeps
+;; a null predicate and remains an unconditional synthetic exit. CProj stays a zero-byte block head.
 (module aot.node.cpus.arm64.branch)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
+(import "aot.node.cfg" :use *)
+(import "aot.node.control" :use *)
+(import "aot.codegen.machine" :use *)
+(import "aot.codegen.encoding" :use *)
+(import "aot.codegen.regmask" :use *)
+(import "aot.node.cpus.arm64.base" :use *)
+(import "aot.node.cpus.arm64.bits" :use *)
+
+;; Target-local ideal identity for a block-layout jump. It is never accepted by the frontend or
+;; optimizer selector; Machine.mach-jump constructs it only after selected CFG layout begins.
+(const ARM64-IDEAL-JUMP 10000)
+
+(defstruct Arm64CfgNode
+  [(hdr NodeHdr)
+   (ideal-op i64)
+   (condition i64)
+   (proj-idx i64)
+   (result-ty i64)
+   (block-head bool)
+   (size i64)
+   (inverted bool)
+   (jump-target-nid i64)])
+
+(defn arm64-cfg-node [(n (dyn NodeOps))] (-> (ptr Arm64CfgNode))
+  (if (!= (n-op n) OP-MACH-CFG)
+      (do
+        (panic-i "arm64-cfg-node: not selected CFG" (n-op n))
+        (primitive/cast (ptr Arm64CfgNode) (hdr n)))
+      (primitive/cast (ptr Arm64CfgNode) (hdr n))))
+
+(defn arm64-cfg-install-hook [(n (dyn NodeOps))] (-> (Option (dyn CFGOps)))
+  (if (= (n-op n) OP-MACH-CFG)
+      (Some (primitive/make-dyn CFGOps (primitive/cast (ptr Arm64CfgNode) (hdr n))))
+      (None [(dyn CFGOps)])))
+
+(defn arm64-cfg-alloc [(src (dyn NodeOps))
+                       (ideal-op i64)
+                       (condition i64)
+                       (proj-idx i64)
+                       (block-head bool)
+                       (size i64)] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [Arm64CfgNode] (alloc/create [Arm64CfgNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.ideal-op p) ideal-op)
+    (set! (.condition p) condition)
+    (set! (.proj-idx p) proj-idx)
+    (set! (.result-ty p) (n-ty src))
+    (set! (.block-head p) block-head)
+    (set! (.size p) size)
+    (set! (.inverted p) false)
+    (set! (.jump-target-nid p) 0)
+    (n-init! d OP-MACH-CFG)
+    (arm64-scalar--raw-inputs! d src)
+    (n-force-ty! d (.result-ty p))
+    d))
+
+(defn arm64-jump-make [] (-> (dyn NodeOps))
+  (let [jump (arm64-cfg-alloc (xctrl-make) ARM64-IDEAL-JUMP 0 -1 false 4)]
+    ;; Like final Simple's UJmpARM constructor, the jump is born unbound. Block layout installs
+    ;; input zero once it knows which scheduled block needs the explicit transfer.
+    (loop (if (= (n-nins jump) 0)
+              (break 0)
+              (do (pop! (mut (.ins (hdr jump)))) (continue))))
+    jump))
+
+(defn arm64-layout-jump [(source (dyn NodeOps)) (target (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [jump (arm64-jump-make)]
+    (n-add-def! jump (Some source))
+    (set! (.jump-target-nid (arm64-cfg-node jump)) (n-nid target))
+    (n-set-block-nid! jump (n-block-nid source))
+    (n-set-early-nid! jump (n-block-nid source))
+    jump))
+
+(defn arm64-layout-set-inverted! [(branch (dyn NodeOps)) (inverted bool)] (-> i64)
+  (let [p (arm64-cfg-node branch)]
+    (if (!= (.ideal-op p) OP-IF)
+        (panic-i "arm64-layout-set-inverted!: node is not an If" (n-nid branch))
+        (do (set! (.inverted p) inverted) 0))))
+
+(defn arm64-layout-branch-target [(branch (dyn NodeOps)) (idx i64)] (-> (dyn NodeOps))
+  (if (or (< idx 0) (> idx 1))
+      (do (panic-i "arm64-layout-branch-target: projection index out of range" idx)
+          (unreachable-node))
+      (arm64-cfg-target branch idx)))
+
+(defn arm64-branch-inverted? [(branch (dyn NodeOps))] (-> bool)
+  (.inverted (arm64-cfg-node branch)))
+
+(defn arm64-b19-fits? [(delta i64)] (-> bool)
+  (and (= (% delta 4) 0) (and (>= delta -1048576) (<= delta 1048572))))
+
+(defn arm64-layout-relax-branch! [(branch (dyn NodeOps)) (delta0 i64) (delta1 i64)] (-> bool)
+  (let [p (arm64-cfg-node branch)
+        delta (if (.inverted p) delta1 delta0)]
+    (if (and (= (.size p) 4) (not (arm64-b19-fits? delta)))
+        (do (set! (.size p) 8) true)
+        false)))
+
+(defn arm64-layout-jump? [(n (dyn NodeOps))] (-> bool)
+  (and (= (n-op n) OP-MACH-CFG) (= (.ideal-op (arm64-cfg-node n)) ARM64-IDEAL-JUMP)))
+
+(defn arm64-branch-flags [(pred (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [op (n-op pred)]
+    (if (or (= op OP-EQ) (= op OP-NE) (= op OP-LT) (= op OP-LE) (= op OP-ULT))
+        (n-in! (arm64-compare-select pred) 1)
+        (let [test
+                (arm64-scalar-make pred
+                                   OP-NE
+                                   ARM64-FORM-CMP-IMM
+                                   0
+                                   ARM64-CLASS-GPR
+                                   ARM64-CLASS-FLAGS
+                                   1
+                                   false
+                                   true)]
+          (arm64-scalar-unary-input! test pred)
+          test))))
+
+(defn arm64-branch-condition-op [(pred (dyn NodeOps))] (-> i64)
+  (let [op (n-op pred)]
+    (if (or (= op OP-EQ) (= op OP-NE) (= op OP-LT) (= op OP-LE) (= op OP-ULT)) op OP-NE)))
 
 (defn arm64-branch-select [(n (dyn NodeOps))] (-> (dyn NodeOps))
-  (do (unimplemented "arm64-branch-select" "S6 — src/node/cpus/arm64/branch.coil") (unreachable-node)))
+  (let [op (n-op n)]
+    (if (= op OP-CPROJ)
+        (arm64-cfg-alloc n op 0 (cproj-idx n) true 0)
+        (if (or (= op OP-IF) (= op OP-NEVER))
+            (let [branch
+                    (arm64-cfg-alloc n
+                                     op
+                                     (if (= op OP-NEVER) OP-NE
+                                         (arm64-branch-condition-op (n-in! n 1)))
+                                     -1
+                                     false
+                                     4)]
+              (if (= op OP-NEVER)
+                  (set! (mut (.ins (hdr branch))) 1 (None [(dyn NodeOps)]))
+                  (set! (mut (.ins (hdr branch))) 1 (Some (arm64-branch-flags (n-in! n 1)))))
+              branch)
+            (if (or (= op OP-START) (= op OP-STOP) (= op OP-REGION) (= op OP-LOOP) (= op OP-XCTRL))
+                (arm64-cfg-alloc n
+                                 op
+                                 0
+                                 -1
+                                 (or (= op OP-START) (= op OP-STOP) (= op OP-REGION) (= op OP-LOOP))
+                                 0)
+                (do (panic-i "arm64-branch-select: unsupported ideal opcode" op) (unreachable-node)))))))
+
+(defn arm64-cfg-stop-depth [(n (dyn NodeOps))] (-> i64)
+  (let [(mut i) 0
+        (mut depth) 0]
+    (loop (if (>= (load i) (n-nins n))
+              (break (load depth))
+              (do
+                (match (n-in n (load i))
+                  (Some [pred]
+                        (match (cfg-of pred)
+                          (Some [_]
+                                (let [candidate (+ (cfg-idepth-of pred) 1)]
+                                  (if (> candidate (load depth))
+                                      (set! (mut depth) candidate)
+                                      0)))
+                          (None [] 0)))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+              (continue))))))
+
+(defn arm64-branch-condition [(op i64)] (-> i64)
+  (case op OP-EQ 0 OP-NE 1 OP-LT 11 OP-LE 13 OP-ULT 3
+        (do (panic-i "arm64-branch-condition: unsupported comparison" op) 0)))
+
+(defn arm64-cfg-target [(n (dyn NodeOps)) (projection i64)] (-> (dyn NodeOps))
+  (let [direct (.jump-target-nid (arm64-cfg-node n))
+        (mut i) 0 (mut answer) (None [(dyn NodeOps)])]
+    (if (!= direct 0)
+        (match (arena-node direct)
+          (Some [target] (set! (mut answer) (Some target)))
+          (None [] (panic-i "arm64-cfg-target: jump target is missing" direct)))
+        0)
+    (loop (if (or (>= (load i) (n-nouts n))
+                  (match (load answer) (Some [_] true) (None [] false)))
+              (break 0)
+              (do
+                (match (n-out n (load i))
+                  (Some [use]
+                        (match (cfg-of use)
+                          (Some [_]
+                                (if (or (= projection -1)
+                                        (and (= (enc-ideal-op use) OP-CPROJ)
+                                             (= (.proj-idx (arm64-cfg-node use)) projection)))
+                                    (set! (mut answer) (Some use))
+                                    0))
+                          (None [] 0)))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (match (load answer)
+      (Some [target] target)
+      (None [] (do (panic-i "arm64-cfg-target: selected CFG target is missing" (n-nid n))
+                   (unreachable-node))))))
+
+(defn arm64-encode-cfg! [(encoder i64) (p (ptr Arm64CfgNode))] (-> i64)
+  (let [d (primitive/make-dyn NodeOps p)
+        op (.ideal-op p)]
+    (if (= (.size p) 0)
+        0
+        (if (= op ARM64-IDEAL-JUMP)
+            (do
+              (enc-add4! encoder 0x14000000)
+              (enc-add-local-fixup! encoder ENC-FIXUP-A64-B26 d (arm64-cfg-target d -1)))
+            (if (or (= op OP-IF) (= op OP-NEVER))
+                (let [condition (^ (arm64-branch-condition (.condition p))
+                                    (if (.inverted p) 1 0))
+                      target (arm64-cfg-target d (if (.inverted p) 1 0))]
+                  (if (= (.size p) 8)
+                      (do
+                        ;; Skip the following B when the original condition is false. The B26
+                        ;; supplies the veneer range without introducing a new CFG block.
+                        (enc-add4! encoder (| 0x54000040 (^ condition 1)))
+                        (enc-add4! encoder 0x14000000)
+                        (enc-add-local-fixup-at! encoder ENC-FIXUP-A64-B26 d 4 target))
+                      (do
+                        (enc-add4! encoder (| 0x54000000 condition))
+                        (enc-add-local-fixup! encoder ENC-FIXUP-A64-B19 d target))))
+                (panic-i "arm64-encode-cfg!: nonzero CFG pseudo-node" op))))))
+
+(impl NodeOps Arm64CfgNode
+  (hdr [(self (ptr Arm64CfgNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (compute [(self (ptr Arm64CfgNode))] (-> i64) (.result-ty self))
+  (idealize [(self (ptr Arm64CfgNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
+  (label [(self (ptr Arm64CfgNode))]
+         (-> (slice u8))
+         (if (= (.ideal-op self) ARM64-IDEAL-JUMP)
+             "b"
+             (if (= (.ideal-op self) OP-CPROJ)
+                 "cproj"
+                 (if (= (.ideal-op self) OP-NEVER) "never" "b.cond"))))
+  (eq-extra [(self (ptr Arm64CfgNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (if (!= (n-op other) OP-MACH-CFG)
+                false
+                (let [o (primitive/cast (ptr Arm64CfgNode) (hdr other))]
+                  (and (= (.ideal-op self) (.ideal-op o))
+                       (and (= (.condition self) (.condition o))
+                            (and (= (.proj-idx self) (.proj-idx o))
+                                 (= (.inverted self) (.inverted o))))))))
+  (hash-extra [(self (ptr Arm64CfgNode))]
+              (-> i64)
+              (+ (* (.ideal-op self) 1049)
+                 (+ (* (.condition self) 31)
+                    (+ (.proj-idx self) (if (.inverted self) 1 0)))))
+  (is-const? [(self (ptr Arm64CfgNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr Arm64CfgNode))] (-> bool) true)
+  (is-pinned? [(self (ptr Arm64CfgNode))] (-> bool) true)
+  (binop-copy [(self (ptr Arm64CfgNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)])))
+
+(impl CFGOps Arm64CfgNode
+  (cfg-node [(self (ptr Arm64CfgNode))] (-> (dyn NodeOps)) (primitive/make-dyn NodeOps self))
+  (block-head? [(self (ptr Arm64CfgNode))] (-> bool) (.block-head self))
+  (cfg-idom [(self (ptr Arm64CfgNode))]
+            (-> (Option (dyn NodeOps)))
+            (let [d (primitive/make-dyn NodeOps self)
+                  op (.ideal-op self)]
+              (if (or (= op OP-START) (= op OP-STOP))
+                  (None [(dyn NodeOps)])
+                  (if (= op ARM64-IDEAL-JUMP)
+                      (n-in-safe d 0)
+                  (if (= op OP-REGION)
+                      (region-idom d)
+                      (if (= op OP-LOOP) (n-in-safe d 1) (n-in-safe d 0)))))))
+  (cfg-idepth [(self (ptr Arm64CfgNode))]
+              (-> i64)
+              (let [d (primitive/make-dyn NodeOps self)
+                    op (.ideal-op self)]
+                (if (or (= op OP-START) (= op OP-XCTRL))
+                    0
+                    (if (= op OP-STOP)
+                        (arm64-cfg-stop-depth d)
+                        (if (= op OP-REGION) (region-idepth d) (cfg-idepth-default d)))))))
+
+(impl MachNode Arm64CfgNode
+  (m-node [(self (ptr Arm64CfgNode))] (-> (dyn NodeOps)) (primitive/make-dyn NodeOps self))
+  (m-ideal-op [(self (ptr Arm64CfgNode))] (-> i64) (.ideal-op self))
+  (m-post-select! [(self (ptr Arm64CfgNode))] (-> i64) 0)
+  (m-regmap [(self (ptr Arm64CfgNode)) (i i64)]
+            (-> (Option (ptr RegMask)))
+            (if (and (or (= (.ideal-op self) OP-IF) (= (.ideal-op self) OP-NEVER)) (= i 1))
+                (if (= (.ideal-op self) OP-NEVER)
+                    (None [(ptr RegMask)])
+                    (arm64-class-mask ARM64-CLASS-FLAGS))
+                (None [(ptr RegMask)])))
+  (m-outregmap [(self (ptr Arm64CfgNode))] (-> (Option (ptr RegMask))) (None [(ptr RegMask)]))
+  (m-proj-outregmap [(self (ptr Arm64CfgNode)) (idx i64)]
+                    (-> (Option (ptr RegMask)))
+                    (do (panic-i "Arm64CfgNode has no register projection" idx) (None [(ptr RegMask)])))
+  (m-killmap [(self (ptr Arm64CfgNode))] (-> (Option (ptr RegMask))) (None [(ptr RegMask)]))
+  (m-two-address [(self (ptr Arm64CfgNode))] (-> i64) 0)
+  (m-commutes [(self (ptr Arm64CfgNode))] (-> bool) false)
+  (m-clone-cheap? [(self (ptr Arm64CfgNode))] (-> bool) false)
+  (m-clone [(self (ptr Arm64CfgNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
+  (m-size [(self (ptr Arm64CfgNode))] (-> i64) (.size self))
+  (m-encoding [(self (ptr Arm64CfgNode)) (encoder i64)]
+              (-> i64)
+              (arm64-encode-cfg! encoder self))
+  (m-asm [(self (ptr Arm64CfgNode))]
+         (-> (slice u8))
+         (if (= (.ideal-op self) ARM64-IDEAL-JUMP)
+             "b"
+             (if (= (.ideal-op self) OP-CPROJ) "cproj" "b.cond")))
+  (m-op [(self (ptr Arm64CfgNode))]
+        (-> (slice u8))
+        (if (= (.ideal-op self) ARM64-IDEAL-JUMP)
+            "b"
+            (if (= (.ideal-op self) OP-CPROJ) "cproj" "b.cond"))))

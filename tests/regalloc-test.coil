@@ -1,14 +1,584 @@
-;; SCAFFOLD SUITE: regalloc.
-
-;;
-;; Empty on purpose, and it must STAY named here so the gap is visible in `coil test --list`
-;; rather than being absent. A suite that does not exist cannot be noticed as missing.
-;;
-;; See docs/LAYOUT.md for what this area owns and which build step fills it in.
+;; Register-mask and allocator contracts.
 (module aot.tests.regalloc)
 (import "coil.assert" :use *)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+(import "coil.arraylist" :use *)
+(import "aot.codegen.regmask" :use *)
+(import "aot.codegen.machine" :use *)
+(import "aot.codegen.regalloc" :use *)
+(import "aot.node.boot" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.arith" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.shape" :use *)
+(import "aot.codegen.codegen" :use *)
+(import "aot.codegen.looptree" :use *)
+(import "aot.codegen.gcm" :use *)
+(import "aot.codegen.listsched" :use *)
+(import "aot.node.cpus.arm64" :use *)
+(import "aot.node.cpus.arm64.call" :use *)
+(import "aot.node.cpus.arm64.split" :use *)
+(import "aot.type.type" :use *)
 
-(deftest regalloc_suite_is_a_placeholder
-         ;; Deliberately trivial. When the first real test lands here, DELETE this one — a placeholder
-         ;; left beside real tests inflates the count and makes coverage look better than it is.
-         (assert true))
+(defn regalloc-scheduled-index [(block (dyn NodeOps)) (needle (dyn NodeOps))] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
+    (loop (if (>= (load i) (code-schedule-count block))
+              (break 0)
+              (do
+                (if (n-same? (code-schedule-at block (load i)) needle)
+                    (set! (mut found) (load i))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
+(deftest register_masks_are_not_limited_to_a_machine_word_or_128_locations
+         (let [lo (mask-of 0)
+               flags (mask-of 64)
+               deep-spill (mask-of 513)
+               all (mask-or lo (mask-or flags deep-spill))]
+           (assert (mask-test all 0))
+           (assert (mask-test all 64))
+           (assert (mask-test all 513))
+           (assert-eq (mask-size all) 3)
+           (assert-eq (mask-first all) 0)))
+
+(deftest infinite_stack_masks_intersect_fixed_stack_arguments_exactly
+         (let [stack (mask-stack 65)
+               fixed (mask-of 513)
+               physical (mask-range 0 64)]
+           (assert (mask-test stack 65))
+           (assert (mask-test stack 100000))
+           (assert-eq (mask-size stack) -1)
+           (let [one (mask-and stack fixed)]
+             (assert (mask-singleton? one))
+             (assert-eq (mask-first one) 513))
+           (assert (mask-empty? (mask-and stack physical)))))
+
+(deftest mask_subtraction_can_punch_a_finite_hole_in_the_infinite_stack_tail
+         (let [stack (mask-stack 65)
+               without (mask-sub stack (mask-of 513))]
+           (assert (mask-test without 512))
+           (assert (not (mask-test without 513)))
+           (assert (mask-test without 514))))
+
+(deftest arm64_aapcs64_uses_independent_integer_and_float_argument_banks
+         (let [a (alloc/malloc-allocator)
+               (mut members) (al-new [i64] a)]
+           (push! [i64] (mut members) (ty-int-bot))
+           (let [(mut i) 0]
+             (loop (if (>= (load i) 9)
+                       (break 0)
+                       (do
+                         (push! [i64] (mut members) (ty-int-bot))
+                         (push! [i64] (mut members) (ty-flt-bot))
+                         (set! (mut i) (+ (load i) 1))
+                         (continue)))))
+           (let [sig (ty-tuple (al-slice (load members)))]
+             (assert-eq (mask-first (arm64-arg-mask sig 2 0)) ARM-X0)
+             (assert-eq (mask-first (arm64-arg-mask sig 3 0)) ARM-D0)
+             (assert-eq (mask-first (arm64-arg-mask sig 16 0)) 7)
+             (assert-eq (mask-first (arm64-arg-mask sig 17 0)) 39)
+             (assert-eq (arm64-max-arg-slot sig) 2)
+             (assert-eq (mask-first (arm64-arg-mask sig 18 0)) 66)
+             (assert-eq (mask-first (arm64-arg-mask sig 19 0)) 67)
+             (assert-eq (mask-first (arm64-arg-mask sig 18 3)) 69)
+             (assert-eq (mask-first (arm64-ret-mask sig)) ARM-X0))))
+
+(deftest arm64_save_masks_respect_darwin_reserved_and_aapcs64_callee_registers
+         (let [caller (arm64-caller-save)
+               callee (arm64-callee-save)
+               never (arm64-never-save)]
+           (assert (mask-test caller ARM-X0))
+           (assert (mask-test caller 48))  ; D16
+           (assert (mask-test caller ARM-FLAGS))
+           (assert (not (mask-test caller ARM-X19)))
+           (assert (not (mask-test caller ARM-D8)))
+           (assert (mask-test callee ARM-X19))
+           (assert (mask-test callee ARM-D8))
+           (assert (mask-test never ARM-X18))
+           (assert (mask-test never ARM-SP))))
+
+(deftest arm64_machine_object_exposes_the_complete_target_contract
+         (do
+           (boot! 1)
+           (let [machine (primitive/make-dyn Machine (arm64-machine))
+                 sig (ty-tuple-of2 (ty-int-bot) (ty-int-bot))]
+             (assert-eq (mach-name machine) "arm64")
+             (assert-eq (mach-reg-name machine ARM-X0) "x0")
+             (assert-eq (mach-reg-name machine ARM-X29) "fp")
+             (assert-eq (mach-reg-name machine ARM-LR) "lr")
+             (assert-eq (mach-reg-name machine ARM-D15) "d15")
+             (assert-eq (mach-reg-name machine ARM-FLAGS) "flags")
+             (assert-eq (mach-default-op-size machine) 4)
+             (assert-eq (mach-rpc machine) ARM-LR)
+             (assert-eq (mach-max-reg machine) ARM-MAX-REG)
+             (assert-eq (mask-first (mach-arg-mask machine sig 2 0)) ARM-X0)
+             (assert-eq (mask-first (mach-ret-mask machine sig)) ARM-X0)
+             (let [a (alloc/malloc-allocator)
+                   (mut members) (al-new [i64] a)]
+               (push! [i64] (mut members) (ty-int-bot))
+               (let [(mut i) 0]
+                 (loop (if (>= (load i) 10)
+                           (break 0)
+                           (do
+                             (push! [i64] (mut members) (ty-int-bot))
+                             (set! (mut i) (+ (load i) 1))
+                             (continue)))))
+               (let [wide-sig (ty-tuple (al-slice (load members)))
+                     start (start-make (ty-int-bot))
+                     fun (fun-make start wide-sig "frame-contract")
+                     selected-fun (mach-select machine fun)]
+                 (assert-eq (arm64-fun-max-arg-slot selected-fun) 2)
+                 (assert-eq (mach-finalize-frame machine selected-fun 68 true) 16)
+                 (assert (arm64-fun-has-calls? selected-fun))
+                 (assert-eq (mach-stack-offset machine selected-fun 67) 0)
+                 (assert-eq (mach-stack-offset machine selected-fun 65) 16)
+                 (assert-eq (mach-stack-offset machine selected-fun 66) 24)))
+             (let [jump (mach-jump machine)]
+               (assert-eq (n-nins jump) 0)
+               (match (mach-of jump)
+                 (Some [mach]
+                       (do
+                         (assert-eq (m-op mach) "b")
+                         (assert-eq (m-size mach) 4)))
+                 (None [] (assert false)))))))
+
+(deftest allocator_materializes_each_aapcs64_callee_save_as_fixed_entry_to_return_liveness
+         (do
+           (boot! 1)
+           (code-reset! 1)
+           (let [start (start-make (ty-int-bot))
+                 fun (fun-make start (ty-tuple-of2 (ty-int-bot) (ty-int-bot)) "callee-saves")
+                 rpc (parm-make-slot fun 0 (ty-int-bot) "$rpc")
+                 arg (parm-make fun 0 (ty-int-bot) "x")
+                 value (add-make arg (con-make (ty-int-con 7)))
+                 ret (return-make fun
+                                  (Some (con-make (ty-mem 1 TY-BOT)))
+                                  value
+                                  (Some rpc)
+                                  (Some fun))
+                 stop (stop-make)]
+             (fun-set-ret! fun ret)
+             (stop-add-return! stop ret)
+             (looptree-build! start stop)
+             (let [selected-stop (arm64-select-graph stop)
+                   selected-ret (n-in! selected-stop 0)
+                   selected-fun (n-in! selected-ret RETURN-CTRL)
+                   selected-start (n-in! selected-fun 1)]
+               (code-set-roots! selected-start selected-stop)
+               (gcm-build-cfg!)
+               (sched-run!)
+               (assert-eq (ra-insert-callee-saves!) 18)
+               (assert-eq (ra-insert-callee-saves!) 0)
+               (assert-eq (n-nins selected-ret) 22)
+               (assert (ra-return-has-callee-save? selected-ret ARM-X19))
+               (assert (ra-return-has-callee-save? selected-ret ARM-X28))
+               (assert (ra-return-has-callee-save? selected-ret ARM-D8))
+               (assert (ra-return-has-callee-save? selected-ret ARM-D15))
+               (assert (not (ra-return-has-callee-save? selected-ret ARM-X0)))
+               (assert (not (ra-return-has-callee-save? selected-ret ARM-LR)))
+               (assert (ra-build-lrg! 0))
+               (let [save (n-in! selected-ret 4)]
+                 (assert-eq (n-reg save) -1)
+                 (match (ra-lrg-mask (n-lrg save))
+                   (Some [mask]
+                         (do
+                           (assert (mask-singleton? mask))
+                           (assert-eq (mask-first mask) ARM-X19)))
+                   (None [] (assert false))))))))
+
+(deftest arm64_split_accepts_registers_and_the_unbounded_stack_tail
+         (do
+           (boot! 1)
+           (let [control (con-make TY-CTRL)
+                 value (con-make (ty-int-bot))
+                 selected-value (arm64-select value)
+                 split (arm64-split-make 7 "test" 2)]
+             (arm64-split-bind! split control selected-value)
+             (assert (n-same? (n-in! split 1) selected-value))
+             (assert-eq (n-ty split) (n-ty selected-value))
+             (match (mach-of split)
+               (Some [mach]
+                     (do
+                       (match (m-outregmap mach)
+                         (Some [mask]
+                               (do
+                                 (assert (mask-test mask ARM-X0))
+                                 (assert (mask-test mask ARM-D0))
+                                 (assert (mask-test mask 65))
+                                 (assert (mask-test mask 100000))))
+                         (None [] (assert false)))
+                       (assert-eq (m-size mach) 4)))
+               (None [] (assert false))))))
+
+(deftest live_ranges_union_by_lower_id_intersect_masks_and_record_hard_conflicts
+         (do
+           (boot! 1)
+           (ra-reset-state! 0)
+           (let [a (con-make (ty-int-bot))
+                 b (con-make (ty-int-bot))
+                 raw (con-make (ty-memptr false (ty-struct "RawLrgObject")))
+                 aid (ra-new-lrg! a)
+                 bid (ra-new-lrg! b)
+                 rid (ra-new-lrg! raw)]
+             (assert (< aid bid))
+             (assert (ra-lrg-and-mask! aid (mask-range 0 5)))
+             (assert (ra-lrg-and-mask! bid (mask-of 4)))
+             (assert-eq (ra-union! bid aid) aid)
+             (assert-eq (ra-lrg-of! b) aid)
+             (match (ra-lrg-mask aid)
+               (Some [mask]
+                     (do
+                       (assert (mask-singleton? mask))
+                       (assert-eq (mask-first mask) 4)))
+               (None [] (assert false)))
+             (assert-eq (ra-lrg-kind aid) LRG-SCALAR)
+             (assert-eq (ra-lrg-kind rid) LRG-RAW-REF)
+             (assert (ra-lrg-and-mask! rid (mask-of 1)))
+             (assert (not (ra-lrg-and-mask! rid (mask-of 2))))
+             (assert (ra-lrg-failed? rid)))))
+
+(deftest gc_kind_join_is_conservative_for_mixed_evidence
+         (do
+           (assert-eq (ra-kind-join LRG-SCALAR LRG-SCALAR) LRG-SCALAR)
+           (assert-eq (ra-kind-join LRG-SCALAR LRG-RAW-REF) LRG-RAW-REF)
+           (assert-eq (ra-kind-join LRG-RAW-REF LRG-BOXED) LRG-BOXED)))
+
+(deftest build_lrg_intersects_selected_def_and_use_masks_and_skips_nonregister_edges
+         (do
+           (boot! 1)
+           (code-reset! 1)
+           (let [start (start-make (ty-int-bot))
+                 fun (fun-make start (ty-tuple-of2 (ty-int-bot) (ty-int-bot)) "build-lrg")
+                 rpc (parm-make-slot fun 0 (ty-int-bot) "$rpc")
+                 arg (parm-make fun 0 (ty-int-bot) "x")
+                 add (add-make arg (con-make (ty-int-con 5000)))
+                 mul (mul-make add (con-make (ty-int-con 3)))
+                 ret (return-make fun
+                                  (Some (con-make (ty-mem 1 TY-BOT)))
+                                  mul
+                                  (Some rpc)
+                                  (Some fun))
+                 stop (stop-make)]
+             (fun-set-ret! fun ret)
+             (stop-add-return! stop ret)
+             (looptree-build! start stop)
+             (let [selected-stop (arm64-select-graph stop)
+                   selected-ret (n-in! selected-stop 0)
+                   selected-memory (n-in! selected-ret RETURN-MEM)
+                   selected-mul (n-in! selected-ret RETURN-VALUE)
+                   selected-add (n-in! selected-mul 1)
+                   selected-arg (n-in! selected-add 1)
+                   selected-fun (n-in! selected-ret RETURN-CTRL)
+                   selected-start (n-in! selected-fun 1)]
+               (code-set-roots! selected-start selected-stop)
+               (gcm-build-cfg!)
+               (sched-run!)
+               (assert (ra-build-lrg! 0))
+               (assert (> (n-lrg selected-arg) 0))
+               (assert (> (n-lrg selected-add) 0))
+               (assert (> (n-lrg selected-mul) 0))
+               (assert (!= (n-lrg selected-arg) (n-lrg selected-add)))
+               (match (ra-lrg-mask (n-lrg selected-arg))
+                 (Some [mask]
+                       (do
+                         (assert (mask-singleton? mask))
+                         (assert-eq (mask-first mask) ARM-X0)))
+                 (None [] (assert false)))
+               (assert-eq (n-lrg selected-memory) 0)
+               (assert-eq (n-lrg selected-ret) 0)
+               (let [split
+                       (ra-split-before-use-node!
+                         0
+                         (n-lrg selected-mul)
+                         selected-ret
+                         RETURN-VALUE
+                         SPLIT-KIND-BEFORE-USE)]
+                 (assert (n-same? (n-in! selected-ret RETURN-VALUE) split))
+                 (assert (n-same? (n-in! split 1) selected-mul))
+                 (assert (n-has? (.outs (hdr selected-mul)) split))
+                 (assert (n-has? (.outs (hdr split)) selected-ret))
+                 (sched-run!)
+                 (assert (< (regalloc-scheduled-index selected-fun selected-mul)
+                            (regalloc-scheduled-index selected-fun split)))
+                 (assert (< (regalloc-scheduled-index selected-fun split)
+                            (regalloc-scheduled-index selected-fun selected-ret))))))))
+
+(deftest ifg_adds_an_edge_between_independent_values_live_at_the_same_use
+         (do
+           (boot! 1)
+           (code-reset! 1)
+           (let [start (start-make (ty-int-bot))
+                 fun (fun-make start (ty-tuple-of2 (ty-int-bot) (ty-int-bot)) "ifg")
+                 rpc (parm-make-slot fun 0 (ty-int-bot) "$rpc")
+                 arg (parm-make fun 0 (ty-int-bot) "x")
+                 left (add-make arg (con-make (ty-int-con 5000)))
+                 right (mul-make arg (con-make (ty-int-con 7)))
+                 value (add-make left right)
+                 ret (return-make fun
+                                  (Some (con-make (ty-mem 1 TY-BOT)))
+                                  value
+                                  (Some rpc)
+                                  (Some fun))
+                 stop (stop-make)]
+             (fun-set-ret! fun ret)
+             (stop-add-return! stop ret)
+             (looptree-build! start stop)
+             (let [selected-stop (arm64-select-graph stop)
+                   selected-ret (n-in! selected-stop 0)
+                   selected-value (n-in! selected-ret RETURN-VALUE)
+                   selected-left (n-in! selected-value 1)
+                   selected-right (n-in! selected-value 2)
+                   selected-fun (n-in! selected-ret RETURN-CTRL)
+                   selected-start (n-in! selected-fun 1)]
+               (code-set-roots! selected-start selected-stop)
+               (gcm-build-cfg!)
+               (sched-run!)
+               (assert (ra-build-lrg! 0))
+               (assert (ra-build-ifg! 0))
+               (assert (ra-ifg-interferes? (n-lrg selected-left) (n-lrg selected-right)))
+               (assert (ra-colour! 0))
+               (assert (>= (n-reg selected-left) 0))
+               (assert (>= (n-reg selected-right) 0))
+               (assert (!= (n-reg selected-left) (n-reg selected-right)))
+               (match (ra-lrg-mask (n-lrg selected-left))
+                 (Some [mask] (assert (mask-test mask (n-reg selected-left))))
+                 (None [] (assert false)))
+               (match (ra-lrg-mask (n-lrg selected-right))
+                 (Some [mask] (assert (mask-test mask (n-reg selected-right))))
+                 (None [] (assert false)))))))
+
+(deftest coalescing_unions_a_noninterfering_split_with_its_source
+         (do
+           (boot! 1)
+           (code-reset! 1)
+           (let [start (start-make (ty-int-bot))
+                 fun (fun-make start (ty-tuple-of2 (ty-int-bot) (ty-int-bot)) "coalesce")
+                 value (con-make (ty-int-con 5000))
+                 ret (return-make fun
+                                  (Some (con-make (ty-mem 1 TY-BOT)))
+                                  value
+                                  (None [(dyn NodeOps)])
+                                  (Some fun))
+                 stop (stop-make)]
+             (fun-set-ret! fun ret)
+             (stop-add-return! stop ret)
+             (looptree-build! start stop)
+             (let [selected-stop (arm64-select-graph stop)
+                   selected-ret (n-in! selected-stop 0)
+                   selected-value (n-in! selected-ret RETURN-VALUE)
+                   selected-fun (n-in! selected-ret RETURN-CTRL)
+                   selected-start (n-in! selected-fun 1)]
+               (code-set-roots! selected-start selected-stop)
+               (gcm-build-cfg!)
+               (sched-run!)
+               (assert (ra-build-lrg! 0))
+               (let [split
+                       (ra-split-before-use-node!
+                         0
+                         (n-lrg selected-value)
+                         selected-ret
+                         RETURN-VALUE
+                         SPLIT-KIND-BEFORE-USE)]
+                 (sched-run!)
+                 (assert (ra-build-lrg! 0))
+                 (assert (ra-build-ifg! 0))
+                 (let [source-lrg (n-lrg selected-value)
+                       split-lrg (n-lrg split)]
+                   (assert (!= source-lrg split-lrg))
+                   (assert (not (ra-ifg-interferes? source-lrg split-lrg)))
+                   (assert (ra-coalesce! 0))
+                   (assert-eq (ra-lrg-of! selected-value) (ra-lrg-of! split))
+                   (assert (ra-colour! 0))
+                   (assert-eq (n-reg selected-value) ARM-X0)
+                   (assert-eq (n-reg split) ARM-X0)))))))
+
+(deftest ifg_subtracts_call_clobbers_from_a_value_live_across_allocation
+         (do
+           (boot! 1)
+           (code-reset! 1)
+           (let [start (start-make (ty-int-bot))
+                 fun (fun-make start (ty-tuple-of2 (ty-int-bot) (ty-int-bot)) "ifg-kill")
+                 arg (parm-make fun 0 (ty-int-bot) "x")
+                 value (add-make arg (con-make (ty-int-con 5000)))
+                 object-ty (ty-struct "IfgKillObject")
+                 allocation (new-make fun (con-make (ty-int-con 32)) SHAPE-EMPTY object-ty)]
+             ;; This is a real scheduling dependency with no register mask: it forces `value`
+             ;; above allocation.
+             (n-add-def! allocation (Some value))
+             (let [memory (proj-make allocation 1 "allocation.memory")
+                   post (add-make value (con-make (ty-int-con 9)))
+                   stop (stop-make)]
+               ;; Keep `post` below the allocation without pretending the dependency carries a
+               ;; register. Only `post`, not the crossing value, is constrained to return in X0.
+               (n-add-def! post (Some allocation))
+               (let [ret (return-make fun
+                                      (Some memory)
+                                      post
+                                      (None [(dyn NodeOps)])
+                                      (Some fun))]
+               (fun-set-ret! fun ret)
+               (stop-add-return! stop ret)
+               (looptree-build! start stop)
+               (let [selected-stop (arm64-select-graph stop)
+                     selected-ret (n-in! selected-stop 0)
+                     selected-memory (n-in! selected-ret RETURN-MEM)
+                     selected-allocation (n-in! selected-memory 0)
+                     selected-post (n-in! selected-ret RETURN-VALUE)
+                     selected-value (n-in! selected-post 1)
+                     selected-fun (n-in! selected-ret RETURN-CTRL)
+                     selected-start (n-in! selected-fun 1)]
+                 (code-set-roots! selected-start selected-stop)
+                 (gcm-build-cfg!)
+                 (sched-run!)
+                 (assert (< (regalloc-scheduled-index selected-fun selected-value)
+                            (regalloc-scheduled-index selected-fun selected-allocation)))
+                 (assert (< (regalloc-scheduled-index selected-fun selected-allocation)
+                            (regalloc-scheduled-index selected-fun selected-post)))
+                 (assert (ra-build-lrg! 0))
+                 (assert (ra-build-ifg! 0))
+                 (match (ra-lrg-mask (n-lrg selected-value))
+                   (Some [mask]
+                         (do
+                           (assert (not (mask-test mask ARM-X0)))
+                           (assert (mask-test mask ARM-X19))))
+                   (None [] (assert false)))))))))
+
+(deftest splitting_a_fixed_return_use_repairs_a_value_live_across_a_call
+         (do
+           (boot! 1)
+           (code-reset! 1)
+           (let [start (start-make (ty-int-bot))
+                 fun (fun-make start (ty-tuple-of2 (ty-int-bot) (ty-int-bot)) "split-retry")
+                 arg (parm-make fun 0 (ty-int-bot) "x")
+                 value (add-make arg (con-make (ty-int-con 5000)))
+                 object-ty (ty-struct "SplitRetryObject")
+                 allocation (new-make fun (con-make (ty-int-con 32)) SHAPE-EMPTY object-ty)]
+             ;; Make the return value cross the allocation. Its X0 return constraint and the
+             ;; allocation's X0 clobber cannot coexist until a split is placed below the call.
+             (n-add-def! allocation (Some value))
+             (let [memory (proj-make allocation 1 "allocation.memory")
+                   ret (return-make fun
+                                    (Some memory)
+                                    value
+                                    (None [(dyn NodeOps)])
+                                    (Some fun))
+                   stop (stop-make)]
+               (fun-set-ret! fun ret)
+               (stop-add-return! stop ret)
+               (looptree-build! start stop)
+               (let [selected-stop (arm64-select-graph stop)
+                     selected-ret (n-in! selected-stop 0)
+                     selected-memory (n-in! selected-ret RETURN-MEM)
+                     selected-allocation (n-in! selected-memory 0)
+                     selected-value (n-in! selected-ret RETURN-VALUE)
+                     selected-fun (n-in! selected-ret RETURN-CTRL)
+                     selected-start (n-in! selected-fun 1)]
+                 (code-set-roots! selected-start selected-stop)
+                 (gcm-build-cfg!)
+                 (sched-run!)
+                 (assert (< (regalloc-scheduled-index selected-fun selected-value)
+                            (regalloc-scheduled-index selected-fun selected-allocation)))
+                 (assert (ra-build-lrg! 0))
+                 (assert (not (ra-build-ifg! 0)))
+                 (assert-eq (ra-split-all! 0) 1)
+                 (let [split (n-in! selected-ret RETURN-VALUE)]
+                   (assert-eq (n-op split) OP-MACH-SPLIT)
+                   (assert (n-same? (n-in! split 1) selected-value))
+                   (assert (< (regalloc-scheduled-index selected-fun selected-allocation)
+                              (regalloc-scheduled-index selected-fun split)))
+                   (assert (< (regalloc-scheduled-index selected-fun split)
+                              (regalloc-scheduled-index selected-fun selected-ret)))
+                   (assert (ra-build-lrg! 1))
+                   (assert (ra-build-ifg! 1))
+                   (assert (ra-colour! 1))
+                   (assert-eq (n-reg split) ARM-X0)
+                   (assert (!= (n-reg selected-value) ARM-X0))))))))
+
+(deftest loop_phi_self_conflicts_split_the_cold_edge_before_the_hot_definition
+         (do
+           (boot! 1)
+           (code-reset! 1)
+           (let [start (start-make (ty-int-bot))
+                 fun (fun-make start (ty-tuple-of2 (ty-int-bot) (ty-int-bot)) "loop-self")
+                 loop-node (loop-make fun)
+                 phi (phi-make loop-node (ty-int-bot) "induction")]
+             (phi-add-value! phi (con-make (ty-int-con 0)))
+             (phi-open! phi)
+             (let [arms (if-arms! (if-make loop-node (con-make (ty-int-range 0 1))))
+                   back (arms-true arms)
+                   exit (arms-false arms)
+                   next (add-make phi (con-make (ty-int-con 1)))
+                   ret (return-make exit
+                                    (Some (con-make (ty-mem 1 TY-BOT)))
+                                    phi
+                                    (None [(dyn NodeOps)])
+                                    (Some fun))
+                   stop (stop-make)]
+               (loop-close! loop-node back)
+               (phi-close! phi next)
+               (fun-set-ret! fun ret)
+               (stop-add-return! stop ret)
+               (looptree-build! start stop)
+               (let [selected-stop (arm64-select-graph stop)
+                     selected-ret (n-in! selected-stop 0)
+                     selected-phi (n-in! selected-ret RETURN-VALUE)
+                     selected-loop (n-in! selected-phi 0)
+                     selected-cold (n-in! selected-phi 1)
+                     selected-hot (n-in! selected-phi 2)
+                     cold-pred (n-in! selected-loop 1)
+                     hot-pred (n-in! selected-loop 2)]
+                 (match (mach-of selected-loop)
+                   (Some [mach] (assert (= (m-ideal-op mach) OP-LOOP)))
+                   (None [] (assert false)))
+                 ;; This test isolates splitting from GCM: install the exact block facts that GCM
+                 ;; supplies for a loop Phi and its predecessor-edge uses.
+                 (n-set-block-nid! cold-pred (n-nid cold-pred))
+                 (n-set-block-nid! hot-pred (n-nid hot-pred))
+                 (n-set-block-nid! selected-loop (n-nid selected-loop))
+                 (n-set-block-nid! selected-phi (n-nid selected-loop))
+                 (n-set-block-nid! selected-hot (n-nid hot-pred))
+                 (ra-reset-state! 0)
+                 (let [leader (ra-new-lrg! selected-phi)]
+                   (ra-assign-to-lrg! selected-cold leader)
+                   (ra-assign-to-lrg! selected-hot leader)
+                   (ra-self-conflict! leader selected-phi)
+                   (assert (ra-split-self-conflict! 0 leader))
+                   (assert-eq (n-op (n-in! selected-phi 1)) OP-MACH-SPLIT)
+                   (assert (n-same? (n-in! (n-in! selected-phi 1) 1) selected-cold))
+                   (assert (n-same? (n-in! selected-phi 2) selected-hot))
+                   ;; The remembered Phi receives its hot definition split only if the conflict
+                   ;; survives into the following allocation round.
+                   (ra-reset-state! 1)
+                   (let [next-leader (ra-new-lrg! selected-phi)]
+                     (ra-assign-to-lrg! selected-hot next-leader)
+                     (ra-self-conflict! next-leader selected-phi)
+                     (assert (ra-split-self-conflict! 1 next-leader))
+                     (assert-eq (n-op (n-in! selected-hot 1)) OP-MACH-SPLIT))))))))
+
+(deftest colouring_reports_an_at_risk_clique_that_has_fewer_colours_than_vertices
+         (do
+           (boot! 1)
+           (ra-reset-state! 0)
+           (let [a (con-make (ty-int-bot))
+                 b (con-make (ty-int-bot))
+                 c (con-make (ty-int-bot))
+                 aid (ra-new-lrg! a)
+                 bid (ra-new-lrg! b)
+                 cid (ra-new-lrg! c)
+                 two (mask-or (mask-of 0) (mask-of 1))]
+             (assert (ra-lrg-and-mask! aid two))
+             (assert (ra-lrg-and-mask! bid two))
+             (assert (ra-lrg-and-mask! cid two))
+             (ra-ifg-add! aid bid)
+             (ra-ifg-add! aid cid)
+             (ra-ifg-add! bid cid)
+             (assert (not (ra-colour! 0)))
+             (assert (> (ra-first-failed) 0))
+             (assert-eq (n-reg a) -1))))
