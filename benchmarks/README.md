@@ -16,6 +16,24 @@ three warmups produced:
 The generated AArch64 executable was **1.09 ± 0.02 times faster** in this whole-process benchmark.
 This is one small recursive numeric workload, not a general JavaScript performance claim.
 
+## Warm-JIT comparison
+
+`fib-warm-aot.ts` and `fib-warm-node.js` each execute one explicit `fib(35)` warmup and then twenty
+more calls in the same process. The warmup participates in the validated aggregate, so neither
+compiler can discard it. V8's optimization trace confirms that `fib` advances through Maglev to
+TurboFan during the run.
+
+Ten measured whole-process runs after one external warmup produced:
+
+| Runtime | Mean | Standard deviation | Range |
+| --- | ---: | ---: | ---: |
+| aot-take-2 | 1.690 s | 0.003 s | 1.686–1.695 s |
+| Node | 1.784 s | 0.075 s | 1.728–1.908 s |
+
+The generated executable was **1.06 ± 0.04 times faster**. This comparison is dominated by
+warmed recursive execution, but it still times the whole process and the shared warmup; it is not
+an isolated in-process timing region.
+
 Reproduce it from the repository root:
 
 ```sh
@@ -23,4 +41,8 @@ coil build --release
 build/release/aot compile benchmarks/fib-aot.ts /tmp/aot-take-2-fib.o
 cc /tmp/aot-take-2-fib.o -o /tmp/aot-take-2-fib
 hyperfine --warmup 3 --runs 15 /tmp/aot-take-2-fib 'node benchmarks/fib-node.js'
+
+build/release/aot compile benchmarks/fib-warm-aot.ts /tmp/aot-take-2-fib-warm.o
+cc /tmp/aot-take-2-fib-warm.o -o /tmp/aot-take-2-fib-warm
+hyperfine --warmup 1 --runs 10 /tmp/aot-take-2-fib-warm 'node benchmarks/fib-warm-node.js'
 ```
