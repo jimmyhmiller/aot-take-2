@@ -186,13 +186,14 @@ aot-take-2/
 │   │   ├── gc.coil          ; ✦ Safepoint, Barrier, relocation projections
 │   │   └── cpus/
 │   │       ├── machnode.coil    ; MachNodeVT: regmap, outregmap, killmap, encoding, asm
-│   │       ├── arm64/  { arm64.coil, base.coil, arith.coil, bits.coil, mem.coil,
+│   │       ├── arm64/  { arm64.coil, base.coil, arith.coil, bits.coil, dynamic.coil, mem.coil,
 │   │       │             phi.coil, branch.coil, call.coil, split.coil }
 │   │       └── x86_64/ { x86_64.coil, arith.coil, bits.coil, mem.coil,
 │   │                     branch.coil, call.coil, encode.coil }
 │   │
 │   ├── codegen/
 │   │   ├── codegen.coil     ; the CODE singleton, Phase, driver()          CodeGen
+│   │   ├── pipeline.coil    ; source-to-object/link/run phase orchestration
 │   │   ├── iterpeeps.coil   ; peepholes to fixpoint                        IterPeeps
 │   │   ├── opto.coil        ; optimistic interprocedural SCCP + call graph Opto
 │   │   ├── typecheck.coil   ; the last check for bad programs

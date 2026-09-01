@@ -408,13 +408,19 @@
 (impl CFGOps FunNode
   (cfg-node [(self (ptr FunNode))] (-> (dyn NodeOps)) (primitive/make-dyn NodeOps self))
   (block-head? [(self (ptr FunNode))] (-> bool) true)
-  ;; A Fun is a Region: its dominator is the LCA of its live callers.
+  ;; Final Simple deliberately bypasses Region dominance for a Fun.  Call edges can be recursive,
+  ;; so taking their LCA would walk a cyclic interprocedural CFG.  A function is its own CFG root
+  ;; except during an inline fold, when input 1 is the one caller being spliced into its body.
   (cfg-idom [(self (ptr FunNode))]
             (-> (Option (dyn NodeOps)))
-            (region-idom (primitive/make-dyn NodeOps self)))
+            (if (.folding self)
+                (n-in-safe (primitive/make-dyn NodeOps self) 1)
+                (None [(dyn NodeOps)])))
   (cfg-idepth [(self (ptr FunNode))]
               (-> i64)
-              (region-idepth (primitive/make-dyn NodeOps self))))
+              (if (.folding self)
+                  (region-idepth (primitive/make-dyn NodeOps self))
+                  1)))
 
 ;; Build a Fun with the unknown-caller hook already installed.
 (defn fun-make [(start (dyn NodeOps)) (sig i64) (name (slice u8))] (-> (dyn NodeOps))
@@ -643,6 +649,25 @@
                 (continue))))
     (load found)))
 
+;; The return-program-counter parameter occupies Call slot 0. It is not a source-language
+;; argument, so keep its lookup separate from `fun-parm`, whose index is deliberately source based.
+(defn fun-rpc-parm [(f (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [cnt (n-nouts f)
+        (mut i) 0
+        (mut found) (None [(dyn NodeOps)])]
+    (loop (if (>= (load i) cnt)
+              (break 0)
+              (do
+                (match (n-out f (load i))
+                  (Some [u]
+                        (if (and (= (n-op u) OP-PARM) (= (parm-call-slot u) 0))
+                            (set! (mut found) (Some u))
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
 ;; ---------------------------------------------------------------------------
 ;; FUNPTR — a constant naming a Fun
 ;;
@@ -732,7 +757,27 @@
   (n-in! c (+ CALL-ARG0 i)))
 
 (defn call-cend [(c (dyn NodeOps))] (-> (Option (dyn NodeOps)))
-  (arena-node (.cend-nid (primitive/cast (ptr CallNode) (hdr c)))))
+  ;; Def-use edges are authoritative after GVN: a CallEnd can be subsumed, making the construction
+  ;; back-pointer stale even though the replacement is correctly wired to this Call.
+  (let [(mut i) 0 (mut found) (None [(dyn NodeOps)])]
+    (loop (if (or (>= (load i) (n-nouts c))
+                  (match (load found) (Some [_] true) (None [] false)))
+              (break 0)
+              (do
+                (match (n-out c (load i))
+                  (Some [use]
+                        (if (and (= (n-op use) OP-CALLEND)
+                                 (match (n-in use 0)
+                                   (Some [owner] (n-same? owner c))
+                                   (None [] false)))
+                            (set! (mut found) (Some use))
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (match (load found)
+      (Some [end] (Some end))
+      (None [] (arena-node (.cend-nid (primitive/cast (ptr CallNode) (hdr c))))))))
 
 (defn call-set-cend! [(c (dyn NodeOps)) (e (dyn NodeOps))] (-> i64)
   (do (set! (.cend-nid (primitive/cast (ptr CallNode) (hdr c))) (n-nid e)) 0))
@@ -1047,6 +1092,43 @@
     (code-add! fun)
     (code-add! c)
     0))
+
+;; Final Simple runs `unlink` after serialization and before instruction selection. The optimizer's
+;; Call -> Fun and Return -> CallEnd discovery edges are not runtime control flow; leaving them in
+;; the selected graph creates cross-function liveness and lets GCM enter a callee from its caller.
+;; The current closed-world frontend produces singleton direct targets, so each live Call has zero
+;; or one concrete edge to remove. The FunPtr input remains and supplies the machine symbol/fidx.
+(defn call-unlink-all! [] (-> i64)
+  (let [limit (arena-node-count) (mut nid) 1 (mut removed) 0]
+    (loop (if (> (load nid) limit)
+              (break (load removed))
+              (do
+                (match (arena-node (load nid))
+                  (Some [call]
+                        (if (and (= (n-op call) OP-CALL) (not (n-dead? call)))
+                            (match (call-cend call)
+                              (Some [end]
+                                    (if (= (n-ty end) TY-INVALID)
+                                        0
+                                        (let [fptr (call-fptr call)]
+                                          (if (and (ty-funptr? (n-ty fptr))
+                                                   (ty-funptr-single? (n-ty fptr)))
+                                              (match (n-in fptr 0)
+                                                (Some [fun]
+                                                      (if (call-linked? call fun)
+                                                          (do
+                                                            (call-unlink! call fun)
+                                                            (set! (mut removed)
+                                                                  (+ (load removed) 1))
+                                                            0)
+                                                          0))
+                                                (None [] 0))
+                                              0))))
+                              (None [] 0))
+                            0))
+                  (None [] 0))
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))))
 
 ;; Has this concrete call-graph edge already been installed?  Fun inputs are the authoritative
 ;; call graph; checking them prevents SCCP revisits from duplicating Region/Parm paths.

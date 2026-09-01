@@ -1,4 +1,5 @@
-> This is experimental software. It probably doesn't work yet.
+> This is experimental software. The admitted frontend slice is runnable; the full JavaScript and
+> TypeScript languages are not yet admitted.
 
 # aot-take-2
 
@@ -26,11 +27,20 @@ coil test        # THE gate. Green is the contract; nothing is committed red.
 coil check       # typecheck every target
 ```
 
-**Green is still a partial compiler, not a runnable one.** The ideal graph core, lattice, integer
-value nodes, control flow, calls, trivial and clone inlining, dynamic guards, graph verification,
-and Phi-constant rewriting are real and tested. The frontend, memory, evaluator and backend remain
-hard-error scaffolding or explicitly owed work; every actual stub dies naming itself and the build
-step that owns it.
+The production driver compiles the admitted source slice to an AArch64 Mach-O object, can link it,
+and can run it natively:
+
+```sh
+coil build
+build/release/aot compile input.ts output.o
+build/release/aot run input.ts output.o output
+```
+
+The native path includes JSL semantic lowering and inlining, optimistic type flow, type checking,
+loop-tree construction, instruction selection, global and local scheduling, iterative graph-coloring
+register allocation, encoding, relocation, object writing, and linking. Unsupported language forms
+are rejected at the parser boundary; scaffold APIs for later language/runtime units still hard-error
+by name.
 
 ## Where things are
 
@@ -40,7 +50,7 @@ step that owns it.
 | `src/type/` | Partial interned lattice: simple types, ints, floats, arbitrary tuples, function-index sets, and dynamic tags |
 | `src/shape.coil` | Planned hidden-class transition tree; currently scaffold |
 | `src/codegen/` | The one-way phase pipeline, from peepholes through to the object file |
-| `src/parse/` | The JS/TS lexer and recursive-descent parser — straight into SSA, no AST |
+| `src/parse/` | The admitted JS/TS lexer, syntax arena, and Scope-driven SSA lowering |
 | `src/jsl/` | The reader, checker and graph lowering for JSL |
 | `jsl/` | The JavaScript runtime library, written in JSL. Already written; we compile toward it |
 | `src/verify.coil` | Live graph verifier for the node families implemented so far |
@@ -49,7 +59,9 @@ step that owns it.
 
 ## Status
 
-Working, with tests: the `(dyn NodeOps)` graph engine and GVN; the interned lattice including
+Working, with tests: source-to-native compilation for numeric literals, bindings, assignment,
+blocks, arithmetic, named and forward calls, conditional expressions, `if`/`else`, basic `while`,
+and recursion; the `(dyn NodeOps)` graph engine and GVN; the interned lattice including
 integer ranges, floats, arbitrary-arity tuples, function-pointer identity sets and dynamic tags;
 integer arithmetic, bitwise and comparison nodes; control flow and Phis; Fun/Parm/Call/CallEnd with
 trivial and clone inlining; dynamic Box/Unbox/TypeTest/Cast guards; and constant push-up through
@@ -60,9 +72,9 @@ edge multiplicity, optimizer/model agreement, fixpoint closure, and Region/Phi a
 object/string value representation, complete float behavior, and memory threading remain correctness
 blockers before this is a general JavaScript IR.
 
-The next front is JSL reading, checking and lowering. `HANDOFF.md` gives the fixture-first target,
-the exact prerequisites and the currently owed correctness work; `docs/LAYOUT.md` §7 has the full
-build order.
+The next frontend work is language expansion beyond that explicit admission boundary: strings,
+objects, general numeric fallback, richer control exits, and the corresponding runtime support.
+`docs/FRONTEND.md` records the exact current contract.
 
 ## Provenance and license
 

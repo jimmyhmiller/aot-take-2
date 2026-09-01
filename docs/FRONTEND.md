@@ -138,7 +138,7 @@ ideal graph  ◄──── JSL definitions, lowered from jsl/index into Fun gr
 specialised graph → backend
 ```
 
-### Current arithmetic slice
+### Current executable slice
 
 The implemented `number`-annotated arithmetic slice preserves the JavaScript representation
 boundary even though its accepted values are presently narrower than ECMAScript:
@@ -154,11 +154,13 @@ Parameter and return annotations are optional, so the same function grammar admi
 JavaScript declarations. Annotated and unannotated functions both use the identical `dyn` return
 and argument signature; the annotation never selects a raw representation.
 
-Externally entered `main` parameters are admitted as `dyn:any`, regardless of their TypeScript
-spelling. Programs that only select or forward those values therefore retain an honest generic
-If/Region/Phi graph. Arithmetic over them is not backend-ready yet: until generic numeric fallback
-exists, its live `%UnboxInt` fails the explicit representation-proof handoff instead of trusting the
-annotation.
+The native entry point is currently the source function `main`. Source-to-native regression tests
+use a zero-argument `main`; externally supplied JavaScript values need an entry adapter and runtime
+argument representation before parameterized entry points can be part of the executable contract.
+Internal function parameters are fully dynamic and are specialized only from closed-world call
+evidence. Arithmetic that remains genuinely polymorphic still fails the explicit representation
+proof at typecheck until the generic numeric runtime path is admitted; annotations are never used
+to bypass that proof.
 
 Function bodies currently admit sequential `let`/`const`, assignment, lexical blocks, expression
 statements, return, calls, arithmetic, conditional expressions, statement `if`/`else`, and basic
@@ -171,6 +173,14 @@ parsing. `while` follows final Simple's atomic loop protocol: an open Loop and l
 built first, then `scope-end-loop!` installs the control backedge and every materialized Phi
 backedge without exposing an intermediate graph. `break`, `continue`, and loop-body returns remain
 outside the admitted subset.
+
+Every member of the current `SyntaxExpr` and `SyntaxStmt` sums has a native execution regression:
+numeric literals, names, grouping, `+`/`-`/`*`, named calls, conditional expressions, `let`, `const`,
+assignment, expression statements, blocks and shadowing, returns, `if` with and without `else`, and
+`while` with block and single-statement bodies. The matrix also covers forward declarations,
+unreached functions, recursion, and zero-, one-, and multi-iteration loops. Lexical recognition of
+additional token kinds is not admission: unsupported primaries fail immediately before graph
+lowering.
 
 The production JSL subset now admits integer literals, lexical `let`, value-producing `if`, calls
 between JSL definitions, and dynamic tag predicates such as `%IsInt`. A recognized tag predicate

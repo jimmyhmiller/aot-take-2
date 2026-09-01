@@ -427,6 +427,23 @@
 (defn parser-node [(nid i64)] (-> (dyn NodeOps))
   (match (arena-node nid) (Some [n] n) (None [] (unreachable-node))))
 
+;; Return the compilation unit's source Start through the public `main` Fun, rather than by graph
+;; search: before Opto the linked JSL callees also expose their own Starts in the Stop input cone.
+(defn parser-entry-start [] (-> (dyn NodeOps))
+  (let [idx (syntax-find-fun "main")]
+    (if (< idx 0)
+        (do (panic "parser-entry-start: program has no main function") (unreachable-node))
+        (let [syntax (syntax-fun-at idx)
+              fun (parser-node (.fun-nid syntax))]
+          (match (n-in fun 1)
+            (Some [start]
+                  (if (= (n-op start) OP-START)
+                      start
+                      (do (panic "parser-entry-start: main is not rooted at Start")
+                          (unreachable-node))))
+            (None [] (do (panic "parser-entry-start: main has no entry hook")
+                         (unreachable-node))))))))
+
 (defn lower-name [(name (slice u8))] (-> (dyn NodeOps))
   (match (scope-lookup (parser-node (.current-scope (parser-state))) name)
     (Some [value] value)
@@ -460,6 +477,12 @@
       (scope-set-mem! scope (proj-make end RETURN-MEM "js-binary.mem"))
       (proj-make end RETURN-VALUE "js-binary.value"))))
 
+;; Source predicates cross the same semantic boundary as arithmetic. `If` consumes the raw Boolean
+;; produced by ECMA-262 ToBoolean; it must never compare a NaN-boxed source value directly with
+;; machine zero.
+(defn lower-js-truthy [(value (dyn NodeOps))] (-> (dyn NodeOps))
+  (jsl-lower-toboolean-value value))
+
 (defn lower-syntax-expr [(id i64)] (-> (dyn NodeOps))
   (let [x (syntax-at id)]
     (if (= (.kind x) SX-NUMBER)
@@ -481,7 +504,7 @@
                                          (lower-syntax-expr (.right x))
                                          "JsMul")
                         (if (= (.kind x) SX-CONDITIONAL)
-                            (let [condition (lower-syntax-expr (.left x))
+                            (let [condition (lower-js-truthy (lower-syntax-expr (.left x)))
                                   iff (if-make (parser-node (.current-ctrl (parser-state))) condition)
                                   arms (if-arms! iff)]
                               ;; Both arms are built before either is exposed to peepholing. Branch
@@ -581,7 +604,7 @@
                                               (set! (mut return-nid) nested-return)
                                               0)))
                                       (if (= (.kind stmt) SS-IF)
-                                          (let [condition (lower-syntax-expr (.expr stmt))
+                                          (let [condition (lower-js-truthy (lower-syntax-expr (.expr stmt)))
                                                 iff
                                                   (if-make (parser-node (.current-ctrl (parser-state)))
                                                            condition)
@@ -630,7 +653,7 @@
                                                         (n-nid body-scope))
                                                   (set! (.current-ctrl (parser-state))
                                                         (n-nid (scope-ctrl body-scope)))
-                                                  (let [condition (lower-syntax-expr (.expr stmt))
+                                                  (let [condition (lower-js-truthy (lower-syntax-expr (.expr stmt)))
                                                         iff
                                                           (if-make (scope-ctrl body-scope)
                                                                    condition)
@@ -796,6 +819,95 @@
                   (continue))))
       (jsl-close-world!)
       stop)))
+
+;; Final Simple does not make every parsed function a code-generation root before optimistic SCCP.
+;; Internal Returns are held temporarily while call discovery runs; otherwise Stop itself keeps an
+;; inlined callee alive and its now-caller-controlled Return can GVN/share values across functions.
+;; `main` remains the public program root throughout.
+(defn parser-prepare-opto! [(stop (dyn NodeOps))] (-> i64)
+  (let [(mut i) 0 (mut detached) 0]
+    (loop (if (>= (load i) (n-nins stop))
+              (break (load detached))
+              (let [ret (n-in! stop (load i))]
+                (match (return-fun ret)
+                  (Some [fun]
+                        (if (= (fun-name fun) "main")
+                            (do (set! (mut i) (+ (load i) 1)) (continue))
+                            (do
+                              (n-keep! ret)
+                              (n-del-def! stop (load i))
+                              (set! (mut detached) (+ (load detached) 1))
+                              (continue))))
+                  (None [] (do (set! (mut i) (+ (load i) 1)) (continue)))))))))
+
+;; Mirror final Simple's post-Opto `keepInCompUnit`: only functions whose Fun remains live and whose
+;; control type is reachable are restored to Stop for machine lowering. The temporary keep is
+;; released after the graph edge is installed so a dead/inlined body can be collected normally.
+(defn parser-finish-opto! [(stop (dyn NodeOps))] (-> i64)
+  (let [(mut fi) 0 (mut retained) 0]
+    (loop (if (>= (load fi) (len (.funs (parser-state))))
+              (break (load retained))
+              (let [syntax (syntax-fun-at (load fi))
+                    fun (parser-node (.fun-nid syntax))]
+                (if (= (.name syntax) "main")
+                    0
+                    (match (fun-ret fun)
+                      (Some [ret]
+                            (if (and (not (n-dead? fun)) (not (ty-high? (n-ty fun))))
+                                (do
+                                  (stop-add-return! stop ret)
+                                  (set! (mut retained) (+ (load retained) 1))
+                                  (n-unkeep! ret))
+                                (n-unkeep! ret)))
+                      (None [] 0)))
+                (set! (mut fi) (+ (load fi) 1))
+                (continue))))))
+
+;; Install final Simple's post-Opto code-generation entry hooks. Optimisation uses concrete
+;; Call->Fun edges to discover and inline callees; machine code cannot retain those
+;; interprocedural CFG cycles, so every surviving function is instead rooted at Start immediately
+;; before unlinking. Matching raw Parm arms preserve the Region/Phi positional invariant without
+;; claiming a new runtime value. RPC is reconstructed here because a single linked caller can make
+;; it constant during Opto, but code generation always needs the architectural return address.
+(defn parser-prepare-codegen! [(start (dyn NodeOps))] (-> i64)
+  (let [(mut fi) 0 (mut prepared) 0]
+    (loop (if (>= (load fi) (len (.funs (parser-state))))
+              (break (load prepared))
+              (let [syntax (syntax-fun-at (load fi))
+                    fun (parser-node (.fun-nid syntax))]
+                (if (and (not (n-dead? fun)) (not (ty-high? (n-ty fun))))
+                    (do
+                      (if (not (fun-unknown-callers? fun))
+                          (do
+                            (n-insert-def! fun 1 (Some start))
+                            (let [cnt (n-nouts fun) (mut i) 0]
+                              (loop (if (>= (load i) cnt)
+                                        (break 0)
+                                        (do
+                                          (match (n-out fun (load i))
+                                            (Some [u]
+                                                  (if (= (n-op u) OP-PARM)
+                                                      (n-insert-def! u 1 (None [(dyn NodeOps)]))
+                                                      0))
+                                            (None [] 0))
+                                          (set! (mut i) (+ (load i) 1))
+                                          (continue))))))
+                          0)
+                      (match (fun-rpc-parm fun)
+                        (Some [rpc]
+                              (match (fun-ret fun)
+                                (Some [ret] (n-set-def! ret RETURN-RPC (Some rpc)))
+                                (None [] (panic "parser-prepare-codegen!: live Fun has no Return"))))
+                        (None []
+                              (let [rpc (parm-make-slot fun 0 (ty-int-bot) "$rpc")]
+                                (match (fun-ret fun)
+                                  (Some [ret] (n-set-def! ret RETURN-RPC (Some rpc)))
+                                  (None [] (panic "parser-prepare-codegen!: live Fun has no Return"))))))
+                      (set! (mut prepared) (+ (load prepared) 1))
+                      0)
+                    0)
+                (set! (mut fi) (+ (load fi) 1))
+                (continue))))))
 
 (defn parse-statement [] (-> (dyn NodeOps))
   (do (unimplemented "parse-statement" "S2 — src/parse/parser.coil") (unreachable-node)))
