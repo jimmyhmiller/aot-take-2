@@ -26,7 +26,7 @@
 
 (defstruct Arm64CallNode
   [(hdr NodeHdr) (ideal-op i64) (result-ty i64) (block-head bool) (direct bool) (fidx i64)
-   (symbol (slice u8)) (size i64)
+   (symbol (slice u8)) (size i64) (entry-return bool)
    (max-arg-slot i64) (frame-adjust i64) (has-calls bool)
    (input-masks (ArrayList (Option (ptr RegMask))))
    (output-mask (Option (ptr RegMask)))
@@ -49,6 +49,20 @@
             (None [(dyn CFGOps)])))
       (arm64-cfg-install-hook n)))
 
+(defn arm64-layout-definition-fidx [(n (dyn NodeOps))] (-> (Option i64))
+  (if (= (n-op n) OP-MACH-CALL)
+      (let [p (arm64-call-node n)]
+        (if (= (.ideal-op p) OP-FUN) (Some (.fidx p)) (None [i64])))
+      (None [i64])))
+
+(defn arm64-layout-call-fidx [(n (dyn NodeOps))] (-> (Option i64))
+  (if (= (n-op n) OP-MACH-CALL)
+      (let [p (arm64-call-node n)]
+        (if (and (= (.ideal-op p) OP-CALL) (.direct p) (>= (.fidx p) 0))
+            (Some (.fidx p))
+            (None [i64])))
+      (None [i64])))
+
 (defn arm64-call-alloc [(src (dyn NodeOps)) (block-head bool) (direct bool) (fidx i64) (size i64)]
                        (-> (dyn NodeOps))
   (let [a (alloc/malloc-allocator)
@@ -62,6 +76,7 @@
     (set! (.fidx p) fidx)
     (set! (.symbol p) "")
     (set! (.size p) size)
+    (set! (.entry-return p) false)
     (set! (.max-arg-slot p) 0)
     (set! (.frame-adjust p) 0)
     (set! (.has-calls p) false)
@@ -86,6 +101,9 @@
 (defn arm64-call-set-fidx! [(n (dyn NodeOps)) (fidx i64)] (-> i64)
   (do (set! (.fidx (arm64-call-node n)) fidx) 0))
 
+(defn arm64-call-set-entry-return! [(n (dyn NodeOps))] (-> i64)
+  (do (set! (.entry-return (arm64-call-node n)) true) 0))
+
 (defn arm64-call-set-input-mask! [(n (dyn NodeOps)) (i i64) (mask (ptr RegMask))] (-> i64)
   (let [p (arm64-call-node n)]
     (if (or (< i 0) (>= i (len (.input-masks p))))
@@ -105,6 +123,9 @@
         p (arm64-call-node save)
         fixed (mask-of reg)]
     (set! (.ideal-op p) OP-MACH-CALLEE-SAVE)
+    ;; A CalleeSave preserves untyped physical bits. The fixed output mask carries its bank; any
+    ;; allocator Split at the save boundary must likewise derive the load/store bank from its
+    ;; allocated physical endpoint rather than inventing a semantic lattice type here.
     (set! (.result-ty p) TY-BOT)
     (loop (if (= (n-nins save) 0)
               (break 0)
@@ -145,10 +166,16 @@
 (defn arm64-fun-has-calls? [(fun (dyn NodeOps))] (-> bool)
   (.has-calls (arm64-call-node fun)))
 
+(const ARM64-FRAME-IMMEDIATE-MAX 16777215)  ; 4095<<12 plus 4095
+
 (defn arm64-frame-adjust-insns [(bytes i64)] (-> i64)
-  (if (= bytes 0)
-      0
-      (+ (if (> (/ bytes 4096) 0) 1 0) (if (> (& bytes 4095) 0) 1 0))))
+  (if (< bytes 0)
+      (do (panic-i "arm64-frame-adjust-insns: negative frame size" bytes) 0)
+      (if (= bytes 0)
+          0
+          (if (<= bytes ARM64-FRAME-IMMEDIATE-MAX)
+              (+ (if (> (/ bytes 4096) 0) 1 0) (if (> (& bytes 4095) 0) 1 0))
+              (+ (arm64-const-insns bytes) 1)))))
 
 (defn arm64-set-return-size! [(fun (dyn NodeOps)) (size i64)] (-> i64)
   (let [(mut nid) 1]
@@ -183,23 +210,26 @@
                                                                  (continue))))
                                                      (None [] (break 0)))))
                                          (load owner)))
-                                  (set! (.size p) size)
+                                  (set! (.size p) (+ size (if (.entry-return p) 32 0)))
                                   0))
                             0))
                   (None [] 0))
                 (set! (mut nid) (+ (load nid) 1))
                 (continue))))))
 
-;; `max-location` is one past the largest allocator location used by this function. Incoming stack
-;; argument homes are below the frame base and do not consume local frame bytes. Non-leaf frames
-;; are rounded to 16 bytes, matching final Simple's AArch64 port and AAPCS64 call alignment.
+;; `max-location` is one past the largest allocator location used by this function. Location
+;; ARM-MAX-REG is AAPCS64 stack argument zero: unlike x86, AArch64's return PC lives in LR and has no
+;; stack home. Incoming argument homes are above the pre-adjustment SP and do not consume local frame
+;; bytes. Final Simple rounds only non-leaf frames; AAPCS64 additionally requires SP to remain
+;; 16-byte aligned whenever it is used for memory access, so every nonempty frame is rounded here.
+;; A leaf spill frame otherwise subtracts eight and immediately addresses an ABI-misaligned SP.
 (defn arm64-fun-finalize-frame! [(fun (dyn NodeOps)) (max-location i64) (has-calls bool)]
                                  (-> i64)
   (let [p (arm64-call-node fun)
         incoming (.max-arg-slot p)
         seen-slots (if (> (- max-location 65) incoming) (- max-location 65) incoming)
         raw (* (- seen-slots incoming) 8)
-        adjusted (if has-calls (* (/ (+ raw 15) 16) 16) raw)]
+        adjusted (if (> raw 0) (* (/ (+ raw 15) 16) 16) 0)]
     (set! (.has-calls p) has-calls)
     (set! (.frame-adjust p) adjusted)
     (set! (.size p) (* 4 (arm64-frame-adjust-insns adjusted)))
@@ -210,24 +240,36 @@
   (let [p (arm64-call-node fun)
         slot (- location 65)
         incoming (.max-arg-slot p)
+        ;; Incoming slot N lives at old SP+N*8, hence new SP+frame+N*8. Locations after the
+        ;; incoming area are ordinary frame slots and rotate down to new SP+0.
         rotated (if (< slot incoming)
                     (+ slot (/ (.frame-adjust p) 8))
                     (- slot incoming))]
     (* rotated 8)))
 
 (defn arm64-encode-sp-adjust! [(encoder i64) (bytes i64) (subtract bool)] (-> i64)
-  (let [high (/ bytes 4096)
-        low (& bytes 4095)
-        base (if subtract 0xd10003ff 0x910003ff)]
-    (if (> high 4095)
-        (panic-i "arm64-encode-sp-adjust!: frame exceeds two-immediate range" bytes)
+  (do
+    (if (< bytes 0)
+        (panic-i "arm64-encode-sp-adjust!: negative frame size" bytes)
         0)
-    (if (> high 0)
-        (enc-add4! encoder (| base (| (primitive/ishl high 10) 0x00400000)))
-        0)
-    (if (> low 0)
-        (enc-add4! encoder (| base (primitive/ishl low 10)))
-        0)
+    (if (<= bytes ARM64-FRAME-IMMEDIATE-MAX)
+        (let [high (/ bytes 4096)
+              low (& bytes 4095)
+              base (if subtract 0xd10003ff 0x910003ff)]
+          (if (> high 0)
+              (enc-add4! encoder (| base (| (primitive/ishl high 10) 0x00400000)))
+              0)
+          (if (> low 0)
+              (enc-add4! encoder (| base (primitive/ishl low 10)))
+              0))
+        (do
+          ;; Large frames use IP0 as an exact 64-bit byte count. ADD/SUB extended-register is
+          ;; required because its Rn=31 encoding denotes SP; shifted-register would denote XZR.
+          (arm64-encode-immediate-to-reg! encoder bytes 16)
+          (enc-add4! encoder
+                     (| (if subtract 0xcb206000 0x8b206000)
+                        (| (primitive/ishl 16 16)
+                           (| (primitive/ishl 31 5) 31))))))
     0))
 
 (defn arm64-encode-call! [(encoder i64) (p (ptr Arm64CallNode))] (-> i64)
@@ -247,12 +289,15 @@
                   (enc-add4! encoder 0x94000000)
               (enc-add-symbol-fixup-at!
                 encoder ENC-FIXUP-A64-BL26 d 4 (.fidx p) (.symbol p)))
-                (if (or (= op OP-CALL) (= op OP-BARRIER))
-                    (if (.direct p)
-                        (do
-                          (enc-add4! encoder 0x94000000)
-                          (enc-add-symbol-fixup!
-                            encoder ENC-FIXUP-A64-BL26 d (.fidx p) (.symbol p)))
+                    (if (or (= op OP-CALL) (= op OP-BARRIER))
+                        (if (.direct p)
+                            (do
+                              (enc-add4! encoder 0x94000000)
+                              (if (enc-has-veneer-route? d)
+                                  ;; BL establishes LR once; each veneer hop is B and preserves it.
+                                  (enc-add-planned-veneer-fixup! encoder d 0)
+                                  (enc-add-symbol-fixup!
+                                    encoder ENC-FIXUP-A64-BL26 d (.fidx p) (.symbol p))))
                         (let [target (n-in! d (- (n-nins d) 1))
                               rn (enc-reg encoder target)]
                           (if (or (< rn ARM64-X0) (> rn ARM64-X28))
@@ -261,6 +306,22 @@
                     (if (= op OP-RETURN)
                         (let [fun (enc-enclosing-fun d)
                               frame (arm64-fun-frame-adjust fun)]
+                          (if (.entry-return p)
+                              (do
+                                ;; Host `main` returns an integer status, while JavaScript functions
+                                ;; return a NaN-boxed Number in X0. Preserve the internal ABI and adapt
+                                ;; only at the process boundary: signed-48 payloads sign-extend, doubles
+                                ;; truncate toward zero through D0.
+                                (enc-add4! encoder 0xd370fc10)  ; lsr x16,x0,#48
+                                (enc-add4! encoder 0xd28fff31)  ; mov x17,#0x7ff9
+                                (enc-add4! encoder 0xeb11021f)  ; cmp x16,x17
+                                (enc-add4! encoder 0x54000061)  ; b.ne double-arm
+                                (enc-add4! encoder 0x9340bc00)  ; sbfx x0,x0,#0,#48
+                                (enc-add4! encoder 0x14000003)  ; b done
+                                (enc-add4! encoder 0x9e670000)  ; fmov d0,x0
+                                (enc-add4! encoder 0x9e780000)  ; fcvtzs x0,d0
+                                0)
+                              0)
                           (arm64-encode-sp-adjust! encoder frame false)
                           (enc-add4! encoder 0xd65f03c0)
                           (enc-end-definition! encoder fun d))

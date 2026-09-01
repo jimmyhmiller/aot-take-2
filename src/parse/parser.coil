@@ -10,20 +10,32 @@
 ;;
 ;; Every construct here is a shape of graph, not a shape of tree:
 ;;
-;;   if/else          dup the scope, parse both arms, merge; Phis appear only where the arms differ
-;;   while/for        the loop protocol in `aot.node.scope` — dup, build, then finalize through
+;;   if/else          dup the scope, lower both arms, merge; Phis appear only where the arms differ
+;;   while            the loop protocol in `aot.node.scope` — dup, build, then finalize through
 ;;                    `scope-end-loop!`, which wires control and immediately fills Phi backedges
-;;   && || ?:         short-circuit is a diamond, so these are `if` with a value
-;;   try/catch        an exceptional edge (`aot.node.exception`); `finally` is duplicated onto
-;;                    every path that leaves the block
-;;   typeof x === "n" a guard, which is why `aot.node.scope`'s `scope-add-guards!` exists: the
-;;                    narrowed value is installed in the slot on the taken edge
+;;   ?:               a full Scope diamond with a value Phi pinned to the merged Region
+;;
+;; Short-circuit expressions, nonlocal loop exits, exceptions and source-level narrowing are not
+;; admitted yet; their intended graph shapes do not masquerade here as implemented parser rules.
+;;
+;; Final Simple's `parseTrinary` builds the If and both CProjs, duplicates the current Scope for the
+;; false arm before parsing the true arm, keeps each arm result across the opposing construction
+;; window, restores the false Scope, then balances and merges the complete Scopes. The value Phi is
+;; pinned to the Region produced by that merge. We preserve that order; in particular, memory is a
+;; Scope slot and therefore joins with arm control rather than following the arm lowered last.
+;;
+;; Simple's `addReturn` keeps control, memory, and expression in a pruned return Scope until every
+;; exit merges. We preserve that lifetime and merge shape in a function-local return accumulator.
+;; Bare returns and live fallthrough contribute the canonical boxed `undefined`; recording any
+;; return kills only that path's current control, so later syntax is unreachable without becoming a
+;; parser error and a sibling branch or loop exit remains live.
 ;;
 ;; TypeScript annotations are parsed by `aot.parse.tstype` and attached as DECLARED types. Declared
 ;; is not proven — see `aot.codegen.opto`.
 ;;
 ;; The admitted subset includes named function declarations, number-annotated parameters/returns,
-;; integer literals, calls, bindings, assignment, blocks, conditional expressions, `if`/`else`,
+;; decimal integer spellings with full binary64 Number semantics, calls, bindings, assignment,
+;; blocks, conditional expressions, `if`/`else`,
 ;; basic `while`, and `+`, `-`, and `*`. Parsing first produces a THIN syntax tree, then lowering
 ;; constructs SSA directly. This is the required JavaScript divergence from final Simple's one-pass
 ;; parser: declarations are hoisted, so every Fun header exists before any body is lowered. The
@@ -33,6 +45,7 @@
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
+(import "coil.str" :use [str->cstr])
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
 (import "aot.node.constant" :use *)
@@ -40,6 +53,7 @@
 (import "aot.node.phi" :use *)
 (import "aot.node.call" :use *)
 (import "aot.node.dynamic" :use *)
+(import "aot.node.memory" :use *)
 (import "aot.node.scope" :use *)
 (import "aot.type.type" :use *)
 (import "aot.jsl.lower" :use *)
@@ -78,6 +92,8 @@
    (lo i64)
    (hi i64)
    (number i64)
+   (number-float f64)
+   (number-rep i64)
    (name (slice u8))
    (left i64)
    (right i64)
@@ -90,6 +106,7 @@
    (body (ArrayList i64))
    (lo i64)
    (hi i64)
+   (fidx i64)
    (fun-nid i64)])
 
 (defstruct SyntaxStmt
@@ -109,6 +126,10 @@
    (current-fun i64)
    (current-ctrl i64)
    (current-scope i64)
+   (return-ctrls (ArrayList i64))
+   (return-mems (ArrayList i64))
+   (return-values (ArrayList i64))
+   (entry-fun-nid i64)
    (booted bool)])
 
 (defn parser-state [] (-> (ptr ParserState))
@@ -121,12 +142,20 @@
           (set! (.exprs p) (al-new [SyntaxExpr] (alloc/malloc-allocator)))
           (set! (.stmts p) (al-new [SyntaxStmt] (alloc/malloc-allocator)))
           (set! (.funs p) (al-new [SyntaxFun] (alloc/malloc-allocator)))
+          (set! (.return-ctrls p) (al-new [i64] (alloc/malloc-allocator)))
+          (set! (.return-mems p) (al-new [i64] (alloc/malloc-allocator)))
+          (set! (.return-values p) (al-new [i64] (alloc/malloc-allocator)))
+          (set! (.entry-fun-nid p) 0)
           (set! (.booted p) true)
           0)
         (do
           (al-clear! [SyntaxExpr] (mut (.exprs p)))
           (al-clear! [SyntaxStmt] (mut (.stmts p)))
           (al-clear! [SyntaxFun] (mut (.funs p)))
+          (al-clear! [i64] (mut (.return-ctrls p)))
+          (al-clear! [i64] (mut (.return-mems p)))
+          (al-clear! [i64] (mut (.return-values p)))
+          (set! (.entry-fun-nid p) 0)
           0))))
 
 (defn parse-fail [(what (slice u8)) (t Token)] (-> i64)
@@ -183,23 +212,33 @@
 (defn syntax-stmt-at [(id i64)] (-> SyntaxStmt)
   (get (.stmts (parser-state)) (- id 1)))
 
-(defn parse-number-value [(t Token)] (-> i64)
+(extern strtod :cc c [(ptr i8) (ptr (ptr i8))] (-> f64))
+
+;; ECMAScript decimal integer literals denote binary64 Numbers, even when their spelling no longer
+;; fits the signed-48 immediate payload. Parse through `strtod` first, then choose the compact int
+;; representation only where binary64 is exact and the NaN-box payload can preserve every bit.
+;; Accumulating in i64 first silently wrapped long spellings before this decision could be made.
+(defn parse-number-value [(t Token)] (-> f64)
   (let [text (token-text t)
-        (mut i) 0
-        (mut n) 0]
-    (loop (if (>= (load i) (len text))
-              (break 0)
-              (do
-                (set! (mut n) (+ (* (load n) 10) (- (cast i64 (get text (load i))) 48)))
-                (set! (mut i) (+ (load i) 1))
-                (continue))))
-    (load n)))
+        buf (str->cstr (alloc/malloc-allocator) text)
+        end (primitive/alloc-stack (ptr i8))
+        value (strtod buf end)]
+    (if (!= (- (primitive/cast i64 (load end)) (primitive/cast i64 buf)) (len text))
+        (do (parse-fail "parser: invalid numeric literal at byte" t) 0.0)
+        value)))
 
 (defn parse-syntax-primary [] (-> i64)
   (let [t (take-token)]
     (if (= (.kind t) TOK-NUMBER)
-        (let [(mut x) (syntax-expr-new SX-NUMBER (.start t) (.end t))]
-          (set! (.number (mut x)) (parse-number-value t))
+        (let [value (parse-number-value t)
+              (mut x) (syntax-expr-new SX-NUMBER (.start t) (.end t))]
+          (if (primitive/fcmp-le value 140737488355327.0)
+              (do
+                (set! (.number (mut x)) (primitive/cast i64 value))
+                (set! (.number-rep (mut x)) REP-INT))
+              (do
+                (set! (.number-float (mut x)) value)
+                (set! (.number-rep (mut x)) REP-DOUBLE)))
           (syntax-add! (load x)))
         (if (= (.kind t) TOK-IDENT)
             (let [(mut x) (syntax-expr-new SX-NAME (.start t) (.end t))]
@@ -292,6 +331,17 @@
             (parse-fail "parser: only the number annotation is admitted at byte" t)
             0))))
 
+;; JavaScript's ASI is a parser decision. An omitted semicolon is legal only at a line terminator,
+;; before `}`, or at EOF; accepting one between two same-line statements changes invalid source
+;; into a different valid program.
+(defn parse-statement-end! [] (-> i64)
+  (if (take-is ";")
+      0
+      (let [next (peek-token)]
+        (if (or (.nl-before next) (token-is next "}") (= (.kind next) TOK-EOF))
+            0
+            (parse-fail "parser: expected semicolon or line terminator at byte" next)))))
+
 (defn parse-syntax-statement [] (-> i64)
   (let [first (peek-token)]
     (if (token-is first "while")
@@ -336,19 +386,27 @@
                   (let [expr (parse-syntax-conditional)
                         parsed (syntax-at expr)
                         (mut stmt) (syntax-stmt-new SS-LET (.start keyword) (.hi parsed))]
-                    (take-is ";")
+                    (parse-statement-end!)
                     (set! (.name (mut stmt)) (token-text name))
                     (set! (.expr (mut stmt)) expr)
                     (set! (.final (mut stmt)) (token-is keyword "const"))
                     (syntax-stmt-add! (load stmt))))
                 (if (token-is first "return")
                     (let [keyword (take-token)
-                          expr (parse-syntax-conditional)
-                          parsed (syntax-at expr)
-                          (mut stmt) (syntax-stmt-new SS-RETURN (.start keyword) (.hi parsed))]
-                      (take-is ";")
-                      (set! (.expr (mut stmt)) expr)
-                      (syntax-stmt-add! (load stmt)))
+                          next (peek-token)]
+                      ;; Return is a restricted production: a line terminator ends it before the
+                      ;; following expression. A missing expression is the JavaScript value
+                      ;; `undefined`; the next line remains a separate, unreachable statement.
+                      (if (or (.nl-before next) (token-is next ";") (token-is next "}") (= (.kind next) TOK-EOF))
+                          (let [(mut stmt) (syntax-stmt-new SS-RETURN (.start keyword) (.end keyword))]
+                            (parse-statement-end!)
+                            (syntax-stmt-add! (load stmt)))
+                          (let [expr (parse-syntax-conditional)
+                                parsed (syntax-at expr)
+                                (mut stmt) (syntax-stmt-new SS-RETURN (.start keyword) (.hi parsed))]
+                            (parse-statement-end!)
+                            (set! (.expr (mut stmt)) expr)
+                            (syntax-stmt-add! (load stmt)))))
                     (if (token-is first "{")
                         (do
                           (take-token)
@@ -370,12 +428,12 @@
                                   (let [rhs (parse-syntax-conditional)
                                         parsed (syntax-at rhs)
                                         (mut stmt) (syntax-stmt-new SS-ASSIGN (.lo lhs-expr) (.hi parsed))]
-                                    (take-is ";")
+                                    (parse-statement-end!)
                                     (set! (.name (mut stmt)) (.name lhs-expr))
                                     (set! (.expr (mut stmt)) rhs)
                                     (syntax-stmt-add! (load stmt))))
                               (let [(mut stmt) (syntax-stmt-new SS-EXPR (.lo lhs-expr) (.hi lhs-expr))]
-                                (take-is ";")
+                                (parse-statement-end!)
                                 (set! (.expr (mut stmt)) lhs)
                                 (syntax-stmt-add! (load stmt))))))))))))
 
@@ -416,46 +474,75 @@
   (get (.funs (parser-state)) i))
 
 (defn syntax-find-fun [(name (slice u8))] (-> i64)
-  (let [(mut i) 0]
-    (loop (if (>= (load i) (len (.funs (parser-state))))
+  ;; Function declarations are hoisted and later declarations replace earlier declarations of the
+  ;; same binding. Resolve from the end so calls and the public entry observe that JavaScript rule;
+  ;; obsolete bodies then disappear through the ordinary closed-world lifetime protocol.
+  (let [(mut i) (- (len (.funs (parser-state))) 1)]
+    (loop (if (< (load i) 0)
               (break -1)
               (let [f (syntax-fun-at (load i))]
                 (if (= (.name f) name)
                     (break (load i))
-                    (do (set! (mut i) (+ (load i) 1)) (continue))))))))
+                    (do (set! (mut i) (- (load i) 1)) (continue))))))))
 
 (defn parser-node [(nid i64)] (-> (dyn NodeOps))
   (match (arena-node nid) (Some [n] n) (None [] (unreachable-node))))
 
-;; Return the compilation unit's source Start through the public `main` Fun, rather than by graph
-;; search: before Opto the linked JSL callees also expose their own Starts in the Stop input cone.
-(defn parser-entry-start [] (-> (dyn NodeOps))
+(defn parser-internal-main-name [] (-> (slice u8))
+  ;; A dot cannot occur in an admitted JavaScript identifier. Compiler-owned native symbols must
+  ;; live outside the source namespace or a user declaration can collide with the renamed source
+  ;; entry even though their graph identities and function indices are distinct.
+  "$aot$.source_main")
+
+(defn parser-entry-fun [] (-> (dyn NodeOps))
+  (if (= (.entry-fun-nid (parser-state)) 0)
+      (do (panic "parser-entry-fun: process-entry wrapper is not installed") (unreachable-node))
+      (parser-node (.entry-fun-nid (parser-state)))))
+
+;; Return the compilation unit's source Start through the compiler-owned process wrapper, rather
+;; than by graph search: linked source/JSL callees also expose their own Starts in the Stop cone.
+(defn parser-entry-arity [] (-> i64)
   (let [idx (syntax-find-fun "main")]
     (if (< idx 0)
-        (do (panic "parser-entry-start: program has no main function") (unreachable-node))
-        (let [syntax (syntax-fun-at idx)
-              fun (parser-node (.fun-nid syntax))]
-          (match (n-in fun 1)
-            (Some [start]
-                  (if (= (n-op start) OP-START)
-                      start
-                      (do (panic "parser-entry-start: main is not rooted at Start")
-                          (unreachable-node))))
-            (None [] (do (panic "parser-entry-start: main has no entry hook")
-                         (unreachable-node))))))))
+        (do (panic "parser-entry-arity: program has no main function") 0)
+        (let [syntax (syntax-fun-at idx)]
+          (len (.params syntax))))))
+
+(defn parser-entry-start [] (-> (dyn NodeOps))
+  (do
+    ;; argc/argv belong to the host wrapper and never enter source `main`. The wrapper supplies the
+    ;; ECMAScript value `undefined` for every declared-but-omitted source parameter.
+    (match (n-in (parser-entry-fun) 1)
+      (Some [start]
+            (if (= (n-op start) OP-START)
+                start
+                (do
+                  (panic "parser-entry-start: wrapper is not rooted at Start")
+                  (unreachable-node))))
+      (None []
+            (do
+              (panic "parser-entry-start: wrapper has no entry hook")
+              (unreachable-node))))))
 
 (defn lower-name [(name (slice u8))] (-> (dyn NodeOps))
   (match (scope-lookup (parser-node (.current-scope (parser-state))) name)
     (Some [value] value)
-    (None [] (do (panic "parser: unknown binding during lowering") (unreachable-node)))))
+    (None []
+          ;; `undefined` is the one global value in the admitted runtime slice. Resolve lexical
+          ;; bindings first because JavaScript permits a parameter or local to shadow that global;
+          ;; only an unresolved identifier receives the canonical singleton.
+          (if (= name "undefined")
+              (dyn-undefined-make)
+              (do (panic "parser: unknown binding during lowering") (unreachable-node))))))
 
 (defn parser-set-current-ctrl! [(ctrl (dyn NodeOps))] (-> i64)
   (do
     (set! (.current-ctrl (parser-state)) (n-nid ctrl))
     (scope-set-ctrl! (parser-node (.current-scope (parser-state))) ctrl)))
 
-;; JavaScript numeric operators are semantic calls, even in this deliberately integer-proven slice.
-;; Boxing exposes the dynamic boundary to JSL; specialization may later cancel both pairs.
+;; JavaScript numeric operators are semantic calls for every admitted Number representation.
+;; Values cross the dynamic boundary into JSL; specialization may expose raw integer or binary64
+;; arithmetic, while mixed number/undefined flow retains the guarded generic path.
 (defn lower-js-binary [(lhs (dyn NodeOps))
                        (rhs (dyn NodeOps))
                        (name (slice u8))] (-> (dyn NodeOps))
@@ -477,18 +564,32 @@
       (scope-set-mem! scope (proj-make end RETURN-MEM "js-binary.mem"))
       (proj-make end RETURN-VALUE "js-binary.value"))))
 
-;; Source predicates cross the same semantic boundary as arithmetic. `If` consumes the raw Boolean
-;; produced by ECMA-262 ToBoolean; it must never compare a NaN-boxed source value directly with
-;; machine zero.
+;; Source predicates cross the same semantic boundary as arithmetic. JSL handles both numeric
+;; representations, signed zero, and NaN; its raw Boolean result is the compiler-internal predicate
+;; expected by If and never escapes as a source-language value.
 (defn lower-js-truthy [(value (dyn NodeOps))] (-> (dyn NodeOps))
-  (jsl-lower-toboolean-value value))
+  (let [target (jsl-graph-of "JsTruthy")
+        scope (parser-node (.current-scope (parser-state)))
+        c (call-make-with-mem (parser-node (.current-ctrl (parser-state))) (scope-mem scope))]
+    (call-add-arg! c value)
+    (n-set-def! c CALL-CTRL (Some (parser-node (.current-ctrl (parser-state)))))
+    (n-set-def! c CALL-MEM (Some (scope-mem scope)))
+    (call-set-fptr! c (funptr-make target (jsl-fidx-of "JsTruthy")))
+    (let [end (callend-make c)]
+      (let [ctrl (cproj-make end RETURN-CTRL "js-truthy.ctrl")]
+        (parser-set-current-ctrl! ctrl))
+      (scope-set-mem! scope (proj-make end RETURN-MEM "js-truthy.mem"))
+      (proj-make end RETURN-VALUE "js-truthy.value"))))
 
 (defn lower-syntax-expr [(id i64)] (-> (dyn NodeOps))
   (let [x (syntax-at id)]
     (if (= (.kind x) SX-NUMBER)
         ;; A source literal is a JavaScript value. The raw integer exists only inside its Box and
         ;; may reappear after a proven JSL Unbox cancels that Box during specialization.
-        (box-make (con-int (.number x)))
+        (box-make-at (Some (parser-node (.current-ctrl (parser-state))))
+                     (if (= (.number-rep x) REP-INT)
+                         (con-int (.number x))
+                         (con-flt (.number-float x))))
         (if (= (.kind x) SX-NAME)
             (lower-name (.name x))
             (if (= (.kind x) SX-ADD)
@@ -506,33 +607,38 @@
                         (if (= (.kind x) SX-CONDITIONAL)
                             (let [condition (lower-js-truthy (lower-syntax-expr (.left x)))
                                   iff (if-make (parser-node (.current-ctrl (parser-state))) condition)
-                                  arms (if-arms! iff)]
-                              ;; Both arms are built before either is exposed to peepholing. Branch
-                              ;; expressions may contain calls, so each carries its own final control.
-                              (parser-set-current-ctrl! (arms-true arms))
+                                  arms (if-arms! iff)
+                                  true-scope (parser-node (.current-scope (parser-state)))
+                                  false-scope (scope-dup true-scope false)]
+                              ;; A conditional expression is the same full Scope diamond as a
+                              ;; statement `if`: calls in either arm advance memory independently,
+                              ;; so joining only control and the selected value would let the
+                              ;; following expression observe whichever arm happened to lower last.
+                              (scope-set-ctrl! true-scope (arms-true arms))
+                              (set! (.current-ctrl (parser-state)) (n-nid (arms-true arms)))
                               (let [yes (lower-syntax-expr (.right x))
-                                    yes-ctrl (parser-node (.current-ctrl (parser-state)))]
-                                ;; Switching the parser Scope to the false arm removes its only
-                                ;; temporary use of the true control. Keep both products across
-                                ;; that construction window; Region/Phi take ownership below.
-                                (n-keep! yes-ctrl)
+                                    yes-scope (parser-node (.current-scope (parser-state)))]
+                                ;; The true value is not an environment slot, so hold it while the
+                                ;; false arm is lowered. The true Scope owns its control and memory.
                                 (n-keep! yes)
-                                (parser-set-current-ctrl! (arms-false arms))
-                                (let [no (lower-syntax-expr (.third x))
-                                      no-ctrl (parser-node (.current-ctrl (parser-state)))
-                                      region (region-make)
-                                      phi
-                                        (phi-make region
-                                                  (ty-meet (n-ty yes) (n-ty no))
-                                                  "conditional")]
-                                  (region-add-path! region yes-ctrl)
-                                  (region-add-path! region no-ctrl)
-                                  (phi-add-value! phi yes)
-                                  (phi-add-value! phi no)
-                                  (parser-set-current-ctrl! region)
-                                  (n-unkeep! yes-ctrl)
-                                  (n-unkeep! yes)
-                                  phi)))
+                                (set! (.current-scope (parser-state)) (n-nid false-scope))
+                                (scope-set-ctrl! false-scope (arms-false arms))
+                                (set! (.current-ctrl (parser-state)) (n-nid (arms-false arms)))
+                                (let [no (lower-syntax-expr (.third x))]
+                                  (n-keep! no)
+                                  (let [merged (scope-merge! yes-scope false-scope)
+                                        region (scope-ctrl merged)
+                                        phi
+                                          (phi-make region
+                                                    (ty-meet (n-ty yes) (n-ty no))
+                                                    "conditional")]
+                                    (phi-add-value! phi yes)
+                                    (phi-add-value! phi no)
+                                    (set! (.current-scope (parser-state)) (n-nid merged))
+                                    (set! (.current-ctrl (parser-state)) (n-nid region))
+                                    (n-unkeep! yes)
+                                    (n-unkeep! no)
+                                    phi))))
                             (if (= (.kind x) SX-CALL)
                                 (let [target-idx (syntax-find-fun (.name x))]
                                   (if (< target-idx 0)
@@ -541,26 +647,35 @@
                                         (unreachable-node))
                                       (let [target-syntax (syntax-fun-at target-idx)
                                             target (parser-node (.fun-nid target-syntax))]
-                                        (if (!= (len (.args x))
-                                                (len (.params target-syntax)))
-                                            (panic "parser: call argument count mismatch")
-                                            0)
                                         (let [scope (parser-node (.current-scope (parser-state)))
                                               c
-                                                (call-make-with-mem
-                                                  (parser-node (.current-ctrl (parser-state)))
-                                                  (scope-mem scope))
+                                                (call-make-with-mem (parser-node (.current-ctrl (parser-state)))
+                                                                    (scope-mem scope))
+                                              formal-count (len (.params target-syntax))
                                               (mut i) 0]
+                                          ;; JavaScript evaluates every actual left-to-right. The
+                                          ;; current fixed internal ABI carries only declared
+                                          ;; formals: extra actuals still run for effects, while
+                                          ;; omitted formals receive the canonical boxed undefined.
                                           (loop (if (>= (load i) (len (.args x)))
                                                     (break 0)
                                                     (do
-                                                      (call-add-arg! c
-                                                                     (lower-syntax-expr (get (.args x) (load i))))
+                                                      (let [actual
+                                                              (lower-syntax-expr (get (.args x) (load i)))]
+                                                        (if (< (load i) formal-count)
+                                                            (call-add-arg! c actual)
+                                                            0))
+                                                      (set! (mut i) (+ (load i) 1))
+                                                      (continue))))
+                                          (loop (if (>= (load i) formal-count)
+                                                    (break 0)
+                                                    (do
+                                                      (call-add-arg! c (dyn-undefined-make))
                                                       (set! (mut i) (+ (load i) 1))
                                                       (continue))))
                                           (n-set-def! c CALL-CTRL (Some (parser-node (.current-ctrl (parser-state)))))
                                           (n-set-def! c CALL-MEM (Some (scope-mem scope)))
-                                          (call-set-fptr! c (funptr-make target target-idx))
+                                          (call-set-fptr! c (funptr-make target (.fidx target-syntax)))
                                           (let [end (callend-make c)]
                                             (let [ctrl (cproj-make end RETURN-CTRL "call.ctrl")]
                                               (parser-set-current-ctrl! ctrl))
@@ -570,15 +685,90 @@
                                   (panic "parser: unknown syntax expression")
                                   (unreachable-node)))))))))))
 
-(defn lower-syntax-statements [(stmts (ArrayList i64))] (-> i64)
-  (let [(mut i) 0
-        (mut return-nid) 0]
-    (loop (if (>= (load i) (len stmts))
+;; Final Simple's `Parser.addReturn` accumulates a pruned return Scope holding control, memory, and
+;; `$expr`, then kills the current control. Later exits merge into that accumulator and function
+;; fallthrough contributes its default value only while control remains live. These three nid lists
+;; are the same pruned accumulator: source locals are irrelevant after exit, while control, memory,
+;; and value are all kept until one final Return owns them.
+(defn parser-reset-returns! [] (-> i64)
+  (let [p (parser-state)]
+    (al-clear! [i64] (mut (.return-ctrls p)))
+    (al-clear! [i64] (mut (.return-mems p)))
+    (al-clear! [i64] (mut (.return-values p)))
+    0))
+
+(defn parser-record-return! [(value (dyn NodeOps))] (-> i64)
+  (let [p (parser-state)
+        scope (parser-node (.current-scope p))
+        ctrl (scope-ctrl scope)
+        ;; Force lazy loop memory before severing the current control, exactly as Simple does.
+        mem (scope-mem scope)
+        dead (xctrl-make)]
+    (n-keep! ctrl)
+    (n-keep! mem)
+    (n-keep! value)
+    (push! [i64] (mut (.return-ctrls p)) (n-nid ctrl))
+    (push! [i64] (mut (.return-mems p)) (n-nid mem))
+    (push! [i64] (mut (.return-values p)) (n-nid value))
+    (scope-set-ctrl! scope dead)
+    (set! (.current-ctrl p) (n-nid dead))
+    1))
+
+(defn parser-release-return-keeps! [] (-> i64)
+  (let [p (parser-state)
+        (mut i) 0]
+    (loop (if (>= (load i) (len (.return-values p)))
               (break 0)
               (do
-                (if (!= (load return-nid) 0)
-                    (panic "parser: statement follows return in admitted subset")
-                    0)
+                (n-unkeep! (parser-node (get (.return-ctrls p) (load i))))
+                (n-unkeep! (parser-node (get (.return-mems p) (load i))))
+                (n-unkeep! (parser-node (get (.return-values p) (load i))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn parser-build-return! [(fun (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [p (parser-state)
+        count (len (.return-values p))]
+    (if (= count 0)
+        (do (panic "parser-build-return!: function has no exit") (unreachable-node))
+        (let [ret
+                (if (= count 1)
+                    (return-make (parser-node (get (.return-ctrls p) 0))
+                                 (Some (parser-node (get (.return-mems p) 0)))
+                                 (parser-node (get (.return-values p) 0))
+                                 (None [(dyn NodeOps)])
+                                 (Some fun))
+                    (let [region (region-make)
+                          memphi (memphi-make region ALIAS-BULK TY-BOT "$return.mem")
+                          valuephi (phi-make region (ty-dyn TAG-ANY) "$return.value")
+                          (mut i) 0]
+                      (loop (if (>= (load i) count)
+                                (break 0)
+                                (do
+                                  (region-add-path! region
+                                                    (parser-node (get (.return-ctrls p) (load i))))
+                                  (memphi-add-state! memphi
+                                                     (parser-node (get (.return-mems p) (load i))))
+                                  (phi-add-value! valuephi
+                                                  (parser-node (get (.return-values p) (load i))))
+                                  (set! (mut i) (+ (load i) 1))
+                                  (continue))))
+                      (return-make region
+                                   (Some memphi)
+                                   valuephi
+                                   (None [(dyn NodeOps)])
+                                   (Some fun))))]
+          (parser-release-return-keeps!)
+          ret))))
+
+;; Return 1 when every path through this statement list has exited and 0 when a fallthrough path
+;; remains. Each exit has already transferred ownership into the function return accumulator.
+(defn lower-syntax-statements [(stmts (ArrayList i64))] (-> i64)
+  (let [(mut i) 0
+        (mut terminated) 0]
+    (loop (if (or (>= (load i) (len stmts)) (!= (load terminated) 0))
+              (break 0)
+              (do
                 (let [stmt (syntax-stmt-at (get stmts (load i)))]
                   (if (= (.kind stmt) SS-LET)
                       (let [value (lower-syntax-expr (.expr stmt))]
@@ -588,11 +778,21 @@
                                        (.final stmt)
                                        value))
                       (if (= (.kind stmt) SS-ASSIGN)
-                          (scope-update! (parser-node (.current-scope (parser-state)))
-                                         (.name stmt)
-                                         (lower-syntax-expr (.expr stmt)))
+                          (let [scope (parser-node (.current-scope (parser-state)))
+                                bound (>= (scope-find scope (.name stmt)) 0)
+                                value (lower-syntax-expr (.expr stmt))]
+                            ;; This admitted source slice is non-strict. The global `undefined`
+                            ;; binding is non-writable: PutValue has no effect, but JavaScript still
+                            ;; evaluates the complete RHS first. A lexical binding named
+                            ;; `undefined` takes the ordinary update path, including `const` checks.
+                            (if (and (not bound) (= (.name stmt) "undefined"))
+                                0
+                                (scope-update! scope (.name stmt) value)))
                           (if (= (.kind stmt) SS-RETURN)
-                              (set! (mut return-nid) (n-nid (lower-syntax-expr (.expr stmt))))
+                              (set! (mut terminated)
+                                    (parser-record-return! (if (= (.expr stmt) 0)
+                                                               (dyn-undefined-make)
+                                                               (lower-syntax-expr (.expr stmt)))))
                               (if (= (.kind stmt) SS-EXPR)
                                   (do (lower-syntax-expr (.expr stmt)) 0)
                                   (if (= (.kind stmt) SS-BLOCK)
@@ -601,7 +801,7 @@
                                         (let [nested-return (lower-syntax-statements (.body stmt))]
                                           (scope-pop! scope)
                                           (if (!= nested-return 0)
-                                              (set! (mut return-nid) nested-return)
+                                              (set! (mut terminated) 1)
                                               0)))
                                       (if (= (.kind stmt) SS-IF)
                                           (let [condition (lower-js-truthy (lower-syntax-expr (.expr stmt)))
@@ -615,9 +815,6 @@
                                             (set! (.current-ctrl (parser-state))
                                                   (n-nid (arms-true arms)))
                                             (let [true-return (lower-syntax-statements (.body stmt))]
-                                              (if (!= true-return 0)
-                                                  (n-keep! (parser-node true-return))
-                                                  0)
                                               (set! (.current-scope (parser-state))
                                                     (n-nid false-scope))
                                               (scope-set-ctrl! false-scope (arms-false arms))
@@ -628,25 +825,20 @@
                                                 (set! (.current-scope (parser-state)) (n-nid merged))
                                                 (set! (.current-ctrl (parser-state))
                                                       (n-nid (scope-ctrl merged)))
-                                                (if (and (= true-return 0) (= false-return 0))
-                                                    0
-                                                    (if (or (= true-return 0) (= false-return 0))
-                                                        (panic "parser: only one if arm returns; function-exit merge required")
-                                                        (let [answer
-                                                                (phi-make (scope-ctrl merged)
-                                                                          (ty-meet (n-ty (parser-node true-return))
-                                                                                   (n-ty (parser-node false-return)))
-                                                                          "if.return")]
-                                                          (phi-add-value! answer
-                                                                          (parser-node true-return))
-                                                          (phi-add-value! answer
-                                                                          (parser-node false-return))
-                                                          (n-unkeep! (parser-node true-return))
-                                                          (set! (mut return-nid) (n-nid answer))
-                                                          0))))))
+                                                (if (and (!= true-return 0)
+                                                         (!= false-return 0))
+                                                    (set! (mut terminated) 1)
+                                                    0))))
                                           (if (= (.kind stmt) SS-WHILE)
                                               (let [entry (parser-node (.current-scope (parser-state)))
                                                     head (loop-make (scope-ctrl entry))]
+                                                ;; The condition and body can resolve every lazy
+                                                ;; sentinel (notably memory plus all assigned
+                                                ;; variables). The resulting edge replacements may
+                                                ;; leave the parser's raw `entry` pointer as its only
+                                                ;; owner, so hold it from before construction until
+                                                ;; `scope-end-loop!` has consumed every entry slot.
+                                                (n-keep! entry)
                                                 (scope-set-ctrl! entry head)
                                                 (let [body-scope (scope-dup entry true)]
                                                   (set! (.current-scope (parser-state))
@@ -667,16 +859,14 @@
                                                                        (arms-true arms))
                                                       (set! (.current-ctrl (parser-state))
                                                             (n-nid (arms-true arms)))
-                                                      (if (!= (lower-syntax-statements (.body stmt))
-                                                              0)
-                                                          (panic "parser: return inside while is not yet admitted")
-                                                          0)
+                                                      (lower-syntax-statements (.body stmt))
                                                       ;; This is one atomic protocol: backedge
                                                       ;; control first, then all materialized Phi
                                                       ;; backedges, before any peephole can run.
                                                       (scope-end-loop! entry
-                                                                       body-scope
+                                                                       (parser-node (.current-scope (parser-state)))
                                                                        exit-scope)
+                                                      (n-unkeep! entry)
                                                       (set! (.current-scope (parser-state))
                                                             (n-nid exit-scope))
                                                       (set! (.current-ctrl (parser-state))
@@ -685,7 +875,49 @@
                                               (panic "parser: unknown statement during lowering")))))))))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
-    (load return-nid)))
+    (load terminated)))
+
+;; The source-level `main` is an ordinary boxed JavaScript function. A distinct compiler-owned
+;; function owns the platform symbol `main`, calls that source function without raw argc/argv, and
+;; is the only Return on which ARM64 applies the process-exit conversion. Keeping this call out of
+;; the inliner makes both ABIs explicit in the final graph and lets ordinary source calls to `main`
+;; continue to observe its boxed result.
+(defn parser-install-entry-wrapper! [(start (dyn NodeOps)) (stop (dyn NodeOps))] (-> i64)
+  (let [main-idx (syntax-find-fun "main")]
+    (if (< main-idx 0)
+        (panic "parser-install-entry-wrapper!: program has no main function")
+        (let [syntax (syntax-fun-at main-idx)
+              target (parser-node (.fun-nid syntax))
+              wrapper
+              ;; Darwin enters `main(int argc, char **argv)`. Only argc needs a signature slot to
+              ;; describe the incoming register bank; the wrapper intentionally ignores both host
+              ;; values and supplies boxed undefined for every omitted JavaScript argument.
+              (fun-make start (ty-tuple-of2 (ty-dyn TAG-ANY) (ty-int-bot)) "main") mem-parm
+              (parm-make-slot wrapper CALL-MEM (ty-mem 1 TY-BOT) "$mem")]
+          (parm-set-unknown-input! mem-parm (proj-make start 1 "entry.start.mem"))
+          (n-keep! mem-parm)
+          (let [c (call-make-with-mem wrapper mem-parm)]
+            (let [(mut i) 0]
+              (loop (if (>= (load i) (len (.params syntax)))
+                        (break 0)
+                        (do
+                          (call-add-arg! c (dyn-undefined-make))
+                          (set! (mut i) (+ (load i) 1))
+                          (continue)))))
+            (call-set-fptr! c (funptr-make target (.fidx syntax)))
+            (let [end (callend-make c)]
+              (callend-set-never-inline! end)
+              (let [ret
+                      (return-make (cproj-make end RETURN-CTRL "entry.ctrl")
+                                   (Some (proj-make end RETURN-MEM "entry.mem"))
+                                   (proj-make end RETURN-VALUE "entry.value")
+                                   (None [(dyn NodeOps)])
+                                   (Some wrapper))]
+                (fun-set-ret! wrapper ret)
+                (stop-add-return! stop ret))))
+          (n-unkeep! mem-parm)
+          (set! (.entry-fun-nid (parser-state)) (n-nid wrapper))
+          0))))
 
 (defn parse-program [(src (slice u8))] (-> (dyn NodeOps))
   (do
@@ -717,8 +949,17 @@
                                 (push! [i64] (mut members) (ty-dyn TAG-ANY))
                                 (set! (mut i) (+ (load i) 1))
                                 (continue)))))
-                  (let [fun (fun-make start (ty-tuple (al-slice (load members))) (.name fp))
+                  (let [fun
+                          (fun-make start
+                                    (ty-tuple (al-slice (load members)))
+                                    (if (= (load fi) (syntax-find-fun "main"))
+                                        (parser-internal-main-name)
+                                        (.name fp)))
                         (mut i) 0]
+                    ;; JSL declarations reserved the low closed-world identities. Every source
+                    ;; declaration receives a distinct identity from the same compilation-local
+                    ;; allocator; syntax-table position is not a symbol identity.
+                    (set! (.fidx fp) (next-inline-fidx!))
                     (set! (.fun-nid fp) (n-nid fun))
                     ;; Slot 1 is the exact Call memory input, as in final Simple. The unknown-caller
                     ;; seed is Start's bulk memory; closed-world internal functions drop it with
@@ -746,6 +987,7 @@
                 (break 0)
                 (let [f (syntax-fun-at (load fi))
                       fun (parser-node (.fun-nid f))
+                      body-start (arena-node-count)
                       scope (scope-make)]
                   (set! (.current-fun (parser-state)) (load fi))
                   (set! (.current-ctrl (parser-state)) (n-nid fun))
@@ -755,35 +997,46 @@
                     (Some [m] (n-add-def! scope (Some m)))
                     (None [] (panic "parser: function memory Parm is missing")))
                   (scope-push! scope)
+                  (parser-reset-returns!)
                   (let [(mut i) 0]
                     (loop (if (>= (load i) (len (.params f)))
                               (break 0)
-                              (do
-                                (scope-define! scope
-                                               (get (.params f) (load i))
-                                               (ty-dyn TAG-ANY)
-                                               false
-                                               (match (fun-parm fun (load i))
-                                                 (Some [p] p)
-                                                 (None [] (unreachable-node))))
+                              (let [name (get (.params f) (load i))
+                                    (mut later) (+ (load i) 1)
+                                    (mut shadowed) false]
+                                ;; A non-strict JavaScript simple parameter list may repeat a
+                                ;; name. Every positional Parm still exists for the ABI, but only
+                                ;; the last occurrence introduces the body binding.
+                                (loop (if (>= (load later) (len (.params f)))
+                                          (break 0)
+                                          (if (= (get (.params f) (load later)) name)
+                                              (break (do (set! (mut shadowed) true) 0))
+                                              (do
+                                                (set! (mut later) (+ (load later) 1))
+                                                (continue)))))
+                                (if (not (load shadowed))
+                                    (scope-define! scope
+                                                   name
+                                                   (ty-dyn TAG-ANY)
+                                                   false
+                                                   (match (fun-parm fun (load i))
+                                                     (Some [p] p)
+                                                     (None [] (unreachable-node))))
+                                    0)
                                 (set! (mut i) (+ (load i) 1))
                                 (continue)))))
-                  (let [value-nid (lower-syntax-statements (.body f))
-                        final-scope (parser-node (.current-scope (parser-state)))
-                        value
-                          (if (= value-nid 0)
-                              (do
-                                (panic "parser: function has no return in admitted subset")
-                                (unreachable-node))
-                              (parser-node value-nid))
-                        ret
-                          (return-make (scope-ctrl final-scope)
-                                       (Some (scope-mem final-scope))
-                                       value
-                                       (None [(dyn NodeOps)])
-                                       (Some fun))]
-                    (fun-set-ret! fun ret)
-                    (stop-add-return! stop ret))
+                  (let [terminated (lower-syntax-statements (.body f))]
+                    ;; JavaScript functions return undefined when control reaches the closing brace.
+                    (if (= terminated 0)
+                        (parser-record-return! (dyn-undefined-make))
+                        0)
+                    (let [ret (parser-build-return! fun)]
+                      (fun-set-ret! fun ret)
+                      ;; Header hoisting interleaves unrelated Fun/Parm nids before this body.
+                      ;; Preserve Simple's per-function construction estimate by measuring only
+                      ;; this lowering window; live-size remains the independent second cap.
+                      (fun-set-approx-size! fun (- (arena-node-count) body-start))
+                      (stop-add-return! stop ret)))
                   ;; Branches normally merge back into `scope`; loops deliberately replace it
                   ;; with their false-edge exit Scope. Publish and discard the actual final
                   ;; environment, then discard an obsolete loop-entry environment separately.
@@ -794,44 +1047,52 @@
                   (match (fun-mem-parm fun) (Some [m] (n-unkeep! m)) (None [] 0))
                   (set! (mut fi) (+ (load fi) 1))
                   (continue))))
-      ;; Closed world: all call edges are now known, so parameter types are driven only by them.
-      (set! (mut fi) 0)
-      (loop (if (>= (load fi) (len (.funs (parser-state))))
-                (break 0)
-                (let [f (syntax-fun-at (load fi))]
-                  ;; `main` is the externally entered program root. Internal functions close over
-                  ;; their concrete call sites; removing main's Start hook would make the entire
-                  ;; Stop-rooted program unreachable during optimistic SCCP.
-                  (if (= (.name f) "main")
-                      0
-                      (fun-drop-unknown-callers! (parser-node (.fun-nid f))))
-                  (let [fun (parser-node (.fun-nid f))
-                        (mut i) 0]
-                    (loop (if (>= (load i) (len (.params f)))
-                              (break 0)
-                              (do
-                                (match (fun-parm fun (load i))
-                                  (Some [p] (n-unkeep! p))
-                                  (None [] 0))
-                                (set! (mut i) (+ (load i) 1))
-                                (continue)))))
-                  (set! (mut fi) (+ (load fi) 1))
-                  (continue))))
-      (jsl-close-world!)
+      (parser-install-entry-wrapper! start stop)
       stop)))
+
+;; Close the source and JSL call worlds only after pessimistic Iter has visited the Start-rooted
+;; graph with every unknown-caller hook intact. Lazy Call->Fun links are installed by Opto; dropping
+;; hooks in `parse-program` let pessimistic Iter compute an unlinked Fun as XCTRL before Opto linked
+;; it and computed CTRL, violating the optimistic-below-pessimistic invariant.
+(defn parser-close-world! [] (-> i64)
+  (let [(mut fi) 0]
+    (loop (if (>= (load fi) (len (.funs (parser-state))))
+              (break 0)
+              (let [f (syntax-fun-at (load fi))]
+                ;; Every source function, including source-level `main`, is closed-world. The
+                ;; compiler-owned wrapper alone retains the external Start hook.
+                (fun-drop-unknown-callers! (parser-node (.fun-nid f)))
+                (let [fun (parser-node (.fun-nid f))
+                      (mut i) 0]
+                  (loop (if (>= (load i) (len (.params f)))
+                            (break 0)
+                            (do
+                              (match (fun-parm fun (load i))
+                                (Some [p] (n-unkeep! p))
+                                (None [] 0))
+                              (set! (mut i) (+ (load i) 1))
+                              (continue)))))
+                (set! (mut fi) (+ (load fi) 1))
+                (continue))))
+    (jsl-close-world!)
+    0))
 
 ;; Final Simple does not make every parsed function a code-generation root before optimistic SCCP.
 ;; Internal Returns are held temporarily while call discovery runs; otherwise Stop itself keeps an
 ;; inlined callee alive and its now-caller-controlled Return can GVN/share values across functions.
 ;; `main` remains the public program root throughout.
 (defn parser-prepare-opto! [(stop (dyn NodeOps))] (-> i64)
-  (let [(mut i) 0 (mut detached) 0]
+  (let [entry-fun (parser-entry-fun)
+        (mut i) 0
+        (mut detached) 0]
     (loop (if (>= (load i) (n-nins stop))
               (break (load detached))
               (let [ret (n-in! stop (load i))]
                 (match (return-fun ret)
                   (Some [fun]
-                        (if (= (fun-name fun) "main")
+                        ;; Stop inputs compress as internal Returns are removed. Function identity,
+                        ;; not the mutable edge index, decides which Return is the public root.
+                        (if (n-same? fun entry-fun)
                             (do (set! (mut i) (+ (load i) 1)) (continue))
                             (do
                               (n-keep! ret)
@@ -844,22 +1105,25 @@
 ;; control type is reachable are restored to Stop for machine lowering. The temporary keep is
 ;; released after the graph edge is installed so a dead/inlined body can be collected normally.
 (defn parser-finish-opto! [(stop (dyn NodeOps))] (-> i64)
-  (let [(mut fi) 0 (mut retained) 0]
+  (let [(mut fi) 0
+        (mut retained) 0]
     (loop (if (>= (load fi) (len (.funs (parser-state))))
               (break (load retained))
               (let [syntax (syntax-fun-at (load fi))
                     fun (parser-node (.fun-nid syntax))]
-                (if (= (.name syntax) "main")
-                    0
-                    (match (fun-ret fun)
-                      (Some [ret]
-                            (if (and (not (n-dead? fun)) (not (ty-high? (n-ty fun))))
-                                (do
-                                  (stop-add-return! stop ret)
-                                  (set! (mut retained) (+ (load retained) 1))
-                                  (n-unkeep! ret))
-                                (n-unkeep! ret)))
-                      (None [] 0)))
+                (match (fun-ret fun)
+                  (Some [ret]
+                        (if (and (and (not (n-dead? fun)) (not (fun-folding? fun)))
+                                 (not (ty-high? (n-ty fun))))
+                            (do
+                              (stop-add-return! stop ret)
+                              (set! (mut retained) (+ (load retained) 1))
+                              (n-unkill! ret))
+                            ;; Match the JSL lifetime protocol: an inlined or unreachable source
+                            ;; Return has no compilation-unit owner and must detach from its former
+                            ;; caller control as soon as the temporary Opto keep is released.
+                            (n-unkill! ret)))
+                  (None [] 0))
                 (set! (mut fi) (+ (load fi) 1))
                 (continue))))))
 
@@ -870,42 +1134,13 @@
 ;; claiming a new runtime value. RPC is reconstructed here because a single linked caller can make
 ;; it constant during Opto, but code generation always needs the architectural return address.
 (defn parser-prepare-codegen! [(start (dyn NodeOps))] (-> i64)
-  (let [(mut fi) 0 (mut prepared) 0]
+  (let [(mut fi) 0
+        (mut prepared) 0]
     (loop (if (>= (load fi) (len (.funs (parser-state))))
-              (break (load prepared))
+              (break (+ (load prepared) (fun-prepare-codegen! (parser-entry-fun) start)))
               (let [syntax (syntax-fun-at (load fi))
                     fun (parser-node (.fun-nid syntax))]
-                (if (and (not (n-dead? fun)) (not (ty-high? (n-ty fun))))
-                    (do
-                      (if (not (fun-unknown-callers? fun))
-                          (do
-                            (n-insert-def! fun 1 (Some start))
-                            (let [cnt (n-nouts fun) (mut i) 0]
-                              (loop (if (>= (load i) cnt)
-                                        (break 0)
-                                        (do
-                                          (match (n-out fun (load i))
-                                            (Some [u]
-                                                  (if (= (n-op u) OP-PARM)
-                                                      (n-insert-def! u 1 (None [(dyn NodeOps)]))
-                                                      0))
-                                            (None [] 0))
-                                          (set! (mut i) (+ (load i) 1))
-                                          (continue))))))
-                          0)
-                      (match (fun-rpc-parm fun)
-                        (Some [rpc]
-                              (match (fun-ret fun)
-                                (Some [ret] (n-set-def! ret RETURN-RPC (Some rpc)))
-                                (None [] (panic "parser-prepare-codegen!: live Fun has no Return"))))
-                        (None []
-                              (let [rpc (parm-make-slot fun 0 (ty-int-bot) "$rpc")]
-                                (match (fun-ret fun)
-                                  (Some [ret] (n-set-def! ret RETURN-RPC (Some rpc)))
-                                  (None [] (panic "parser-prepare-codegen!: live Fun has no Return"))))))
-                      (set! (mut prepared) (+ (load prepared) 1))
-                      0)
-                    0)
+                (set! (mut prepared) (+ (load prepared) (fun-prepare-codegen! fun start)))
                 (set! (mut fi) (+ (load fi) 1))
                 (continue))))))
 

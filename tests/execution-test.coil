@@ -1,10 +1,14 @@
 ;; End-to-end execution tests: ideal graph through the complete implemented backend and native link.
 (module aot.tests.execution)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
 (import "coil.assert" :use *)
 (import "aot.node.boot" :use *)
 (import "aot.node.node" :use *)
 (import "aot.node.constant" :use *)
 (import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.node.arith" :use *)
 (import "aot.node.call" :use *)
 (import "aot.node.memory" :use *)
 (import "aot.type.type" :use *)
@@ -25,6 +29,27 @@
                                            "/tmp/aot-take-2-source-matrix"
                                            1)
                expected)
+    0))
+
+(defn execution-assert-varying-argv [(executable (slice u8)) (expected i64)] (-> i64)
+  (let [(mut argv) (al-new [(slice u8)] (alloc/malloc-allocator))]
+    ;; Process entry receives argc in X0. Running the same binary with several argc values proves
+    ;; that loop-Phi entry and backedge arms came from their graph definitions, not ambient ABI
+    ;; registers that happened to make a zero-result loop test pass.
+    (assert-eq (obj-run-process executable (al-slice (load argv))) expected)
+    (push! [(slice u8)] (mut argv) "first")
+    (assert-eq (obj-run-process executable (al-slice (load argv))) expected)
+    (push! [(slice u8)] (mut argv) "second")
+    (push! [(slice u8)] (mut argv) "third")
+    (assert-eq (obj-run-process executable (al-slice (load argv))) expected)))
+
+(defn execution-assert-source-with-varying-argv [(source (slice u8)) (expected i64)] (-> i64)
+  (do
+    (pipeline-compile-macho! source "/tmp/aot-take-2-source-argv.o" 1)
+    (assert-eq (macho-link! "/tmp/aot-take-2-source-argv.o"
+                            "/tmp/aot-take-2-source-argv")
+               0)
+    (execution-assert-varying-argv "/tmp/aot-take-2-source-argv" expected)
     0))
 
 (deftest ideal_main_runs_through_selection_scheduling_allocation_encoding_and_native_link
@@ -60,6 +85,55 @@
                           0)
                (assert-eq (run-executable! "/tmp/aot-take-2-exec-test") 42)))))
 
+(deftest ideal_two_loop_carried_values_execute_independently_of_process_argc
+         (do
+           (boot! 1)
+           (code-reset! 1)
+           (let [start (start-make (ty-int-bot))
+                 fun (fun-make start (ty-tuple-of2 (ty-int-bot) (ty-int-bot)) "main")
+                 loop-node (loop-make fun)
+                 value (phi-make loop-node (ty-int-bot) "value")
+                 count (phi-make loop-node (ty-int-bot) "count")]
+             (phi-add-value! value (con-make (ty-int-con 10)))
+             (phi-open! value)
+             (phi-add-value! count (con-make (ty-int-con 1)))
+             (phi-open! count)
+             (let [arms (if-arms! (if-make loop-node count))
+                   back (arms-true arms)
+                   exit (arms-false arms)
+                   next-value (add-make value (con-make (ty-int-con 1)))
+                   next-count (sub-make count (con-make (ty-int-con 1)))
+                   ret (return-make exit
+                                    (Some (con-make (ty-mem 1 TY-BOT)))
+                                    value
+                                    (None [(dyn NodeOps)])
+                                    (Some fun))
+                   stop (stop-make)]
+               (loop-close! loop-node back)
+               (phi-close! value next-value)
+               (phi-close! count next-count)
+               (fun-set-ret! fun ret)
+               (stop-add-return! stop ret)
+               (looptree-build! start stop)
+               (let [selected-stop (arm64-select-graph stop)
+                     selected-ret (n-in! selected-stop 0)
+                     selected-loop (n-in! (n-in! selected-ret RETURN-VALUE) 0)
+                     selected-fun (n-in! selected-loop 1)
+                     selected-start (n-in! selected-fun 1)]
+                 (code-set-roots! selected-start selected-stop)
+                 (gcm-build-cfg!)
+                 (sched-run!)
+                 (ra-run!)
+                 (enc-layout!)
+                 (enc-emit!)
+                 (enc-relocate!)
+                 (assert-eq (macho-write "/tmp/aot-take-2-loop-phi.o")
+                            (len (macho-bytes)))
+                 (assert-eq (macho-link! "/tmp/aot-take-2-loop-phi.o"
+                                         "/tmp/aot-take-2-loop-phi")
+                            0)
+                 (execution-assert-varying-argv "/tmp/aot-take-2-loop-phi" 11))))))
+
 (deftest source_arithmetic_runs_from_parser_through_native_execution
          (execution-assert-source "function main() { return 20 + 22; }" 42))
 
@@ -72,10 +146,267 @@
             function main(): number { return scale(2, 3); }"
            14))
 
+(deftest source_user_and_jsl_call_ownership_is_stable_under_an_alternate_worklist_seed
+         (assert-eq
+           (pipeline-compile-link-run!
+             "function scale(a: number, b: number): number { return a + b * 4; }
+              function main(): number { return scale(2, 3); }"
+             "/tmp/aot-take-2-jsl-owner-seed.o"
+             "/tmp/aot-take-2-jsl-owner-seed"
+             17)
+           14))
+
 (deftest source_forward_function_declarations_reach_native_execution
          (execution-assert-source
            "function main() { return later(40); }
             function later(value) { return value + 2; }"
+           42))
+
+(deftest source_duplicate_function_declarations_reach_native_execution
+         (execution-assert-source
+           "function answer() { return 7; }
+            function answer() { return 42; }
+            function main() { return answer(); }"
+           42))
+
+(deftest source_duplicate_main_declarations_emit_only_the_live_program_entry
+         (execution-assert-source
+           "function main() { return 7; }
+            function main() { return 42; }"
+           42))
+
+(deftest source_identifier_cannot_collide_with_the_compiler_owned_main_symbol
+         (execution-assert-source
+           "function $aot$main() { return 42; }
+            function main() { return $aot$main(); }"
+           42))
+
+(deftest process_wrapper_supplies_boxed_undefined_in_registers_and_stack_slots
+         (execution-assert-source
+           "function main(a, b, c, d, e, f, g, h, i, j) {
+              return j ? 7 : 42;
+            }"
+           42))
+
+(deftest internal_calls_to_source_main_preserve_the_boxed_javascript_abi
+         (execution-assert-source
+           "function main(value) { return value ? 42 : main(1); }"
+           42))
+
+(deftest source_numbers_cross_the_signed_48_payload_boundary_without_truncation
+         (execution-assert-source
+           "function identity_noInline(value) { return value; }
+            function main() {
+              return identity_noInline(140737488355328) - 140737488355286;
+            }"
+           42))
+
+(deftest source_decimal_literals_obey_binary64_rounding_beyond_safe_integer_precision
+         (execution-assert-source
+           "function identity_noInline(value) { return value; }
+            function main() {
+              return identity_noInline(9007199254740993) - 9007199254740950;
+            }"
+           42))
+
+(deftest source_negative_zero_is_false_at_the_jsl_truthiness_boundary
+         (execution-assert-source
+           "function main() { return (0 * (0 - 1)) ? 7 : 42; }"
+           42))
+
+(deftest source_automatic_semicolon_insertion_accepts_line_terminated_statements
+         (execution-assert-source
+           "function main() {
+              let answer = 40
+              answer = answer + 2
+              return answer
+            }"
+           42))
+
+(deftest source_return_automatic_semicolon_insertion_produces_undefined
+         (execution-assert-source
+           "function main() {
+              return
+              42;
+            }"
+           0))
+
+(deftest source_line_comments_preserve_statement_and_expression_boundaries
+         (execution-assert-source
+           "function main() {
+              let answer = 40; // the newline terminates the comment
+              return answer + 2; // trailing comment before the closing brace
+            }"
+           42))
+
+(deftest source_bare_return_reaches_native_execution_as_undefined
+         (execution-assert-source "function main() { return; }" 0))
+
+(deftest source_global_undefined_reaches_native_execution
+         (execution-assert-source "function main() { return undefined; }" 0))
+
+(deftest source_assignment_to_global_undefined_is_a_non_strict_noop
+         (execution-assert-source
+           "function main() { undefined = 42; return undefined; }"
+           0))
+
+(deftest source_global_undefined_is_false_at_the_jsl_truthiness_boundary
+         (execution-assert-source
+           "function main() { return undefined ? 7 : 42; }"
+           42))
+
+(deftest source_global_undefined_uses_the_guarded_numeric_fallback
+         (execution-assert-source
+           "function main() { return (undefined + 1) ? 7 : 42; }"
+           42))
+
+(deftest source_lexical_binding_can_shadow_global_undefined
+         (execution-assert-source
+           "function main() { let undefined = 7; undefined = 42; return undefined; }"
+           42))
+
+(deftest source_implicit_function_fallthrough_reaches_native_execution_as_undefined
+         (execution-assert-source "function main() { let answer = 42; }" 0))
+
+(deftest source_one_arm_early_return_merges_with_a_later_return
+         (execution-assert-source
+           "function choose(condition) {
+              if (condition) { return 40; }
+              return 2;
+            }
+            function main() { return choose(1) + choose(0); }"
+           42))
+
+(deftest source_return_inside_while_merges_with_the_zero_iteration_exit
+         (execution-assert-source
+           "function choose(condition) {
+              while (condition) { return 40; }
+              return 2;
+            }
+            function main() { return choose(1) + choose(0); }"
+           42))
+
+(deftest source_unreachable_statements_after_return_do_not_reenter_control
+         (execution-assert-source
+           "function main() {
+              return 42;
+              let answer = 7;
+              answer = answer + 1;
+            }"
+           42))
+
+(deftest source_missing_ordinary_call_formals_are_boxed_undefined
+         (execution-assert-source
+           "function choose_noInline(answer, missing) {
+              return missing ? 7 : answer;
+            }
+            function main() { return choose_noInline(42); }"
+           42))
+
+(deftest source_missing_stack_call_formals_are_boxed_undefined
+         (execution-assert-source
+           "function choose_noInline(a, b, c, d, e, f, g, h, i, missing) {
+              return missing ? 7 : a;
+            }
+            function main() { return choose_noInline(42); }"
+           42))
+
+(deftest source_mixed_number_and_undefined_flow_executes_the_guarded_numeric_fallback
+         (execution-assert-source
+           "function increment_noInline(value) { return value + 1; }
+            function main(missing) {
+              increment_noInline(1);
+              return increment_noInline(missing);
+            }"
+           0))
+
+(deftest guarded_numeric_fallback_is_stable_under_an_alternate_worklist_seed
+         (assert-eq
+           (pipeline-compile-link-run!
+             "function increment_noInline(value) { return value + 1; }
+              function main(missing) {
+                increment_noInline(1);
+                return increment_noInline(missing);
+              }"
+             "/tmp/aot-take-2-undefined-seed.o"
+             "/tmp/aot-take-2-undefined-seed"
+             17)
+           0))
+
+(deftest supported_source_pipeline_is_stable_across_diverse_worklist_seeds
+         (let [source
+                 "function count_noInline(value, missing) {
+                    let answer = 40;
+                    while (value) {
+                      if (missing) { return 7; }
+                      answer = answer + 1;
+                      value = value - 1;
+                    }
+                    return answer;
+                  }
+                  function main(missing) { return count_noInline(2, missing); }"]
+           (assert-eq
+             (pipeline-compile-link-run! source
+                                         "/tmp/aot-take-2-seed-3.o"
+                                         "/tmp/aot-take-2-seed-3"
+                                         3)
+             42)
+           (assert-eq
+             (pipeline-compile-link-run! source
+                                         "/tmp/aot-take-2-seed-37.o"
+                                         "/tmp/aot-take-2-seed-37"
+                                         37)
+             42)
+           (assert-eq
+             (pipeline-compile-link-run! source
+                                         "/tmp/aot-take-2-seed-101.o"
+                                         "/tmp/aot-take-2-seed-101"
+                                         101)
+             42)))
+
+(deftest source_extra_ordinary_call_actuals_are_ignored_by_the_fixed_abi
+         (execution-assert-source
+           "function identity_noInline(answer) { return answer; }
+            function main() { return identity_noInline(42, 7, 9); }"
+           42))
+
+(deftest source_duplicate_parameter_names_bind_the_last_formal
+         (execution-assert-source
+           "function choose_noInline(value, value) { return value; }
+            function main() { return choose_noInline(7, 42); }"
+           42))
+
+(deftest source_first_call_result_survives_a_second_call_at_native_execution
+         (execution-assert-source
+           "function identity_noInline(value) { return value; }
+            function main() { return identity_noInline(20) + identity_noInline(20) + 2; }"
+           42))
+
+(deftest source_ninth_stack_argument_reaches_native_execution
+         (execution-assert-source
+           "function ninth_noInline(a, b, c, d, e, f, g, h, i) { return i; }
+            function main() { return ninth_noInline(1, 2, 3, 4, 5, 6, 7, 8, 42); }"
+           42))
+
+(deftest source_tenth_stack_argument_reaches_native_execution
+         (execution-assert-source
+           "function tenth_noInline(a, b, c, d, e, f, g, h, i, j) { return j; }
+            function main() { return tenth_noInline(1, 2, 3, 4, 5, 6, 7, 8, 20, 42); }"
+           42))
+
+(deftest source_two_stack_arguments_reach_native_execution
+         (execution-assert-source
+           "function addStack_noInline(a, b, c, d, e, f, g, h, i, j) { return i + j; }
+            function main() { return addStack_noInline(1, 2, 3, 4, 5, 6, 7, 8, 20, 22); }"
+           42))
+
+(deftest source_stack_argument_is_rebased_across_an_outgoing_stack_call
+         (execution-assert-source
+           "function ninth_noInline(a, b, c, d, e, f, g, h, i) { return i; }
+            function bridge_noInline(a, b, c, d, e, f, g, h, i) {
+              return ninth_noInline(a, b, c, d, e, f, g, h, i);
+            }
+            function main() { return bridge_noInline(1, 2, 3, 4, 5, 6, 7, 8, 42); }"
            42))
 
 (deftest source_bindings_assignment_and_shadowing_reach_native_execution
@@ -87,6 +418,11 @@
               return x * 2;
             }"
            10))
+
+(deftest source_block_local_return_reaches_native_execution
+         (execution-assert-source
+           "function main() { { let answer = 42; return answer; } }"
+           42))
 
 (deftest source_parentheses_expression_statements_and_unreached_functions_reach_native_execution
          (execution-assert-source
@@ -100,6 +436,16 @@
 
 (deftest source_conditional_expressions_reach_native_execution
          (execution-assert-source "function main() { return 1 ? 7 : 9; }" 7))
+
+(deftest source_conditional_calls_merge_effects_and_reach_native_execution
+         (execution-assert-source
+           "function left_noInline(value) { return value; }
+            function right_noInline(value) { return value; }
+            function choose(condition, a, b) {
+              return condition ? left_noInline(a) : right_noInline(b);
+            }
+            function main() { return choose(1, 7, 9); }"
+           7))
 
 (deftest source_if_else_assignment_merges_reach_native_execution
          (execution-assert-source
@@ -127,6 +473,15 @@
             }
             function main() { return choose(1, 6, 8); }"
            6))
+
+(deftest source_if_block_local_returns_reach_native_execution
+         (execution-assert-source
+           "function choose(condition) {
+              if (condition) { let yes = 42; return yes; }
+              else { let no = 9; return no; }
+            }
+            function main() { return choose(1); }"
+           42))
 
 (deftest source_zero_iteration_loops_reach_native_execution
          (execution-assert-source
@@ -159,6 +514,36 @@
             }"
            0))
 
+(deftest source_nested_loop_scopes_and_backedges_reach_native_execution
+         (execution-assert-source
+           "function main() {
+              let outer = 0;
+              let sum = 0;
+              while (outer - 2) {
+                let inner = 0;
+                while (inner - 2) {
+                  sum = sum + 10;
+                  inner = inner + 1;
+                }
+                outer = outer + 1;
+              }
+              return sum + 2;
+            }"
+           42))
+
+(deftest source_two_loop_carried_values_ignore_process_argc_at_native_execution
+         (execution-assert-source-with-varying-argv
+           "function main() {
+              let value = 10;
+              let count = 1;
+              while (count) {
+                value = value + 1;
+                count = count - 1;
+              }
+              return value;
+            }"
+           11))
+
 (deftest source_recursive_calls_and_runtime_branches_reach_native_execution
          (execution-assert-source
            "function descend(value) {
@@ -167,3 +552,14 @@
             }
             function main() { return descend(3); }"
            7))
+
+(deftest source_multi_parameter_recursive_value_survives_its_call_at_native_execution
+         (execution-assert-source
+           "function accumulate(value, bias) {
+              if (value) {
+                let current = value + bias;
+                return current + accumulate(value - 1, bias);
+              } else { return 0; }
+            }
+            function main() { return accumulate(2, 5); }"
+           13))

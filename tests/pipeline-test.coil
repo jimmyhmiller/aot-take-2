@@ -1,0 +1,232 @@
+;; Production source-to-object phase-contract regressions.
+(module aot.tests.pipeline)
+(import "coil.assert" :use *)
+(import "aot.node.boot" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.type.type" :use *)
+(import "aot.codegen.codegen" :use *)
+(import "aot.codegen.machine" :use *)
+(import "aot.codegen.iterpeeps" :use *)
+(import "aot.codegen.opto" :use *)
+(import "aot.codegen.typecheck" :use *)
+(import "aot.codegen.looptree" :use *)
+(import "aot.codegen.gcmeta" :use *)
+(import "aot.codegen.gcm" :use *)
+(import "aot.codegen.listsched" :use *)
+(import "aot.codegen.pipeline" :use *)
+(import "aot.node.cpus.arm64" :use *)
+(import "aot.jsl.lower" :use *)
+(import "aot.parse.parser" :use *)
+
+(defn pipeline-test-ideal-op [(n (dyn NodeOps))] (-> i64)
+  (match (mach-of n) (Some [mach] (m-ideal-op mach)) (None [] (n-op n))))
+
+;; A block head has exactly one CFG tail. In particular, a Return and a Call cannot both be direct
+;; control children of the same Fun: local scheduling would be free to emit either terminal first.
+(defn pipeline-test-has-sibling-return-and-call? [] (-> bool)
+  (let [(mut nid) 1
+        (mut bad) false]
+    (loop (if (or (> (load nid) (arena-node-count)) (load bad))
+              (break 0)
+              (do
+                (match (arena-node (load nid))
+                  (Some [fun]
+                        (if (and (not (n-dead? fun)) (= (pipeline-test-ideal-op fun) OP-FUN))
+                            (let [(mut oi) 0
+                                  (mut saw-return) false
+                                  (mut saw-call) false]
+                              (loop (if (>= (load oi) (n-nouts fun))
+                                        (break 0)
+                                        (do
+                                          (match (n-out fun (load oi))
+                                            (Some [use_]
+                                                  (if (match (n-in-safe use_ 0)
+                                                        (Some [ctrl] (n-same? ctrl fun))
+                                                        (None [] false))
+                                                      (let [op (pipeline-test-ideal-op use_)]
+                                                        (if (= op OP-RETURN)
+                                                            (set! (mut saw-return) true)
+                                                            (if (= op OP-CALL)
+                                                                (set! (mut saw-call) true)
+                                                                0)))
+                                                      0))
+                                            (None [] 0))
+                                          (set! (mut oi) (+ (load oi) 1))
+                                          (continue))))
+                              (if (and (load saw-return) (load saw-call))
+                                  (set! (mut bad) true)
+                                  0))
+                            0))
+                  (None [] 0))
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))
+    (load bad)))
+
+(defn pipeline-test-has-call-to-fun-link? [] (-> bool)
+  (let [(mut nid) 1
+        (mut found) false]
+    (loop (if (or (> (load nid) (arena-node-count)) (load found))
+              (break 0)
+              (do
+                (match (arena-node (load nid))
+                  (Some [call]
+                        (if (and (not (n-dead? call)) (= (pipeline-test-ideal-op call) OP-CALL))
+                            (let [(mut oi) 0]
+                              (loop (if (or (>= (load oi) (n-nouts call)) (load found))
+                                        (break 0)
+                                        (do
+                                          (match (n-out call (load oi))
+                                            (Some [use_]
+                                                  (if (= (pipeline-test-ideal-op use_) OP-FUN)
+                                                      (set! (mut found) true)
+                                                      0))
+                                            (None [] 0))
+                                          (set! (mut oi) (+ (load oi) 1))
+                                          (continue)))))
+                            0))
+                  (None [] 0))
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))
+    (load found)))
+
+(deftest source_to_object_driver_crosses_every_phase_boundary_in_order
+         (do
+           (assert (> (pipeline-compile-macho! "function main() { return 42; }"
+                                               "/tmp/aot-take-2-phase-contract.o"
+                                               29)
+                      0))
+           (assert-eq (code-phase) PHASE-EXPORT)))
+
+(deftest forward_declaration_pipeline_is_independent_of_seeded_worklist_order
+         (let [source
+                 "function main() { return later(40); }
+                  function later(value) { return value + 2; }"]
+           (assert (> (pipeline-compile-macho! source
+                                               "/tmp/aot-take-2-forward-seed-2.o"
+                                               2)
+                      0))
+           (assert (> (pipeline-compile-macho! source
+                                               "/tmp/aot-take-2-forward-seed-97.o"
+                                               97)
+                      0))
+           (assert (> (pipeline-compile-macho! source
+                                               "/tmp/aot-take-2-forward-seed-65537.o"
+                                               65537)
+                      0))))
+
+(deftest typecheck_checks_only_the_stop_reachable_program
+         (do
+           (boot! 47)
+           (let [start (start-make (ty-int-bot))
+                 sig (ty-tuple-of2 (ty-int-bot) (ty-int-bot))
+                 fun (fun-make start sig "main")
+                 ret
+                   (return-make fun
+                                (None [(dyn NodeOps)])
+                                (con-int 42)
+                                (None [(dyn NodeOps)])
+                                (Some fun))
+                 stop (stop-make)
+                 detached-call (call-make (con-make TY-CTRL))
+                 detached-unbox (unbox-make (con-make (ty-dyn TAG-ANY)) REP-INT)]
+             (fun-set-ret! fun ret)
+             (stop-add-return! stop ret)
+             ;; These deliberately invalid semantic shells are live in the arena but absent from
+             ;; the Stop input closure. Final Simple's Stop.walk does not diagnose them as source.
+             (assert (not (n-dead? detached-call)))
+             (assert (not (unbox-proven? detached-unbox)))
+             (typecheck-run! stop))))
+
+(deftest source_nested_loops_receive_a_complete_loop_tree_before_selection
+         (do
+           (boot! 1)
+           (code-reset! 1)
+           (let [stop
+                   (parse-program
+                     "function main() {
+                        let outer = 0;
+                        let sum = 0;
+                        while (outer - 2) {
+                          let inner = 0;
+                          while (inner - 2) {
+                            sum = sum + 10;
+                            inner = inner + 1;
+                          }
+                          outer = outer + 1;
+                        }
+                        return sum + 2;
+                      }")
+                 start (parser-entry-start)]
+             (n-keep! start)
+             (jsl-prepare-opto!)
+             (iter-seed-connected! stop)
+             (iter-run!)
+             (parser-close-world!)
+             (parser-prepare-opto! stop)
+             (opto-run!)
+             (iter-seed-all!)
+             (iter-run!)
+             (parser-finish-opto! stop)
+             (jsl-finish-opto! stop)
+             (typecheck-run! stop)
+             (looptree-build! start stop)
+             (let [(mut nid) 1
+                   (mut loops) 0]
+               (loop (if (> (load nid) (arena-node-count))
+                         (break 0)
+                         (do
+                           (match (arena-node (load nid))
+                             (Some [n]
+                                   (if (and (= (n-op n) OP-LOOP) (not (n-dead? n)))
+                                       (do
+                                         (set! (mut loops) (+ (load loops) 1))
+                                         (assert (!= (n-ltree-parent n) 0)))
+                                       0))
+                             (None [] 0))
+                           (set! (mut nid) (+ (load nid) 1))
+                           (continue))))
+               (assert-eq (load loops) 2))
+             (n-unkeep! start))))
+
+(deftest forward_declaration_never_builds_sibling_return_and_call_tails
+         (do
+           (boot! 31)
+           (code-reset! 31)
+           (let [stop
+                   (parse-program
+                     "function main() { return later(40); }
+                      function later(value) { return value + 2; }")
+                 start (parser-entry-start)]
+             (n-keep! start)
+             (jsl-prepare-opto!)
+             (iter-seed-connected! stop)
+             (iter-run!)
+             (parser-close-world!)
+             (parser-prepare-opto! stop)
+             (opto-run!)
+             (iter-seed-all!)
+             (iter-run!)
+             (parser-finish-opto! stop)
+             (jsl-finish-opto! stop)
+             (typecheck-run! stop)
+             (looptree-build! start stop)
+             (gc-lower-barriers-from! stop)
+             (parser-prepare-codegen! start)
+             (jsl-prepare-codegen! start)
+             (call-unlink-all!)
+             (assert (not (pipeline-test-has-call-to-fun-link?)))
+             (assert (not (pipeline-test-has-sibling-return-and-call?)))
+             (n-unkeep! start)
+             (let [selected-stop (arm64-select-graph stop)
+                   selected-start (pipeline-find-selected-start selected-stop)]
+               (code-set-roots! selected-start selected-stop)
+               (assert (not (pipeline-test-has-call-to-fun-link?)))
+               (assert (not (pipeline-test-has-sibling-return-and-call?)))
+               (gcm-build-cfg!)
+               (assert (not (pipeline-test-has-sibling-return-and-call?)))
+               (sched-run!)
+               (assert (not (pipeline-test-has-sibling-return-and-call?)))))))

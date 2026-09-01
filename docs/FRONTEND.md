@@ -33,10 +33,14 @@ the entry point for essentially every JavaScript construct:
 | a class field | `DefineField` |
 | `a instanceof B` | `OrdinaryInstanceOf` |
 
-So the rule is:
+So the semantic-boundary rule is:
 
-> **The frontend's entire semantic knowledge is a table mapping syntax to a JSL entry-point name.
-> It emits a call to that name and nothing else. It never reimplements a semantic step.**
+> **Each admitted JavaScript operator or predicate maps to a JSL entry-point name. The frontend
+> emits that call and does not reimplement the abstract operation.**
+
+Structural control and lexical Scope construction remain frontend work, and the current slice
+constructs its sole global primitive, `undefined`, directly. As additional expressions become
+admitted, their observable JavaScript semantics belong behind this JSL boundary.
 
 `jsl/abstract/property.jsl` states this contract in its own words, beside `GetGlobalBinding`:
 *"Keep the presence decision beside GetGlobalBinding so the frontend does not duplicate the Realm
@@ -44,35 +48,34 @@ environment semantics."* That is the boundary, and it was drawn by the people wh
 
 ### What this buys, concretely
 
-`a + b` is not an `Add` node. `JsAdd` is:
+`a + b` is not an `Add` node. The currently compiled numeric/undefined `JsAdd` is:
 
 ```lisp
-(builtin JsAdd :transitioning true :params [(a dyn) (b dyn)] :ret dyn
-  (let [(left  (ToPrimitive (%Box a) (%Box undefined)))
-        (right (ToPrimitive (%Box b) (%Box undefined)))]
-    (if (%IsString left)
-        (%StringConcat left (ToStringValue right))
-        (if (%IsString right)
-            (%StringConcat (ToStringValue left) right)
-            (%Box (%Add (NumberRaw left) (NumberRaw right)))))))
+(builtin JsAdd :params [(a dyn) (b dyn)] :ret dyn
+  (let [(left (if (%IsUndefined a)
+                  (%Div (%ToFloat 0) (%ToFloat 0))
+                  (%UnboxNumber a)))
+        (right (if (%IsUndefined b)
+                   (%Div (%ToFloat 0) (%ToFloat 0))
+                   (%UnboxNumber b)))]
+    (%Box (%Add left right))))
 ```
 
 The parser emits `Call(JsAdd, a, b)` and stops. Then the ordinary optimiser does the work — and
 this is the whole performance thesis in one example:
 
 ```
-Call(JsAdd, a, b)              a and b proven int
+Call(JsAdd, a, b)              a and b proven numeric
   inline                       the JsAdd graph is an ordinary Fun graph
-  ToPrimitive folds            a primitive is already primitive
-  %IsString folds false        the tag is proven
-  → %Box(%Add(%NumberRaw a, %NumberRaw b))
-  Box/Unbox cancel             they are ordinary nodes that cancel in pairs
-  → Add(a, b)                  one machine instruction
+  %IsUndefined folds false     the tags are proven
+  %UnboxNumber specializes     boxed int converts; boxed double is a representation move
+  → %Box(%Add(left, right))    IEEE binary64 addition
+  select                       one floating add plus the required result representation boundary
 ```
 
 Nothing about that is speculative and there is no deoptimisation path. Where the types are *not*
-proven, the same graph survives as the generic path with the branches intact — which is exactly
-what should happen, because then the program really can concatenate strings.
+proven, the same graph survives with its undefined-to-NaN branches intact. String concatenation and
+the rest of full `JsAdd` remain outside the currently admitted source/runtime slice.
 
 **This is the reason the op count does not grow with ECMAScript.** A builtin that lowers to the
 ideal graph is inlined and specialised into user code. An opcode plus a runtime C function never
@@ -100,11 +103,12 @@ JavaScript does not permit it, and the reasons are specific rather than general:
 
 **But the tree must not become a second IR.** Simple's real insight — the graph *is* the program —
 still holds. The tree exists to solve ordering and lookahead, and it is discarded the moment
-lowering finishes. So:
+lowering finishes. The current implementation therefore uses:
 
-- one `defsum Syntax`, with children in a side array addressed by `(offset, len)` — the same trick
-  the type lattice uses, keeping the sum small and non-recursive;
-- arena-allocated with dense ids, freed after lowering;
+- compact tagged `SyntaxExpr` and `SyntaxStmt` records plus `SyntaxFun` declaration headers, with
+  child expressions/statements referenced by dense ids in parser-owned side arrays;
+- parser-owned dense storage that is cleared before the next compilation unit; no later compiler
+  pass retains or queries syntax records after graph lowering;
 - source spans, because a diagnostic without one is unactionable;
 - **no** per-construct structs, **no** visitor framework, **no** typed-AST layer, and **no**
   analysis that could equally be done on the graph.
@@ -118,18 +122,18 @@ about *syntax*.
 
 ```
 source text
-   │  lexer                      regex-vs-divide and ASI need parser feedback
+   │  lexer                      line terminators feed ASI; unsupported regex context fails closed
    ▼
 tokens
-   │  parser                     cover grammars resolved here
+   │  parser                     constructs the admitted grammar without semantic typing
    ▼
-Syntax tree  ──────────────┐     thin, arena, discarded after lowering
-   │  declaration pass     │     hoisting, TDZ, module records, binding resolution
+Syntax tree  ──────────────┐     thin, parser-owned, not observed after lowering
+   │  declaration pass     │     named-function hoisting and stable function identities
    ▼                       │
-lowering walk  ────────────┘     drives ScopeNode; SSA falls out
+lowering walk  ────────────┘     resolves admitted bindings and drives ScopeNode; SSA falls out
    │
-   │  every operator / property / binding / iteration step emits
-   │      Call(<JSL entry point>, args…)
+   │  admitted JavaScript arithmetic and truthiness emit
+   │      Call(<JSL entry point>, args…); structural control lowers directly
    ▼
 ideal graph  ◄──── JSL definitions, lowered from jsl/index into Fun graphs
    │
@@ -140,57 +144,76 @@ specialised graph → backend
 
 ### Current executable slice
 
-The implemented `number`-annotated arithmetic slice preserves the JavaScript representation
-boundary even though its accepted values are presently narrower than ECMAScript:
+The implemented numeric/undefined slice preserves the JavaScript representation boundary:
 
-- source literals are `Box(ConInt)`, not raw integer values;
+- source integer spellings are boxed as either exact signed-48 payloads or binary64 values, never
+  silently truncated raw integers;
 - user-function parameters, results and calls use `dyn`, exactly like JSL calls;
 - a `number` annotation does not change a parameter into a raw integer;
-- closed-world argument flow may prove a singleton integer tag, after which JSL's `%UnboxInt`
-  becomes justified and ordinary Box/Unbox cancellation exposes raw arithmetic;
-- backend handoff refuses a live Unbox whose dynamic input is not representation-proven.
+- closed-world argument flow may prove a numeric representation, after which JSL's
+  `%UnboxNumber` and ordinary Box/Unbox cancellation expose raw arithmetic;
+- a genuinely mixed number/undefined value keeps the JSL TypeTest/If/Cast fallback through
+  selection, with JavaScript `ToNumber(undefined)` producing NaN rather than trusting an
+  annotation;
+- backend handoff still refuses any live Unbox whose control-path representation proof is absent.
 
 Parameter and return annotations are optional, so the same function grammar admits ordinary
 JavaScript declarations. Annotated and unannotated functions both use the identical `dyn` return
 and argument signature; the annotation never selects a raw representation.
 
-The native entry point is currently the source function `main`. Source-to-native regression tests
-use a zero-argument `main`; externally supplied JavaScript values need an entry adapter and runtime
-argument representation before parameterized entry points can be part of the executable contract.
-Internal function parameters are fully dynamic and are specialized only from closed-world call
-evidence. Arithmetic that remains genuinely polymorphic still fails the explicit representation
-proof at typecheck until the generic numeric runtime path is admitted; annotations are never used
-to bypass that proof.
+The native entry point is a distinct compiler-owned `main` wrapper. It calls the boxed source
+function under the deliberately unspellable internal symbol `$aot$.source_main`, supplies the
+canonical boxed `undefined` for every omitted source parameter in both register and stack slots,
+and converts the boxed JavaScript result to a host process status. An ordinary source call uses the
+same fixed internal ABI: missing formals receive `undefined`; every extra actual is still evaluated
+left-to-right for effects and is then omitted from the callee's formal input bank. Internal
+parameters remain fully dynamic and specialize only from closed-world call evidence; annotations
+are never used to bypass representation proof.
+
+The sole admitted global value is the shadowable binding `undefined`. This source slice is
+non-strict (duplicate formal parameters follow non-strict last-binding semantics), so assigning to
+the unshadowed, non-writable global evaluates the complete right-hand side and then has no effect.
+A lexical `let undefined` instead resolves through the ordinary Scope slot and updates normally.
 
 Function bodies currently admit sequential `let`/`const`, assignment, lexical blocks, expression
 statements, return, calls, arithmetic, conditional expressions, statement `if`/`else`, and basic
 `while` loops.
 Statement branches duplicate and merge ScopeNode directly, so reassigned bindings acquire Phis
-only when the arm values differ. Two returning arms join their controls and values at the function
-Return. A one-arm return remains refused until the final function-exit scope can merge early exits.
-ScopeNode is the sole lowering environment, so shadowing and reassignment construct SSA during
-parsing. `while` follows final Simple's atomic loop protocol: an open Loop and lazy binding Phis are
-built first, then `scope-end-loop!` installs the control backedge and every materialized Phi
-backedge without exposing an intermediate graph. `break`, `continue`, and loop-body returns remain
-outside the admitted subset.
+only when the arm values differ. Final Simple's pruned return-Scope protocol is represented by a
+function-local accumulator of control, memory, and value: bare returns and live fallthrough add
+boxed `undefined`, early exits kill only their own path, and one final Region/MemPhi/value Phi owns
+all exits. Statements after an unconditional return remain valid parsed syntax but are not lowered
+back onto live control. ScopeNode is the sole lowering environment, so shadowing and reassignment
+construct SSA during parsing. `while` follows final Simple's atomic loop protocol: an open Loop and
+lazy binding Phis are built first, then `scope-end-loop!` installs the control backedge and every
+materialized Phi backedge without exposing an intermediate graph. A return in the body contributes
+to the function accumulator while the loop's false projection remains live. `break` and `continue`
+remain outside the admitted subset.
 
 Every member of the current `SyntaxExpr` and `SyntaxStmt` sums has a native execution regression:
 numeric literals, names, grouping, `+`/`-`/`*`, named calls, conditional expressions, `let`, `const`,
-assignment, expression statements, blocks and shadowing, returns, `if` with and without `else`, and
-`while` with block and single-statement bodies. The matrix also covers forward declarations,
-unreached functions, recursion, and zero-, one-, and multi-iteration loops. Lexical recognition of
-additional token kinds is not admission: unsupported primaries fail immediately before graph
-lowering.
+assignment, expression statements, blocks and shadowing, value/bare/implicit returns, `if` with and
+without `else`, and `while` with block and single-statement bodies. The matrix also covers forward
+and duplicate declarations, duplicate parameter last-binding semantics, missing and extra actuals,
+the shadowable global `undefined` and its non-strict non-writable assignment behavior, ASI
+(including restricted `return`), line comments, unreachable statements after return, recursion,
+and zero-, one-, multi-iteration and nested loops. Graph tests separately assert left-to-right
+control and memory ordering, including the preserved RHS effects of an assignment to global
+`undefined`, where the admitted source subset has no externally visible mutation. Lexical
+recognition of additional token kinds is not admission:
+unsupported primaries fail immediately before graph lowering.
 
 The production JSL subset now admits integer literals, lexical `let`, value-producing `if`, calls
-between JSL definitions, and dynamic tag predicates such as `%IsInt`. A recognized tag predicate
-installs an ordinary Cast for the tested binding on the true control edge; checked `%UnboxInt`
-therefore consumes proof from the graph instead of trusting a TypeScript annotation. The guarded
-`JsIncrementIntOrIdentity` definition demonstrates both outcomes: unknown dynamic input preserves
-its TypeTest/If/Phi fallback, while boxed integer input specializes to raw addition and re-boxing.
-Index loading is two-pass: every declaration receives its stable function index before any body
-lowers, then bodies resolve names across the complete table. Forward semantic references therefore
-remain legal without making function indices depend on traversal accidents.
+between JSL definitions, numeric conversion primitives, and dynamic tag predicates such as
+`%IsInt` and `%IsUndefined`. A recognized tag predicate installs ordinary Cast proof on both the
+taken and complementary edges when the dynamic tag lattice can represent the complement; checked
+Unboxes therefore consume control-path proof from the graph instead of trusting a TypeScript
+annotation. The guarded `JsIncrementIntOrIdentity` definition demonstrates specialization, while
+the numeric builtins retain an undefined-to-NaN fallback when their arguments do not sharpen to a
+single numeric representation. Index loading is two-pass: every declaration receives its stable
+function index before any body lowers, then bodies resolve names across the complete table. Forward
+semantic references therefore remain legal without making function indices depend on traversal
+accidents.
 
 Two things join in the middle, and they join at **`Call` to a `Fun`** — nothing more exotic:
 
@@ -255,36 +278,24 @@ discovered, not from a clever cost model.
 ## 4. What has to exist before any of it runs
 
 The control, call, inlining, dynamic-value and optimizer spine below is implemented and tested.
-What remains is to connect it first to one fixture JSL definition and then to source lowering.
+It was established in the following order; each step remains covered directly even though the
+production source path now crosses the complete sequence.
 
 The shortest path to proving the architecture, and it needs no parser at all:
 
 1. ~~`Start`, `Stop`, `Return`, `Region`, `If`, `Phi`, `Proj`, and `iterpeeps`.~~ Implemented.
 2. ~~`Fun`, `Parm`, `Call`, `CallEnd`, and inlining.~~ Implemented.
-3. Implement `src/jsl/` reader and lowering for **one** fixture builtin.
-4. Make a hand-built `Call(FixtureSub, con 5, con 3)` fold to the constant `2`.
+3. ~~Implement the JSL reader/checker and lower one production numeric builtin.~~ Implemented.
+4. ~~Make a hand-built `Call(JsSub, con 5, con 3)` specialize to the numeric result `2`.~~
+   Implemented.
 
 Step 4 is one test, and passing it exercises the reader, the lowering, the primitive layer, `Fun`
 and `Call`, the inliner, `Box`/`Unbox` cancellation and the peephole fixpoint — the entire spine.
 
-**But not with a real `jsl/` builtin, and it is worth being precise about why.** `JsSub` looks
-isolated — `(%Box (%Sub (NumberRaw a) (NumberRaw b)))` — but `NumberRaw` is
-`(%UnboxNumber (ToNumberValue v))`, and `ToNumberValue` reaches `ThrowTypeError`, `IsNumber`,
-`ToPrimitiveNumber` and thence `ToPrimitive`, `GetMethod` and `Call`. Lowering is
-transitive even when *folding* is not: on two proven integers `IsNumber` folds true and the whole
-`ToPrimitive` arm is dead — but the arm still has to be BUILT before it can be deleted.
-
-So the first target is a **fixture unit of our own**, living in `tests/fixtures/*.jsl` and loaded
-only by tests. It never goes in `jsl/`, so `jsl/` stays exactly the real ECMA-262 library and no
-coverage claim can accidentally cite a fixture:
-
-```lisp
-(builtin FixtureSub :params [(a dyn) (b dyn)] :ret dyn
-  (%Box (%Sub (%UnboxInt a) (%UnboxInt b))))
-```
-
-That proves the machinery honestly and then real `jsl/` units follow as their dependencies land.
-A fixture is a scaffold for the pipeline, never evidence about ECMAScript: no coverage claim may
-cite one.
+The proof now uses the production `jsl/compiler/sub.jsl` unit rather than a reduced fixture. Its
+undefined-to-NaN guards, `%UnboxNumber` conversions, binary64 subtraction and `%Box` result all
+lower before the ordinary call/inlining fixpoint specializes boxed `5` and `3` to `2`. This makes
+the test evidence match the unit the source frontend actually calls; no reduced fixture is counted
+as ECMAScript coverage.
 
 The parser comes after that, because only then does every entry point it emits actually resolve.

@@ -14,10 +14,18 @@
 ;; here is STATICALLY KNOWN, so the same inlining needs no speculation to justify it and has no
 ;; deoptimisation path to maintain.
 ;;
-;; Structured exits (`:labels`/`goto`/`:otherwise`) lower to ordinary control: a fast path that
-;; bails to a generic one is a branch, which is the same mechanism a guard uses.
+;; STATUS: the checker-admitted core lowers completely to this graph vocabulary. Integer literals,
+;; parameters, lexical `let`, value-producing `if`, the admitted pure primitives, calls between JSL
+;; definitions, and dynamic tag predicates all have concrete lowering. `if` threads control and
+;; memory through both arms and joins differing values with a Region/Phi; a recognized tag test
+;; installs edge-local Cast proof before an Unbox. Index loading is two-pass, so every declaration
+;; receives its stable function identity before bodies resolve forward calls. Temporary Return
+;; ownership, closed-world caller removal, and final compilation-unit retention follow the same Fun
+;; lifetime protocol as source declarations.
 ;;
-;; SCAFFOLD: signatures are final; bodies hard-error. Filled in at S5.
+;; Structured exits (`:labels`/`goto`/`:otherwise`) and transitioning primitives are not admitted
+;; by `aot.jsl.check` yet. Consequently `jsl-check-transitions` is truthfully empty for today's pure
+;; graph set; admitting allocation or a callback requires its safepoint/relocation walk first.
 (module aot.jsl.lower)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
@@ -30,6 +38,7 @@
 (import "aot.node.memory" :use *)
 (import "aot.node.call" :use *)
 (import "aot.node.arith" :use *)
+(import "aot.node.bits" :use *)
 (import "aot.node.compare" :use *)
 (import "aot.node.constant" :use *)
 (import "aot.node.dynamic" :use *)
@@ -103,30 +112,75 @@
 (defn jsl-node [(nid i64)] (-> (dyn NodeOps))
   (match (arena-node nid) (Some [n] n) (None [] (unreachable-node))))
 
+(defn jsl-lower-type [(x (ptr rd/Sexp))] (-> i64)
+  (let [name (rd/sexp-sym x)]
+    (if (= name "dyn")
+        (ty-dyn TAG-ANY)
+        (if (= name "int")
+            (ty-int-bot)
+            (if (= name "bool")
+                (ty-bool)
+                (if (= name "flt")
+                    (ty-flt-bot)
+                    (do (panic "jsl-lower-type: checker/lowerer drift") TY-INVALID)))))))
+
 ;; JSL defines ToBoolean as `%Not(%Not(v))`. The frontend requests that semantic expansion here so
 ;; the definition enters the ideal graph directly, just like a JSL macro expansion, without
 ;; manufacturing a runtime call boundary for a pure primitive composition.
 (defn jsl-lower-toboolean-value [(value (dyn NodeOps))] (-> (dyn NodeOps))
   (n-peephole! (not-make (n-peephole! (not-make value)))))
 
-(defn jsl-tag-predicate [(name (slice u8))] (-> i64)
-  (if (= name "%IsInt")
-      TAG-INT
-      (if (= name "%IsFlt")
-          TAG-DOUBLE
-          (if (= name "%IsString")
-              TAG-STRING
-              (if (= name "%IsBool")
-                  TAG-BOOL
-                  (if (= name "%IsNull")
-                      TAG-NULL
-                      (if (= name "%IsUndefined")
-                          TAG-UNDEFINED
-                          (if (= name "%IsSymbol")
-                              TAG-SYMBOL
-                              (if (= name "%IsObject")
-                                  TAG-OBJECT
-                                  (if (= name "%IsFunction") TAG-FUNCTION 0))))))))))
+(defn jsl-unary-primitive? [(name (slice u8))] (-> bool)
+  (or (= name "%Box")
+      (= name "%Not")
+      (= name "%UnboxInt")
+      (= name "%UnboxFlt")
+      (= name "%UnboxNumber")
+      (= name "%ToFloat")))
+
+(defn jsl-lower-unary-primitive [(name (slice u8))
+                                 (value (dyn NodeOps))
+                                 (ctrl (dyn NodeOps))] (-> (dyn NodeOps))
+  (if (= name "%Box")
+      (n-peephole! (box-make-at (Some ctrl) value))
+      (if (= name "%Not")
+          (n-peephole! (not-make value))
+          (if (= name "%UnboxInt")
+              (n-peephole! (unbox-make value REP-INT))
+              (if (= name "%UnboxFlt")
+                  (n-peephole! (unbox-make value REP-DOUBLE))
+                  (if (= name "%UnboxNumber")
+                      (n-peephole! (unbox-make value REP-NUMBER))
+                      (if (= name "%ToFloat")
+                          (n-peephole! (to-float-make value))
+                          (do
+                            (panic "jsl-lower-unary-primitive: checker/lowerer drift")
+                            (unreachable-node)))))))))
+
+(defn jsl-lower-binary-primitive [(name (slice u8))
+                                  (lhs (dyn NodeOps))
+                                  (rhs (dyn NodeOps))] (-> (dyn NodeOps))
+  (n-peephole! (if (= name "%Sub")
+                   (sub-make lhs rhs)
+                   (if (= name "%Add")
+                       (add-make lhs rhs)
+                       (if (= name "%Mul")
+                           (mul-make lhs rhs)
+                           (if (= name "%Div")
+                               (div-make lhs rhs)
+                               (if (= name "%Eq")
+                                   (eq-make lhs rhs)
+                                   (if (= name "%Ne")
+                                       (ne-make lhs rhs)
+                                       (if (= name "%Lt")
+                                           (lt-make lhs rhs)
+                                           (if (= name "%Le")
+                                               (le-make lhs rhs)
+                                               (if (= name "%And")
+                                                   (and-make lhs rhs)
+                                                   (do
+                                                     (panic "jsl-lower-binary-primitive: checker/lowerer drift")
+                                                     (unreachable-node)))))))))))))
 
 (defn jsl-lower-call [(x (ptr rd/Sexp))
                       (name (slice u8))
@@ -176,7 +230,8 @@
       (jsl-expr-result (con-int (rd/sexp-int x)) ctrl mem)
       (if (rd/sexp-sym? x)
           (jsl-expr-result (jsl-env-lookup params values (load local-names) (load local-values) (rd/sexp-sym x))
-                           ctrl mem)
+                           ctrl
+                           mem)
           (let [name (rd/sexp-sym (rd/sexp-nth x 0))]
             (if (= name "let")
                 (let [bindings (rd/sexp-nth x 1)
@@ -260,6 +315,21 @@
                         (if (= guarded-name "")
                             0
                             (do (pop! (mut local-names)) (pop! (mut local-values)) 0))
+                        ;; The false edge carries the complementary proof. Without this Cast,
+                        ;; `if (%IsUndefined x) ... (%UnboxNumber x)` keeps the original
+                        ;; undefined|number union in the else arm and reaches the backend as an
+                        ;; unproven unbox even though control established exactly the needed fact.
+                        (if (= guarded-name "")
+                            0
+                            (do
+                              (push! [(slice u8)] (mut local-names) guarded-name)
+                              (push! [(dyn NodeOps)]
+                                     (mut local-values)
+                                     (cast-make (arms-false arms)
+                                                (n-in! (.value pred) 1)
+                                                (ty-dyn (primitive/iand TAG-ANY
+                                                                        (primitive/ixor TAG-ANY
+                                                                                        (typetest-tags (.value pred)))))))))
                         (let [lowered-no
                                 (jsl-lower-expr (rd/sexp-nth x 3)
                                                 params
@@ -273,6 +343,9 @@
                                           (ty-meet (n-ty (.value guarded-yes))
                                                    (n-ty (.value lowered-no)))
                                           "jsl.if")]
+                          (if (= guarded-name "")
+                              0
+                              (do (pop! (mut local-names)) (pop! (mut local-values)) 0))
                           (region-add-path! region (.ctrl guarded-yes))
                           (region-add-path! region (.ctrl lowered-no))
                           (phi-add-value! phi (.value guarded-yes))
@@ -298,61 +371,44 @@
                                                 (mut local-values)
                                                 ctrl
                                                 mem)]
-                          (if (= name "%Box")
-                              (jsl-expr-result (n-peephole! (box-make (.value lhs))) (.ctrl lhs) (.mem lhs))
-                              (if (= name "%Not")
-                                  (jsl-expr-result (n-peephole! (not-make (.value lhs)))
+                          (if (jsl-unary-primitive? name)
+                              (jsl-expr-result (jsl-lower-unary-primitive name (.value lhs) (.ctrl lhs))
+                                               (.ctrl lhs)
+                                               (.mem lhs))
+                              (if (!= (jsl-tag-predicate name) 0)
+                                  (jsl-expr-result (n-peephole! (typetest-make (.value lhs) (jsl-tag-predicate name)))
                                                    (.ctrl lhs)
                                                    (.mem lhs))
-                              (if (= name "%UnboxInt")
-                                  (jsl-expr-result (n-peephole! (unbox-make (.value lhs) REP-INT))
-                                                   (.ctrl lhs)
-                                                   (.mem lhs))
-                                  (if (!= (jsl-tag-predicate name) 0)
-                                      (jsl-expr-result (n-peephole! (typetest-make (.value lhs)
-                                                                                   (jsl-tag-predicate name)))
-                                                       (.ctrl lhs)
-                                                       (.mem lhs))
-                                      (let [rhs
-                                              (jsl-lower-expr (rd/sexp-nth x 2)
-                                                              params
-                                                              values
-                                                              (mut local-names)
-                                                              (mut local-values)
-                                                              (.ctrl lhs)
-                                                              (.mem lhs))]
-                                        (if (= name "%Sub")
-                                            (jsl-expr-result (n-peephole! (sub-make (.value lhs) (.value rhs)))
-                                                             (.ctrl rhs)
-                                                             (.mem rhs))
-                                            (if (= name "%Add")
-                                                (jsl-expr-result (n-peephole! (add-make (.value lhs) (.value rhs)))
-                                                                 (.ctrl rhs)
-                                                                 (.mem rhs))
-                                                (if (= name "%Mul")
-                                                    (jsl-expr-result (n-peephole! (mul-make (.value lhs) (.value rhs)))
-                                                                     (.ctrl rhs)
-                                                                     (.mem rhs))
-                                                    (do
-                                                      (panic "jsl-lower-expr: checker/lowerer construct drift")
-                                                      (jsl-expr-result (unreachable-node) (.ctrl rhs) (.mem rhs)))))))))))))))))))
+                                  (let [rhs
+                                          (jsl-lower-expr (rd/sexp-nth x 2)
+                                                          params
+                                                          values
+                                                          (mut local-names)
+                                                          (mut local-values)
+                                                          (.ctrl lhs)
+                                                          (.mem lhs))]
+                                    (jsl-expr-result (jsl-lower-binary-primitive name (.value lhs) (.value rhs))
+                                                     (.ctrl rhs)
+                                                     (.mem rhs)))))))))))))
 
 (defn jsl-declare-form! [(form (ptr rd/Sexp))] (-> (dyn NodeOps))
   (let [a (alloc/malloc-allocator)
         name (rd/sexp-sym (rd/sexp-nth form 1))
         params (rd/sexp-nth form 3)
-        dyn-ty (ty-dyn TAG-ANY)
+        ret-ty (jsl-lower-type (rd/sexp-nth form 5))
         (mut sig-members) (al-new [i64] a)]
     ;; Signature layout is `(return, arg0, arg1, ...)`, exactly the layout Fun/Parm consume.
-    (push! [i64] (mut sig-members) dyn-ty)
+    (push! [i64] (mut sig-members) ret-ty)
     (let [(mut i) 0]
       (loop (if (>= (load i) (rd/sexp-count params))
                 (break 0)
                 (do
-                  (push! [i64] (mut sig-members) dyn-ty)
+                  (push! [i64]
+                         (mut sig-members)
+                         (jsl-lower-type (rd/sexp-nth (rd/sexp-nth params (load i)) 1)))
                   (set! (mut i) (+ (load i) 1))
                   (continue)))))
-    (let [start (start-make dyn-ty)
+    (let [start (start-make ret-ty)
           fun (fun-make start (ty-tuple (al-slice (load sig-members))) name)]
       (let [mem-parm (parm-make-slot fun CALL-MEM (ty-mem 1 TY-BOT) "$mem")]
         (parm-set-unknown-input! mem-parm (proj-make start 1 "jsl.start.mem"))
@@ -364,13 +420,17 @@
                         p
                           (parm-make fun
                                      (load i)
-                                     dyn-ty
+                                     (jsl-lower-type (rd/sexp-nth decl 1))
                                      (rd/sexp-sym (rd/sexp-nth decl 0)))]
                     (n-keep! p)
                     (set! (mut i) (+ (load i) 1))
                     (continue)))))
       (jsl-graphs-boot!)
       (let [fidx (len (.items (jsl-graphs)))]
+        ;; Reserve the complete JSL namespace at declaration time. A definition need not happen to
+        ;; have a FunPtr use, so relying on `funptr-make` to advance the allocator lets the source
+        ;; frontend reuse a runtime-library identity and relocations can bind to the wrong symbol.
+        (reserve-fidx! fidx)
         (push! [JslGraph] (mut (.items (jsl-graphs))) (jsl-graph-new name (n-nid fun) fidx)))
       fun)))
 
@@ -379,6 +439,7 @@
         name (rd/sexp-sym (rd/sexp-nth form 1))
         params (rd/sexp-nth form 3)
         fun (jsl-graph-of name)
+        body-start (arena-node-count)
         (mut values) (al-new [(dyn NodeOps)] a)
         (mut local-names) (al-new [(slice u8)] a)
         (mut local-values) (al-new [(dyn NodeOps)] a)]
@@ -410,6 +471,10 @@
                          (None [(dyn NodeOps)])
                          (Some fun))]
       (fun-set-ret! fun ret)
+      ;; All JSL declarations are hoisted before any definition. Measure only nodes allocated by
+      ;; this definition so unrelated later headers cannot push a small builtin over Simple's
+      ;; inlining cap.
+      (fun-set-approx-size! fun (- (arena-node-count) body-start))
       fun)))
 
 (defn jsl-lower-form! [(form (ptr rd/Sexp))] (-> (dyn NodeOps))
@@ -520,36 +585,80 @@
                   (continue)))))
     0))
 
+;; JSL Returns are not parser roots: until closed-world call discovery decides which bodies survive,
+;; each one needs the same temporary ownership that `parser-prepare-opto!` gives source functions.
+;; Final Simple obtains this lifetime structurally because a FunPtr points at the callee Return;
+;; our FunPtr points at the Fun so forward JSL declarations can be lowered before their bodies.
+;; Keeping the Return here preserves the whole definition across optimistic SCCP and the final
+;; all-arena sweep without prematurely making every runtime-library body a compilation-unit root.
+(defn jsl-prepare-opto! [] (-> i64)
+  (do
+    (jsl-graphs-boot!)
+    (let [(mut i) 0
+          (mut kept) 0]
+      (loop (if (>= (load i) (len (.items (jsl-graphs))))
+                (break (load kept))
+                (let [g (get (.items (jsl-graphs)) (load i))]
+                  (match (arena-node (.nid g))
+                    (Some [fun]
+                          (match (fun-ret fun)
+                            (Some [ret]
+                                  (do
+                                    (n-keep! ret)
+                                    (set! (mut kept) (+ (load kept) 1))
+                                    0))
+                            (None [] (panic "jsl-prepare-opto!: JSL Fun has no Return"))))
+                    (None [] (panic "jsl-prepare-opto!: stale graph id")))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))))
+
 ;; Final Simple's compilation-unit rooting applies to runtime-library functions as well as source
 ;; declarations. A JSL body that survives inlining must remain an emitted definition; its linked
-;; Call edges are optimisation metadata and will be removed before selection.
+;; Call edges are optimisation metadata and will be removed before selection. Release every
+;; temporary keep installed by `jsl-prepare-opto!`; a surviving definition first gains the Stop
+;; edge that owns it for code generation, while an inlined/dead body is allowed to disappear.
 (defn jsl-finish-opto! [(stop (dyn NodeOps))] (-> i64)
   (do
     (jsl-graphs-boot!)
-    (let [(mut i) 0 (mut retained) 0]
+    (let [(mut i) 0
+          (mut retained) 0]
       (loop (if (>= (load i) (len (.items (jsl-graphs))))
                 (break (load retained))
                 (let [g (get (.items (jsl-graphs)) (load i))]
                   (match (arena-node (.nid g))
                     (Some [fun]
-                          (if (and (not (n-dead? fun)) (not (ty-high? (n-ty fun))))
-                              (match (fun-ret fun)
-                                (Some [ret]
-                                      (if (and (not (n-dead? ret))
-                                               (and (!= (n-ty ret) TY-INVALID)
-                                                    (match (n-in ret RETURN-CTRL)
-                                                      (Some [ctrl]
-                                                            (and (!= (n-ty ctrl) TY-INVALID)
-                                                                 (not (ty-high? (n-ty ctrl)))))
-                                                      (None [] false))))
-                                          (do
-                                            (stop-add-return! stop ret)
-                                            (set! (mut retained) (+ (load retained) 1))
-                                            0)
-                                          0))
-                                (None [] (panic "jsl-finish-opto!: live Fun has no Return")))
-                              0))
+                          (match (fun-ret fun)
+                            (Some [ret]
+                                  (if (and (and (not (n-dead? fun)) (not (fun-folding? fun)))
+                                           (not (ty-high? (n-ty fun))))
+                                      (do
+                                        (stop-add-return! stop ret)
+                                        (set! (mut retained) (+ (load retained) 1))
+                                        (n-unkill! ret))
+                                      ;; Releasing the temporary hold must also collect an inlined
+                                      ;; Return that has no CallEnd or Stop owner. A bare unkeep
+                                      ;; leaves that unused CFG sink attached to caller control,
+                                      ;; where it can corrupt later loop-tree nesting.
+                                      (n-unkill! ret)))
+                            (None [] (panic "jsl-finish-opto!: JSL Fun lost its Return"))))
                     (None [] 0))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))))
+
+(defn jsl-prepare-codegen! [(start (dyn NodeOps))] (-> i64)
+  (do
+    (jsl-graphs-boot!)
+    (let [(mut i) 0
+          (mut prepared) 0]
+      (loop (if (>= (load i) (len (.items (jsl-graphs))))
+                (break (load prepared))
+                (do
+                  (let [g (get (.items (jsl-graphs)) (load i))]
+                    (match (arena-node (.nid g))
+                      (Some [fun]
+                            (set! (mut prepared)
+                                  (+ (load prepared) (fun-prepare-codegen! fun start))))
+                      (None [] 0)))
                   (set! (mut i) (+ (load i) 1))
                   (continue)))))))
 

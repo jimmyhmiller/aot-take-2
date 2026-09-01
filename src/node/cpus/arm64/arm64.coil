@@ -7,6 +7,14 @@
 ;; Machine node families are grouped exactly as ideal nodes are — arith, bits, mem, branch, call —
 ;; rather than one file per instruction.
 ;;
+;; Final Simple's shared frame model reserves a function's incoming argument homes at the low end
+;; of allocator stack locations, biases outgoing homes past them, and rotates both ranges around the
+;; local frame during encoding. Its ARM port deliberately leaves stack arguments with a nonzero
+;; incoming area as TODO and retains the generic stack-RPC `+1` formula. AAPCS64 has no such stack
+;; RPC: BL writes X30/LR. We therefore complete the model with location ARM-MAX-REG as stack argument
+;; zero, count only preceding overflow arguments across the independent GPR/FPR banks, bias outgoing
+;; arguments by the caller's incoming count, and give CallEnd the identical outgoing kill range.
+;;
 (module aot.node.cpus.arm64)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
@@ -20,6 +28,7 @@
 (import "aot.node.call" :use *)
 (import "aot.node.control" :use *)
 (import "aot.node.gc" :use *)
+(import "aot.node.dynamic" :use *)
 (import "aot.node.cpus.arm64.base" :use *)
 (import "aot.node.cpus.arm64.arith" :use *)
 (import "aot.node.cpus.arm64.bits" :use *)
@@ -35,6 +44,10 @@
 (const ARM-X0 0)
 
 (const ARM-X1 1)
+
+(const ARM-X16 16)
+
+(const ARM-X17 17)
 
 (const ARM-X18 18)  ; Darwin platform register, never allocated
 
@@ -109,7 +122,7 @@
               (break 0)
               (do
                 (set! (mut kills)
-                      (mask-or (load kills) (mask-of (+ ARM-MAX-REG (+ 1 (+ caller-max (load i)))))))
+                      (mask-or (load kills) (mask-of (+ ARM-MAX-REG (+ caller-max (load i))))))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
     (load kills)))
@@ -180,10 +193,25 @@
                     (if (= op OP-RETURN)
                         (match (arena-node (return-fun-nid n))
                           (Some [fun]
-                                (let [selected (arm64-call-alloc n false false 0 4)
-                                      sig (fun-sig fun)]
+                                (let [sig (fun-sig fun)
+                                      ;; Only the compiler-owned process wrapper has the public
+                                      ;; name and the boxed dynamic return ABI. Hand-built backend
+                                      ;; tests and other raw entry graphs may also name their Fun
+                                      ;; `main`; their integer result is already the host ABI and
+                                      ;; must not be interpreted as a NaN-boxed word.
+                                      entry
+                                        (and (= (fun-name fun) "main")
+                                             (ty-dyn? (ty-tuple-at sig 0)))
+                                      selected (arm64-call-alloc n false false 0 (if entry 36 4))]
                                   (arm64-call-set-input-mask! selected RETURN-VALUE (arm64-ret-mask sig))
                                   (arm64-call-set-input-mask! selected RETURN-RPC (mask-of ARM-LR))
+                                  (if entry
+                                      (do
+                                        (arm64-call-set-entry-return! selected)
+                                        (arm64-call-set-kill-mask!
+                                          selected
+                                          (mask-or (mask-of ARM-X16) (mask-of ARM-X17))))
+                                      0)
                                   selected))
                           (None [] (do (panic "arm64-call-select: Return has no owning Fun")
                                       (unreachable-node))))
@@ -250,7 +278,11 @@
                                (primitive/fnptr-of arm64-layout-set-inverted!)
                                (primitive/fnptr-of arm64-layout-branch-target)
                                (primitive/fnptr-of arm64-layout-relax-branch!)
-                               (primitive/fnptr-of arm64-layout-jump?))
+                               (primitive/fnptr-of arm64-layout-jump?)
+                               (primitive/fnptr-of arm64-layout-literal-bits)
+                               (primitive/fnptr-of arm64-layout-long-target)
+                               (primitive/fnptr-of arm64-layout-definition-fidx)
+                               (primitive/fnptr-of arm64-layout-call-fidx))
     (set-selected-abi-hook! (primitive/fnptr-of arm64-caller-save)
                             (primitive/fnptr-of arm64-never-save)
                             (primitive/fnptr-of arm64-active-max-reg)
@@ -285,7 +317,10 @@
                 (= op OP-LE)
                 (= op OP-ULT))
             (arm64-bits-select n)
-            (if (or (= op OP-BOX) (= op OP-UNBOX))
+            (if (or (= op OP-BOX)
+                    (= op OP-UNBOX)
+                    (= op OP-TYPETEST)
+                    (= op OP-CAST))
                 (arm64-dynamic-select n)
             (if (or (= op OP-LOAD) (= op OP-STORE))
                 (arm64-mem-select n)
@@ -312,13 +347,21 @@
                         (if (= op OP-CON)
                         (let [t (con-ty-of n)]
                           (if (ty-constant? t)
-                              (let [selected
+                              (let [dynamic-undefined
+                                      (and (ty-dyn? t)
+                                           (and (not (ty-dyn-high? t))
+                                                (= (ty-dyn-tags t) TAG-UNDEFINED)))
+                                    selected
                                       (arm64-scalar-make n
                                                          op
                                                          ARM64-FORM-CONST
                                                          (if (ty-int? t)
                                                              (ty-int-lo t)
-                                                             (flt--bits (ty-flt-value t)))
+                                                             (if (ty-flt? t)
+                                                                 (flt--bits (ty-flt-value t))
+                                                                 (if dynamic-undefined
+                                                                     DYNAMIC-UNDEFINED-WORD
+                                                                     0)))
                                                          ARM64-CLASS-NONE
                                                          (if (ty-flt? t)
                                                              ARM64-CLASS-FPR
@@ -326,10 +369,14 @@
                                                          0
                                                          false
                                                          true)]
-                                (if (ty-int? t)
+                                (if (or (ty-int? t) dynamic-undefined)
                                     (arm64-scalar-set-size!
                                       selected
-                                      (* 4 (arm64-const-insns (ty-int-lo t))))
+                                      (* 4
+                                         (arm64-const-insns
+                                           (if dynamic-undefined
+                                               DYNAMIC-UNDEFINED-WORD
+                                               (ty-int-lo t)))))
                                     (arm64-scalar-set-size! selected 4))
                                 selected)
                               (let [pseudo
@@ -363,7 +410,7 @@
             (= (n-op n) OP-MACH-CALL) (= (n-op n) OP-MACH-PHI) (>= id (len (.map state))))
         (let [(mut i) 0]
           (loop (if (>= (load i) (n-nins n))
-                    (break n)
+                    (break 0)
                     (do
                       (match (n-in n (load i))
                         (Some [old]
@@ -372,7 +419,13 @@
                                     (Some (arm64-select--node! old state))))
                         (None [] 0))
                       (set! (mut i) (+ (load i) 1))
-                      (continue)))))
+                      (continue))))
+          ;; Final Simple calls MachNode.postSelect only after every input has been recursively
+          ;; remapped. Multi-node target expansions enter through this arm and need the same hook.
+          (match (mach-of n)
+            (Some [mach] (m-post-select! mach))
+            (None [] (panic "arm64-select--node!: selected expansion has no MachNode view")))
+          n)
         (match (get (.map state) id)
           (Some [already] already)
           (None []
@@ -397,6 +450,11 @@
                                   (None [] 0))
                                 (set! (mut i) (+ (load i) 1))
                                 (continue)))))
+                  ;; Match final Simple's `mach.postSelect()` point: the selected shell is already
+                  ;; in the cycle map and every selected input now names its machine replacement.
+                  (match (mach-of selected)
+                    (Some [mach] (m-post-select! mach))
+                    (None [] (panic "arm64-select--node!: selector returned a non-machine node")))
                   selected))))))
 
 (defn arm64-select--rebuild-outs! [(n (dyn NodeOps)) (state (ptr Arm64SelectState))] (-> i64)
@@ -510,10 +568,12 @@
                       class-index (arm64--prior-class-count sig idx float)]
                   (if (< class-index 8)
                       (mask-of (+ (if float ARM-D0 ARM-X0) class-index))
-                      ;; Slot ARM-MAX-REG is the return-PC home. Incoming stack arguments begin at
-                      ;; +1; outgoing arguments are biased past the caller's incoming area.
+                      ;; AArch64 keeps the return PC in LR, so ARM-MAX-REG is stack argument zero.
+                      ;; Outgoing arguments are biased past the caller's incoming area: this gives
+                      ;; each fixed ABI home a distinct allocator location while the frame-offset
+                      ;; rotation below maps it back to AAPCS64's SP+0, SP+8, ... call boundary.
                       (mask-of (+ ARM-MAX-REG
-                                  (+ 1 (+ max-arg-slot (arm64--prior-stack-count sig idx))))))))))))
+                                  (+ max-arg-slot (arm64--prior-stack-count sig idx)))))))))))
 
 (defn arm64-max-arg-slot [(sig i64)] (-> i64)
   (let [n (ty-sig-nargs sig)

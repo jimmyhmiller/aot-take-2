@@ -12,7 +12,10 @@
 (import "aot.codegen.codegen" :use *)
 (import "aot.codegen.gcm" :use *)
 (import "aot.codegen.listsched" :use *)
+(import "aot.codegen.machine" :use *)
 (import "aot.node.cpus.arm64" :use *)
+(import "aot.node.cpus.arm64.call" :use *)
+(import "aot.node.cpus.arm64.split" :use *)
 (import "aot.shape" :use *)
 (import "aot.type.type" :use *)
 
@@ -62,10 +65,15 @@
                  (sched-count-inputs! selected-fun (mut state))
                  (sched-compute-flags! selected-fun (mut state))
                  (assert (get (.single state) (n-nid selected-arg)))
-                 (assert (< (sched-score selected-arg (mut state))
+                 ;; Final Simple's ParmNode extends PhiNode, so it receives Phi's fixed entry score
+                 ;; instead of the ordinary pressure score its Return use would otherwise distort.
+                 (assert-eq (sched-score selected-arg (mut state)) 1000)
+                 (assert (> (sched-score selected-arg (mut state))
                             (sched-score selected-constant (mut state)))))
                (sched-run!)
                (assert (n-same? (code-schedule-at selected-fun 0) selected-fun))
+               (assert (< (scheduled-index selected-fun selected-arg)
+                          (scheduled-index selected-fun selected-constant)))
                (assert (< (scheduled-index selected-fun selected-arg)
                           (scheduled-index selected-fun selected-add)))
                (assert (< (scheduled-index selected-fun selected-add)
@@ -141,3 +149,165 @@
                      second-proj (if (> pointer-index memory-index) pointer-index memory-index)]
                  (assert-eq first-proj (+ allocation-index 1))
                  (assert-eq second-proj (+ allocation-index 2)))))))
+
+(deftest remote_cfg_users_do_not_look_like_the_current_blocks_tail
+         (do
+           (boot! 7)
+           (code-reset! 7)
+           (let [start (start-make (ty-int-bot))
+                 fun
+                   (fun-make start
+                             (ty-tuple-of3 (ty-int-bot) (ty-int-bot) (ty-int-bot))
+                             "remote-tail")
+                 rpc (parm-make-slot fun 0 (ty-int-bot) "$rpc")
+                 arg (parm-make fun 0 (ty-int-bot) "x")
+                 value (parm-make fun 1 (ty-int-bot) "value")
+                 iff (if-make fun arg)
+                 arms (if-arms! iff)
+                 merge (region-make)
+                 ret
+                   (return-make merge
+                                (Some (con-make (ty-mem 1 TY-BOT)))
+                                value
+                                (Some rpc)
+                                (Some fun))
+                 stop (stop-make)]
+             (region-add-path! merge (arms-true arms))
+             (region-add-path! merge (arms-false arms))
+             (fun-set-ret! fun ret)
+             (stop-add-return! stop ret)
+             (looptree-build! start stop)
+             (let [selected-stop (arm64-select-graph stop)
+                   selected-ret (n-in! selected-stop 0)
+                   selected-value (n-in! selected-ret RETURN-VALUE)
+                   selected-fun (n-in! selected-value 0)
+                   selected-start (n-in! selected-fun 1)]
+               (code-set-roots! selected-start selected-stop)
+               (gcm-build-cfg!)
+               (let [(mut state) (sched-state-new)]
+                 (sched-collect! selected-fun (mut state))
+                 (sched-count-inputs! selected-fun (mut state))
+                 (sched-compute-flags! selected-fun (mut state))
+                 (assert (get (.remote-def state) (n-nid selected-value)))
+                 ;; The Return consumes `value` in the Region block. It is a remote use, not the
+                 ;; Fun block's CFG tail, and therefore does not trigger the fixed-register stall.
+                 (assert-eq (sched-opening-pressure selected-value (mut state)) 0))))))
+
+(deftest allocation_projection_wrappers_do_not_turn_the_multi_into_a_cfg_tail
+         (do
+           (boot! 9)
+           (code-reset! 9)
+           (let [start (start-make (ty-int-bot))
+                 fun (fun-make start (ty-tuple-of2 (ty-int-bot) (ty-int-bot)) "multi-pressure")
+                 rpc (parm-make-slot fun 0 (ty-int-bot) "$rpc")
+                 object-ty (ty-struct "MultiPressureObject")
+                 allocation (new-make fun (con-int 32) SHAPE-EMPTY object-ty)
+                 pointer (proj-make allocation 0 "pointer")
+                 memory (proj-make allocation 1 "memory")
+                 store
+                   (store-make fun memory pointer (con-int 0) (con-int 7) 11 (ty-int-bot))
+                 ret (return-make fun (Some store) (con-int 0) (Some rpc) (Some fun))
+                 stop (stop-make)]
+             (fun-set-ret! fun ret)
+             (stop-add-return! stop ret)
+             (looptree-build! start stop)
+             (let [selected-stop (arm64-select-graph stop)
+                   selected-ret (n-in! selected-stop 0)
+                   selected-store (n-in! selected-ret RETURN-MEM)
+                   selected-memory (n-in! selected-store 1)
+                   selected-allocation (n-in! selected-memory 0)
+                   selected-fun (n-in! selected-ret RETURN-CTRL)
+                   selected-start (n-in! selected-fun 1)]
+               (code-set-roots! selected-start selected-stop)
+               (gcm-build-cfg!)
+               (let [(mut state) (sched-state-new)]
+                 (sched-collect! selected-fun (mut state))
+                 (sched-count-inputs! selected-fun (mut state))
+                 (sched-compute-flags! selected-fun (mut state))
+                 (assert (< (sched-opening-pressure selected-allocation (mut state)) 10000))
+                 (assert (> (sched-score selected-allocation (mut state)) 1)))))))
+
+(deftest callee_save_entry_split_precedes_the_first_ordinary_body_definition
+         (do
+           (boot! 10)
+           (code-reset! 10)
+           (let [start (start-make (ty-int-bot))
+                 fun (fun-make start (ty-tuple-of2 (ty-int-bot) (ty-int-bot)) "save-split")
+                 rpc (parm-make-slot fun 0 (ty-int-bot) "$rpc")
+                 body (add-make-mode (con-int 5000) (con-int 7000) MODE-INT)
+                 ret (return-make fun
+                                  (Some (con-make (ty-mem 1 TY-BOT)))
+                                  body
+                                  (Some rpc)
+                                  (Some fun))
+                 stop (stop-make)]
+             (fun-set-ret! fun ret)
+             (stop-add-return! stop ret)
+             (looptree-build! start stop)
+             (let [selected-stop (arm64-select-graph stop)
+                   selected-ret (n-in! selected-stop 0)
+                   selected-body (n-in! selected-ret RETURN-VALUE)
+                   selected-fun (n-in! selected-ret RETURN-CTRL)
+                   selected-start (n-in! selected-fun 1)]
+               (code-set-roots! selected-start selected-stop)
+               (gcm-build-cfg!)
+               (let [save (arm64-callee-save-make selected-fun selected-ret ARM-D8)
+                     other-save (arm64-callee-save-make selected-fun selected-ret ARM-X19)
+                     split (arm64-split-make 1 "entry-save" 0)]
+                 ;; Model final Simple's `insertAfter(CalleeSave)`: allocation has created the
+                 ;; entry-side Split and will rebuild the durable schedule from placement facts.
+                 (n-set-block-nid! save (n-nid selected-fun))
+                 (n-set-early-nid! save (n-nid selected-fun))
+                 (n-set-block-nid! other-save (n-nid selected-fun))
+                 (n-set-early-nid! other-save (n-nid selected-fun))
+                 (arm64-split-bind! split selected-fun save)
+                 (n-set-block-nid! split (n-nid selected-fun))
+                 (n-set-early-nid! split (n-nid selected-fun))
+                 (sched-run!)
+                 (let [(mut state) (sched-state-new)]
+                   (assert-eq (sched-score split (mut state)) 1000))
+                 (assert (< (scheduled-index selected-fun other-save)
+                            (scheduled-index selected-fun split)))
+                 (assert (< (scheduled-index selected-fun save)
+                            (scheduled-index selected-fun split)))
+                 (assert (< (scheduled-index selected-fun split)
+                            (scheduled-index selected-fun selected-body))))))))
+
+(deftest local_schedule_collection_scales_with_block_outputs_not_the_whole_arena
+         (do
+           (boot! 11)
+           (code-reset! 11)
+           (let [start (start-make (ty-int-bot))
+                 fun (fun-make start (ty-tuple-of2 (ty-int-bot) (ty-int-bot)) "sparse-schedule")
+                 rpc (parm-make-slot fun 0 (ty-int-bot) "$rpc")
+                 arg (parm-make fun 0 (ty-int-bot) "x")
+                 value (add-make-mode arg (con-int 5000) MODE-INT)
+                 ret (return-make fun
+                                  (Some (con-make (ty-mem 1 TY-BOT)))
+                                  value
+                                  (Some rpc)
+                                  (Some fun))
+                 stop (stop-make)]
+             (fun-set-ret! fun ret)
+             (stop-add-return! stop ret)
+             (looptree-build! start stop)
+             (let [selected-stop (arm64-select-graph stop)
+                   selected-ret (n-in! selected-stop 0)
+                   selected-fun (n-in! selected-ret RETURN-CTRL)
+                   selected-start (n-in! selected-fun 1)
+                   (mut i) 0]
+               (code-set-roots! selected-start selected-stop)
+               (gcm-build-cfg!)
+               ;; Inflate the shared arena with selected nodes that belong to no scheduled block.
+               ;; Final Simple's local scheduler never sees them because it walks block outputs.
+               (loop (if (>= (load i) 512)
+                         (break 0)
+                         (do
+                           (arm64-select (con-int (load i)))
+                           (set! (mut i) (+ (load i) 1))
+                           (continue))))
+               (assert (> (arena-node-count) 1000))
+               (assert (> (sched-run!) 1))
+               (assert (< (sched-last-collect-visits) 128))
+               (assert-eq (sched-last-state-init-visits) (+ (arena-node-count) 1))
+               (assert (> (code-schedule-count selected-fun) 1))))))

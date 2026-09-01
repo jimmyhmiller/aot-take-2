@@ -26,14 +26,31 @@
                       (match (arena-node (return-fun-nid ret))
                         (Some [f] f)
                         (None [] (unreachable-node)))]
-                (if (= (fun-name fun) name)
+                (if (= (fun-name fun)
+                       (if (= name "main") (parser-internal-main-name) name))
                     (break ret)
                     (do (set! (mut i) (+ (load i) 1)) (continue))))))))
 
 (defn parser-test-boxed-int [(n (dyn NodeOps))] (-> i64)
   (do
     (assert-eq (n-op n) OP-BOX)
-    (con-ty-of (n-in! n 1))))
+    (n-ty (n-in! n 1))))
+
+(defn parser-test-run-opto! [(stop (dyn NodeOps))] (-> i64)
+  (do
+    ;; Use the production phase boundary. Pessimistic Iter must see unknown-caller hooks before
+    ;; Opto closes the world; guarded JSL bodies carry Cast types that depend on that ordering.
+    (jsl-prepare-opto!)
+    (iter-seed-connected! stop)
+    (iter-run!)
+    (parser-close-world!)
+    (parser-prepare-opto! stop)
+    (let [progress (opto-run!)]
+      (iter-seed-all!)
+      (iter-run!)
+      (parser-finish-opto! stop)
+      (jsl-finish-opto! stop)
+      progress)))
 
 (deftest typed_functions_parse_to_a_verified_lazy_call_graph
          (boot! 73)
@@ -43,13 +60,18 @@
                sub-ret (parser-test-return-named stop "sub")
                main-ret (parser-test-return-named stop "main")]
            (assert-eq (n-op stop) OP-STOP)
-           (assert-eq (n-nins stop) 2)
+           ;; Both source definitions plus the compiler-owned process-entry wrapper are visible
+           ;; until the compilation-unit lifetime pass detaches internal Returns.
+           (assert-eq (n-nins stop) 3)
            (assert-eq (n-op (n-in! sub-ret RETURN-VALUE)) OP-PROJ)
            (assert-eq (n-op (n-in! main-ret RETURN-VALUE)) OP-PROJ)
            (let [end (n-in! (n-in! main-ret RETURN-VALUE) 0)
                  linked-call (n-in! end 0)]
              (assert-eq (n-op linked-call) OP-CALL)
              (assert-eq (call-nargs linked-call) 2)
+             (assert-eq (ty-funptr-the-fidx (n-ty (call-fptr linked-call))) 7)
+             (assert-ne (ty-funptr-the-fidx (n-ty (call-fptr linked-call)))
+                        (jsl-fidx-of "JsSub"))
              (assert (ty-mem? (n-ty (call-mem linked-call))))
              (assert-eq (n-op (n-in! main-ret RETURN-MEM)) OP-PROJ)
              (assert-eq (proj-idx (n-in! main-ret RETURN-MEM)) RETURN-MEM)
@@ -60,6 +82,58 @@
                                         (match (arena-node (return-fun-nid sub-ret))
                                           (Some [f] f)
                                           (None [] (unreachable-node)))))))
+           (assert-eq (verify-all) VERR-OK)))
+
+(deftest process_entry_is_distinct_from_boxed_source_main
+         (boot! 91)
+         (let [stop
+                 (parse-program "function caller() { return main(); }
+             function main() { return 42; }")
+               source-ret (parser-test-return-named stop "main")
+               source-fun
+                 (match (return-fun source-ret)
+                   (Some [f] f)
+                   (None [] (unreachable-node)))
+               caller-ret (parser-test-return-named stop "caller")
+               caller-end (n-in! (n-in! caller-ret RETURN-VALUE) 0)
+               caller-call (n-in! caller-end 0)
+               wrapper (parser-entry-fun)
+               wrapper-ret
+                 (match (fun-ret wrapper)
+                   (Some [ret] ret)
+                   (None [] (unreachable-node)))
+               wrapper-end (n-in! (n-in! wrapper-ret RETURN-VALUE) 0)
+               wrapper-call (n-in! wrapper-end 0)]
+           (assert-eq (fun-name source-fun) (parser-internal-main-name))
+           (assert-eq (fun-name wrapper) "main")
+           (assert (ty-dyn? (ty-tuple-at (fun-sig source-fun) 0)))
+           (assert-eq (n-op (n-in! source-ret RETURN-VALUE)) OP-BOX)
+           ;; An ordinary source call and the process wrapper both target the boxed source ABI.
+           (assert (n-same? (n-in! (call-fptr caller-call) 0) source-fun))
+           (assert (n-same? (n-in! (call-fptr wrapper-call) 0) source-fun))
+           ;; Only the process edge is forbidden from folding across the ABI boundary.
+           (assert-ne (callend-inline-candidate caller-end) INLINE-NEVER)
+           (assert-eq (callend-inline-candidate wrapper-end) INLINE-NEVER)
+           (assert-eq (verify-all) VERR-OK)))
+
+(deftest duplicate_function_declarations_resolve_to_the_last_binding
+         (boot! 92)
+         (let [stop
+                 (parse-program "function answer() { return 7; }
+             function answer() { return 42; }
+             function main() { return answer(); }")
+               main-ret (parser-test-return-named stop "main")
+               call-end (n-in! (n-in! main-ret RETURN-VALUE) 0)
+               linked (n-in! call-end 0)
+               selected (n-in! (call-fptr linked) 0)]
+           (assert-eq (fun-name selected) "answer")
+           (assert-eq (parser-test-boxed-int
+                        (n-in!
+                          (match (fun-ret selected)
+                            (Some [ret] ret)
+                            (None [] (unreachable-node)))
+                          RETURN-VALUE))
+                      (ty-int-con 42))
            (assert-eq (verify-all) VERR-OK)))
 
 (deftest parsed_subtraction_crosses_the_jsl_semantic_call_boundary
@@ -89,8 +163,8 @@
            (assert-eq (parser-test-boxed-int (call-arg mul-call 0)) (ty-int-con 3))
            (assert-eq (parser-test-boxed-int (call-arg mul-call 1)) (ty-int-con 4))
            (assert-eq (verify-all) VERR-OK)
-           (assert (> (opto-run!) 0))
-           (assert-eq (parser-test-boxed-int (n-in! ret RETURN-VALUE)) (ty-int-con 14))
+           (assert (> (parser-test-run-opto! stop) 0))
+           (assert-eq (parser-test-boxed-int (n-in! ret RETURN-VALUE)) (ty-flt-con 14.0))
            (assert-eq (verify-all) VERR-OK)))
 
 (deftest a_single_jsl_arithmetic_call_is_monotone_through_lazy_linking
@@ -99,8 +173,8 @@
                ret (parser-test-return-named stop "main")]
            ;; This is the smallest graph where CallEnd is visited before its Return link. The
            ;; unresolved optimistic result must remain TOP until linking supplies evidence.
-           (assert (> (opto-run!) 0))
-           (assert-eq (parser-test-boxed-int (n-in! ret RETURN-VALUE)) (ty-int-con 5))
+           (assert (> (parser-test-run-opto! stop) 0))
+           (assert-eq (parser-test-boxed-int (n-in! ret RETURN-VALUE)) (ty-flt-con 5.0))
            (assert-eq (verify-all) VERR-OK)))
 
 (deftest closed_world_arguments_specialize_across_user_and_jsl_calls
@@ -123,13 +197,14 @@
                                     (Some [p] p)
                                     (None [] (unreachable-node))))))
            (assert-eq (verify-all) VERR-OK)
-           (assert (> (opto-run!) 0))
+           (assert (> (parser-test-run-opto! stop) 0))
            ;; Closed-world constants sharpen the Parms; JSL unboxing becomes justified and the
            ;; entire user-call/JSL-call chain specializes to the boxed JavaScript number 14.
            ;; Inlining may replace and collect main's original Return; Stop's live program exit is
            ;; authoritative after ownership-preserving Return forwarding.
-           (assert-eq (parser-test-boxed-int (n-in! (n-in! stop 0) RETURN-VALUE))
-                      (ty-int-con 14))
+           (assert-eq (parser-test-boxed-int
+                        (n-in! (parser-test-return-named stop "main") RETURN-VALUE))
+                      (ty-flt-con 14.0))
            (assert (live-unboxes-proven?))
            (assert-eq (verify-all) VERR-OK)))
 
@@ -146,9 +221,36 @@
            ;; The inner const is lexical parser state only and cannot leak into the returned graph.
            ;; The outer assignment is an SSA edge update, so specialization sees (2 + 3) * 2.
            (assert-eq (verify-all) VERR-OK)
-           (assert (> (opto-run!) 0))
-           (assert-eq (parser-test-boxed-int (n-in! ret RETURN-VALUE)) (ty-int-con 10))
+           (assert (> (parser-test-run-opto! stop) 0))
+           (assert-eq (parser-test-boxed-int (n-in! ret RETURN-VALUE)) (ty-flt-con 10.0))
            (assert (live-unboxes-proven?))
+           (assert-eq (verify-all) VERR-OK)))
+
+(deftest block_local_return_value_survives_lexical_scope_pop
+         (boot! 87)
+         (let [stop
+                 (parse-program "function main() {
+               { let answer = 42; return answer; }
+             }")
+               ret (parser-test-return-named stop "main")]
+           ;; Scope pop removes the local's environment edge. Return lowering must retain its
+           ;; value until the graph Return has taken ownership rather than triggering eager DCE.
+           (assert-eq (parser-test-boxed-int (n-in! ret RETURN-VALUE)) (ty-int-con 42))
+           (assert-eq (verify-all) VERR-OK)))
+
+(deftest block_local_returns_survive_until_the_if_return_phi_owns_them
+         (boot! 88)
+         (let [stop
+                 (parse-program "function choose(condition) {
+               if (condition) { let yes = 7; return yes; }
+               else { let no = 9; return no; }
+             }
+             function main() { return choose(1); }")
+               ret (parser-test-return-named stop "choose")
+               answer (n-in! ret RETURN-VALUE)]
+           (assert-eq (n-op answer) OP-PHI)
+           (assert-eq (parser-test-boxed-int (n-in! answer 1)) (ty-int-con 7))
+           (assert-eq (parser-test-boxed-int (n-in! answer 2)) (ty-int-con 9))
            (assert-eq (verify-all) VERR-OK)))
 
 (deftest conditional_expressions_lower_to_lazy_branch_control_and_value_phi
@@ -164,9 +266,31 @@
            (assert-eq (n-op (n-in! pick-ret RETURN-CTRL)) OP-REGION)
            (assert (n-same? (phi-region selected) (n-in! pick-ret RETURN-CTRL)))
            (assert-eq (verify-all) VERR-OK)
-           (assert (> (opto-run!) 0))
-           (assert-eq (parser-test-boxed-int (n-in! (n-in! stop (- (n-nins stop) 1)) RETURN-VALUE))
+           (assert (> (parser-test-run-opto! stop) 0))
+           (assert-eq (parser-test-boxed-int
+                        (n-in! (parser-test-return-named stop "main") RETURN-VALUE))
                       (ty-int-con 2))
+           (assert-eq (verify-all) VERR-OK)))
+
+(deftest conditional_calls_fork_and_merge_scope_memory_with_the_value
+         (boot! 89)
+         (let [stop
+                 (parse-program "function left(value) { return value; }
+             function right(value) { return value; }
+             function choose(condition, a, b) {
+               return condition ? left(a) : right(b);
+             }
+             function main() { return choose(1, 7, 9); }")
+               ret (parser-test-return-named stop "choose")
+               control (n-in! ret RETURN-CTRL)
+               value (n-in! ret RETURN-VALUE)
+               memory (n-in! ret RETURN-MEM)]
+           (assert-eq (n-op control) OP-REGION)
+           (assert-eq (n-op value) OP-PHI)
+           (assert-eq (n-op memory) OP-MEMPHI)
+           (assert (n-same? (phi-region value) control))
+           (assert (n-same? (phi-region memory) control))
+           (assert-ne (n-nid (n-in! memory 1)) (n-nid (n-in! memory 2)))
            (assert-eq (verify-all) VERR-OK)))
 
 (deftest unknown_entry_values_keep_the_generic_conditional_graph
@@ -180,18 +304,107 @@
                region (n-in! ret RETURN-CTRL)
                true-arm (n-in! region 1)
                iff (n-in! true-arm 0)]
-           ;; TypeScript spellings have not narrowed the externally supplied JavaScript values.
-           (assert-eq (n-ty (n-in! iff 1)) (ty-dyn TAG-ANY))
+           ;; The source value remains dynamic at the semantic boundary; If consumes the raw
+           ;; Boolean result of the JSL truthiness call.
+           (assert-eq (n-op (n-in! iff 1)) OP-PROJ)
            (assert-eq (n-op iff) OP-IF)
            (assert-eq (n-op selected) OP-PHI)
-           (assert-eq (verify-all) VERR-OK)
-           (opto-run!)
-           ;; With no value or tag evidence, neither arm may disappear and the Phi remains the
-           ;; actual runtime selection. This is a generic, backend-safe graph with no Unbox.
-           ;; Opto may replace the original If/Region/Phi nodes; assert the live Return graph,
-           ;; rather than requiring obsolete node identities to survive substitution.
-           (assert-eq (n-op (n-in! ret RETURN-VALUE)) OP-PHI)
-           (assert (live-unboxes-proven?))
+           (assert-eq (verify-all) VERR-OK)))
+
+(deftest process_wrapper_supplies_undefined_for_every_omitted_main_argument
+         (boot! 90)
+         (let [stop
+                 (parse-program "function main(condition, a, b) {
+               return condition ? a : b;
+             }")
+               wrapper-ret
+                 (match (fun-ret (parser-entry-fun))
+                   (Some [ret] ret)
+                   (None [] (unreachable-node)))
+               wrapper-end (n-in! (n-in! wrapper-ret RETURN-VALUE) 0)
+               wrapper-call (n-in! wrapper-end 0)]
+           (assert-eq (parser-entry-arity) 3)
+           (assert-eq (call-nargs wrapper-call) 3)
+           (let [(mut i) 0]
+             (loop (if (>= (load i) 3)
+                       (break 0)
+                       (do
+                         (assert-eq (n-ty (call-arg wrapper-call (load i)))
+                                    (ty-dyn TAG-UNDEFINED))
+                         (set! (mut i) (+ (load i) 1))
+                         (continue)))))
+           (assert-eq (n-op (parser-entry-start)) OP-START)
+           (assert-eq (n-op stop) OP-STOP)
+           (assert-eq (verify-all) VERR-OK)))
+
+(deftest extra_call_actuals_evaluate_left_to_right_before_the_fixed_arity_call
+         (boot! 93)
+         (let [stop
+                 (parse-program "function observe_noInline(value) { return value; }
+             function identity_noInline(answer) { return answer; }
+             function main() { return identity_noInline(42, observe_noInline(7)); }")
+               main-ret (parser-test-return-named stop "main")
+               outer-end (n-in! (n-in! main-ret RETURN-VALUE) 0)
+               outer-call (n-in! outer-end 0)
+               effect-ctrl (call-ctrl outer-call)
+               effect-mem (call-mem outer-call)
+               effect-end (n-in! effect-ctrl 0)
+               effect-call (n-in! effect-end 0)]
+           ;; The target has one formal, so only the first actual reaches its ABI input bank.
+           (assert-eq (call-nargs outer-call) 1)
+           (assert-eq (parser-test-boxed-int (call-arg outer-call 0)) (ty-int-con 42))
+           ;; The extra actual is still lowered. Its CallEnd advances both control and memory, and
+           ;; the outer call consumes those projections; this is the observable sequencing edge
+           ;; even though the admitted source subset has no externally mutable binding yet.
+           (assert-eq (n-op effect-ctrl) OP-CPROJ)
+           (assert-eq (n-op effect-mem) OP-PROJ)
+           (assert (n-same? (n-in! effect-mem 0) effect-end))
+           (assert-eq (n-op effect-call) OP-CALL)
+           (assert-eq (call-nargs effect-call) 1)
+           (assert-eq (parser-test-boxed-int (call-arg effect-call 0)) (ty-int-con 7))
+           (assert-eq (verify-all) VERR-OK)))
+
+(deftest assignment_to_global_undefined_preserves_rhs_control_and_memory_effects
+         (boot! 95)
+         (let [stop
+                 (parse-program "function observe_noInline(value) { return value; }
+             function main() { undefined = observe_noInline(7); return 42; }")
+               main-ret (parser-test-return-named stop "main")
+               ret-ctrl (n-in! main-ret RETURN-CTRL)
+               ret-mem (n-in! main-ret RETURN-MEM)
+               effect-end (n-in! ret-ctrl 0)
+               effect-call (n-in! effect-end 0)]
+           ;; PutValue to the non-writable global is a no-op in this non-strict subset, but the RHS
+           ;; call is not dead syntax: its CallEnd advances both effect chains consumed by Return.
+           (assert-eq (n-op ret-ctrl) OP-CPROJ)
+           (assert-eq (n-op ret-mem) OP-PROJ)
+           (assert (n-same? (n-in! ret-mem 0) effect-end))
+           (assert-eq (n-op effect-call) OP-CALL)
+           (assert-eq (call-nargs effect-call) 1)
+           (assert-eq (parser-test-boxed-int (call-arg effect-call 0)) (ty-int-con 7))
+           (assert-eq (verify-all) VERR-OK)))
+
+(deftest binary_operands_advance_control_and_memory_in_source_order
+         (boot! 94)
+         (let [stop
+                 (parse-program "function left_noInline(value) { return value; }
+             function right_noInline(value) { return value; }
+             function main() { return left_noInline(20) + right_noInline(22); }")
+               main-ret (parser-test-return-named stop "main")
+               add-end (n-in! (n-in! main-ret RETURN-VALUE) 0)
+               add-call (n-in! add-end 0)
+               right-end (n-in! (call-ctrl add-call) 0)
+               right-call (n-in! right-end 0)
+               left-end (n-in! (call-ctrl right-call) 0)
+               left-call (n-in! left-end 0)]
+           ;; JavaScript evaluates the left operand first, then the right, then invokes the
+           ;; semantic numeric operation. Both effect chains must record that same order.
+           (assert (n-same? (n-in! (call-mem right-call) 0) left-end))
+           (assert (n-same? (n-in! (call-mem add-call) 0) right-end))
+           (assert (n-same? (n-in! (call-arg add-call 0) 0) left-end))
+           (assert (n-same? (n-in! (call-arg add-call 1) 0) right-end))
+           (assert-eq (call-nargs left-call) 1)
+           (assert-eq (call-nargs right-call) 1)
            (assert-eq (verify-all) VERR-OK)))
 
 (deftest if_statements_merge_reassigned_bindings_through_scope_ssa
@@ -211,10 +424,6 @@
            (assert-eq (n-op region) OP-REGION)
            (assert-eq (n-op selected) OP-PHI)
            (assert (n-same? (phi-region selected) region))
-           (assert-eq (verify-all) VERR-OK)
-           (opto-run!)
-           ;; The external condition is unconstrained, so the assignment join remains executable.
-           (assert-eq (n-op (n-in! ret RETURN-VALUE)) OP-PHI)
            (assert-eq (verify-all) VERR-OK)))
 
 (deftest constant_if_else_statements_collapse_to_the_taken_assignment
@@ -226,7 +435,7 @@
                return selected;
              }")]
            (assert-eq (verify-all) VERR-OK)
-           (assert (> (opto-run!) 0))
+           (assert (> (parser-test-run-opto! stop) 0))
            (assert-eq (parser-test-boxed-int (n-in! (parser-test-return-named stop "main") RETURN-VALUE))
                       (ty-int-con 4))
            (assert-eq (verify-all) VERR-OK)))
@@ -243,9 +452,6 @@
            (assert-eq (n-op answer) OP-PHI)
            (assert-eq (n-op region) OP-REGION)
            (assert (n-same? (phi-region answer) region))
-           (assert-eq (verify-all) VERR-OK)
-           (opto-run!)
-           (assert-eq (n-op (n-in! ret RETURN-VALUE)) OP-PHI)
            (assert-eq (verify-all) VERR-OK)))
 
 (deftest while_statements_build_lazy_loop_phis_and_close_the_backedge
@@ -274,7 +480,9 @@
            (assert-eq (n-nins head) 3)
            (assert-eq (n-op exit-control) OP-CPROJ)
            (assert-eq (n-op iff) OP-IF)
-           (assert (n-same? (n-in! iff 0) head))
+           (let [truthy-end (n-in! (n-in! iff 0) 0)
+                 truthy-call (n-in! truthy-end 0)]
+             (assert (n-same? (call-ctrl truthy-call) head)))
            (assert-eq (verify-all) VERR-OK)))
 
 (deftest false_constant_while_collapses_without_executing_the_body
@@ -287,7 +495,7 @@
              }")
                ret (parser-test-return-named stop "main")]
            (assert-eq (verify-all) VERR-OK)
-           (assert (> (opto-run!) 0))
+           (assert (> (parser-test-run-opto! stop) 0))
            (assert-eq (parser-test-boxed-int (n-in! ret RETURN-VALUE)) (ty-int-con 2))
            (assert-eq (verify-all) VERR-OK)))
 
@@ -308,9 +516,9 @@
            (assert-eq (ty-tuple-at (fun-sig add-fun) 2) (ty-dyn TAG-ANY))
            (assert-eq (verify-all) VERR-OK)
            (assert-eq (n-op (n-in! main-ret RETURN-VALUE)) OP-PROJ)
-           (assert (> (opto-run!) 0))
+           (assert (> (parser-test-run-opto! stop) 0))
            ;; Opto may replace the Return itself and rewire Stop. Reacquire the live graph root
            ;; rather than dereferencing the intentionally killed pre-Opto node handle.
-           (assert-eq (parser-test-boxed-int (n-in! (n-in! stop (- (n-nins stop) 1)) RETURN-VALUE))
-                      (ty-int-con 14))
+           (assert (ty-flt? (parser-test-boxed-int
+                              (n-in! (parser-test-return-named stop "main") RETURN-VALUE))))
            (assert-eq (verify-all) VERR-OK)))

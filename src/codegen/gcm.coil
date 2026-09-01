@@ -41,9 +41,12 @@
 ;; So a node is placed at its DEEPEST input — the last place all of its operands become available.
 ;; That is the earliest legal position.
 ;;
-;; The recursion deliberately SKIPS Phis. Simple's comment: because Phis are skipped it "never walks
-;; the backedge of Phis (and thus spins around a data-only loop)". Walk them and you eventually
-;; rely on a pre-visited-but-not-post-visited node that has no scheduled control yet.
+;; The recursion deliberately SKIPS Phi definitions. Simple's comment: because Phis are skipped it
+;; "never walks the backedge of Phis (and thus spins around a data-only loop)". A Phi nevertheless
+;; exposes its Region immediately through `cfg0()`, before schedEarly visits its arms. Selected Phis
+;; do not have that Java virtual query, so we must install the same Region placement before recursing
+;; into their inputs. Otherwise backedge arithmetic observes an unplaced Phi and is illegally given
+;; Start/Fun as its early bound, allowing the frequency heuristic to hoist it out of the loop.
 ;;
 ;; PINNED nodes are not moved at all: Phis, Projs, and anything else that must execute where it was
 ;; written.
@@ -51,8 +54,13 @@
 ;; ## schedLate — breadth-first, backwards from Stop
 ;;
 ;; A node may be placed no later than the LCA (in the dominator tree) of all its uses. Simple walks
-;; BREADTH-FIRST from Stop, and a node becomes ready only when EVERY use already has a placement —
-;; you cannot compute an LCA over uses that are not placed yet.
+;; A sparse worklist starts at Stop and walks definitions backwards. A node becomes ready only when
+;; EVERY use already has a placement — you cannot compute an LCA over uses that are not placed yet.
+;; When a node finishes, its inputs are pushed because one of their uses just became ready. Loads
+;; also wake when any user of their memory definition finishes, because anti-dependence placement
+;; waits on those clobbers. A Loop explicitly wakes its Phis to break the loop-carried data cycle.
+;; This is final Simple's `breadth`; rescanning the whole arena once per dependency layer turns a
+;; deep expression chain into quadratic compile time.
 ;;
 ;; Some placements are known immediately rather than computed:
 ;;
@@ -87,6 +95,10 @@
 ;; LICM pass. Deepest idepth as the tie-break shortens live ranges, which directly reduces register
 ;; pressure — GCM's placement choice is the register allocator's input.
 ;;
+;; Before that walk, a singleton-register machine definition scans the late-to-early CFG path for a
+;; machine operand constrained to the same register. That CFG use becomes the new early boundary:
+;; hoisting above it would manufacture a long fixed-register range that allocation can only spill.
+;;
 ;; ## Anti-dependences: the edges the ideal graph does not carry
 ;;
 ;; A Load must be scheduled before any Store that could clobber its alias class, even though no
@@ -99,6 +111,7 @@
 ;;
 (module aot.codegen.gcm)
 (import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
 (import "coil.arraylist" :use *)
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
@@ -107,6 +120,7 @@
 (import "aot.node.memory" :use *)
 (import "aot.codegen.codegen" :use *)
 (import "aot.codegen.machine" :use *)
+(import "aot.codegen.regmask" :use *)
 (import "aot.codegen.looptree" :use *)
 (import "aot.type.type" :use *)
 
@@ -136,10 +150,13 @@
                      (n (dyn NodeOps))
                      (seen (mut (ArrayList bool)))
                      (post (mut (ArrayList i64)))] (-> i64)
-  (if (or (>= (n-nid n) (len (load seen)))
+  ;; Validate optimizer-only edges before the visited shortcut. A leaked Call->Fun edge normally
+  ;; points back to an already-visited Fun; checking `seen` first would silently hide the exact
+  ;; unlink failure this guard exists to diagnose.
+  (if (or (gcm-skip-cfg-edge? from n)
+          (>= (n-nid n) (len (load seen)))
           (get (load seen) (n-nid n))
-          (= (n-ty n) TY-XCTRL)
-          (gcm-skip-cfg-edge? from n))
+          (= (n-ty n) TY-XCTRL))
       0
       (match (cfg-of n)
         (None [] 0)
@@ -193,8 +210,6 @@
                 (push! [i64] (mut (.cfg (code))) (get (load post) (load i)))
                 (set! (mut i) (- (load i) 1))
                 (continue))))
-    ;; A root mismatch is an error here, not a later missing Return during encoding.
-    (if (= (n-block-nid (code-stop)) 0) 0 0)
     (set! (mut i) 0)
     (loop (if (>= (load i) (code-cfg-count))
               (break 0)
@@ -226,6 +241,14 @@
         0
         (do
           (set! (mut seen) id true)
+          ;; Final Simple's `PhiNode.cfg0()` is structurally its Region even before schedEarly has
+          ;; visited the Phi. Our selected representation caches cfg0 in `block-nid`; publish that
+          ;; fact before following either arm so a loop backedge can use it as an early bound.
+          (if (gcm-selected-phi? n)
+              (let [region (n-in! n 0)]
+                (n-set-block-nid! n (n-block-nid region))
+                (n-set-early-nid! n (n-block-nid region)))
+              0)
           ;; CFG placement was fixed during RPO. Recurse only through data inputs; following
           ;; control predecessors here would spin around loops and duplicates the RPO walk.
           (let [(mut i) 0]
@@ -243,9 +266,7 @@
           (if (cfg? n)
               0
               (if (gcm-selected-phi? n)
-                  (let [region (n-in! n 0)]
-                    (n-set-block-nid! n (n-block-nid region))
-                    (n-set-early-nid! n (n-block-nid region)))
+                  0
                   (if (is-pinned? n)
                       (let [block
                               (match (n-in n 0)
@@ -330,7 +351,7 @@
        (and (> (n-nins n) 0)
             (match (n-in n 0)
               (Some [ctrl]
-                    (and (n-same? ctrl (code-start))
+                    (and (= (gcm-ideal-op ctrl) OP-START)
                          (match (mach-of n)
                            (Some [mach]
                                  (and (m-clone-cheap? mach)
@@ -431,92 +452,106 @@
                           (continue)))))
             copy))))
 
-(defn gcm-break-up-global! [(con (dyn NodeOps))] (-> i64)
-  (do
-    ;; A user without function ownership is another global chain member. Split it first so its
-    ;; subsequently function-pinned clones become ordinary direct users of this value.
-    (let [(mut i) 0]
-      (loop (if (>= (load i) (n-nouts con))
-                (break 0)
-                (do
-                  (match (n-out con (load i))
-                    (Some [use_]
-                          (match (gcm-use-fun use_)
-                            (Some [_] 0)
-                            (None []
-                                  (if (gcm-start-pinned-global? use_)
-                                      (gcm-break-up-global! use_)
-                                      (break 0)))))
-                    (None [] 0))
-                  (set! (mut i) (+ (load i) 1))
-                  (continue)))))
-    (loop
-      (let [(mut fun) (None [(dyn NodeOps)])
-            (mut shared) false
-            (mut i) 0]
-        (loop (if (or (>= (load i) (n-nouts con)) (load shared))
-                  (break 0)
-                  (do
-                    (match (n-out con (load i))
-                      (Some [use_]
-                            (match (gcm-use-fun use_)
-                              (Some [owner]
-                                    (match (load fun)
-                                      (Some [first]
-                                            (if (n-same? first owner)
-                                                0
-                                                (set! (mut shared) true)))
-                                      (None [] (set! (mut fun) (Some owner)))))
-                              (None [] 0)))
-                      (None [] 0))
-                    (set! (mut i) (+ (load i) 1))
-                    (continue))))
-        (match (load fun)
-          (None [] (break 0))
-          (Some [owner]
-                (if (not (load shared))
-                    (do (n-set-def! con 0 (Some owner)) (break 0))
-                    (let [a (alloc/malloc-allocator)
-                          (mut memo) (al-new [(Option (dyn NodeOps))] a)
-                          limit (+ (arena-node-count) 1)
-                          (mut j) 0]
-                      (loop (if (>= (load j) limit)
-                                (break 0)
-                                (do
-                                  (push! [(Option (dyn NodeOps))]
-                                         (mut memo)
-                                         (None [(dyn NodeOps)]))
-                                  (set! (mut j) (+ (load j) 1))
-                                  (continue))))
-                      (let [copy (gcm-clone-global-for-fun con owner (mut memo))]
-                        (set! (mut j) 0)
-                        (loop (if (>= (load j) (n-nouts con))
-                                  (break 0)
-                                  (match (n-out con (load j))
-                                    (Some [use_]
-                                          (match (gcm-use-fun use_)
-                                            (Some [use-owner]
-                                                  (if (n-same? use-owner owner)
-                                                      (let [(mut k) 0]
-                                                        (loop (if (>= (load k) (n-nins use_))
-                                                                  (break 0)
-                                                                  (if (n-same? (n-in! use_ (load k)) con)
-                                                                      (do
-                                                                        (n-set-def! use_ (load k) (Some copy))
-                                                                        (break 0))
-                                                                      (do
-                                                                        (set! (mut k) (+ (load k) 1))
-                                                                        (continue))))))
-                                                      (set! (mut j) (+ (load j) 1))))
-                                            (None [] (set! (mut j) (+ (load j) 1)))))
-                                    (None [] (set! (mut j) (+ (load j) 1)))))))))))))
-    0))
-
-(defn gcm-break-up-globals! [] (-> i64)
-  (let [(mut i) 0]
-    (loop (if (>= (load i) (n-nouts (code-start)))
+(defn gcm-global-users-splittable? [(con (dyn NodeOps))] (-> bool)
+  ;; Final Simple's `breakUpGlobalConstantSingle` returns immediately when an unowned user is not
+  ;; another explicitly Start-pinned global. Preserve that result across this separate scan instead
+  ;; of merely breaking the loop and then continuing with function reparenting.
+  (let [(mut i) 0
+        (mut splittable) true]
+    (loop (if (or (>= (load i) (n-nouts con)) (not (load splittable)))
               (break 0)
-              (match (n-out (code-start) (load i))
+              (do
+                (match (n-out con (load i))
+                  (Some [use_]
+                        (match (gcm-use-fun use_)
+                          (Some [_] 0)
+                          (None []
+                                (if (gcm-start-pinned-global? use_)
+                                    (gcm-break-up-global! use_)
+                                    (set! (mut splittable) false)))))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load splittable)))
+
+(defn gcm-break-up-global! [(con (dyn NodeOps))] (-> i64)
+  (if (not (gcm-global-users-splittable? con))
+      0
+      (do
+        (loop
+          (let [(mut fun) (None [(dyn NodeOps)])
+                (mut shared) false
+                (mut i) 0]
+            (loop (if (or (>= (load i) (n-nouts con)) (load shared))
+                      (break 0)
+                      (do
+                        (match (n-out con (load i))
+                          (Some [use_]
+                                (match (gcm-use-fun use_)
+                                  (Some [owner]
+                                        (match (load fun)
+                                          (Some [first]
+                                                (if (n-same? first owner)
+                                                    0
+                                                    (set! (mut shared) true)))
+                                          (None [] (set! (mut fun) (Some owner)))))
+                                  (None [] 0)))
+                          (None [] 0))
+                        (set! (mut i) (+ (load i) 1))
+                        (continue))))
+            (match (load fun)
+              (None [] (break 0))
+              (Some [owner]
+                    (if (not (load shared))
+                        (do
+                          (n-set-def! con 0 (Some owner))
+                          (n-set-block-nid! con (n-nid owner))
+                          (n-set-early-nid! con (n-nid owner))
+                          (break 0))
+                        (let [a (alloc/malloc-allocator)
+                              (mut memo) (al-new [(Option (dyn NodeOps))] a)
+                              limit (+ (arena-node-count) 1)
+                              (mut j) 0]
+                          (loop (if (>= (load j) limit)
+                                    (break 0)
+                                    (do
+                                      (push! [(Option (dyn NodeOps))]
+                                             (mut memo)
+                                             (None [(dyn NodeOps)]))
+                                      (set! (mut j) (+ (load j) 1))
+                                      (continue))))
+                          (let [copy (gcm-clone-global-for-fun con owner (mut memo))]
+                            (set! (mut j) 0)
+                            (loop (if (>= (load j) (n-nouts con))
+                                      (break 0)
+                                      (match (n-out con (load j))
+                                        (Some [use_]
+                                              (match (gcm-use-fun use_)
+                                                (Some [use-owner]
+                                                      (if (n-same? use-owner owner)
+                                                          (let [(mut k) 0]
+                                                            (loop (if (>= (load k) (n-nins use_))
+                                                                      (break 0)
+                                                                      (if (n-same? (n-in! use_ (load k)) con)
+                                                                          (do
+                                                                            (n-set-def! use_
+                                                                                        (load k)
+                                                                                        (Some copy))
+                                                                            (break 0))
+                                                                          (do
+                                                                            (set! (mut k)
+                                                                                  (+ (load k) 1))
+                                                                            (continue))))))
+                                                          (set! (mut j) (+ (load j) 1))))
+                                                (None [] (set! (mut j) (+ (load j) 1)))))
+                                        (None [] (set! (mut j) (+ (load j) 1)))))))))))))
+        0)))
+
+(defn gcm-break-up-start-globals! [(start (dyn NodeOps))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (n-nouts start))
+              (break 0)
+              (match (n-out start (load i))
                 (Some [con]
                       (if (gcm-start-pinned-global? con)
                           (let [before (n-nins con)]
@@ -528,6 +563,24 @@
                                 (set! (mut i) (+ (load i) 1))))
                           (set! (mut i) (+ (load i) 1))))
                 (None [] (set! (mut i) (+ (load i) 1))))))
+    0))
+
+(defn gcm-break-up-globals! [] (-> i64)
+  (let [limit (+ (arena-node-count) 1) (mut nid) 1]
+    ;; Simple has one compilation Start. This compiler also has library-declaration Starts whose
+    ;; pure constants can remain reachable after their functions are attached to the unit Start.
+    ;; Treat every selected Start as the same global-placement boundary.
+    (loop (if (>= (load nid) limit)
+              (break 0)
+              (do
+                (match (arena-node (load nid))
+                  (Some [n]
+                        (if (= (gcm-ideal-op n) OP-START)
+                            (gcm-break-up-start-globals! n)
+                            0))
+                  (None [] 0))
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))
     0))
 
 ;; Breadth-first backwards from Stop; place each node at the best position between its use-LCA and
@@ -603,6 +656,95 @@
                 (continue))))
     (load lca)))
 
+(defn gcm-node-constrains-reg? [(n (dyn NodeOps)) (reg i64)] (-> bool)
+  (match (mach-of n)
+    (None [] false)
+    (Some [mach]
+          (let [(mut i) 1
+                (mut constrained) false]
+            (loop (if (or (>= (load i) (n-nins n)) (load constrained))
+                      (break 0)
+                      (do
+                        (match (m-regmap mach (load i))
+                          (Some [mask]
+                                (if (mask-test mask reg)
+                                    (set! (mut constrained) true)
+                                    0))
+                          (None [] 0))
+                        (set! (mut i) (+ (load i) 1))
+                        (continue))))
+            (load constrained)))))
+
+(defn gcm-block-constrains-reg? [(block (dyn NodeOps)) (reg i64)] (-> bool)
+  (let [(mut oi) 0
+        (mut constrained) (gcm-node-constrains-reg? block reg)]
+    ;; Our dominator metadata names block heads, whereas final Simple's chain can name the machine
+    ;; CFG tail itself. Inspect the fixed CFG members directly owned by each block so Call/Return/If
+    ;; operand constraints form the same hoist boundary.
+    (loop (if (or (>= (load oi) (n-nouts block)) (load constrained))
+              (break 0)
+              (do
+                (match (n-out block (load oi))
+                  (Some [use_]
+                        (if (and (cfg? use_)
+                                 (= (n-block-nid use_) (n-nid block)))
+                            (if (gcm-node-constrains-reg? use_ reg)
+                                (set! (mut constrained) true)
+                                0)
+                            0))
+                  (None [] 0))
+                (set! (mut oi) (+ (load oi) 1))
+                (continue))))
+    (load constrained)))
+
+(defn gcm-constrained-early [(n (dyn NodeOps))
+                             (early (dyn NodeOps))
+                             (late (dyn NodeOps))] (-> (dyn NodeOps))
+  (match (mach-of n)
+    (None [] early)
+    (Some [mach]
+          (match (m-outregmap mach)
+            (None [] early)
+            (Some [out]
+                  (if (not (mask-singleton? out))
+                      early
+                      (let [reg (mask-first out)
+                            (mut cur-id) (n-nid late)
+                            (mut answer-id) (n-nid early)
+                            (mut done) false
+                            (mut guard) 0]
+                        ;; Final Simple stops a singleton-register definition at the first CFG node
+                        ;; on late->early whose operand mask admits that same register. Hoisting it
+                        ;; above that use would create a long, necessarily conflicting fixed range.
+                        (loop (if (load done)
+                                  (break 0)
+                                  (let [cur
+                                          (match (arena-node (load cur-id))
+                                            (Some [x] x)
+                                            (None [] (unreachable-node)))]
+                                    (if (n-same? cur early)
+                                        (set! (mut done) true)
+                                        (if (gcm-block-constrains-reg? cur reg)
+                                            (do
+                                              (set! (mut answer-id) (n-nid cur))
+                                              (set! (mut done) true))
+                                            (match (cfg-idom-of cur)
+                                              (Some [parent]
+                                                    (set! (mut cur-id)
+                                                          (n-nid (gcm-node-block parent))))
+                                              (None []
+                                                    (do
+                                                      (panic "gcm-constrained-early: late is outside early")
+                                                      (set! (mut done) true))))))
+                                    (set! (mut guard) (+ (load guard) 1))
+                                    (if (> (load guard) 1000000)
+                                        (broken "gcm-constrained-early: dominator walk did not converge")
+                                        0)
+                                    (continue))))
+                        (match (arena-node (load answer-id))
+                          (Some [answer] answer)
+                          (None [] (unreachable-node))))))))))
+
 (defn gcm-best-block [(early (dyn NodeOps)) (late0 (dyn NodeOps))] (-> (dyn NodeOps))
   (let [(mut cur-id) (n-nid late0)
         (mut best-id) (n-nid late0)
@@ -656,70 +798,131 @@
                                 (gcm-find-anti-dep late n early)
                                 late))
                       (None [] late))
-                  best (gcm-best-block early bounded)]
+                  constrained-early (gcm-constrained-early n early bounded)
+                  best (gcm-best-block constrained-early bounded)]
               (n-set-def! n 0 (Some best))
               (n-set-block-nid! n (n-nid best))))
       ;; A selected value without a selected use is retained only by a keep edge. Its early block
       ;; is the shortest legal lifetime and is already installed.
       (None [] 0))))
 
+(defstruct GcmLateStats [(pushes i64) (pops i64)])
+
+(defn gcm-late-stats [] (-> (ptr GcmLateStats))
+  (primitive/alloc-static GcmLateStats))
+
+(defn gcm-last-late-pushes [] (-> i64)
+  (.pushes (gcm-late-stats)))
+
+(defn gcm-last-late-pops [] (-> i64)
+  (.pops (gcm-late-stats)))
+
+(defn gcm-late-push! [(n (dyn NodeOps))
+                      (done (mut (ArrayList bool)))
+                      (on (mut (ArrayList bool)))
+                      (work (mut (ArrayList i64)))] (-> i64)
+  (let [id (n-nid n)]
+    (if (or (>= id (len (load done)))
+            (get (load done) id)
+            (get (load on) id)
+            (not (gcm-selected-reachable? n)))
+        0
+        (do
+          (set! (mut on) id true)
+          (push! [i64] (mut work) id)
+          (set! (.pushes (gcm-late-stats)) (+ (.pushes (gcm-late-stats)) 1))
+          1))))
+
+(defn gcm-late-wake-defs! [(n (dyn NodeOps))
+                           (done (mut (ArrayList bool)))
+                           (on (mut (ArrayList bool)))
+                           (work (mut (ArrayList i64)))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (n-nins n))
+              (break 0)
+              (do
+                (match (n-in n (load i))
+                  (Some [def]
+                        (do
+                          (gcm-late-push! def (mut done) (mut on) (mut work))
+                          ;; Completing any use of a memory definition may make a waiting Load's
+                          ;; anti-dependence layer ready. This is final Simple's def-triggered wakeup.
+                          (let [(mut oi) 0]
+                            (loop (if (>= (load oi) (n-nouts def))
+                                      (break 0)
+                                      (do
+                                        (match (n-out def (load oi))
+                                          (Some [use_]
+                                                (match (mem-of use_)
+                                                  (Some [access]
+                                                        (if (mem-is-load? access)
+                                                            (gcm-late-push! use_
+                                                                            (mut done)
+                                                                            (mut on)
+                                                                            (mut work))
+                                                            0))
+                                                  (None [] 0)))
+                                          (None [] 0))
+                                        (set! (mut oi) (+ (load oi) 1))
+                                        (continue)))))))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (if (= (gcm-ideal-op n) OP-LOOP)
+        (let [(mut oi) 0]
+          (loop (if (>= (load oi) (n-nouts n))
+                    (break 0)
+                    (do
+                      (match (n-out n (load oi))
+                        (Some [use_]
+                              (if (gcm-selected-phi? use_)
+                                  (gcm-late-push! use_ (mut done) (mut on) (mut work))
+                                  0))
+                        (None [] 0))
+                      (set! (mut oi) (+ (load oi) 1))
+                      (continue)))))
+        0)
+    0))
+
 (defn gcm-schedule-late! [] (-> i64)
   (let [a (alloc/malloc-allocator)
         (mut done) (al-new [bool] a)
+        (mut on) (al-new [bool] a)
+        (mut work) (al-new [i64] a)
         limit (+ (arena-node-count) 1)
-        (mut i) 0
-        (mut remaining) 0]
+        (mut i) 0]
     (loop (if (>= (load i) limit)
               (break 0)
               (do
                 (push! [bool] (mut done) false)
+                (push! [bool] (mut on) false)
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
-    ;; CFG and pinned nodes have fixed late locations. Everything movable waits for its uses.
-    (set! (mut i) 1)
-    (loop (if (>= (load i) limit)
-              (break 0)
-              (do
-                (match (arena-node (load i))
-                  (Some [n]
-                        (if (gcm-selected-reachable? n)
-                            (if (or (cfg? n) (is-pinned? n))
-                                (set! (mut done) (load i) true)
-                                (set! (mut remaining) (+ (load remaining) 1)))
-                            0))
-                  (None [] 0))
-                (set! (mut i) (+ (load i) 1))
-                (continue))))
-    (let [(mut progress) true]
-      (loop (if (= (load remaining) 0)
-                (break 0)
-                (if (not (load progress))
-                    (do
-                      (panic-i "gcm-schedule-late!: movable use cycle did not reach a Phi"
-                               (load remaining))
-                      (break 0))
-                    (do
-                      (set! (mut progress) false)
-                      (set! (mut i) 1)
-                      (loop (if (>= (load i) limit)
-                                (break 0)
-                                (do
-                                  (if (not (get (load done) (load i)))
-                                      (match (arena-node (load i))
-                                        (Some [n]
-                                              (if (and (gcm-selected-reachable? n)
-                                                       (gcm-late-ready? n (mut done)))
-                                                  (do
-                                                    (gcm-place-late! n)
-                                                    (set! (mut done) (load i) true)
-                                                    (set! (mut remaining) (- (load remaining) 1))
-                                                    (set! (mut progress) true))
-                                                  0))
-                                        (None [] 0))
-                                      0)
-                                  (set! (mut i) (+ (load i) 1))
-                                  (continue))))
-                      (continue))))))
+    (set! (.pushes (gcm-late-stats)) 0)
+    (set! (.pops (gcm-late-stats)) 0)
+    ;; Final Simple's sparse backwards walk: Stop is the only seed. A completed use wakes its defs;
+    ;; a completed memory use additionally wakes Loads sharing that memory definition.
+    (gcm-late-push! (code-stop) (mut done) (mut on) (mut work))
+    (loop (match (pop! [i64] (mut work))
+            (None [] (break 0))
+            (Some [id]
+                  (do
+                    (set! (mut on) id false)
+                    (set! (.pops (gcm-late-stats)) (+ (.pops (gcm-late-stats)) 1))
+                    (if (get (load done) id)
+                        0
+                        (match (arena-node id)
+                          (Some [n]
+                                (if (or (cfg? n)
+                                        (is-pinned? n)
+                                        (gcm-late-ready? n (mut done)))
+                                    (do
+                                      (if (or (cfg? n) (is-pinned? n)) 0 (gcm-place-late! n))
+                                      (set! (mut done) id true)
+                                      (gcm-late-wake-defs! n (mut done) (mut on) (mut work)))
+                                    0))
+                          (None [] 0)))
+                    (continue)))))
     0))
 
 ;; The block in which `use_` consumes `n`. For a Phi arm this is the matching Region PREDECESSOR,

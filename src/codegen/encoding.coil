@@ -6,10 +6,15 @@
 ;; layout until sizes stop changing. AArch64 conditional branches grow monotonically from B.cond to
 ;; an inverted-condition/B26 pair; keeping layout separate from emission lets that growth stabilize
 ;; before bytes or typed fixups are recorded.
+;;
+;; Final Simple's Split retains its owning LRG and asks that LRG for the function during encoding.
+;; Our machine nodes retain stable block ownership instead, so final layout caches block-to-Fun
+;; ownership once and gives repeated spill sizing/emission the same constant-time answer.
 (module aot.codegen.encoding)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
 (import "aot.node.cfg" :use *)
@@ -29,6 +34,17 @@
 
 (const ENC-FIXUP-A64-BL26 3)
 
+;; Flush pending literals after at most 256KiB of code. In the worst case every four-byte
+;; instruction contributes a distinct eight-byte literal, so source-to-last-slot distance stays
+;; below 3*256KiB, safely inside AArch64 LDR-literal's signed ±1MiB reach.
+(const ENC-LITERAL-CODE-SPAN 262144)
+
+;; Veneer hubs are at most 32MiB apart and transfers longer than 64MiB route through them. This
+;; leaves a full 64MiB of headroom inside B26's ±128MiB reach for hub entries and later relaxation.
+(const ENC-VENEER-HUB-SPAN 33554432)
+
+(const ENC-VENEER-ROUTE-SPAN 67108864)
+
 (defstruct EncodingState
   [(bits (ArrayList u8))
    (starts (ArrayList i64))
@@ -45,14 +61,42 @@
    (literal-sources (ArrayList i64))
    (literal-bits (ArrayList i64))
    (literal-offsets (ArrayList i64))
+   (literal-indices (ArrayList i64))
+   (literal-emitted (ArrayList bool))
+   (island-before-sources (ArrayList i64))
+   (island-first-literals (ArrayList i64))
+   (island-literal-counts (ArrayList i64))
+   (island-offsets (ArrayList i64))
+   (island-sizes (ArrayList i64))
+   (veneer-hub-before-sources (ArrayList i64))
+   (veneer-hub-offsets (ArrayList i64))
+   (veneer-hub-sizes (ArrayList i64))
+   (veneer-hub-entry-counts (ArrayList i64))
+   (veneer-hub-first-entries (ArrayList i64))
+   (veneer-hub-last-entries (ArrayList i64))
+   (veneer-hub-indices (ArrayList i64))
+   (veneer-entry-hubs (ArrayList i64))
+   (veneer-entry-ordinals (ArrayList i64))
+   (veneer-entry-in-hub-next (ArrayList i64))
+   (veneer-entry-next (ArrayList i64))
+   (veneer-entry-targets (ArrayList i64))
+   (veneer-route-sources (ArrayList i64))
+   (veneer-first-by-source (ArrayList i64))
    (definition-sources (ArrayList i64))
    (definition-fidxs (ArrayList i64))
    (definition-names (ArrayList (slice u8)))
    (definition-ends (ArrayList i64))
    (layout-blocks (ArrayList i64))
    (layout-jumps (ArrayList i64))
+   ;; Block-to-Fun ownership is immutable during final layout. Stack spill sizing and emission both
+   ;; ask for it, so cache it once instead of repeating dominator walks for every access.
+   (owner-funs (ArrayList i64))
+   (owner-ready bool)
+   (owner-walk-visits i64)
+   (owner-cfg-version i64)
    (laid-out bool)
-   (emitted bool)])
+   (emitted bool)
+   (initialized bool)])
 
 (defn enc-state [] (-> (ptr EncodingState))
   (primitive/alloc-static EncodingState))
@@ -76,21 +120,51 @@
     (set! (.literal-sources state) (al-new [i64] a))
     (set! (.literal-bits state) (al-new [i64] a))
     (set! (.literal-offsets state) (al-new [i64] a))
+    (set! (.literal-indices state) (al-new [i64] a))
+    (set! (.literal-emitted state) (al-new [bool] a))
+    (set! (.island-before-sources state) (al-new [i64] a))
+    (set! (.island-first-literals state) (al-new [i64] a))
+    (set! (.island-literal-counts state) (al-new [i64] a))
+    (set! (.island-offsets state) (al-new [i64] a))
+    (set! (.island-sizes state) (al-new [i64] a))
+    (set! (.veneer-hub-before-sources state) (al-new [i64] a))
+    (set! (.veneer-hub-offsets state) (al-new [i64] a))
+    (set! (.veneer-hub-sizes state) (al-new [i64] a))
+    (set! (.veneer-hub-entry-counts state) (al-new [i64] a))
+    (set! (.veneer-hub-first-entries state) (al-new [i64] a))
+    (set! (.veneer-hub-last-entries state) (al-new [i64] a))
+    (set! (.veneer-hub-indices state) (al-new [i64] a))
+    (set! (.veneer-entry-hubs state) (al-new [i64] a))
+    (set! (.veneer-entry-ordinals state) (al-new [i64] a))
+    (set! (.veneer-entry-in-hub-next state) (al-new [i64] a))
+    (set! (.veneer-entry-next state) (al-new [i64] a))
+    (set! (.veneer-entry-targets state) (al-new [i64] a))
+    (set! (.veneer-route-sources state) (al-new [i64] a))
+    (set! (.veneer-first-by-source state) (al-new [i64] a))
     (set! (.definition-sources state) (al-new [i64] a))
     (set! (.definition-fidxs state) (al-new [i64] a))
     (set! (.definition-names state) (al-new [(slice u8)] a))
     (set! (.definition-ends state) (al-new [i64] a))
     (set! (.layout-blocks state) (al-new [i64] a))
     (set! (.layout-jumps state) (al-new [i64] a))
+    (set! (.owner-funs state) (al-new [i64] a))
     (loop (if (> (load i) (arena-node-count))
               (break 0)
               (do
                 (push! [i64] (mut (.starts state)) -1)
                 (push! [i64] (mut (.lengths state)) -1)
+                (push! [i64] (mut (.literal-indices state)) -1)
+                (push! [i64] (mut (.veneer-hub-indices state)) -1)
+                (push! [i64] (mut (.veneer-first-by-source state)) -1)
+                (push! [i64] (mut (.owner-funs state)) 0)
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
+    (set! (.owner-ready state) false)
+    (set! (.owner-walk-visits state) 0)
+    (set! (.owner-cfg-version state) (cfg-version))
     (set! (.laid-out state) false)
     (set! (.emitted state) false)
+    (set! (.initialized state) true)
     0))
 
 (defn enc-ensure-node-capacity! [(n (dyn NodeOps))] (-> i64)
@@ -100,6 +174,10 @@
               (do
                 (push! [i64] (mut (.starts state)) -1)
                 (push! [i64] (mut (.lengths state)) -1)
+                (push! [i64] (mut (.literal-indices state)) -1)
+                (push! [i64] (mut (.veneer-hub-indices state)) -1)
+                (push! [i64] (mut (.veneer-first-by-source state)) -1)
+                (push! [i64] (mut (.owner-funs state)) 0)
                 (continue))))
     0))
 
@@ -186,21 +264,69 @@
 (defn enc-symbol-fixup-name [(i i64)] (-> (slice u8))
   (get (.symbol-names (enc-state)) i))
 
+(defn enc-has-veneer-route? [(source (dyn NodeOps))] (-> bool)
+  (and (< (n-nid source) (len (.veneer-first-by-source (enc-state))))
+       (>= (get (.veneer-first-by-source (enc-state)) (n-nid source)) 0)))
+
+(defn enc-add-planned-veneer-fixup! [(encoder i64)
+                                     (source (dyn NodeOps))
+                                     (addend i64)] (-> i64)
+  (let [state (enc-state)
+        (mut entry) (get (.veneer-first-by-source state) (n-nid source))
+        (mut guard) 0]
+    (if (< (load entry) 0)
+        (panic-i "enc-add-planned-veneer-fixup!: source has no route" (n-nid source))
+        0)
+    (loop (let [next (get (.veneer-entry-next state) (load entry))]
+            (if (>= next 0)
+                (do
+                  (set! (mut entry) next)
+                  (set! (mut guard) (+ (load guard) 1))
+                  (if (> (load guard) (len (.veneer-entry-hubs state)))
+                      (panic "enc-add-planned-veneer-fixup!: route did not converge")
+                      (continue)))
+                (let [target-nid (get (.veneer-entry-targets state) (load entry))]
+                  (match (arena-node target-nid)
+                    (Some [target]
+                          (break (enc-add-local-fixup-at! encoder
+                                                          ENC-FIXUP-A64-B26
+                                                          source
+                                                          addend
+                                                          target)))
+                    (None []
+                          (break (panic-i "enc-add-planned-veneer-fixup!: missing target"
+                                          target-nid))))))))))
+
 (defn enc-add-f64-literal! [(encoder i64) (source (dyn NodeOps)) (bits i64)] (-> i64)
   (do
     (enc-require-handle encoder)
-    (push! [i64] (mut (.literal-sources (enc-state))) (n-nid source))
-    (push! [i64] (mut (.literal-bits (enc-state))) bits)
-    (push! [i64] (mut (.literal-offsets (enc-state))) -1)
+    (if (.laid-out (enc-state))
+        (let [idx (get (.literal-indices (enc-state)) (n-nid source))]
+          (if (or (< idx 0)
+                  (>= idx (len (.literal-bits (enc-state))))
+                  (!= (get (.literal-bits (enc-state)) idx) bits))
+              (panic-i "enc-add-f64-literal!: emitted literal disagrees with layout"
+                       (n-nid source))
+              (set! (mut (.literal-emitted (enc-state))) idx true)))
+        (do
+          ;; Isolated instruction encoding has no layout pass; relocation retains the compact
+          ;; trailing-pool fallback for that diagnostic/test mode.
+          (push! [i64] (mut (.literal-sources (enc-state))) (n-nid source))
+          (push! [i64] (mut (.literal-bits (enc-state))) bits)
+          (push! [i64] (mut (.literal-offsets (enc-state))) -1)
+          (push! [bool] (mut (.literal-emitted (enc-state))) true)))
     0))
 
 (defn enc-literal-count [] (-> i64)
   (len (.literal-sources (enc-state))))
 
+(defn enc-literal-offset [(i i64)] (-> i64)
+  (get (.literal-offsets (enc-state)) i))
+
 (defn enc-add-definition! [(encoder i64)
-                            (source (dyn NodeOps))
-                            (fidx i64)
-                            (name (slice u8))] (-> i64)
+                           (source (dyn NodeOps))
+                           (fidx i64)
+                           (name (slice u8))] (-> i64)
   (do
     (enc-require-handle encoder)
     (push! [i64] (mut (.definition-sources (enc-state))) (n-nid source))
@@ -224,9 +350,10 @@
   (get (.definition-names (enc-state)) i))
 
 (defn enc-end-definition! [(encoder i64)
-                            (source (dyn NodeOps))
-                            (last-instruction (dyn NodeOps))] (-> i64)
-  (let [(mut i) 0 (mut found) false]
+                           (source (dyn NodeOps))
+                           (last-instruction (dyn NodeOps))] (-> i64)
+  (let [(mut i) 0
+        (mut found) false]
     (enc-require-handle encoder)
     (loop (if (or (>= (load i) (enc-definition-count)) (load found))
               (break 0)
@@ -254,7 +381,8 @@
     (if (>= explicit 0)
         (- explicit start)
         ;; A hand-built/object-only graph may omit Return. Bound it by the next function, or text.
-        (let [(mut j) 0 (mut end) (enc-byte-count)]
+        (let [(mut j) 0
+              (mut end) (enc-byte-count)]
           (loop (if (>= (load j) (enc-definition-count))
                     (break (- (load end) start))
                     (do
@@ -352,13 +480,8 @@
 (defn enc-ideal-op [(n (dyn NodeOps))] (-> i64)
   (match (mach-of n) (Some [mach] (m-ideal-op mach)) (None [] (n-op n))))
 
-(defn enc-enclosing-fun [(n (dyn NodeOps))] (-> (dyn NodeOps))
-  (let [(mut cur)
-          (if (= (n-block-nid n) 0)
-              (Some n)
-              (match (arena-node (n-block-nid n))
-                (Some [block] (Some block))
-                (None [] (None [(dyn NodeOps)]))))
+(defn enc-find-enclosing-fun [(start (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [(mut cur) (Some start)
         (mut steps) 0
         limit (+ (arena-node-count) 1)
         (mut answer) (None [(dyn NodeOps)])]
@@ -368,19 +491,89 @@
               (break 0)
               (match (load cur)
                 (Some [c]
-                      (if (= (enc-ideal-op c) OP-FUN)
-                          (set! (mut answer) (Some c))
-                          (do
-                            (set! (mut cur) (cfg-idom-of c))
-                            (set! (mut steps) (+ (load steps) 1))
-                            (continue))))
+                      (do
+                        (set! (.owner-walk-visits (enc-state))
+                              (+ (.owner-walk-visits (enc-state)) 1))
+                        (if (= (enc-ideal-op c) OP-FUN)
+                            (set! (mut answer) (Some c))
+                            (do
+                              (set! (mut cur) (cfg-idom-of c))
+                              (set! (mut steps) (+ (load steps) 1))
+                              (continue)))))
                 (None [] (break 0)))))
-    (match (load answer)
-      (Some [fun] fun)
-      (None []
-            (do
-              (panic-i "enc-enclosing-fun: instruction has no owning Fun" (n-nid n))
-              (unreachable-node))))))
+    (load answer)))
+
+(defn enc-clear-owner-cache! [] (-> i64)
+  (let [state (enc-state) (mut i) 0]
+    (loop (if (>= (load i) (len (.owner-funs state)))
+              (break 0)
+              (do
+                (set! (mut (.owner-funs state)) (load i) 0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (set! (.owner-ready state) false)
+    (set! (.owner-walk-visits state) 0)
+    (set! (.owner-cfg-version state) (cfg-version))
+    0))
+
+(defn enc-cache-block-owners! [] (-> i64)
+  (let [state (enc-state) (mut ci) 0]
+    (if (!= (.owner-cfg-version state) (cfg-version)) (enc-clear-owner-cache!) 0)
+    (if (not (.owner-ready state))
+        (do
+          (loop (if (>= (load ci) (code-cfg-count))
+                    (break 0)
+                    (let [block (code-cfg-at (load ci))]
+                      (if (cfg-block-head-of? block)
+                          (do
+                            (enc-ensure-node-capacity! block)
+                            (match (enc-find-enclosing-fun block)
+                              (Some [fun]
+                                    (set! (mut (.owner-funs state))
+                                          (n-nid block)
+                                          (n-nid fun)))
+                              (None [] 0)))
+                          0)
+                      (set! (mut ci) (+ (load ci) 1))
+                      (continue))))
+          (set! (.owner-ready state) true))
+        0)
+    (load ci)))
+
+(defn enc-enclosing-fun-from-block [(n (dyn NodeOps)) (block (dyn NodeOps))]
+                                    (-> (dyn NodeOps))
+  (do
+    (if (not (.initialized (enc-state))) (enc-reset!) 0)
+    (enc-ensure-node-capacity! block)
+    (enc-cache-block-owners!)
+    (let [owner (get (.owner-funs (enc-state)) (n-nid block))]
+      (if (> owner 0)
+          (match (arena-node owner)
+            (Some [fun] fun)
+            (None []
+                  (do
+                    (panic-i "enc-enclosing-fun: cached Fun is missing" owner)
+                    (unreachable-node))))
+          (match (enc-find-enclosing-fun block)
+            (Some [fun]
+                  (do
+                    (set! (mut (.owner-funs (enc-state))) (n-nid block) (n-nid fun))
+                    fun))
+            (None []
+                  (do
+                    (panic-i "enc-enclosing-fun: instruction has no owning Fun" (n-nid n))
+                    (unreachable-node))))))))
+
+(defn enc-enclosing-fun [(n (dyn NodeOps))] (-> (dyn NodeOps))
+  (match (if (= (n-block-nid n) 0) (Some n) (arena-node (n-block-nid n)))
+    (Some [block] (enc-enclosing-fun-from-block n block))
+    (None []
+          (do
+            (panic-i "enc-enclosing-fun: instruction block is missing" (n-nid n))
+            (unreachable-node)))))
+
+(defn enc-owner-walk-visits [] (-> i64)
+  (.owner-walk-visits (enc-state)))
 
 (defn enc-stack-offset [(encoder i64) (n (dyn NodeOps)) (location i64)] (-> i64)
   (do
@@ -388,19 +581,23 @@
     (mach-active-stack-offset (enc-enclosing-fun n) location)))
 
 (defn enc-block-tail [(block (dyn NodeOps))] (-> (dyn NodeOps))
-  (let [count (code-schedule-count block) (mut i) (- count 1)]
+  (let [count (code-schedule-count block)
+        (mut i) (- count 1)]
     (if (= count 0)
         (do (panic-i "enc-block-tail: empty block schedule" (n-nid block)) (unreachable-node))
         (loop (if (< (load i) 0)
-                  (break (do (panic-i "enc-block-tail: schedule has no CFG node" (n-nid block))
-                             (unreachable-node)))
+                  (break (do
+                           (panic-i "enc-block-tail: schedule has no CFG node" (n-nid block))
+                           (unreachable-node)))
                   (let [candidate (code-schedule-at block (load i))]
                     (if (cfg? candidate)
                         (break candidate)
                         (do (set! (mut i) (- (load i) 1)) (continue)))))))))
 
 (defn enc-unique-cfg-successor [(tail (dyn NodeOps))] (-> (Option (dyn NodeOps)))
-  (let [(mut i) 0 (mut answer) (None [(dyn NodeOps)]) (mut several) false]
+  (let [(mut i) 0
+        (mut answer) (None [(dyn NodeOps)])
+        (mut several) false]
     (loop (if (or (>= (load i) (n-nouts tail)) (load several))
               (break 0)
               (do
@@ -443,7 +640,9 @@
     0))
 
 (defn enc-layout-child-loop [(block (dyn NodeOps)) (container i64)] (-> i64)
-  (let [(mut head) (n-ltree-head block) (mut child) 0 (mut guard) 0]
+  (let [(mut head) (n-ltree-head block)
+        (mut child) 0
+        (mut guard) 0]
     (loop (if (or (= (load head) 0) (= (load head) container))
               (break (load child))
               (if (> (load guard) (arena-node-count))
@@ -462,7 +661,9 @@
     (load child)))
 
 (defn enc-forwards-empty-scan? [(start (dyn NodeOps)) (branch-depth i64)] (-> bool)
-  (let [(mut cur) (Some start) (mut answer) false (mut guard) 0]
+  (let [(mut cur) (Some start)
+        (mut answer) false
+        (mut guard) 0]
     (loop (if (or (match (load cur) (Some [_] false) (None [] true))
                   (> (load guard) (arena-node-count)))
               (break (load answer))
@@ -498,7 +699,8 @@
 (defn enc-should-invert? [(taken (dyn NodeOps))
                           (fall (dyn NodeOps))
                           (branch-depth i64)] (-> bool)
-  (let [taken-depth (looptree-depth-of taken) fall-depth (looptree-depth-of fall)]
+  (let [taken-depth (looptree-depth-of taken)
+        fall-depth (looptree-depth-of fall)]
     (if (< taken-depth branch-depth)
         (enc-forwards-empty-scan? fall branch-depth)
         (if (< fall-depth branch-depth)
@@ -540,15 +742,17 @@
               (let [(mut si) 0]
                 (loop (if (>= (load si) (code-schedule-count block))
                           (break 0)
-                          (let [n (code-schedule-at block (load si)) (mut oi) 0]
+                          (let [n (code-schedule-at block (load si))
+                                (mut oi) 0]
                             (loop (if (>= (load oi) (n-nouts n))
                                       (break 0)
                                       (do
                                         (match (n-out n (load oi))
                                           (Some [use]
                                                 (if (cfg-block-head-of? use)
-                                                    (enc-preferred-rpo-walk!
-                                                      use (mut seen) (mut post))
+                                                    (enc-preferred-rpo-walk! use
+                                                                             (mut seen)
+                                                                             (mut post))
                                                     0))
                                           (None [] 0))
                                         (set! (mut oi) (+ (load oi) 1))
@@ -580,7 +784,8 @@
                   (Some [block]
                         (if (get (load seen) (n-nid block))
                             0
-                            (let [lo (len (load post)) (mut pi) 0]
+                            (let [lo (len (load post))
+                                  (mut pi) 0]
                               (enc-preferred-rpo-walk! block (mut seen) (mut post))
                               (set! (mut pi) (- (len (load post)) 1))
                               (loop (if (< (load pi) lo)
@@ -647,20 +852,51 @@
                 0
                 (match (arena-node (get (load blocks) 0))
                   (Some [first] (n-ltree-head first))
-                  (None [] (panic-i "enc-layout-order-blocks!: missing first block"
-                                    (get (load blocks) 0)))))]
+                  (None []
+                        (panic-i "enc-layout-order-blocks!: missing first block"
+                                 (get (load blocks) 0)))))]
       (if (or (= (len (load blocks)) 0) (= root 0))
-        (do
-          (set! (mut ci) 0)
-          (loop (if (>= (load ci) (len (load blocks)))
+          (do
+            (set! (mut ci) 0)
+            (loop (if (>= (load ci) (len (load blocks)))
+                      (break 0)
+                      (do
+                        (push! [i64]
+                               (mut (.layout-blocks (enc-state)))
+                               (get (load blocks) (load ci)))
+                        (push! [i64] (mut (.layout-jumps (enc-state))) 0)
+                        (set! (mut ci) (+ (load ci) 1))
+                        (continue)))))
+          (enc-layout-emit-loop! root (enc-preferred-rpo (load blocks)) (mut emitted))))
+    ;; A stale/orphan loop-tree head must fail at the layout boundary, before a later branch fixup
+    ;; asks for an absent opcode offset. Never silently append the block: that would hide the
+    ;; upstream loop-tree invariant violation and destroy nested-loop contiguity.
+    (if (!= (enc-layout-block-count) (len (load blocks)))
+        (let [(mut placed) (al-new [bool] a)]
+          (set! (mut i) 0)
+          (loop (if (> (load i) (arena-node-count))
                     (break 0)
                     (do
-                      (push! [i64] (mut (.layout-blocks (enc-state)))
-                             (get (load blocks) (load ci)))
-                      (push! [i64] (mut (.layout-jumps (enc-state))) 0)
-                      (set! (mut ci) (+ (load ci) 1))
+                      (push! [bool] (mut placed) false)
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (set! (mut i) 0)
+          (loop (if (>= (load i) (enc-layout-block-count))
+                    (break 0)
+                    (do
+                      (set! (mut placed) (n-nid (enc-layout-block-at (load i))) true)
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (set! (mut i) 0)
+          (loop (if (>= (load i) (len (load blocks)))
+                    (break 0)
+                    (let [nid (get (load blocks) (load i))]
+                      (if (not (get (load placed) nid))
+                          (panic-i "enc-layout-order-blocks!: loop tree omitted block" nid)
+                          0)
+                      (set! (mut i) (+ (load i) 1))
                       (continue)))))
-          (enc-layout-emit-loop! root (enc-preferred-rpo (load blocks)) (mut emitted))))
+        0)
     (enc-layout-block-count)))
 
 ;; Final Simple first chooses a CFG order, then makes every physical fallthrough explicit: an If
@@ -701,9 +937,368 @@
                   (continue)))))
     (enc-layout-block-count)))
 
+(defn enc-b26-fits? [(delta i64)] (-> bool)
+  (and (= (% delta 4) 0) (and (>= delta -134217728) (<= delta 134217724))))
+
+(defn enc-clear-veneer-plan! [] (-> i64)
+  (let [state (enc-state)
+        (mut i) 0]
+    (loop (if (>= (load i) (len (.veneer-hub-before-sources state)))
+              (break 0)
+              (do
+                (set! (mut (.veneer-hub-indices state))
+                      (get (.veneer-hub-before-sources state) (load i))
+                      -1)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (set! (mut i) 0)
+    (loop (if (>= (load i) (len (.veneer-route-sources state)))
+              (break 0)
+              (do
+                (set! (mut (.veneer-first-by-source state))
+                      (get (.veneer-route-sources state) (load i))
+                      -1)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (al-clear! [i64] (mut (.veneer-hub-before-sources state)))
+    (al-clear! [i64] (mut (.veneer-hub-offsets state)))
+    (al-clear! [i64] (mut (.veneer-hub-sizes state)))
+    (al-clear! [i64] (mut (.veneer-hub-entry-counts state)))
+    (al-clear! [i64] (mut (.veneer-hub-first-entries state)))
+    (al-clear! [i64] (mut (.veneer-hub-last-entries state)))
+    (al-clear! [i64] (mut (.veneer-entry-hubs state)))
+    (al-clear! [i64] (mut (.veneer-entry-ordinals state)))
+    (al-clear! [i64] (mut (.veneer-entry-in-hub-next state)))
+    (al-clear! [i64] (mut (.veneer-entry-next state)))
+    (al-clear! [i64] (mut (.veneer-entry-targets state)))
+    (al-clear! [i64] (mut (.veneer-route-sources state)))
+    0))
+
+(defn enc-plan-veneer-hub-before! [(n (dyn NodeOps)) (last-offset (mut i64))] (-> i64)
+  (let [state (enc-state)
+        at (enc-op-start n)]
+    (if (>= (- at (load last-offset)) ENC-VENEER-HUB-SPAN)
+        (let [idx (len (.veneer-hub-before-sources state))]
+          (push! [i64] (mut (.veneer-hub-before-sources state)) (n-nid n))
+          (push! [i64] (mut (.veneer-hub-offsets state)) at)
+          (push! [i64] (mut (.veneer-hub-sizes state)) 0)
+          (push! [i64] (mut (.veneer-hub-entry-counts state)) 0)
+          (push! [i64] (mut (.veneer-hub-first-entries state)) -1)
+          (push! [i64] (mut (.veneer-hub-last-entries state)) -1)
+          (set! (mut (.veneer-hub-indices state)) (n-nid n) idx)
+          (set! last-offset at))
+        0)
+    0))
+
+(defn enc-add-veneer-entry! [(hub i64)] (-> i64)
+  (let [state (enc-state)
+        idx (len (.veneer-entry-hubs state))
+        ordinal (get (.veneer-hub-entry-counts state) hub)
+        prior-in-hub (get (.veneer-hub-last-entries state) hub)]
+    (push! [i64] (mut (.veneer-entry-hubs state)) hub)
+    (push! [i64] (mut (.veneer-entry-ordinals state)) ordinal)
+    (push! [i64] (mut (.veneer-entry-in-hub-next state)) -1)
+    (push! [i64] (mut (.veneer-entry-next state)) -1)
+    (push! [i64] (mut (.veneer-entry-targets state)) 0)
+    (if (>= prior-in-hub 0)
+        (set! (mut (.veneer-entry-in-hub-next state)) prior-in-hub idx)
+        (set! (mut (.veneer-hub-first-entries state)) hub idx))
+    (set! (mut (.veneer-hub-last-entries state)) hub idx)
+    (set! (mut (.veneer-hub-entry-counts state)) hub (+ ordinal 1))
+    idx))
+
+(defn enc-plan-veneer-route! [(source (dyn NodeOps)) (target (dyn NodeOps))] (-> i64)
+  (let [state (enc-state)
+        addend (if (= (enc-ideal-op source) OP-IF) 4 0)
+        source-at (+ (enc-op-start source) addend)
+        target-at (enc-op-start target)
+        forward (> target-at source-at)
+        (mut hub) (if forward 0 (- (len (.veneer-hub-offsets state)) 1))
+        (mut first) -1
+        (mut prior) -1]
+    (if (>= (get (.veneer-first-by-source state) (n-nid source)) 0)
+        (panic-i "enc-plan-veneer-route!: source already has a route" (n-nid source))
+        0)
+    (loop (if (if forward
+                  (>= (load hub) (len (.veneer-hub-offsets state)))
+                  (< (load hub) 0))
+              (break 0)
+              (let [at (get (.veneer-hub-offsets state) (load hub))
+                    between
+                      (if forward
+                          (and (> at source-at) (< at target-at))
+                          (and (< at source-at) (> at target-at)))]
+                (if between
+                    (let [entry (enc-add-veneer-entry! (load hub))]
+                      (if (< (load first) 0) (set! (mut first) entry) 0)
+                      (if (>= (load prior) 0)
+                          (set! (mut (.veneer-entry-next state)) (load prior) entry)
+                          0)
+                      (set! (mut prior) entry))
+                    0)
+                (set! (mut hub) (+ (load hub) (if forward 1 -1)))
+                (continue))))
+    (if (< (load first) 0)
+        (panic-i "enc-plan-veneer-route!: no hub lies between far transfer and target"
+                 (n-nid source))
+        (do
+          (set! (mut (.veneer-entry-targets state)) (load prior) (n-nid target))
+          (set! (mut (.veneer-first-by-source state)) (n-nid source) (load first))
+          (push! [i64] (mut (.veneer-route-sources state)) (n-nid source))))
+    0))
+
+(defn enc-plan-veneer-transfer-target! [(source (dyn NodeOps))
+                                        (target (dyn NodeOps))] (-> i64)
+  (let [addend (if (= (enc-ideal-op source) OP-IF) 4 0)
+        delta (- (enc-op-start target) (+ (enc-op-start source) addend))]
+    (if (or (> delta ENC-VENEER-ROUTE-SPAN) (< delta (- 0 ENC-VENEER-ROUTE-SPAN)))
+        (enc-plan-veneer-route! source target)
+        0)))
+
+(defn enc-plan-veneer-transfer! [(source (dyn NodeOps))
+                                 (definitions (HashMap i64 i64))] (-> i64)
+  (match (mach-layout-long-target source)
+    (Some [target] (enc-plan-veneer-transfer-target! source target))
+    (None []
+          (match (mach-layout-call-fidx source)
+            (Some [fidx]
+                  (match (get definitions fidx)
+                    (Some [nid]
+                          (match (arena-node nid)
+                            (Some [target] (enc-plan-veneer-transfer-target! source target))
+                            (None [] 0)))
+                    (None [] 0)))
+            (None [] 0)))))
+
+(defn enc-plan-veneers! [] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        (mut definitions) (hm-new-scalar [i64 i64] a)
+        state (enc-state)
+        (mut ci) 0
+        (mut last-hub) 0]
+    (enc-clear-veneer-plan!)
+    ;; First collect sparse hubs in final block order.
+    (loop (if (>= (load ci) (enc-layout-block-count))
+              (break 0)
+              (let [block (enc-layout-block-at (load ci))
+                    (mut i) 0]
+                (loop (if (>= (load i) (code-schedule-count block))
+                          (break 0)
+                          (let [n (code-schedule-at block (load i))]
+                            (match (mach-of n)
+                              (Some [_]
+                                    (do
+                                      (enc-plan-veneer-hub-before! n (mut last-hub))
+                                      (match (mach-layout-definition-fidx n)
+                                        (Some [fidx]
+                                              (set! (mut definitions) fidx (n-nid n)))
+                                        (None [] 0))))
+                              (None [] 0))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (match (enc-layout-jump-at (load ci))
+                  (Some [jump] (enc-plan-veneer-hub-before! jump (mut last-hub)))
+                  (None [] 0))
+                (set! (mut ci) (+ (load ci) 1))
+                (continue))))
+    ;; Then route only transfers long enough to need the reserved headroom.
+    (set! (mut ci) 0)
+    (loop (if (>= (load ci) (enc-layout-block-count))
+              (break 0)
+              (let [block (enc-layout-block-at (load ci))
+                    (mut i) 0]
+                (loop (if (>= (load i) (code-schedule-count block))
+                          (break 0)
+                          (let [n (code-schedule-at block (load i))]
+                            (match (mach-of n)
+                              (Some [_] (enc-plan-veneer-transfer! n (load definitions)))
+                              (None [] 0))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (match (enc-layout-jump-at (load ci))
+                  (Some [jump] (enc-plan-veneer-transfer! jump (load definitions)))
+                  (None [] 0))
+                (set! (mut ci) (+ (load ci) 1))
+                (continue))))
+    (let [(mut hub) 0]
+      (loop (if (>= (load hub) (len (.veneer-hub-sizes state)))
+                (break 0)
+                (do
+                  (let [count (get (.veneer-hub-entry-counts state) (load hub))]
+                    (set! (mut (.veneer-hub-sizes state))
+                          (load hub)
+                          (if (> count 0) (+ 4 (* count 4)) 0)))
+                  (set! (mut hub) (+ (load hub) 1))
+                  (continue)))))
+    (len (.veneer-entry-hubs state))))
+
+(defn enc-layout-veneer-hub-before! [(n (dyn NodeOps)) (cursor (mut i64))] (-> i64)
+  (let [state (enc-state)
+        hub (get (.veneer-hub-indices state) (n-nid n))]
+    (if (>= hub 0)
+        (do
+          (set! (mut (.veneer-hub-offsets state)) hub (load cursor))
+          (set! cursor (+ (load cursor) (get (.veneer-hub-sizes state) hub))))
+        0)
+    0))
+
+(defn enc-veneer-entry-offset [(entry i64)] (-> i64)
+  (let [state (enc-state)
+        hub (get (.veneer-entry-hubs state) entry)]
+    (+ (get (.veneer-hub-offsets state) hub)
+       (+ 4 (* (get (.veneer-entry-ordinals state) entry) 4)))))
+
+(defn enc-verify-veneer-routes! [] (-> i64)
+  (let [state (enc-state)
+        (mut route) 0]
+    (loop (if (>= (load route) (len (.veneer-route-sources state)))
+              (break 0)
+              (let [source-nid (get (.veneer-route-sources state) (load route))
+                    source
+                      (match (arena-node source-nid)
+                        (Some [n] n)
+                        (None []
+                              (do
+                                (panic-i "enc-verify-veneer-routes!: missing source" source-nid)
+                                (unreachable-node))))
+                    addend (if (= (enc-ideal-op source) OP-IF) 4 0)
+                    (mut at) (+ (enc-op-start source) addend)
+                    (mut entry) (get (.veneer-first-by-source state) source-nid)
+                    (mut guard) 0]
+                (loop (if (< (load entry) 0)
+                          (break 0)
+                          (let [entry-at (enc-veneer-entry-offset (load entry))
+                                next (get (.veneer-entry-next state) (load entry))]
+                            (if (not (enc-b26-fits? (- entry-at (load at))))
+                                (panic-i "enc-verify-veneer-routes!: source or hop is out of range"
+                                         (- entry-at (load at)))
+                                0)
+                            (set! (mut at) entry-at)
+                            (if (>= next 0)
+                                (set! (mut entry) next)
+                                (let [target-nid (get (.veneer-entry-targets state) (load entry))
+                                      target
+                                        (match (arena-node target-nid)
+                                          (Some [n] n)
+                                          (None []
+                                                (do
+                                                  (panic-i "enc-verify-veneer-routes!: missing target"
+                                                           target-nid)
+                                                  (unreachable-node))))]
+                                  (if (not (enc-b26-fits? (- (enc-op-start target) (load at))))
+                                      (panic-i "enc-verify-veneer-routes!: final hop is out of range"
+                                               (- (enc-op-start target) (load at)))
+                                      0)
+                                  (set! (mut entry) -1)))
+                            (set! (mut guard) (+ (load guard) 1))
+                            (if (> (load guard) (len (.veneer-entry-hubs state)))
+                                (panic "enc-verify-veneer-routes!: entry chain did not converge")
+                                (continue)))))
+                (set! (mut route) (+ (load route) 1))
+                (continue))))
+    0))
+
+(defn enc-literal-plan-reset! [] (-> i64)
+  (let [state (enc-state)
+        (mut i) 0]
+    (loop (if (>= (load i) (len (.literal-sources state)))
+              (break 0)
+              (do
+                (set! (mut (.literal-indices state))
+                      (get (.literal-sources state) (load i))
+                      -1)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (al-clear! [i64] (mut (.literal-sources state)))
+    (al-clear! [i64] (mut (.literal-bits state)))
+    (al-clear! [i64] (mut (.literal-offsets state)))
+    (al-clear! [bool] (mut (.literal-emitted state)))
+    (al-clear! [i64] (mut (.island-before-sources state)))
+    (al-clear! [i64] (mut (.island-first-literals state)))
+    (al-clear! [i64] (mut (.island-literal-counts state)))
+    (al-clear! [i64] (mut (.island-offsets state)))
+    (al-clear! [i64] (mut (.island-sizes state)))
+    0))
+
+(defn enc-plan-literal! [(source (dyn NodeOps)) (bits i64)] (-> i64)
+  (let [state (enc-state)
+        idx (len (.literal-sources state))]
+    (enc-ensure-node-capacity! source)
+    (if (>= (get (.literal-indices state) (n-nid source)) 0)
+        (panic-i "enc-plan-literal!: machine node requests several literals" (n-nid source))
+        0)
+    (set! (mut (.literal-indices state)) (n-nid source) idx)
+    (push! [i64] (mut (.literal-sources state)) (n-nid source))
+    (push! [i64] (mut (.literal-bits state)) bits)
+    (push! [i64] (mut (.literal-offsets state)) -1)
+    (push! [bool] (mut (.literal-emitted state)) false)
+    0))
+
+(defn enc-plan-literal-island! [(before-source i64)
+                                (first-literal i64)
+                                (cursor (mut i64))
+                                (seen (mut (HashMap i64 i64)))] (-> i64)
+  (let [state (enc-state)
+        start (load cursor)
+        end (len (.literal-sources state))
+        (mut data) (+ start 4)
+        (mut i) first-literal]
+    (if (>= first-literal end)
+        (panic-i "enc-plan-literal-island!: empty island" first-literal)
+        0)
+    (hm-clear! [i64 i64] (mut seen))
+    (if (!= (& (load data) 7) 0) (set! (mut data) (+ (load data) 4)) 0)
+    (loop (if (>= (load i) end)
+              (break 0)
+              (let [bits (get (.literal-bits state) (load i))]
+                (match (get (load seen) bits)
+                  (Some [offset]
+                        (set! (mut (.literal-offsets state)) (load i) offset))
+                  (None []
+                        (do
+                          (set! (mut (.literal-offsets state)) (load i) (load data))
+                          (set! (mut seen) bits (load data))
+                          (set! (mut data) (+ (load data) 8)))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (push! [i64] (mut (.island-before-sources state)) before-source)
+    (push! [i64] (mut (.island-first-literals state)) first-literal)
+    (push! [i64] (mut (.island-literal-counts state)) (- end first-literal))
+    (push! [i64] (mut (.island-offsets state)) start)
+    (push! [i64] (mut (.island-sizes state)) (- (load data) start))
+    (set! cursor (load data))
+    0))
+
+(defn enc-layout-maybe-literal-island! [(before (dyn NodeOps))
+                                        (cursor (mut i64))
+                                        (pending-first (mut i64))
+                                        (first-source-offset (mut i64))
+                                        (seen (mut (HashMap i64 i64)))] (-> i64)
+  (if (and (>= (load pending-first) 0)
+           (or (= (enc-ideal-op before) OP-FUN)
+               (>= (- (load cursor) (load first-source-offset)) ENC-LITERAL-CODE-SPAN)))
+      (do
+        (enc-plan-literal-island! (n-nid before)
+                                  (load pending-first)
+                                  (mut cursor)
+                                  (mut seen))
+        (set! pending-first -1)
+        (set! first-source-offset -1))
+      0))
+
+(defn enc-layout-align-function! [(n (dyn NodeOps)) (cursor (mut i64))] (-> i64)
+  (if (= (enc-ideal-op n) OP-FUN)
+      (set! cursor (* (/ (+ (load cursor) 15) 16) 16))
+      0))
+
 (defn enc-layout-offsets! [] (-> i64)
-  (let [(mut cursor) 0
+  (let [a (alloc/malloc-allocator)
+        (mut seen) (hm-new-scalar [i64 i64] a)
+        (mut cursor) 0
+        (mut pending-first) -1
+        (mut first-source-offset) -1
         (mut ci) 0]
+    (enc-literal-plan-reset!)
     (loop (if (>= (load ci) (enc-layout-block-count))
               (break 0)
               (let [block (enc-layout-block-at (load ci))
@@ -714,11 +1309,30 @@
                             (match (mach-of n)
                               (Some [mach]
                                     (let [size (m-size mach)]
+                                      (enc-layout-veneer-hub-before! n (mut cursor))
+                                      (enc-layout-maybe-literal-island! n
+                                                                        (mut cursor)
+                                                                        (mut pending-first)
+                                                                        (mut first-source-offset)
+                                                                        (mut seen))
+                                      (enc-layout-align-function! n (mut cursor))
                                       (if (< size 0)
                                           (panic-i "enc-layout!: negative machine size" (n-nid n))
                                           0)
                                       (set! (mut (.starts (enc-state))) (n-nid n) (load cursor))
                                       (set! (mut (.lengths (enc-state))) (n-nid n) size)
+                                      (match (mach-layout-literal-bits n)
+                                        (Some [bits]
+                                              (do
+                                                (if (< (load pending-first) 0)
+                                                    (do
+                                                      (set! (mut pending-first)
+                                                            (enc-literal-count))
+                                                      (set! (mut first-source-offset)
+                                                            (load cursor)))
+                                                    0)
+                                                (enc-plan-literal! n bits)))
+                                        (None [] 0))
                                       (set! (mut cursor) (+ (load cursor) size))))
                               (None [] 0))
                             (set! (mut i) (+ (load i) 1))
@@ -728,6 +1342,12 @@
                         (match (mach-of jump)
                           (Some [mach]
                                 (let [size (m-size mach)]
+                                  (enc-layout-veneer-hub-before! jump (mut cursor))
+                                  (enc-layout-maybe-literal-island! jump
+                                                                    (mut cursor)
+                                                                    (mut pending-first)
+                                                                    (mut first-source-offset)
+                                                                    (mut seen))
                                   (set! (mut (.starts (enc-state))) (n-nid jump) (load cursor))
                                   (set! (mut (.lengths (enc-state))) (n-nid jump) size)
                                   (set! (mut cursor) (+ (load cursor) size))))
@@ -735,10 +1355,14 @@
                   (None [] 0))
                 (set! (mut ci) (+ (load ci) 1))
                 (continue))))
+    (if (>= (load pending-first) 0)
+        (enc-plan-literal-island! 0 (load pending-first) (mut cursor) (mut seen))
+        0)
     (load cursor)))
 
 (defn enc-relax-branches! [] (-> bool)
-  (let [(mut ci) 0 (mut changed) false]
+  (let [(mut ci) 0
+        (mut changed) false]
     (loop (if (>= (load ci) (enc-layout-block-count))
               (break (load changed))
               (let [block (enc-layout-block-at (load ci))
@@ -760,17 +1384,136 @@
     (enc-reset!)
     (enc-build-block-layout!)
     (let [(mut size) (enc-layout-offsets!)]
-      (loop (if (enc-relax-branches!)
-                (do (set! (mut size) (enc-layout-offsets!)) (continue))
-                (break 0)))
+      (loop
+        ;; Stabilize short conditional forms without veneers, then plan sparse hubs from those
+        ;; offsets. Hub insertion has ample range headroom; if it tips a boundary B19 over its
+        ;; limit, discard and rebuild the sparse plan once more from the enlarged branch form.
+        (loop (if (enc-relax-branches!)
+                  (do (set! (mut size) (enc-layout-offsets!)) (continue))
+                  (break 0)))
+        (enc-plan-veneers!)
+        (set! (mut size) (enc-layout-offsets!))
+        (if (enc-relax-branches!)
+            (do
+              (enc-clear-veneer-plan!)
+              (set! (mut size) (enc-layout-offsets!))
+              (continue))
+            (break 0)))
+      (enc-verify-veneer-routes!)
       (set! (.laid-out (enc-state)) true)
       (load size))))
+
+(defn enc-literal-island-count [] (-> i64)
+  (len (.island-offsets (enc-state))))
+
+(defn enc-literal-island-offset [(i i64)] (-> i64)
+  (get (.island-offsets (enc-state)) i))
+
+(defn enc-literal-island-size [(i i64)] (-> i64)
+  (get (.island-sizes (enc-state)) i))
+
+(defn enc-veneer-hub-count [] (-> i64)
+  (len (.veneer-hub-offsets (enc-state))))
+
+(defn enc-veneer-route-count [] (-> i64)
+  (len (.veneer-route-sources (enc-state))))
+
+(defn enc-veneer-entry-count [] (-> i64)
+  (len (.veneer-entry-hubs (enc-state))))
+
+(defn enc-emit-veneer-hub-before! [(n (dyn NodeOps))] (-> i64)
+  (let [state (enc-state)
+        hub (get (.veneer-hub-indices state) (n-nid n))]
+    (if (and (>= hub 0) (> (get (.veneer-hub-sizes state) hub) 0))
+        (let [start (get (.veneer-hub-offsets state) hub)
+              size (get (.veneer-hub-sizes state) hub)
+              (mut entry) (get (.veneer-hub-first-entries state) hub)]
+          (if (!= (enc-byte-count) start)
+              (panic-i "enc-emit-veneer-hub-before!: offset disagrees with layout" hub)
+              0)
+          ;; Fallthrough skips the hub. Transfers target individual B entries after this first B.
+          (enc-add4! ENCODER-HANDLE (| 0x14000000 (/ size 4)))
+          (loop (if (< (load entry) 0)
+                    (break 0)
+                    (do
+                      (if (!= (enc-byte-count) (enc-veneer-entry-offset (load entry)))
+                          (panic-i "enc-emit-veneer-hub-before!: entry order is inconsistent"
+                                   (load entry))
+                          0)
+                      (enc-add4! ENCODER-HANDLE 0x14000000)
+                      (set! (mut entry)
+                            (get (.veneer-entry-in-hub-next state) (load entry)))
+                      (continue))))
+          (if (!= (enc-byte-count) (+ start size))
+              (panic-i "enc-emit-veneer-hub-before!: size disagrees with layout" hub)
+              0))
+        0)
+    0))
+
+(defn enc-emit-literal-island! [(i i64)] (-> i64)
+  (let [state (enc-state)
+        start (get (.island-offsets state) i)
+        size (get (.island-sizes state) i)
+        first (get (.island-first-literals state) i)
+        end (+ first (get (.island-literal-counts state) i))
+        (mut request) first]
+    (if (!= (enc-byte-count) start)
+        (panic-i "enc-emit-literal-island!: emitted offset disagrees with layout" i)
+        0)
+    (if (or (!= (& size 3) 0) (<= size 4) (> (/ size 4) 33554431))
+        (panic-i "enc-emit-literal-island!: invalid branch-over size" size)
+        0)
+    (enc-add4! ENCODER-HANDLE (| 0x14000000 (/ size 4)))
+    (loop (if (= (& (enc-byte-count) 7) 0)
+              (break 0)
+              (do (enc-add1! ENCODER-HANDLE 0) (continue))))
+    (loop (if (>= (load request) end)
+              (break 0)
+              (let [offset (get (.literal-offsets state) (load request))]
+                ;; The first occurrence of each bit pattern owns the monotonically increasing slot;
+                ;; duplicates point backward to an already-emitted slot in this same island.
+                (if (= offset (enc-byte-count))
+                    (enc-add8! ENCODER-HANDLE (get (.literal-bits state) (load request)))
+                    (if (> offset (enc-byte-count))
+                        (panic-i "enc-emit-literal-island!: literal plan has a gap" offset)
+                        0))
+                (set! (mut request) (+ (load request) 1))
+                (continue))))
+    (if (!= (enc-byte-count) (+ start size))
+        (panic-i "enc-emit-literal-island!: emitted size disagrees with layout" i)
+        0)
+    0))
+
+(defn enc-emit-literal-islands-before! [(source-nid i64) (next (mut i64))] (-> i64)
+  (loop (if (or (>= (load next) (enc-literal-island-count))
+                (!= (get (.island-before-sources (enc-state)) (load next)) source-nid))
+            (break 0)
+            (do
+              (enc-emit-literal-island! (load next))
+              (set! next (+ (load next) 1))
+              (continue)))))
+
+(defn enc-emit-function-padding! [(n (dyn NodeOps))] (-> i64)
+  (if (= (enc-ideal-op n) OP-FUN)
+      (do
+        (loop (if (>= (enc-byte-count) (enc-op-start n))
+                  (break 0)
+                  (do
+                    ;; AArch64's architectural NOP keeps alignment bytes executable and
+                    ;; disassembly-stable if control ever reaches them through malformed input.
+                    (enc-add4! ENCODER-HANDLE 0xd503201f)
+                    (continue))))
+        (if (> (enc-byte-count) (enc-op-start n))
+            (panic-i "enc-emit-function-padding!: padding crossed function start" (n-nid n))
+            0))
+      0))
 
 (defn enc-emit! [] (-> i64)
   (do
     (if (not (.laid-out (enc-state))) (enc-layout!) 0)
     (al-clear! [u8] (mut (.bits (enc-state))))
-    (let [(mut ci) 0]
+    (let [(mut ci) 0
+          (mut next-island) 0]
       (loop (if (>= (load ci) (enc-layout-block-count))
                 (break 0)
                 (let [block (enc-layout-block-at (load ci))
@@ -780,16 +1523,21 @@
                             (let [n (code-schedule-at block (load i))]
                               (match (mach-of n)
                                 (Some [mach]
-                                      (let [before (enc-byte-count)]
-                                        (if (!= before (enc-op-start n))
-                                            (panic-i "enc-emit!: emitted offset disagrees with layout"
-                                                     (n-nid n))
-                                            0)
-                                        (m-encoding mach ENCODER-HANDLE)
-                                        (if (!= (- (enc-byte-count) before) (enc-op-length n))
-                                            (panic-i "enc-emit!: wrong size; ideal-op*100000+nid"
-                                                     (+ (* (m-ideal-op mach) 100000) (n-nid n)))
-                                            0)))
+                                      (do
+                                        (enc-emit-veneer-hub-before! n)
+                                        (enc-emit-literal-islands-before! (n-nid n)
+                                                                          (mut next-island))
+                                        (enc-emit-function-padding! n)
+                                        (let [before (enc-byte-count)]
+                                          (if (!= before (enc-op-start n))
+                                              (panic-i "enc-emit!: emitted offset disagrees with layout"
+                                                       (n-nid n))
+                                              0)
+                                          (m-encoding mach ENCODER-HANDLE)
+                                          (if (!= (- (enc-byte-count) before) (enc-op-length n))
+                                              (panic-i "enc-emit!: wrong size; ideal-op*100000+nid"
+                                                       (+ (* (m-ideal-op mach) 100000) (n-nid n)))
+                                              0))))
                                 (None [] 0))
                               (set! (mut i) (+ (load i) 1))
                               (continue))))
@@ -797,16 +1545,28 @@
                     (Some [jump]
                           (match (mach-of jump)
                             (Some [mach]
-                                  (let [before (enc-byte-count)]
-                                    (m-encoding mach ENCODER-HANDLE)
-                                    (if (!= (- (enc-byte-count) before) (enc-op-length jump))
-                                        (panic-i "enc-emit!: synthetic jump emitted wrong size"
-                                                 (n-nid jump))
-                                        0)))
+                                  (do
+                                    (enc-emit-veneer-hub-before! jump)
+                                    (enc-emit-literal-islands-before! (n-nid jump)
+                                                                      (mut next-island))
+                                    (let [before (enc-byte-count)]
+                                      (if (!= before (enc-op-start jump))
+                                          (panic-i "enc-emit!: synthetic jump offset disagrees with layout"
+                                                   (n-nid jump))
+                                          0)
+                                      (m-encoding mach ENCODER-HANDLE)
+                                      (if (!= (- (enc-byte-count) before) (enc-op-length jump))
+                                          (panic-i "enc-emit!: synthetic jump emitted wrong size"
+                                                   (n-nid jump))
+                                          0))))
                             (None [] (panic "enc-emit!: synthetic jump is not a machine node"))))
                     (None [] 0))
                   (set! (mut ci) (+ (load ci) 1))
-                  (continue)))))
+                  (continue))))
+      (enc-emit-literal-islands-before! 0 (mut next-island))
+      (if (!= (load next-island) (enc-literal-island-count))
+          (panic-i "enc-emit!: unplaced literal island" (load next-island))
+          0))
     (set! (.emitted (enc-state)) true)
     (enc-byte-count)))
 
@@ -831,7 +1591,15 @@
                     (panic-i "enc-relocate!: missing fixup target" target-nid)
                     (unreachable-node))))
         at (+ (enc-op-start source) source-addend)
-        delta (- (enc-op-start target) at)
+        first-veneer
+          (if (= kind ENC-FIXUP-A64-B26)
+              (get (.veneer-first-by-source state) source-nid)
+              -1)
+        destination
+          (if (>= first-veneer 0)
+              (enc-veneer-entry-offset first-veneer)
+              (enc-op-start target))
+        delta (- destination at)
         scaled (/ delta 4)
         old (enc-read4 at)]
     (if (!= (* scaled 4) delta)
@@ -852,34 +1620,77 @@
                                         (primitive/iand scaled 0x3ffffff)))))
     0))
 
+(defn enc-veneer-fixups! [] (-> i64)
+  (let [state (enc-state)
+        (mut entry) 0]
+    (loop (if (>= (load entry) (len (.veneer-entry-hubs state)))
+              (break 0)
+              (let [at (enc-veneer-entry-offset (load entry))
+                    next (get (.veneer-entry-next state) (load entry))
+                    target-nid (get (.veneer-entry-targets state) (load entry))
+                    destination
+                      (if (>= next 0)
+                          (enc-veneer-entry-offset next)
+                          (match (arena-node target-nid)
+                            (Some [target] (enc-op-start target))
+                            (None []
+                                  (do
+                                    (panic-i "enc-veneer-fixups!: missing final target" target-nid)
+                                    0))))
+                    delta (- destination at)
+                    scaled (/ delta 4)
+                    old (enc-read4 at)]
+                (if (or (!= (* scaled 4) delta) (not (enc-b26-fits? delta)))
+                    (panic-i "enc-veneer-fixups!: planned hop is out of B26 range" delta)
+                    (enc-patch4! ENCODER-HANDLE
+                                 at
+                                 (primitive/ior (primitive/iand old (primitive/ixor 0x3ffffff -1))
+                                                (primitive/iand scaled 0x3ffffff))))
+                (set! (mut entry) (+ (load entry) 1))
+                (continue))))
+    0))
+
 (defn enc-literal-pools! [] (-> i64)
   (let [state (enc-state)
         (mut i) 0]
-    ;; Assign one pool slot per distinct bit pattern, retaining NaN payloads and signed zero.
-    (loop (if (>= (load i) (enc-literal-count))
-              (break 0)
-              (let [(mut j) 0
-                    (mut prior) -1
-                    bits (get (.literal-bits state) (load i))]
-                (loop (if (>= (load j) (load i))
-                          (break 0)
-                          (do
-                            (if (and (= (load prior) -1)
-                                     (= (get (.literal-bits state) (load j)) bits))
-                                (set! (mut prior) (get (.literal-offsets state) (load j)))
-                                0)
-                            (set! (mut j) (+ (load j) 1))
-                            (continue))))
-                (if (>= (load prior) 0)
-                    (set! (mut (.literal-offsets state)) (load i) (load prior))
-                    (do
-                      (loop (if (= (& (enc-byte-count) 7) 0)
-                                (break 0)
-                                (do (enc-add1! ENCODER-HANDLE 0) (continue))))
-                      (set! (mut (.literal-offsets state)) (load i) (enc-byte-count))
-                      (enc-add8! ENCODER-HANDLE bits)))
-                (set! (mut i) (+ (load i) 1))
-                (continue))))
+    (if (.laid-out state)
+        ;; Complete layout emitted every island in place. Check that every selected LDR registered
+        ;; its planned request instead of silently tolerating an encoder/layout disagreement.
+        (loop (if (>= (load i) (enc-literal-count))
+                  (break 0)
+                  (do
+                    (if (or (not (get (.literal-emitted state) (load i)))
+                            (< (get (.literal-offsets state) (load i)) 0))
+                        (panic-i "enc-literal-pools!: planned literal was not emitted" (load i))
+                        0)
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        ;; Isolated instruction encoding has no layout plan. Retain one compact trailing pool per
+        ;; distinct bit pattern for that diagnostic mode; production emission never takes this path.
+        (loop (if (>= (load i) (enc-literal-count))
+                  (break 0)
+                  (let [(mut j) 0
+                        (mut prior) -1
+                        bits (get (.literal-bits state) (load i))]
+                    (loop (if (>= (load j) (load i))
+                              (break 0)
+                              (do
+                                (if (and (= (load prior) -1)
+                                         (= (get (.literal-bits state) (load j)) bits))
+                                    (set! (mut prior) (get (.literal-offsets state) (load j)))
+                                    0)
+                                (set! (mut j) (+ (load j) 1))
+                                (continue))))
+                    (if (>= (load prior) 0)
+                        (set! (mut (.literal-offsets state)) (load i) (load prior))
+                        (do
+                          (loop (if (= (& (enc-byte-count) 7) 0)
+                                    (break 0)
+                                    (do (enc-add1! ENCODER-HANDLE 0) (continue))))
+                          (set! (mut (.literal-offsets state)) (load i) (enc-byte-count))
+                          (enc-add8! ENCODER-HANDLE bits)))
+                    (set! (mut i) (+ (load i) 1))
+                    (continue)))))
     ;; LDR (literal), 64-bit SIMD/FP: signed imm19 is scaled by four from the opcode start.
     (set! (mut i) 0)
     (loop (if (>= (load i) (enc-literal-count))
@@ -919,4 +1730,5 @@
                     (enc-local-fixup-patch! (load i))
                     (set! (mut i) (+ (load i) 1))
                     (continue))))
+        (enc-veneer-fixups!)
         (enc-literal-pools!))))

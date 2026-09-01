@@ -34,7 +34,7 @@ machine calls and ABI edges, not the optimizer's Call-to-Fun discovery edges.
 | Calls have explicit effects | frontend/JSL plus memory SSA | Calls with observable effects are ordered by memory, never by GVN identity tricks | Production parser and JSL calls thread bulk memory; null-memory construction is test-only |
 | Alias identity | `shape.coil`, `type/type.coil`, `node/memory.coil` | Every load/store carries a stable alias class; equal classes may conflict | Implemented for hidden-class fields |
 | Load/store memory chain | `node/memory.coil`, `node/scope.coil` | Load and Store name their memory input and pointer; MemPhi follows Region arity | Implemented and verified |
-| No unresolved representation guards | dynamic nodes plus typecheck | A live Unbox reaching selection has representation proof or an explicit generic path | Implemented check for current dynamic subset |
+| No unresolved representation guards | dynamic nodes plus typecheck | A live Unbox reaching selection has representation proof or an explicit generic path | Implemented; every checker-admitted singleton tag predicate has a concrete runtime classifier |
 | Machine-lowerable type | typecheck plus machine selector | Every live ideal opcode/type pair has one legal target lowering or a named rejection | Missing |
 | Safepoint semantics | GC ideal nodes and `gcmeta` | References do not survive relocation without redefinition; barriers are explicit | Produced and structurally verified |
 
@@ -174,7 +174,8 @@ Allocation is iterative graph coloring, not a one-pass greedy assignment:
 5. Detect self-conflicting ranges, especially Phi cycles, and split them. Loop Phis receive the
    cold-edge split before a hot-edge split.
 6. Coalesce noninterfering copies without violating masks.
-7. Simplify trivially colorable ranges first, then optimistic ranges; assign colors in reverse.
+7. Simplify trivially colorable ranges first using Simple's fixed/ordinary/Split reverse-color
+   priority, then optimistic ranges; assign colors in reverse with biased Split-chain choices.
 8. Split every failed range deterministically and retry, with an eight-round hard limit.
 9. Number spill slots after physical registers so split copies use one location namespace.
 10. Remove no-op copies after coloring and finalize frame size, callee saves, and stack arguments.
@@ -210,13 +211,16 @@ Encoding is layout-sensitive and iterative. It must:
 
 Current producers: `encoding.coil` projects GCM RPO through the loop tree so every nested loop body
 is a contiguous interval while relative RPO within each nesting level is retained. It records stable
-scheduled offsets, verifies selected sizes during emission, makes physical fallthrough explicit by
-inverting selected branches or appending a target-owned unconditional jump, applies checked AArch64
+scheduled offsets, aligns every function entry to 16 bytes, verifies selected sizes during
+emission, makes physical fallthrough explicit by inverting selected branches or appending a
+target-owned unconditional jump, applies checked AArch64
 `B.cond`/`B` local fixups, retains typed symbol-bearing `BL` fixups, and writes aligned exact-bit
-deduplicated f64 literal pools. A monotone relaxation loop expands an out-of-range conditional into
-an inverted `B.cond +8` followed by a checked `B26`; local-fixup addends identify the second
-instruction exactly. Structural tests cover nested-loop splicing; exact-byte tests cover both
-branch polarities, the neither-successor-adjacent case, every B19 boundary, and the expanded veneer.
+deduplicated f64 literal islands. A monotone relaxation loop expands an out-of-range conditional
+into an inverted `B.cond +8` followed by a checked `B26`; sparse layout-planned veneer hubs route
+`B26` and closed-world `BL26` targets beyond direct range without consuming a scratch register.
+Local-fixup addends identify the relaxed instruction exactly. Structural tests cover nested-loop
+splicing; exact-byte tests cover both branch polarities, the neither-successor-adjacent case, every
+B19 boundary, conditional relaxation and far B26/BL26 routes.
 The arm64 machine families emit
 scalar, memory, copy/spill, branch, call, frame and return instructions. `objfile.coil` writes
 independently validated arm64 Mach-O and ELF64 relocatable objects with definitions, undefined
@@ -246,12 +250,11 @@ the IFG, functions preserve LR, and encoding retains a typed symbol relocation. 
 barrier-free.
 
 Work outside this nine-stage backend slice remains: compilation-unit/serialized-IR sections,
-explicit loop-backedge safepoint placement, the collector implementation/runtime object, the
-source-to-object phase driver, branches beyond B26 range, and cross-platform linked execution
-coverage. The execution suite
-does cover the complete implemented ideal-to-native arm64 path—selection, GCM, local scheduling,
-iterative allocation, frame finalization, encoding, Mach-O writing, linking and execution—without
-hand-assigned registers.
+explicit loop-backedge safepoint placement, the collector implementation/runtime object, and
+cross-platform linked execution coverage. The source-to-object phase driver and execution suite
+cover the complete implemented source-to-native arm64 path—parsing, optimization, selection, GCM,
+local scheduling, iterative allocation, frame finalization, encoding, Mach-O writing, linking and
+execution—without hand-assigned registers.
 
 ## Required implementation order
 

@@ -10,7 +10,14 @@
 ;; Diagnostics are RANGED — they carry the source span — because a JSL unit is a specification
 ;; transcription and "somewhere in this 200-line builtin" is not an actionable report.
 ;;
-;; SCAFFOLD: signatures are final; bodies hard-error. Filled in at S5.
+;; STATUS: the currently lowerable JSL core is checked here. A form must have the exact `builtin`
+;; declaration shape; parameters and returns must use the admitted dyn/int/bool/float families;
+;; parameter and lexical-let references must resolve; `if`, `let`, primitives, and indexed calls
+;; must have exact arity; and every expression is checked against the real raw/dynamic operand and
+;; result families consumed by lowering. Tag-test branches refine the named dynamic value on both
+;; arms before checking guarded expressions. Everything else exits through the ranged `jsl-refuse`
+;; diagnostic. This is intentionally an admission boundary for the implemented JSL vocabulary,
+;; not a claim that the complete runtime-library language is already accepted.
 (module aot.jsl.check)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
@@ -19,6 +26,120 @@
 (import "coil.os" :as os)
 (import "aot.util.panic" :use *)
 (import "aot.jsl.reader" :use *)
+(import "aot.type.type" :use *)
+
+;; The checker keeps JSL's source families distinct even where the ideal lattice shares a machine
+;; representation (notably raw `bool` as the integer range 0..1). Dynamic types carry their exact
+;; possible tag set so an `if (%IsX name)` can refine both branches before checking guarded code.
+(const JSL-CHECK-TY-INVALID 0)
+(const JSL-CHECK-TY-INT 1)
+(const JSL-CHECK-TY-BOOL 2)
+(const JSL-CHECK-TY-FLT 3)
+(const JSL-CHECK-TY-DYN-BASE 4096)
+
+(defn jsl-check-dyn-type [(tags i64)] (-> i64)
+  (+ JSL-CHECK-TY-DYN-BASE tags))
+
+(defn jsl-check-dyn-type? [(t i64)] (-> bool)
+  (and (>= t JSL-CHECK-TY-DYN-BASE) (<= t (+ JSL-CHECK-TY-DYN-BASE TAG-ANY))))
+
+(defn jsl-check-dyn-tags [(t i64)] (-> i64)
+  (if (jsl-check-dyn-type? t) (- t JSL-CHECK-TY-DYN-BASE) 0))
+
+(defn jsl-check-type-name [(x (ptr rd/Sexp))] (-> i64)
+  (if (not (rd/sexp-sym? x))
+      JSL-CHECK-TY-INVALID
+      (let [name (rd/sexp-sym x)]
+        (if (= name "dyn")
+            (jsl-check-dyn-type TAG-ANY)
+            (if (= name "int")
+                JSL-CHECK-TY-INT
+                (if (= name "bool")
+                    JSL-CHECK-TY-BOOL
+                    (if (= name "flt") JSL-CHECK-TY-FLT JSL-CHECK-TY-INVALID)))))))
+
+(defn jsl-check-type-assignable? [(actual i64) (expected i64)] (-> bool)
+  (if (= actual JSL-CHECK-TY-INVALID)
+      false
+      (if (jsl-check-dyn-type? expected)
+          (and (jsl-check-dyn-type? actual)
+               (= (primitive/iand (jsl-check-dyn-tags actual)
+                                  (primitive/ixor TAG-ANY (jsl-check-dyn-tags expected)))
+                  0))
+          (or (= actual expected)
+              (and (= expected JSL-CHECK-TY-INT) (= actual JSL-CHECK-TY-BOOL))))))
+
+(defn jsl-check-intlike? [(t i64)] (-> bool)
+  (or (= t JSL-CHECK-TY-INT) (= t JSL-CHECK-TY-BOOL)))
+
+(defn jsl-check-numeric? [(t i64)] (-> bool)
+  (or (jsl-check-intlike? t) (= t JSL-CHECK-TY-FLT)))
+
+(defn jsl-check-join [(a i64) (b i64)] (-> i64)
+  (if (= a b)
+      a
+      (if (and (jsl-check-dyn-type? a) (jsl-check-dyn-type? b))
+          (jsl-check-dyn-type (primitive/ior (jsl-check-dyn-tags a) (jsl-check-dyn-tags b)))
+          (if (and (jsl-check-intlike? a) (jsl-check-intlike? b))
+              JSL-CHECK-TY-INT
+              JSL-CHECK-TY-INVALID))))
+
+;; Shared by checking and lowering so the admitted predicate set cannot drift from its graph tag.
+(defn jsl-tag-predicate [(name (slice u8))] (-> i64)
+  (if (= name "%IsInt")
+      TAG-INT
+      (if (= name "%IsFlt")
+          TAG-DOUBLE
+          (if (= name "%IsString")
+              TAG-STRING
+              (if (= name "%IsBool")
+                  TAG-BOOL
+                  (if (= name "%IsNull")
+                      TAG-NULL
+                      (if (= name "%IsUndefined")
+                          TAG-UNDEFINED
+                          (if (= name "%IsSymbol")
+                              TAG-SYMBOL
+                              (if (= name "%IsObject")
+                                  TAG-OBJECT
+                                  (if (= name "%IsFunction") TAG-FUNCTION 0))))))))))
+
+;; These are precisely the scalar/value families the current ideal graph can represent at a JSL
+;; function boundary. Keeping the admission predicate shared by parameter and return checks avoids
+;; a declaration being accepted on one side and silently forced to `dyn` by the lowerer.
+(defn jsl-admitted-type? [(x (ptr rd/Sexp))] (-> bool)
+  (and (rd/sexp-sym? x)
+       (let [name (rd/sexp-sym x)]
+         (or (= name "dyn") (= name "int") (= name "bool") (= name "flt")))))
+
+;; JSL is a specification DSL, not non-strict JavaScript: each formal has one unambiguous type and
+;; slot. Duplicate formal names would make the checker's name lookup and the lowerer's value lookup
+;; depend on traversal direction, so they are refused at this boundary.
+(defn jsl-check-params-unique? [(params (ptr rd/Sexp))] (-> bool)
+  (let [(mut i) 0
+        (mut unique) true]
+    (loop (if (or (not (load unique)) (>= (load i) (rd/sexp-count params)))
+              (break (load unique))
+              (let [decl (rd/sexp-nth params (load i))]
+                (if (and (rd/sexp-list? decl)
+                         (> (rd/sexp-count decl) 0)
+                         (rd/sexp-sym? (rd/sexp-nth decl 0)))
+                    (let [name (rd/sexp-sym (rd/sexp-nth decl 0))
+                          (mut prior) 0]
+                      (loop (if (or (not (load unique)) (>= (load prior) (load i)))
+                                (break 0)
+                                (let [other (rd/sexp-nth params (load prior))]
+                                  (if (and (rd/sexp-list? other)
+                                           (> (rd/sexp-count other) 0)
+                                           (rd/sexp-sym? (rd/sexp-nth other 0))
+                                           (= (rd/sexp-sym (rd/sexp-nth other 0)) name))
+                                      (set! (mut unique) false)
+                                      0)
+                                  (set! (mut prior) (+ (load prior) 1))
+                                  (continue)))))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
 
 (defn jsl-symbol-in-params? [(params (ptr rd/Sexp)) (name (slice u8))] (-> bool)
   (let [(mut i) 0
@@ -103,11 +224,22 @@
                                                     (do (pop! (mut locals)) (continue))))
                                           0)))
                                   (let [expected
-                                          (if (or (= name "%Sub") (= name "%Add") (= name "%Mul"))
+                                          (if (or (= name "%Sub")
+                                                  (= name "%Add")
+                                                  (= name "%Mul")
+                                                  (= name "%Div")
+                                                  (= name "%Eq")
+                                                  (= name "%Ne")
+                                                  (= name "%Lt")
+                                                  (= name "%Le")
+                                                  (= name "%And"))
                                               3
                                               (if (or (= name "%Box")
                                                       (= name "%Not")
                                                       (= name "%UnboxInt")
+                                                      (= name "%UnboxFlt")
+                                                      (= name "%UnboxNumber")
+                                                      (= name "%ToFloat")
                                                       (= name "%IsInt")
                                                       (= name "%IsFlt")
                                                       (= name "%IsString")
@@ -138,6 +270,235 @@
   (let [(mut locals) (al-new [(slice u8)] (alloc/malloc-allocator))]
     (jsl-check-expr-in x params (mut locals))))
 
+(defn jsl-check-param-type [(params (ptr rd/Sexp)) (name (slice u8))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (rd/sexp-count params))
+              (break JSL-CHECK-TY-INVALID)
+              (let [decl (rd/sexp-nth params (load i))]
+                (if (= (rd/sexp-sym (rd/sexp-nth decl 0)) name)
+                    (break (jsl-check-type-name (rd/sexp-nth decl 1)))
+                    (do (set! (mut i) (+ (load i) 1)) (continue))))))))
+
+(defn jsl-check-local-type [(names (ArrayList (slice u8)))
+                            (types (ArrayList i64))
+                            (name (slice u8))] (-> i64)
+  (let [(mut i) (- (len names) 1)]
+    (loop (if (< (load i) 0)
+              (break JSL-CHECK-TY-INVALID)
+              (if (= (get names (load i)) name)
+                  (break (get types (load i)))
+                  (do (set! (mut i) (- (load i) 1)) (continue)))))))
+
+(defn jsl-check-env-type [(params (ptr rd/Sexp))
+                          (names (ArrayList (slice u8)))
+                          (types (ArrayList i64))
+                          (name (slice u8))] (-> i64)
+  (let [local (jsl-check-local-type names types name)]
+    (if (!= local JSL-CHECK-TY-INVALID) local (jsl-check-param-type params name))))
+
+(defn jsl-check-binary-type [(name (slice u8)) (lhs i64) (rhs i64)] (-> i64)
+  (if (or (= lhs JSL-CHECK-TY-INVALID) (= rhs JSL-CHECK-TY-INVALID))
+      JSL-CHECK-TY-INVALID
+      (if (or (= name "%Add") (= name "%Sub") (= name "%Mul") (= name "%Div"))
+          (if (and (jsl-check-numeric? lhs) (jsl-check-numeric? rhs))
+              (if (or (= lhs JSL-CHECK-TY-FLT) (= rhs JSL-CHECK-TY-FLT))
+                  JSL-CHECK-TY-FLT
+                  JSL-CHECK-TY-INT)
+              JSL-CHECK-TY-INVALID)
+          (if (or (= name "%Lt") (= name "%Le"))
+              (if (and (jsl-check-numeric? lhs) (jsl-check-numeric? rhs))
+                  JSL-CHECK-TY-BOOL
+                  JSL-CHECK-TY-INVALID)
+              (if (or (= name "%Eq") (= name "%Ne"))
+                  (if (or (and (jsl-check-numeric? lhs) (jsl-check-numeric? rhs))
+                          (and (jsl-check-dyn-type? lhs) (jsl-check-dyn-type? rhs)))
+                      JSL-CHECK-TY-BOOL
+                      JSL-CHECK-TY-INVALID)
+                  (if (= name "%And")
+                      (if (and (jsl-check-intlike? lhs) (jsl-check-intlike? rhs))
+                          (if (and (= lhs JSL-CHECK-TY-BOOL) (= rhs JSL-CHECK-TY-BOOL))
+                              JSL-CHECK-TY-BOOL
+                              JSL-CHECK-TY-INT)
+                          JSL-CHECK-TY-INVALID)
+                      JSL-CHECK-TY-INVALID))))))
+
+(defn jsl-check-unary-type [(name (slice u8)) (arg i64)] (-> i64)
+  (if (= arg JSL-CHECK-TY-INVALID)
+      JSL-CHECK-TY-INVALID
+      (if (= name "%Box")
+          ;; Bool shares an integer machine representation today, but boxing it as TAG-INT would
+          ;; make `%IsBool` false. Admit only representations with implemented tag-preserving Box.
+          (if (= arg JSL-CHECK-TY-INT)
+              (jsl-check-dyn-type TAG-INT)
+              (if (= arg JSL-CHECK-TY-FLT)
+                  (jsl-check-dyn-type TAG-DOUBLE)
+                  JSL-CHECK-TY-INVALID))
+          (if (= name "%Not")
+              (if (jsl-check-intlike? arg) JSL-CHECK-TY-BOOL JSL-CHECK-TY-INVALID)
+              (if (= name "%ToFloat")
+                  (if (jsl-check-intlike? arg) JSL-CHECK-TY-FLT JSL-CHECK-TY-INVALID)
+                  (if (= name "%UnboxInt")
+                      (if (jsl-check-dyn-type? arg) JSL-CHECK-TY-INT JSL-CHECK-TY-INVALID)
+                      (if (or (= name "%UnboxFlt") (= name "%UnboxNumber"))
+                          (if (jsl-check-dyn-type? arg) JSL-CHECK-TY-FLT JSL-CHECK-TY-INVALID)
+                          (if (!= (jsl-tag-predicate name) 0)
+                              (if (jsl-check-dyn-type? arg)
+                                  JSL-CHECK-TY-BOOL
+                                  JSL-CHECK-TY-INVALID)
+                              JSL-CHECK-TY-INVALID))))))))
+
+(defn jsl-check-call-type [(x (ptr rd/Sexp))
+                           (name (slice u8))
+                           (params (ptr rd/Sexp))
+                           (local-names (mut (ArrayList (slice u8))))
+                           (local-types (mut (ArrayList i64)))] (-> i64)
+  (match (jsl-definition-form name)
+    (None [] JSL-CHECK-TY-INVALID)
+    (Some [target]
+          (if (or (!= (rd/sexp-count target) 7)
+                  (not (rd/sexp-vec? (rd/sexp-nth target 3))))
+              JSL-CHECK-TY-INVALID
+              (let [target-params (rd/sexp-nth target 3)
+                    (mut i) 0
+                    (mut valid) true]
+                (loop (if (or (not (load valid)) (>= (load i) (rd/sexp-count target-params)))
+                          (break 0)
+                          (let [actual
+                                  (jsl-check-expr-type-in (rd/sexp-nth x (+ (load i) 1))
+                                                          params
+                                                          (mut local-names)
+                                                          (mut local-types))
+                                expected
+                                  (jsl-check-type-name
+                                    (rd/sexp-nth (rd/sexp-nth target-params (load i)) 1))]
+                            (if (not (jsl-check-type-assignable? actual expected))
+                                (set! (mut valid) false)
+                                0)
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (if (load valid)
+                    (jsl-check-type-name (rd/sexp-nth target 5))
+                    JSL-CHECK-TY-INVALID))))))
+
+(defn jsl-check-expr-type-in [(x (ptr rd/Sexp))
+                              (params (ptr rd/Sexp))
+                              (local-names (mut (ArrayList (slice u8))))
+                              (local-types (mut (ArrayList i64)))] (-> i64)
+  (if (rd/sexp-int? x)
+      JSL-CHECK-TY-INT
+      (if (rd/sexp-sym? x)
+          (jsl-check-env-type params (load local-names) (load local-types) (rd/sexp-sym x))
+          (let [name (rd/sexp-sym (rd/sexp-nth x 0))]
+            (if (= name "let")
+                (let [bindings (rd/sexp-nth x 1)
+                      base (len (load local-names))
+                      (mut i) 0]
+                  (loop (if (>= (load i) (rd/sexp-count bindings))
+                            (break 0)
+                            (let [binding (rd/sexp-nth bindings (load i))
+                                  init-type
+                                    (jsl-check-expr-type-in (rd/sexp-nth binding 1)
+                                                            params
+                                                            (mut local-names)
+                                                            (mut local-types))]
+                              (push! [(slice u8)]
+                                     (mut local-names)
+                                     (rd/sexp-sym (rd/sexp-nth binding 0)))
+                              (push! [i64] (mut local-types) init-type)
+                              (set! (mut i) (+ (load i) 1))
+                              (continue))))
+                  (let [answer
+                          (jsl-check-expr-type-in (rd/sexp-nth x 2)
+                                                  params
+                                                  (mut local-names)
+                                                  (mut local-types))]
+                    (loop (if (<= (len (load local-names)) base)
+                              (break 0)
+                              (do (pop! (mut local-names))
+                                  (pop! (mut local-types))
+                                  (continue))))
+                    answer))
+                (if (= name "if")
+                    (let [pred
+                            (jsl-check-expr-type-in (rd/sexp-nth x 1)
+                                                    params
+                                                    (mut local-names)
+                                                    (mut local-types))
+                          pred-ok
+                            (or (jsl-check-intlike? pred) (jsl-check-dyn-type? pred))
+                          pred-form (rd/sexp-nth x 1)
+                          guarded-tag
+                            (if (and (rd/sexp-list? pred-form)
+                                     (and (= (rd/sexp-count pred-form) 2)
+                                          (rd/sexp-sym? (rd/sexp-nth pred-form 0))))
+                                (jsl-tag-predicate (rd/sexp-sym (rd/sexp-nth pred-form 0)))
+                                0)
+                          guarded-name
+                            (if (and (!= guarded-tag 0)
+                                     (rd/sexp-sym? (rd/sexp-nth pred-form 1)))
+                                (rd/sexp-sym (rd/sexp-nth pred-form 1))
+                                "")
+                          original
+                            (if (= guarded-name "")
+                                JSL-CHECK-TY-INVALID
+                                (jsl-check-env-type params
+                                                    (load local-names)
+                                                    (load local-types)
+                                                    guarded-name))
+                          narrow (and (!= guarded-name "") (jsl-check-dyn-type? original))]
+                      (if narrow
+                          (do
+                            (push! [(slice u8)] (mut local-names) guarded-name)
+                            (push! [i64]
+                                   (mut local-types)
+                                   (jsl-check-dyn-type
+                                     (primitive/iand (jsl-check-dyn-tags original) guarded-tag))))
+                          0)
+                      (let [yes
+                              (jsl-check-expr-type-in (rd/sexp-nth x 2)
+                                                      params
+                                                      (mut local-names)
+                                                      (mut local-types))]
+                        (if narrow (do (pop! (mut local-names)) (pop! (mut local-types)) 0) 0)
+                        (if narrow
+                            (do
+                              (push! [(slice u8)] (mut local-names) guarded-name)
+                              (push! [i64]
+                                     (mut local-types)
+                                     (jsl-check-dyn-type
+                                       (primitive/iand
+                                         (jsl-check-dyn-tags original)
+                                         (primitive/ixor TAG-ANY guarded-tag)))))
+                            0)
+                        (let [no
+                                (jsl-check-expr-type-in (rd/sexp-nth x 3)
+                                                        params
+                                                        (mut local-names)
+                                                        (mut local-types))]
+                          (if narrow (do (pop! (mut local-names)) (pop! (mut local-types)) 0) 0)
+                          (if pred-ok (jsl-check-join yes no) JSL-CHECK-TY-INVALID))))
+                    (if (>= (jsl-definition-arity name) 0)
+                        (jsl-check-call-type x name params (mut local-names) (mut local-types))
+                        (let [lhs
+                                (jsl-check-expr-type-in (rd/sexp-nth x 1)
+                                                        params
+                                                        (mut local-names)
+                                                        (mut local-types))]
+                          (if (= (rd/sexp-count x) 2)
+                              (jsl-check-unary-type name lhs)
+                              (jsl-check-binary-type
+                                name
+                                lhs
+                                (jsl-check-expr-type-in (rd/sexp-nth x 2)
+                                                        params
+                                                        (mut local-names)
+                                                        (mut local-types))))))))))))
+
+(defn jsl-check-expr-type [(x (ptr rd/Sexp)) (params (ptr rd/Sexp))] (-> i64)
+  (let [(mut local-names) (al-new [(slice u8)] (alloc/malloc-allocator))
+        (mut local-types) (al-new [i64] (alloc/malloc-allocator))]
+    (jsl-check-expr-type-in x params (mut local-names) (mut local-types))))
+
 (defn jsl-check-form [(form (ptr rd/Sexp))] (-> i64)
   (do
     (if (or (not (rd/sexp-list? form)) (!= (rd/sexp-count form) 7))
@@ -156,16 +517,22 @@
       (if (not (rd/sexp-sym? name))
           (jsl-refuse "builtin name" (.lo name) (.hi name))
           0)
+      (if (and (rd/sexp-sym? name) (!= (jsl-definition-count (rd/sexp-sym name)) 1))
+          (jsl-refuse "duplicate builtin definition" (.lo name) (.hi name))
+          0)
       (if (not (and (rd/sexp-kw? params-key) (= (rd/sexp-kw params-key) "params")))
           (jsl-refuse ":params" (.lo params-key) (.hi params-key))
           0)
       (if (not (rd/sexp-vec? params))
           (jsl-refuse "parameter vector" (.lo params) (.hi params))
           0)
+      (if (and (rd/sexp-vec? params) (not (jsl-check-params-unique? params)))
+          (jsl-refuse "duplicate parameter name" (.lo params) (.hi params))
+          0)
       (if (not (and (rd/sexp-kw? ret-key) (= (rd/sexp-kw ret-key) "ret")))
           (jsl-refuse ":ret" (.lo ret-key) (.hi ret-key))
           0)
-      (if (not (and (rd/sexp-sym? ret) (= (rd/sexp-sym ret) "dyn")))
+      (if (not (jsl-admitted-type? ret))
           (jsl-refuse "return type" (.lo ret) (.hi ret))
           0)
       (let [(mut i) 0]
@@ -176,13 +543,19 @@
                         (jsl-refuse "parameter declaration" (.lo p) (.hi p))
                         0)
                     (if (not (and (rd/sexp-sym? (rd/sexp-nth p 0))
-                                  (and (rd/sexp-sym? (rd/sexp-nth p 1))
-                                       (= (rd/sexp-sym (rd/sexp-nth p 1)) "dyn"))))
+                                  (jsl-admitted-type? (rd/sexp-nth p 1))))
                         (jsl-refuse "parameter type" (.lo p) (.hi p))
                         0)
                     (set! (mut i) (+ (load i) 1))
                     (continue)))))
-      (jsl-check-expr body params))))
+      (jsl-check-expr body params)
+      (let [actual (jsl-check-expr-type body params)
+            expected (jsl-check-type-name ret)]
+        (if (= actual JSL-CHECK-TY-INVALID)
+            (jsl-refuse "expression operand type" (.lo body) (.hi body))
+            (if (not (jsl-check-type-assignable? actual expected))
+                (jsl-refuse "body/return type" (.lo body) (.hi body))
+                0))))))
 
 (defn jsl-check-unit [(unit i64)] (-> i64)
   (let [(mut i) 0]

@@ -6,11 +6,17 @@
 ;; ready set with nodes whose count is zero, and decrements a user's count once for every outgoing
 ;; edge of the node just emitted. Phi nodes do not consume their arms in the merge block. Proj and
 ;; CProj nodes are entry work, Phi nodes immediately follow, ordinary machine nodes use a pressure
-;; score, and CFG tails have the lowest score so the terminator is last.
+;; score, and CFG tails have the lowest score so the terminator is last. Final Simple inserts a
+;; Split of a CalleeSave immediately after the complete Phi/CalleeSave entry cluster. Allocation
+;; reschedules this IR after inserting splits, so that structural insertion point is preserved by a
+;; dedicated entry score: below Proj/CalleeSave, tied with Phi, and above every ordinary body op.
 ;;
-;; Simple stores the resulting order by rearranging the block head's `_outputs`. We cannot: this
-;; IR's `outs` is the authoritative def-use multiset. `CodeGen.schedule` is therefore the owned
-;; equivalent: a flattened order with per-block bounds.
+;; Membership is the block head's sparse output list installed by GCM, exactly as Simple's `local`;
+;; scanning the whole arena for every block is quadratic in block count. Simple folds data Projs
+;; into their multi while rearranging `_outputs`. We cannot rearrange them because this IR's `outs`
+;; is the authoritative def-use multiset, so sparse collection follows those zero-byte Projs from
+;; the multi and `CodeGen.schedule` records them explicitly in a flattened order with per-block
+;; bounds.
 (module aot.codegen.listsched)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
@@ -27,16 +33,32 @@
    (ready (ArrayList i64))
    (bcnt (ArrayList i64))
    (rcnt (ArrayList i64))
+   (member (ArrayList bool))
    (remote-use (ArrayList bool))
    (remote-def (ArrayList bool))
    (single (ArrayList bool))
    (announced (ArrayList bool))
    (emitted (ArrayList bool))])
 
+;; Production diagnostics used by scale regressions. Final Simple's `local` visits `bb._outputs`
+;; once per block and creates metadata only for those members. Our nid-indexed tables are allocated
+;; once per scheduling pass, then reset sparsely; neither count may scale as arena-size * blocks.
+(defstruct SchedStats [(collect-visits i64) (state-init-visits i64)])
+
+(defn sched-stats [] (-> (ptr SchedStats))
+  (primitive/alloc-static SchedStats))
+
+(defn sched-last-collect-visits [] (-> i64)
+  (.collect-visits (sched-stats)))
+
+(defn sched-last-state-init-visits [] (-> i64)
+  (.state-init-visits (sched-stats)))
+
 (defn sched-state-new [] (-> SchedState)
   (let [a (alloc/malloc-allocator)
         (mut bcnt) (al-new [i64] a)
         (mut rcnt) (al-new [i64] a)
+        (mut member) (al-new [bool] a)
         (mut remote-use) (al-new [bool] a)
         (mut remote-def) (al-new [bool] a)
         (mut single) (al-new [bool] a)
@@ -49,11 +71,14 @@
               (do
                 (push! [i64] (mut bcnt) 0)
                 (push! [i64] (mut rcnt) 0)
+                (push! [bool] (mut member) false)
                 (push! [bool] (mut remote-use) false)
                 (push! [bool] (mut remote-def) false)
                 (push! [bool] (mut single) false)
                 (push! [bool] (mut announced) false)
                 (push! [bool] (mut emitted) false)
+                (set! (.state-init-visits (sched-stats))
+                      (+ (.state-init-visits (sched-stats)) 1))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
     (let [(mut state) (primitive/zeroed SchedState)]
@@ -61,6 +86,7 @@
       (set! (.ready (mut state)) (al-new [i64] a))
       (set! (.bcnt (mut state)) (load bcnt))
       (set! (.rcnt (mut state)) (load rcnt))
+      (set! (.member (mut state)) (load member))
       (set! (.remote-use (mut state)) (load remote-use))
       (set! (.remote-def (mut state)) (load remote-def))
       (set! (.single (mut state)) (load single))
@@ -68,20 +94,71 @@
       (set! (.emitted (mut state)) (load emitted))
       (load state))))
 
+(defn sched-state-reset! [(state (mut SchedState))] (-> i64)
+  (let [(mut i) 0]
+    ;; Clear only nodes discovered for the previous block. The arena-sized backing tables are
+    ;; initialized once by `sched-run!`, avoiding one full-arena zero-fill per block.
+    (loop (if (>= (load i) (len (.members state)))
+              (break 0)
+              (let [id (get (.members state) (load i))]
+                (set! (mut (.bcnt state)) id 0)
+                (set! (mut (.rcnt state)) id 0)
+                (set! (mut (.member state)) id false)
+                (set! (mut (.remote-use state)) id false)
+                (set! (mut (.remote-def state)) id false)
+                (set! (mut (.single state)) id false)
+                (set! (mut (.announced state)) id false)
+                (set! (mut (.emitted state)) id false)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (al-clear! [i64] (mut (.members state)))
+    (al-clear! [i64] (mut (.ready state)))
+    0))
+
 (defn sched-ideal-op [(n (dyn NodeOps))] (-> i64)
   (match (mach-of n) (Some [m] (m-ideal-op m)) (None [] (n-op n))))
 
 (defn sched-phi? [(n (dyn NodeOps))] (-> bool)
-  (let [op (sched-ideal-op n)] (or (= op OP-PHI) (= op OP-MEMPHI))))
+  ;; Final Simple's ParmNode extends PhiNode: it is an entry merge, not an ordinary instruction
+  ;; whose backedge-like Return use can participate in a local dependency cycle.
+  (let [op (sched-ideal-op n)]
+    (or (= op OP-PHI) (= op OP-MEMPHI) (= op OP-PARM))))
+
+(defn sched-control? [(n (dyn NodeOps))] (-> bool)
+  ;; ARM64 uses one concrete call-family node for calls, entries, Parm/Proj adapters, allocation,
+  ;; barriers and safepoints, so the Coil trait is intentionally broader than Simple's CFGNode
+  ;; class. Scheduling priority follows the retained ideal operation, not that storage artifact.
+  (let [op (sched-ideal-op n)]
+    (or (= op OP-START)
+        (= op OP-STOP)
+        (= op OP-FUN)
+        (= op OP-CALL)
+        (= op OP-CALLEND)
+        (= op OP-RETURN)
+        (= op OP-IF)
+        (= op OP-NEVER)
+        (= op OP-CPROJ)
+        (= op OP-REGION)
+        (= op OP-LOOP)
+        (= op OP-XCTRL))))
+
+(defn sched-entry-save-split? [(n (dyn NodeOps))] (-> bool)
+  (and (= (sched-ideal-op n) OP-MACH-SPLIT)
+       (and (> (n-nins n) 1)
+            (match (n-in n 1)
+              (Some [source] (= (sched-ideal-op source) OP-MACH-CALLEE-SAVE))
+              (None [] false)))))
 
 (defn sched-member? [(n (dyn NodeOps)) (block (dyn NodeOps))] (-> bool)
-  (and (= (n-block-nid n) (n-nid block)) (or (cfg? n) (mach? n))))
+  (and (not (n-dead? n))
+       (and (= (n-block-nid n) (n-nid block)) (or (cfg? n) (mach? n)))))
 
 (defn sched-edge-register? [(def (dyn NodeOps)) (use_ (dyn NodeOps))] (-> bool)
   (match (mach-of use_)
     (None [] false)
     (Some [mach]
-          (let [(mut i) 1 (mut found) false]
+          (let [(mut i) 1
+                (mut found) false]
             (loop (if (or (>= (load i) (n-nins use_)) (load found))
                       (break 0)
                       (do
@@ -123,9 +200,8 @@
                                                                           (match (m-regmap use-mach (load ii))
                                                                             (Some [use-mask]
                                                                                   (set! (mut allowed)
-                                                                                        (mask-and
-                                                                                          (load allowed)
-                                                                                          use-mask)))
+                                                                                        (mask-and (load allowed)
+                                                                                                  use-mask)))
                                                                             (None [] 0))
                                                                           0))
                                                                 (None [] 0))
@@ -141,8 +217,10 @@
   (let [(mut mi) 0]
     (loop (if (>= (load mi) (len (.members state)))
               (break 0)
-              (let [n (match (arena-node (get (.members state) (load mi)))
-                        (Some [x] x) (None [] (unreachable-node)))
+              (let [n
+                      (match (arena-node (get (.members state) (load mi)))
+                        (Some [x] x)
+                        (None [] (unreachable-node)))
                     (mut remote-use) false
                     (mut remote-def) false
                     (mut i) 1]
@@ -178,7 +256,8 @@
                 (continue))))
     ;; Simple propagates `_single` through the input an instruction must overwrite. Iterate because
     ;; arena order need not be definition order and two-address chains can be arbitrarily long.
-    (let [(mut changed) true (mut guard) 0]
+    (let [(mut changed) true
+          (mut guard) 0]
       (loop (if (not (load changed))
                 (break 0)
                 (do
@@ -186,8 +265,10 @@
                   (set! (mut mi) 0)
                   (loop (if (>= (load mi) (len (.members state)))
                             (break 0)
-                            (let [n (match (arena-node (get (.members state) (load mi)))
-                                      (Some [x] x) (None [] (unreachable-node)))]
+                            (let [n
+                                    (match (arena-node (get (.members state) (load mi)))
+                                      (Some [x] x)
+                                      (None [] (unreachable-node)))]
                               (match (mach-of n)
                                 (Some [mach]
                                       (let [two (m-two-address mach)]
@@ -213,18 +294,52 @@
                   (continue)))))
     0))
 
+(defn sched-collect-one! [(block (dyn NodeOps))
+                          (n (dyn NodeOps))
+                          (state (mut SchedState))] (-> i64)
+  (let [id (n-nid n)]
+    (if (or (>= id (len (.member state)))
+            (get (.member state) id)
+            (not (sched-member? n block))
+            (n-same? n block))
+        0
+        (do
+          (set! (mut (.member state)) id true)
+          (push! [i64] (mut (.members state)) id)
+          ;; Simple folds non-CFG projections into their multi. Our durable flattened schedule
+          ;; records zero-byte Projs explicitly, so discover them from the parent's sparse outputs
+          ;; instead of falling back to an arena scan.
+          (let [(mut oi) 0]
+            (loop (if (>= (load oi) (n-nouts n))
+                      (break 0)
+                      (do
+                        (match (n-out n (load oi))
+                          (Some [use_]
+                                (if (= (sched-ideal-op use_) OP-PROJ)
+                                    (do
+                                      (set! (.collect-visits (sched-stats))
+                                            (+ (.collect-visits (sched-stats)) 1))
+                                      (sched-collect-one! block use_ (mut state)))
+                                    0))
+                          (None [] 0))
+                        (set! (mut oi) (+ (load oi) 1))
+                        (continue)))))
+          1))))
+
 (defn sched-collect! [(block (dyn NodeOps)) (state (mut SchedState))] (-> i64)
-  (let [(mut id) 1]
-    (loop (if (> (load id) (arena-node-count))
+  (let [(mut oi) 0]
+    ;; Final Simple's block head outputs are the sparse membership index installed by GCM when it
+    ;; rewrites input zero. Inspect each direct output once; duplicate def-use edges are deduplicated
+    ;; by nid while dependency counting below still preserves their multiplicity.
+    (loop (if (>= (load oi) (n-nouts block))
               (break 0)
               (do
-                (match (arena-node (load id))
-                  (Some [n]
-                        (if (and (sched-member? n block) (not (n-same? n block)))
-                            (push! [i64] (mut (.members state)) (n-nid n))
-                            0))
+                (set! (.collect-visits (sched-stats))
+                      (+ (.collect-visits (sched-stats)) 1))
+                (match (n-out block (load oi))
+                  (Some [n] (sched-collect-one! block n (mut state)))
                   (None [] 0))
-                (set! (mut id) (+ (load id) 1))
+                (set! (mut oi) (+ (load oi) 1))
                 (continue))))
     (len (.members state))))
 
@@ -232,8 +347,10 @@
   (let [(mut mi) 0]
     (loop (if (>= (load mi) (len (.members state)))
               (break 0)
-              (let [n (match (arena-node (get (.members state) (load mi)))
-                        (Some [x] x) (None [] (unreachable-node)))
+              (let [n
+                      (match (arena-node (get (.members state) (load mi)))
+                        (Some [x] x)
+                        (None [] (unreachable-node)))
                     (mut count) 0
                     (mut i) 0]
                 (if (not (sched-phi? n))
@@ -274,7 +391,9 @@
                       (do
                         (match (n-out n (load i))
                           (Some [use_]
-                                (if (and (sched-member? use_ block) (not (sched-phi? use_)))
+                                (if (and (and (not (n-same? use_ block))
+                                              (sched-member? use_ block))
+                                         (not (sched-phi? use_)))
                                     (let [use-id (n-nid use_)
                                           blocked (get (.bcnt state) use-id)]
                                       (if (<= blocked 0)
@@ -295,12 +414,31 @@
   (let [(mut i) 0]
     (loop (if (>= (load i) (len (.members state)))
               (break 0)
-              (let [n (match (arena-node (get (.members state) (load i)))
-                        (Some [x] x) (None [] (unreachable-node)))]
+              (let [n
+                      (match (arena-node (get (.members state) (load i)))
+                        (Some [x] x)
+                        (None [] (unreachable-node)))]
                 (sched-announce-ready! block n (mut state))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
     0))
+
+(defn sched-opening-pressure-use! [(use_ (dyn NodeOps))
+                                   (single bool)
+                                   (state (mut SchedState))
+                                   (regular (mut i64))
+                                   (constrained (mut i64))
+                                   (tail-use (mut bool))] (-> i64)
+  (if (and (< (n-nid use_) (len (.bcnt state)))
+           (get (.member state) (n-nid use_)))
+      (if (sched-control? use_)
+          (set! (mut tail-use) true)
+          (if (> (get (.bcnt state) (n-nid use_)) 0)
+              (if single
+                  (set! (mut constrained) (+ (load constrained) 1))
+                  (set! (mut regular) (+ (load regular) 1)))
+              0))
+      0))
 
 (defn sched-opening-pressure [(n (dyn NodeOps)) (state (mut SchedState))] (-> i64)
   (match (mach-of n)
@@ -317,16 +455,34 @@
                           (do
                             (match (n-out n (load i))
                               (Some [use_]
-                                    (if (and (< (n-nid use_) (len (.bcnt state)))
-                                             (!= (n-block-nid use_) 0))
-                                        (if (cfg? use_)
-                                            (set! (mut tail-use) true)
-                                            (if (> (get (.bcnt state) (n-nid use_)) 0)
-                                                (if (get (.single state) (n-nid n))
-                                                    (set! (mut constrained) (+ (load constrained) 1))
-                                                    (set! (mut regular) (+ (load regular) 1)))
-                                                0))
-                                        0))
+                                    ;; Final Simple folds each data Proj into its Multi's XSched.
+                                    ;; Our Projs are explicit zero-byte schedule members, so follow
+                                    ;; through them when scoring the Multi instead of mistaking the
+                                    ;; projection wrapper itself for a CFG tail.
+                                    (if (= (sched-ideal-op use_) OP-PROJ)
+                                        (let [(mut j) 0]
+                                          (loop (if (>= (load j) (n-nouts use_))
+                                                    (break 0)
+                                                    (do
+                                                      (match (n-out use_ (load j))
+                                                        (Some [projection-use]
+                                                              (sched-opening-pressure-use!
+                                                                projection-use
+                                                                (get (.single state) (n-nid n))
+                                                                (mut state)
+                                                                (mut regular)
+                                                                (mut constrained)
+                                                                (mut tail-use)))
+                                                        (None [] 0))
+                                                      (set! (mut j) (+ (load j) 1))
+                                                      (continue)))))
+                                        (sched-opening-pressure-use!
+                                          use_
+                                          (get (.single state) (n-nid n))
+                                          (mut state)
+                                          (mut regular)
+                                          (mut constrained)
+                                          (mut tail-use))))
                               (None [] 0))
                             (set! (mut i) (+ (load i) 1))
                             (continue))))
@@ -365,11 +521,14 @@
 
 (defn sched-score [(n (dyn NodeOps)) (state (mut SchedState))] (-> i64)
   (let [op (sched-ideal-op n)]
-    (if (or (= op OP-PROJ) (= op OP-CPROJ))
+    ;; Simple's CalleeSaveNode is a ProjNode inserted immediately after entry Phis. Our target uses
+    ;; a dedicated machine family, so give it the same entry priority explicitly; scheduling it near
+    ;; its Return use would erase the whole-function interference that decides whether it must spill.
+    (if (or (= op OP-PROJ) (= op OP-CPROJ) (= op OP-MACH-CALLEE-SAVE))
         1001
-        (if (sched-phi? n)
+        (if (or (sched-phi? n) (sched-entry-save-split? n))
             1000
-            (if (cfg? n)
+            (if (sched-control? n)
                 1
                 (match (mach-of n)
                   (None [] 500)
@@ -382,24 +541,30 @@
 
 (defn sched-ready-pop-best! [(state (mut SchedState))] (-> (dyn NodeOps))
   (if (= (len (.ready state)) 0)
-      (do (panic "sched-ready-pop-best!: dependency cycle in local schedule")
-          (unreachable-node))
+      (do
+        (panic "sched-ready-pop-best!: dependency cycle in local schedule")
+        (unreachable-node))
       (let [(mut best-i) 0
             (mut i) 1
-            first (match (arena-node (get (.ready state) 0))
-                    (Some [n] n) (None [] (unreachable-node)))
+            first
+              (match (arena-node (get (.ready state) 0))
+                (Some [n] n)
+                (None [] (unreachable-node)))
             (mut best-score) (sched-score first (mut state))
             (mut best-nid) (n-nid first)]
         (loop (if (>= (load i) (len (.ready state)))
                   (break 0)
-                  (let [candidate (match (arena-node (get (.ready state) (load i)))
-                                    (Some [n] n) (None [] (unreachable-node)))
+                  (let [candidate
+                          (match (arena-node (get (.ready state) (load i)))
+                            (Some [n] n)
+                            (None [] (unreachable-node)))
                         score (sched-score candidate (mut state))]
                     (if (or (> score (load best-score))
                             (and (= score (load best-score)) (< (n-nid candidate) (load best-nid))))
-                        (do (set! (mut best-i) (load i))
-                            (set! (mut best-score) score)
-                            (set! (mut best-nid) (n-nid candidate)))
+                        (do
+                          (set! (mut best-i) (load i))
+                          (set! (mut best-score) score)
+                          (set! (mut best-nid) (n-nid candidate)))
                         0)
                     (set! (mut i) (+ (load i) 1))
                     (continue))))
@@ -408,9 +573,11 @@
               last-id (get (.ready state) last-i)]
           (set! (mut (.ready state)) (load best-i) last-id)
           (match (pop! [i64] (mut (.ready state)))
-            (Some [_] 0) (None [] (do (panic "sched-ready-pop-best!: ready pop failed") 0)))
+            (Some [_] 0)
+            (None [] (do (panic "sched-ready-pop-best!: ready pop failed") 0)))
           (match (arena-node picked-id)
-            (Some [n] n) (None [] (unreachable-node)))))))
+            (Some [n] n)
+            (None [] (unreachable-node)))))))
 
 (defn sched-release-users! [(block (dyn NodeOps))
                             (n (dyn NodeOps))
@@ -421,7 +588,8 @@
               (do
                 (match (n-out n (load i))
                   (Some [use_]
-                        (if (and (sched-member? use_ block)
+                        (if (and (and (not (n-same? use_ block))
+                                      (sched-member? use_ block))
                                  (not (sched-phi? use_))
                                  (not (get (.emitted state) (n-nid use_))))
                             (let [old (get (.bcnt state) (n-nid use_))]
@@ -440,11 +608,10 @@
                 (continue))))
     0))
 
-(defn sched-block! [(block (dyn NodeOps))] (-> i64)
+(defn sched-block-with-state! [(block (dyn NodeOps)) (state (mut SchedState))] (-> i64)
   (if (not (cfg-block-head-of? block))
-      (panic-i "sched-block!: expected a block head" (n-nid block))
-      (let [(mut state) (sched-state-new)
-            count (sched-collect! block (mut state))
+      (panic-i "sched-block-with-state!: expected a block head" (n-nid block))
+      (let [count (sched-collect! block (mut state))
             (mut emitted-count) 0]
         (code-schedule-begin-block! block)
         (code-schedule-add! block block)
@@ -465,15 +632,27 @@
         (code-schedule-end-block! block)
         (+ count 1))))
 
+(defn sched-block! [(block (dyn NodeOps))] (-> i64)
+  (let [(mut state) (sched-state-new)]
+    (sched-block-with-state! block (mut state))))
+
 (defn sched-run! [] (-> i64)
-  (let [(mut i) 0 (mut blocks) 0]
-    (code-schedule-reset!)
-    (loop (if (>= (load i) (code-cfg-count))
-              (break 0)
-              (let [cfg (code-cfg-at (load i))]
-                (if (cfg-block-head-of? cfg)
-                    (do (sched-block! cfg) (set! (mut blocks) (+ (load blocks) 1)))
-                    0)
-                (set! (mut i) (+ (load i) 1))
-                (continue))))
-    (load blocks)))
+  (do
+    (set! (.collect-visits (sched-stats)) 0)
+    (set! (.state-init-visits (sched-stats)) 0)
+    (let [(mut state) (sched-state-new)
+        (mut i) 0
+        (mut blocks) 0]
+      (code-schedule-reset!)
+      (loop (if (>= (load i) (code-cfg-count))
+                (break 0)
+                (let [cfg (code-cfg-at (load i))]
+                  (if (cfg-block-head-of? cfg)
+                      (do
+                        (sched-state-reset! (mut state))
+                        (sched-block-with-state! cfg (mut state))
+                        (set! (mut blocks) (+ (load blocks) 1)))
+                      0)
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      (load blocks))))

@@ -7,13 +7,22 @@
 (import "aot.node.control" :use *)
 (import "aot.node.call" :use *)
 (import "aot.node.arith" :use *)
+(import "aot.node.compare" :use *)
 (import "aot.node.phi" :use *)
 (import "aot.node.memory" :use *)
+(import "aot.node.dynamic" :use *)
 (import "aot.codegen.looptree" :use *)
 (import "aot.codegen.codegen" :use *)
 (import "aot.codegen.gcm" :use *)
 (import "aot.node.cpus.arm64" :use *)
 (import "aot.type.type" :use *)
+
+(defn gcm-test-add-chain [(value (dyn NodeOps))
+                          (step (dyn NodeOps))
+                          (remaining i64)] (-> (dyn NodeOps))
+  (if (<= remaining 0)
+      value
+      (gcm-test-add-chain (add-make-mode value step MODE-INT) step (- remaining 1))))
 
 (deftest loop_tree_assigns_root_depth_to_straight_line_control
          (boot! 1)
@@ -51,6 +60,34 @@
            (assert-eq (looptree-depth-of back) 1)
            (assert-eq (n-nid (looptree-loop-of exit)) (n-nid st))
            (assert-eq (looptree-depth-of exit) 0)))
+
+(deftest loop_tree_nests_inner_loop_and_keeps_outer_exit_at_the_function_root
+         (boot! 1)
+         (let [start (start-make (ty-int-bot))
+               fun (fun-make start (ty-tuple-of2 (ty-int-bot) (ty-int-bot)) "nested-loop")
+               outer (loop-make fun)
+               outer-arms (if-arms! (if-make outer (con-make (ty-int-range 0 1))))
+               inner (loop-make (arms-true outer-arms))
+               inner-arms (if-arms! (if-make inner (con-make (ty-int-range 0 1))))
+               ret
+                 (return-make (arms-false outer-arms)
+                              (None [(dyn NodeOps)])
+                              (con-int 42)
+                              (None [(dyn NodeOps)])
+                              (Some fun))
+               stop (stop-make)]
+           (loop-close! inner (arms-true inner-arms))
+           (loop-close! outer (arms-false inner-arms))
+           (n-set-ty! inner TY-CTRL)
+           (n-set-ty! outer TY-CTRL)
+           (fun-set-ret! fun ret)
+           (stop-add-return! stop ret)
+           (looptree-build! start stop)
+           (assert-eq (n-ltree-parent inner) (n-nid outer))
+           (assert-eq (n-ltree-parent outer) (n-nid start))
+           (assert-eq (n-nid (looptree-loop-of (arms-true inner-arms))) (n-nid inner))
+           (assert-eq (n-nid (looptree-loop-of (arms-false inner-arms))) (n-nid outer))
+           (assert-eq (n-nid (looptree-loop-of (arms-false outer-arms))) (n-nid start))))
 
 (deftest loop_tree_forces_an_aligned_never_exit_for_a_truly_infinite_loop
          (boot! 1)
@@ -204,6 +241,63 @@
                      (assert (n-same? use-block selected-fun))
                      (assert (not (n-same? use-block selected-region))))))))))
 
+(deftest gcm_loop_phi_region_is_published_before_both_backedge_values_are_scheduled_early
+         (do
+           (boot! 1)
+           (code-reset! 1)
+           (let [start (start-make (ty-int-bot))
+                 fun (fun-make start (ty-tuple-of2 (ty-int-bot) (ty-int-bot)) "loop-phi-early")
+                 rpc (parm-make-slot fun 0 (ty-int-bot) "$rpc")
+                 loop-node (loop-make fun)
+                 value (phi-make loop-node (ty-int-bot) "value")
+                 count (phi-make loop-node (ty-int-bot) "count")]
+             (phi-add-value! value (con-make (ty-int-con 10)))
+             (phi-open! value)
+             (phi-add-value! count (con-make (ty-int-con 1)))
+             (phi-open! count)
+             (let [arms (if-arms! (if-make loop-node count))
+                   back (arms-true arms)
+                   exit (arms-false arms)
+                   next-value (add-make value (con-make (ty-int-con 1)))
+                   next-count (sub-make count (con-make (ty-int-con 1)))
+                   ret (return-make exit
+                                    (Some (con-make (ty-mem 1 TY-BOT)))
+                                    value
+                                    (Some rpc)
+                                    (Some fun))
+                   stop (stop-make)]
+               (loop-close! loop-node back)
+               (phi-close! value next-value)
+               (phi-close! count next-count)
+               (fun-set-ret! fun ret)
+               (stop-add-return! stop ret)
+               (looptree-build! start stop)
+               (let [selected-stop (arm64-select-graph stop)
+                     selected-ret (n-in! selected-stop 0)
+                     selected-value (n-in! selected-ret RETURN-VALUE)
+                     selected-loop (n-in! selected-value 0)
+                     selected-back (n-in! selected-loop 2)
+                     selected-if (n-in! selected-back 0)
+                     selected-count (n-in! (n-in! selected-if 1) 1)
+                     selected-next-value (n-in! selected-value 2)
+                     selected-next-count (n-in! selected-count 2)
+                     selected-fun (n-in! selected-loop 1)
+                     selected-start (n-in! selected-fun 1)]
+                 (code-set-roots! selected-start selected-stop)
+                 (gcm-build-cfg!)
+                 ;; Both loop-carried definitions consume a Phi. Their earliest legal block is the
+                 ;; Loop, never the function entry; their only late use is the true predecessor edge.
+                 (assert-eq (n-early-nid selected-next-value) (n-nid selected-loop))
+                 (assert-eq (n-early-nid selected-next-count) (n-nid selected-loop))
+                 (assert-eq (n-block-nid selected-next-value) (n-nid selected-back))
+                 (assert-eq (n-block-nid selected-next-count) (n-nid selected-back))
+                 (assert (n-same? (gcm-use-block selected-next-value selected-value)
+                                  selected-back))
+                 (assert (n-same? (gcm-use-block selected-next-count selected-count)
+                                  selected-back))
+                 (assert (not (n-same? (gcm-node-block selected-next-value) selected-fun)))
+                 (assert (not (n-same? (gcm-node-block selected-next-count) selected-fun))))))))
+
 (deftest gcm_adds_an_antidependence_when_a_same_alias_store_shares_the_load_block
          (do
            (boot! 1)
@@ -284,3 +378,132 @@
                        (n-same? (gcm-use-block (n-in! selected-memory-phi 1)
                                                selected-memory-phi)
                                 selected-region)))))))))
+
+(deftest gcm_does_not_reparent_a_global_with_an_unowned_non_global_user
+         (do
+           (boot! 2)
+           (code-reset! 2)
+           (let [ideal-start (start-make (ty-int-bot))
+                 ideal-fun
+                   (fun-make ideal-start (ty-tuple-of2 (ty-int-bot) (ty-int-bot)) "owner")
+                 selected-start (arm64-select ideal-start)
+                 selected-fun (arm64-select ideal-fun)
+                 global (arm64-select (con-int 17))
+                 owned (arm64-select (add-make (con-int 1) (con-int 2)))
+                 unowned (arm64-select (add-make (con-int 3) (con-int 4)))]
+             (code-set-roots! selected-start selected-start)
+             (n-add-def! global (Some selected-start))
+             (gcm-clear-clone-inputs! owned)
+             (n-add-def! owned (Some selected-fun))
+             (n-add-def! owned (Some global))
+             (n-add-def! owned (Some global))
+             (n-set-block-nid! selected-fun (n-nid selected-fun))
+             (n-set-block-nid! owned (n-nid selected-fun))
+             (gcm-clear-clone-inputs! unowned)
+             (n-add-def! unowned (None [(dyn NodeOps)]))
+             (n-add-def! unowned (Some global))
+             (n-add-def! unowned (Some global))
+             (assert (gcm-start-pinned-global? global))
+             (assert (not (gcm-global-users-splittable? global)))
+             (gcm-break-up-global! global)
+             ;; Simple returns without splitting here. Moving the definition under `owner` would
+             ;; leave the unresolved user outside the definition's dominance region.
+             (assert (n-same? (n-in! global 0) selected-start)))))
+
+(deftest selected_box_preserves_its_function_control_through_gcm
+         (do
+           (boot! 3)
+           (code-reset! 3)
+           (let [start (start-make (ty-int-bot))
+                 fun (fun-make start (ty-tuple-of2 (ty-int-bot) (ty-dyn TAG-INT)) "box-owner")
+                 boxed (box-make-at (Some fun) (con-int 7))
+                 ret
+                   (return-make fun
+                                (Some (con-make (ty-mem 1 TY-BOT)))
+                                boxed
+                                (None [(dyn NodeOps)])
+                                (Some fun))
+                 stop (stop-make)]
+             (fun-set-ret! fun ret)
+             (stop-add-return! stop ret)
+             (looptree-build! start stop)
+             (let [selected-stop (arm64-select-graph stop)
+                   selected-ret (n-in! selected-stop 0)
+                   selected-box (n-in! selected-ret RETURN-VALUE)
+                   selected-fun (n-in! selected-ret RETURN-CTRL)
+                   selected-start (n-in! selected-fun 1)]
+               (assert-eq (gcm-ideal-op selected-box) OP-BOX)
+               (assert (n-same? (n-in! selected-box 0) selected-fun))
+               (code-set-roots! selected-start selected-stop)
+               (gcm-build-cfg!)
+               (assert-eq (n-block-nid selected-box) (n-nid selected-fun))))))
+
+(deftest gcm_fixed_flags_do_not_hoist_above_the_loop_branch_that_constrains_them
+         (do
+           (boot! 5)
+           (code-reset! 5)
+           (let [start (start-make (ty-int-bot))
+                 fun (fun-make start (ty-tuple-of2 (ty-int-bot) (ty-int-bot)) "flag-loop")
+                 rpc (parm-make-slot fun 0 (ty-int-bot) "$rpc")
+                 arg (parm-make fun 0 (ty-int-bot) "x")
+                 loop-node (loop-make fun)
+                 predicate (cmp--make OP-LT arg (con-int 9) MODE-INT)
+                 arms (if-arms! (if-make loop-node predicate))
+                 back (arms-true arms)
+                 exit (arms-false arms)]
+             (loop-close! loop-node back)
+             (let [ret (return-make exit
+                                    (Some (con-make (ty-mem 1 TY-BOT)))
+                                    arg
+                                    (Some rpc)
+                                    (Some fun))
+                   stop (stop-make)]
+               (fun-set-ret! fun ret)
+               (stop-add-return! stop ret)
+               (looptree-build! start stop)
+               (let [selected-stop (arm64-select-graph stop)
+                     selected-ret (n-in! selected-stop 0)
+                     selected-exit (n-in! selected-ret RETURN-CTRL)
+                     selected-branch (n-in! selected-exit 0)
+                     selected-flags (n-in! selected-branch 1)
+                     selected-loop (n-in! selected-branch 0)
+                     selected-fun (n-in! selected-loop 1)
+                     selected-start (n-in! selected-fun 1)]
+                 (code-set-roots! selected-start selected-stop)
+                 (gcm-build-cfg!)
+                 (assert-eq (gcm-ideal-op selected-flags) OP-LT)
+                 ;; The operands are loop invariant, so frequency alone would hoist this compare to
+                 ;; Fun. Its FLAGS result is fixed, and the loop branch consumes FLAGS; final Simple
+                 ;; makes that constrained CFG use the lower bound for hoisting.
+                 (assert-eq (n-block-nid selected-flags) (n-nid selected-loop)))))))
+
+(deftest gcm_late_work_is_linear_in_a_deep_use_chain
+         (do
+           (boot! 7)
+           (code-reset! 7)
+           (let [start (start-make (ty-int-bot))
+                 fun (fun-make start (ty-tuple-of2 (ty-int-bot) (ty-int-bot)) "late-chain")
+                 rpc (parm-make-slot fun 0 (ty-int-bot) "$rpc")
+                 arg (parm-make fun 0 (ty-int-bot) "x")
+                 step (con-int 5000)
+                 value (gcm-test-add-chain arg step 128)]
+             (let [ret (return-make fun
+                                    (Some (con-make (ty-mem 1 TY-BOT)))
+                                    value
+                                    (Some rpc)
+                                    (Some fun))
+                   stop (stop-make)]
+               (fun-set-ret! fun ret)
+               (stop-add-return! stop ret)
+               (looptree-build! start stop)
+               (let [selected-stop (arm64-select-graph stop)
+                     selected-ret (n-in! selected-stop 0)
+                     selected-fun (n-in! selected-ret RETURN-CTRL)
+                     selected-start (n-in! selected-fun 1)]
+                 (code-set-roots! selected-start selected-stop)
+                 (gcm-build-cfg!)
+                 ;; A whole-arena pass per dependency layer is quadratic here. Stop-seeded,
+                 ;; last-use-triggered scheduling visits the chain only a small constant number of
+                 ;; times, including its pinned control/value leaves.
+                 (assert (< (gcm-last-late-pops) 512))
+                 (assert (< (gcm-last-late-pushes) 512)))))))

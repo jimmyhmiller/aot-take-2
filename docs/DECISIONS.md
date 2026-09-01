@@ -31,17 +31,57 @@ is not a safepoint and needs no relocation dance or stack map. A future concurre
 would require amending this decision and changing placement semantics; it must not silently reuse
 this post-write boundary as though the policies were equivalent.
 
+## 2026-09-01 — Hoisted functions measure inlining cost over their own body window
+
+Final Simple parses one function at a time, so its `Return`-minus-`Fun` node-id estimate covers that
+function's construction. This frontend must hoist every function header before lowering any body.
+The same raw node-id span would therefore charge one body for unrelated Fun and Parm headers and
+could push a small source or JSL function over Simple's 100-node inlining threshold.
+
+After constructing a body, source and JSL lowering replace the initial span estimate with the
+number of nodes allocated in that body's lowering window. The independent live-node cap is still
+checked at the decision point. This preserves Simple's heuristic while adapting its construction-
+order assumption to JavaScript declaration hoisting.
+
+## 2026-09-01 — The process entry is a wrapper around boxed source `main`
+
+Source `main` is an ordinary JavaScript function with the internal dynamic-value ABI and the
+private symbol `$aot$.source_main`. The dot is outside the admitted source identifier grammar, so a
+user declaration cannot collide with this compiler-owned name. A distinct compiler-owned function
+owns the platform `main` symbol, calls the source function, and alone converts the boxed result to
+the host integer status. The wrapper is never inlined, so ordinary source calls to `main` continue
+to observe a boxed Number.
+
+Host `argc` and `argv` are not JavaScript actual arguments. The wrapper supplies canonical boxed
+`undefined` for every declared source parameter, including stack-passed parameters, exactly as an
+ordinary omitted actual does. Extra ordinary actuals are evaluated left-to-right for effects but
+are absent from the fixed formal ABI until the language admits an `arguments` object.
+
 ## 2026-08-31 — Dynamic words use high-prefix NaN boxing with signed 48-bit integers
 
 Simple has no JavaScript value representation. Our dynamic word reserves positive quiet-NaN
-prefixes in the high 16 bits: `0x7ff8` is the canonical double NaN, `0x7ff9` is an integer, and
-subsequent prefixes are assigned to the other non-double tags. Non-NaN doubles remain their exact
-IEEE-754 bits. A tagged value's low 48 bits are its payload.
+prefixes in the high 16 bits. The exact assignments are `0x7ff8` canonical double NaN, `0x7ff9`
+integer, `0x7ffa` undefined, `0x7ffb` null, `0x7ffc` Boolean, `0x7ffd` string, `0x7ffe` symbol, and
+`0x7fff` object. Function must remain distinguishable from object for `%IsFunction`, so it uses
+the negative quiet-NaN prefix `0xfff9`. A tagged value's low 48 bits are its payload.
+
+Non-NaN doubles retain their exact IEEE-754 bits. Boxing any NaN canonicalizes it to positive
+`0x7ff8000000000000`; preserving arbitrary NaN payloads would let a Number impersonate one of the
+reserved tags. `%IsFlt` is therefore the complement of the reserved positive prefix range plus the
+function singleton, while every other checker-admitted singleton predicate compares one exact
+prefix. The object-layout kind in a heap payload refines an object or function after this top-level
+classification; it does not replace the dynamic-word tag.
 
 The integer payload is signed two's complement. Boxing therefore replaces the high 16 bits with
 `0x7ff9`; unboxing sign-extends bit 47. This gives the promised signed 48-bit immediate range and
 also preserves a small program result in the low exit-status bits. Encoding this explicitly is
 mandatory: treating Box as an identity would make negative integers and runtime tag tests wrong.
+
+An admitted decimal integer spelling is first rounded to binary64, as ECMAScript requires. Only an
+exact value within the positive signed-48 payload range uses the compact integer representation;
+larger spellings retain their binary64 bits. A dynamic Number consumer tests the integer prefix and
+converts either representation to f64. Cast remains a control-pinned identity move so the proof
+cannot float above its guarding edge.
 
 ## 2026-08-31 — Return GVN identity includes function ownership
 

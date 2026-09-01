@@ -23,8 +23,9 @@ deoptimisation machinery anywhere in the design.
 ## The gate
 
 ```sh
-coil test        # THE gate. Green is the contract; nothing is committed red.
+coil lint --fix  # repeat until it makes no changes
 coil check       # typecheck every target
+coil test        # THE gate. Green is the contract; nothing is committed red.
 ```
 
 The production driver compiles the admitted source slice to an AArch64 Mach-O object, can link it,
@@ -48,7 +49,7 @@ by name.
 |---|---|
 | `src/node/` | The graph: header, dispatch trait, edges, peepholes, GVN — grouped by node family |
 | `src/type/` | Partial interned lattice: simple types, ints, floats, arbitrary tuples, function-index sets, and dynamic tags |
-| `src/shape.coil` | Planned hidden-class transition tree; currently scaffold |
+| `src/shape.coil` | Implemented hidden-class transition tree with inherited aliases and stable property offsets |
 | `src/codegen/` | The one-way phase pipeline, from peepholes through to the object file |
 | `src/parse/` | The admitted JS/TS lexer, syntax arena, and Scope-driven SSA lowering |
 | `src/jsl/` | The reader, checker and graph lowering for JSL |
@@ -59,21 +60,23 @@ by name.
 
 ## Status
 
-Working, with tests: source-to-native compilation for numeric literals, bindings, assignment,
-blocks, arithmetic, named and forward calls, conditional expressions, `if`/`else`, basic `while`,
-and recursion; the `(dyn NodeOps)` graph engine and GVN; the interned lattice including
+Working, with tests: source-to-native compilation for numeric literals and `undefined`, bindings,
+assignment, blocks, arithmetic, named and forward calls, conditional expressions, `if`/`else`,
+nested `while`, early and implicit returns, fixed-ABI missing/extra arguments, and recursion; the
+`(dyn NodeOps)` graph engine and GVN; the interned lattice including
 integer ranges, floats, arbitrary-arity tuples, function-pointer identity sets and dynamic tags;
 integer arithmetic, bitwise and comparison nodes; control flow and Phis; Fun/Parm/Call/CallEnd with
 trivial and clone inlining; dynamic Box/Unbox/TypeTest/Cast guards; and constant push-up through
 Phis.
 
-Property tests now generate shrinkable expression DAGs and control diamonds, checking bidirectional
-edge multiplicity, optimizer/model agreement, fixpoint closure, and Region/Phi arity. General
-object/string value representation, complete float behavior, and memory threading remain correctness
-blockers before this is a general JavaScript IR.
+Property tests generate shrinkable expression DAGs and control diamonds, checking bidirectional
+edge multiplicity, optimizer/model agreement, fixpoint closure, and Region/Phi arity. Calls thread
+bulk memory, and the admitted numeric/undefined path preserves binary64 and dynamic representation
+semantics through native execution. General object/string representations, properties, closures,
+exceptions, and their runtime support remain before this is a general JavaScript compiler.
 
 The next frontend work is language expansion beyond that explicit admission boundary: strings,
-objects, general numeric fallback, richer control exits, and the corresponding runtime support.
+objects, properties, richer expressions and control exits, and the corresponding runtime support.
 `docs/FRONTEND.md` records the exact current contract.
 
 ## Provenance and license

@@ -9,11 +9,11 @@ this file owns completeness.
 
 | Area | Missing behavior | Consequence |
 |---|---|---|
-| Dynamic values | Box/Unbox representations beyond numeric tags | The declared JS value space is not covered |
-| Return | Concrete memory and RPC nodes/types for the final four-input shape | Slots and projection numbering are final; memory and RPC are explicit null/`TOP` inputs while Fun ownership is separate metadata |
-| Calls | Multi-target SCCP lookup and memory threading | Direct calls and clone inlining are complete; multi-target lookup awaits compilation units and memory threading awaits memory SSA |
+| Dynamic values | Box/Unbox construction and payload access beyond numeric tags | Every checker-admitted singleton TypeTest is selected and encoded; producing and consuming the remaining tagged payload families still requires their runtime nodes |
+| Return | Concrete RPC nodes/types for the final four-input shape | Source/JSL Returns carry concrete bulk memory; RPC is reconstructed as a Parm before code generation while Fun ownership remains separate metadata |
+| Calls | Multi-target SCCP lookup | Direct calls, clone inlining, arbitrary fixed arity and bulk-memory threading are complete; multi-target lookup awaits compilation units |
 | Node API | Complete for every implemented node family | Includes cycle-safe two-pass selected-subgraph copy, payload preservation and Fun/Return + Call/CallEnd cross-link repair |
-| Phi | MemPhi construction, memory-specific same-op guards and the dominance-walk null merge | Unary/binary scalar pull-down and structural zero/truthy-Cast merging are complete; Load/Store/MemMerge now exist |
+| Phi | Memory-specific same-op guards and the dominance-walk null merge | MemPhi construction, unary/binary scalar pull-down and structural zero/truthy-Cast merging are complete; Load/Store/MemMerge exist |
 | Verification | Pointer/control/safepoint/unreachable-use checks | Core edge, dead-input, Phi arity, type and GVN checks are live; the remaining checks require their node families |
 | Text IR/eval | Round-trippable graph text and IR interpreter | No durable reduced graph corpus or differential execution oracle |
 
@@ -55,25 +55,24 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
-- The lexer/parser lower named functions, hoisted calls, integer literals, arithmetic calls,
-  bindings, assignment, lexical blocks, conditional expressions, statement `if`/`else`, and basic
-  `while`. Function parameter and return annotations are optional, admitting the corresponding
-  ordinary JavaScript syntax. Strings, objects, classes, `for`, loop exits, exceptions, properties,
-  closures, and most expressions remain.
+- The lexer/parser lower named functions, hoisted calls, decimal integer spellings with full
+  binary64 Number semantics, arithmetic calls, bindings, assignment, lexical blocks, conditional
+  expressions, statement `if`/`else`, and nested `while`. Bare returns and live function
+  fallthrough produce boxed `undefined`; early and loop-body returns merge through the function
+  exit accumulator. Function parameter and return annotations are optional, admitting the
+  corresponding ordinary JavaScript syntax. Strings, objects, classes, `for`, loop exits,
+  exceptions, properties, closures, and most expressions remain.
 - Scope SSA bindings, lazy Phis, branch merges, loop closure, memory binding, and guard machinery
   exist. The frontend uses binding/branch merge and atomic lazy-Phi loop closure today;
   source-level narrowing and nonlocal loop exits remain.
 - JSL reading, indexed two-pass declaration/body lowering, refusal diagnostics, integer literals,
-  lexical `let`, `if`, semantic calls, tag tests, and branch-local Cast narrowing exist. The full
-  production JSL grammar and primitive surface remain.
+  lexical `let`, `if`, semantic calls, tag tests, complementary-edge Cast narrowing, and the
+  numeric/undefined generic fallback exist. The full production JSL grammar and primitive surface
+  remain.
 - `JsOp` construction and the string/object/number primitives below JSL.
 - Distinct JS32 primitive lowering for `%BitAnd/%BitOr/%BitXor/%BitNot/%Shl/%Shr/%Ushr`, including
   float-to-int32 conversion and modulo-32 counts. The implemented scalar bit/shift nodes are
   Simple-style internal i64 operations and must not be reused for this observably different job.
-- `AddNumericValues` must range-check an integer sum before `%Box`: two valid signed 48-bit
-  immediates can sum outside the immediate payload and `%Box` truncates that value. Once JSL
-  lowering is live, the overflow path must box an f64 result (or numeric addition must use f64
-  conservatively).
 
 ## Partial memory, object and runtime subsystems
 
@@ -96,8 +95,9 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Unwritten optimizer, backend and compilation infrastructure
 
-- Multi-target/escaping-function SCCP integration, type checking and the phase driver. Direct-call
-  SCCP and node-aware proof are implemented.
+- Multi-target/escaping-function SCCP integration and semantic checks for the remaining JavaScript
+  value families. Direct-call SCCP, node-aware proof, Stop-reachable type checking and the ordered
+  production phase driver are implemented.
 - Loop-tree construction and typed infinite-loop exit insertion are implemented for the current IR.
 - Arm64 selection and ABI contracts are implemented for current ideal opcodes. The complete JS
   semantic/runtime node surface and x86-64 selection remain.
@@ -110,18 +110,20 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
   native Mach-O linking and a complete implemented ideal-to-native execution test are implemented.
   Split encoding includes IFG-proved X16 scratch expansion for stack-to-stack copies. Preference-
   aware branch inversion, iterative B19 relaxation through an inverted-condition/B26 veneer, and
-  stack-map/object metadata are implemented. Branch islands beyond B26 range and source-to-
-  executable driver coverage remain.
+  sparse layout-planned B26/BL26 veneer hubs beyond direct branch range are implemented alongside
+  stack-map/object metadata. The ordered source-to-object driver and native execution matrix cover
+  every currently admitted source form.
 - Ideal-graph serialization, compilation units and dependency resolution.
 - Assembly and ordinary IR printers. Graphviz is implemented.
-- The CLI compile/run/dump pipeline.
+- CLI `compile` and `run` are implemented; a user-facing IR/assembly dump command remains.
 
 ## Current Simple comparison boundary
 
-The Stop-rooted hand-built programs in `tests/program-graph-test.coil` establish the implemented
+The Stop-rooted hand-built programs in `tests/program-graph-test.coil` establish the structural
 spine: Fun is a Region, Parm is a Phi, pure values float, If produces control projections, and
-Region/Phi positions correspond. They do **not** establish source-to-graph equivalence because the
-frontend, concrete memory/RPC Return members, compilation-unit envelope and branch-local refinement
-above do not exist yet. Return and CallEnd now reserve and preserve Simple's final
-`control, memory, value, RPC` / `control, memory, value` positions, including clearing RPC during
-trivial inlining and preserving the full linked Return tuple in CallEnd.
+Region/Phi positions correspond. Parser, pipeline and native execution suites separately establish
+source-to-graph and source-to-object behavior for every currently admitted syntax form. Return and
+CallEnd preserve Simple's final `control, memory, value, RPC` / `control, memory, value` positions,
+including concrete bulk memory, clearing RPC during trivial inlining and reconstructing the
+architectural RPC Parm before code generation. Persisted compilation units and their serialized
+envelope remain outside the implemented boundary.

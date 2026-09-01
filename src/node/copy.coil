@@ -37,6 +37,7 @@
         d (primitive/make-dyn NodeOps p)
         op (primitive/cast (ptr CallEndNode) (hdr old))]
     (set! (.folding p) (.folding op))
+    (set! (.never-inline p) (.never-inline op))
     (set! (.decision p) (.decision op))
     (n-init! d OP-CALLEND)
     d))
@@ -152,8 +153,11 @@
             (Some [fresh] (Some fresh))
             (None [] (Some old))))))
 
-;; Non-edge metadata pairs are indivisible copy units. Validate before allocating any shells so a
-;; rejected public selection cannot leave a half-built graph behind.
+;; A selected CallEnd requires its Call because input 0 is its structural control predecessor and
+;; this IR also caches that unique continuation on Call. The reverse is deliberately not required:
+;; final Simple's shallow Call copy has empty outputs and therefore no cend when a folding Call is
+;; selected as data but its CallEnd is outside the body. Fun/Return metadata is similarly preserved
+;; externally when only one half is selected, and remapped only when both halves were copied.
 (defn graph-copy-selection-valid? [(selected (slice bool))] (-> bool)
   (let [limit (+ (arena-node-count) 1)
         (mut id) 1
@@ -166,17 +170,11 @@
                       (Some [n]
                             (let [op (n-op n)
                                   peer
-                                    (if (= op OP-FUN)
-                                        (fun-ret n)
-                                        (if (= op OP-RETURN)
-                                            (return-fun n)
-                                            (if (= op OP-CALL)
-                                                (call-cend n)
-                                                (if (= op OP-CALLEND)
-                                                    (if (> (n-nins n) 0)
-                                                        (n-in n 0)
-                                                        (None [(dyn NodeOps)]))
-                                                    (None [(dyn NodeOps)])))))]
+                                    (if (= op OP-CALLEND)
+                                        (if (> (n-nins n) 0)
+                                            (n-in n 0)
+                                            (None [(dyn NodeOps)]))
+                                        (None [(dyn NodeOps)]))]
                               (match peer
                                 (Some [p]
                                       (if (or (>= (n-nid p) (len selected))
@@ -217,7 +215,12 @@
                                                               size)
                                                         0))
                                                 (None []
-                                                      (broken "graph-copy-selected: selected Fun requires its Return"))))
+                                                      (let [size (fun-approx-size fresh)]
+                                                        (fun-set-ret! fresh r)
+                                                        (set! (.approx-size (primitive/cast (ptr FunNode)
+                                                                                            (hdr fresh)))
+                                                              size)
+                                                        0))))
                                         (None [] 0))
                                       (if (= op OP-RETURN)
                                           (let [src (primitive/cast (ptr ReturnNode) (hdr old))
@@ -227,16 +230,14 @@
                                               (Some [f]
                                                     (match (graph-copy-get copy f)
                                                       (Some [nf] (set! (.fun-nid dst) (n-nid nf)))
-                                                      (None []
-                                                            (broken "graph-copy-selected: selected Return requires its Fun"))))
+                                                      (None [] (set! (.fun-nid dst) fid))))
                                               (None [] (set! (.fun-nid dst) 0))))
                                           (if (= op OP-CALL)
                                               (match (call-cend old)
                                                 (Some [e]
                                                       (match (graph-copy-get copy e)
                                                         (Some [ne] (call-set-cend! fresh ne))
-                                                        (None []
-                                                              (broken "graph-copy-selected: selected Call requires its CallEnd"))))
+                                                        (None [] 0)))
                                                 (None [] 0))
                                               (if (= op OP-CALLEND)
                                                   (match (n-in old 0)
@@ -260,7 +261,7 @@
     (set! (.map result) (al-new [(Option (dyn NodeOps))] a))
     (set! (.old-count result) old-count)
     (if (not (graph-copy-selection-valid? selected))
-        (panic "graph-copy-selected: selection is incomplete or splits a metadata pair")
+        (panic "graph-copy-selected: selected CallEnd requires its Call")
         0)
     (let [(mut id) 0]
       (loop (if (>= (load id) old-count)
@@ -288,7 +289,25 @@
                                     (loop (if (>= (load i) (n-nins old))
                                               (break 0)
                                               (do
-                                                (n-add-def! fresh (copy--mapped-edge result (n-in old (load i))))
+                                                ;; Final Simple omits linked Return inputs whose
+                                                ;; owning Fun is outside the copied body; relinking
+                                                ;; below installs a fresh, atomic external edge.
+                                                (match (n-in old (load i))
+                                                  (Some [edge]
+                                                        (if (and (= (n-op old) OP-CALLEND)
+                                                                 (> (load i) 0)
+                                                                 (or (!= (n-op edge) OP-RETURN)
+                                                                     (match (return-fun edge)
+                                                                       (Some [owner]
+                                                                             (match (graph-copy-get result owner)
+                                                                               (Some [_] false)
+                                                                               (None [] true)))
+                                                                       (None [] true))))
+                                                            0
+                                                            (n-add-def! fresh
+                                                                        (copy--mapped-edge result
+                                                                                           (Some edge)))))
+                                                  (None [] (n-add-def! fresh (None [(dyn NodeOps)]))))
                                                 (set! (mut i) (+ (load i) 1))
                                                 (continue))))))
                             (None [] (broken "graph-copy-selected: source disappeared"))))
@@ -643,31 +662,12 @@
     (set-fun-body-size-ext! (primitive/fnptr-of fun-live-body-size-impl))
     (set-clone-inline-ext! (primitive/fnptr-of callend-do-clone-inline!))))
 
-;; Rebuild concrete call-graph edges for calls copied inside the body. Graph edges preserve the
-;; cloned CallEnd's Return inputs. A body-local target therefore already has both cloned halves and
-;; must be left alone. An external target has only the copied Return input: remove that one edge,
-;; then let `call-link!` install both halves in lockstep.
-(defn copy--remove-return! [(end (dyn NodeOps)) (ret (dyn NodeOps))] (-> i64)
-  (let [(mut i) 1
-        (mut found) false]
-    (loop (if (or (>= (load i) (n-nins end)) (load found))
-              (break 0)
-              (do
-                (match (n-in end (load i))
-                  (Some [candidate]
-                        (if (n-same? candidate ret)
-                            (do (n-del-def! end (load i)) (set! (mut found) true) 0)
-                            0))
-                  (None [] 0))
-                (if (load found) 0 (set! (mut i) (+ (load i) 1)))
-                (continue))))
-    (if (load found)
-        0
-        (broken "copy--relink-body-calls!: cloned CallEnd lacks expected Return"))))
-
+;; Rebuild concrete call-graph edges for calls copied inside the body. A body-local target already
+;; has both cloned halves and must be left alone. For an external target, phase two deliberately
+;; omitted the linked Return exactly as final Simple's `bodyEdge` does; `call-link!` now installs
+;; both halves atomically.
 (defn copy--relink-target! [(copy (ptr GraphCopy))
                             (new-call (dyn NodeOps))
-                            (new-end (dyn NodeOps))
                             (old-ret (dyn NodeOps))] (-> i64)
   (match (return-fun old-ret)
     (None [] 0)
@@ -678,11 +678,7 @@
                     (None [] old-fun))]
             (if (call-linked? new-call target)
                 0
-                (do
-                  (match (graph-copy-get copy old-ret)
-                    (Some [new-ret] (copy--remove-return! new-end new-ret))
-                    (None [] (copy--remove-return! new-end old-ret)))
-                  (call-link! new-call target)))))))
+                (call-link! new-call target))))))
 
 (defn copy--relink-one-call! [(copy (ptr GraphCopy)) (old-call (dyn NodeOps))] (-> i64)
   (match (graph-copy-get copy old-call)
@@ -709,7 +705,7 @@
                                             (do
                                               (match (n-in old-end (load i))
                                                 (Some [old-ret]
-                                                      (copy--relink-target! copy new-call new-end old-ret))
+                                                      (copy--relink-target! copy new-call old-ret))
                                                 (None [] 0))
                                               (set! (mut i) (+ (load i) 1))
                                               (continue))))
