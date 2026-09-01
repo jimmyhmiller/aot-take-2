@@ -243,6 +243,7 @@ aot-take-2/
 │   ├── harness.coil                 ; source in → linked binary out → node's answer beside it
 │   ├── execution-test.coil          ; cases that must RUN, not merely compile
 │   └── differential-test.coil       ; compiled output vs. a JavaScript engine
+├── benchmarks/              ; JavaScript/TypeScript input fixtures for native comparisons
 └── tools/
     └── dot-dump.coil
 ```
