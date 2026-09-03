@@ -28,8 +28,8 @@
 
 (defstruct Arm64CallNode
   [(hdr NodeHdr) (ideal-op i64) (result-ty i64) (block-head bool) (direct bool) (fidx i64)
-   (symbol (slice u8)) (size i64) (entry-return bool)
-   (alloc-shape i64) (alloc-map-id i64) (js-prim i64) (barrier-kind i64)
+   (symbol (slice u8)) (size i64) (process-entry bool) (entry-return bool)
+   (alloc-shape i64) (alloc-bytes i64) (alloc-map-id i64) (js-prim i64) (barrier-kind i64)
    (max-arg-slot i64) (frame-adjust i64) (has-calls bool)
    (input-masks (ArrayList (Option (ptr RegMask))))
    (output-mask (Option (ptr RegMask)))
@@ -79,8 +79,10 @@
     (set! (.fidx p) fidx)
     (set! (.symbol p) "")
     (set! (.size p) size)
+    (set! (.process-entry p) false)
     (set! (.entry-return p) false)
     (set! (.alloc-shape p) 0)
+    (set! (.alloc-bytes p) 0)
     (set! (.alloc-map-id p) 0)
     (set! (.js-prim p) 0)
     (set! (.barrier-kind p) 0)
@@ -111,16 +113,24 @@
 (defn arm64-call-set-entry-return! [(n (dyn NodeOps))] (-> i64)
   (do (set! (.entry-return (arm64-call-node n)) true) 0))
 
+(defn arm64-call-set-process-entry! [(n (dyn NodeOps))] (-> i64)
+  (do (set! (.process-entry (arm64-call-node n)) true) 0))
+
 (defn arm64-call-set-alloc-shape! [(n (dyn NodeOps)) (shape i64)] (-> i64)
   (do (set! (.alloc-shape (arm64-call-node n)) shape) 0))
+
+(defn arm64-call-set-alloc-bytes! [(n (dyn NodeOps)) (bytes i64)] (-> i64)
+  (do (set! (.alloc-bytes (arm64-call-node n)) bytes) 0))
 
 (defn arm64-call-set-alloc-map-id! [(n (dyn NodeOps)) (map-id i64)] (-> i64)
   (let [p (arm64-call-node n)]
     (set! (.alloc-map-id p) map-id)
     ;; X1 materializes shape, X2 materializes the stable safepoint id, X3 snapshots caller SP,
     ;; then BL enters the runtime. This size is part of layout and stack-map return-PC identity.
-    (set! (.size p)
-          (+ (* (+ (arm64-const-insns (.alloc-shape p)) (arm64-const-insns map-id)) 4) 8))
+    (let [words (/ (+ (.alloc-bytes p) 7) 8)
+          shape-insns (arm64-const-insns (.alloc-shape p))
+          map-insns (arm64-const-insns map-id)]
+      (set! (.size p) (* (+ (+ (+ 18 (* shape-insns 2)) map-insns) words) 4)))
     0))
 
 (defn arm64-call-set-jsop! [(n (dyn NodeOps))
@@ -145,7 +155,9 @@
     (if (or (= kind BARRIER-KIND-RAW) (= kind BARRIER-KIND-BOXED))
         (do
           (set! (.barrier-kind p) kind)
-          (set! (.size p) (+ (* (arm64-const-insns kind) 4) 4))
+          ;; Ordinary scanned shapes are born with boxed-layout metadata, so boxed barriers do not
+          ;; rewrite that header byte. Raw barriers additionally publish their uncommon layout.
+          (set! (.size p) (* (if (= kind BARRIER-KIND-RAW) 15 16) 4))
           0)
         (panic-i "arm64-call-set-barrier-kind!: invalid barrier kind" kind))))
 
@@ -210,6 +222,9 @@
 
 (defn arm64-fun-has-calls? [(fun (dyn NodeOps))] (-> bool)
   (.has-calls (arm64-call-node fun)))
+
+(defn arm64-fun-process-entry? [(p (ptr Arm64CallNode))] (-> bool)
+  (.process-entry p))
 
 (defn arm64-fun-saved-rpc-offset [(fun (dyn NodeOps))] (-> i64)
   (if (arm64-fun-has-calls? fun)
@@ -276,22 +291,29 @@
 (defn arm64-fun-finalize-frame! [(fun (dyn NodeOps)) (max-location i64) (has-calls bool)]
                                  (-> i64)
   (let [p (arm64-call-node fun)
+        entry (arm64-fun-process-entry? p)
         incoming (.max-arg-slot p)
         seen-slots (if (> (- max-location 65) incoming) (- max-location 65) incoming)
-        raw (+ (* (- seen-slots incoming) 8) (if has-calls 16 0))
+        raw (+ (+ (* (- seen-slots incoming) 8) (if has-calls 16 0)) (if entry 16 0))
         adjusted (if (> raw 0) (* (/ (+ raw 15) 16) 16) 0)]
     (set! (.has-calls p) has-calls)
     (set! (.frame-adjust p) adjusted)
     (set! (.size p)
-          (+ (* 4 (arm64-frame-adjust-insns adjusted))
-             (if has-calls
-                 (* 4 (arm64-split-stack-insns (- adjusted 16)))
+          (+ (+ (* 4 (arm64-frame-adjust-insns adjusted))
+                (if has-calls
+                    (* 4 (arm64-split-stack-insns (- adjusted 16)))
+                    0))
+             (if entry
+                 (+ (* 4 (arm64-split-stack-insns (- adjusted 8))) 8)
                  0)))
     (arm64-set-return-size! fun
                             (+ 4
-                               (+ (* 4 (arm64-frame-adjust-insns adjusted))
-                                  (if has-calls
-                                      (* 4 (arm64-split-stack-insns (- adjusted 16)))
+                               (+ (+ (* 4 (arm64-frame-adjust-insns adjusted))
+                                     (if has-calls
+                                         (* 4 (arm64-split-stack-insns (- adjusted 16)))
+                                         0))
+                                  (if entry
+                                      (* 4 (arm64-split-stack-insns (- adjusted 8)))
                                       0))))
     adjusted))
 
@@ -331,6 +353,162 @@
                            (| (primitive/ishl 31 5) 31))))))
     0))
 
+(defn arm64-barrier-branch [(base i64) (remaining i64) (reg i64)] (-> i64)
+  (| base (| (primitive/ishl remaining 5) reg)))
+
+(defn arm64-encode-barrier! [(encoder i64) (p (ptr Arm64CallNode))] (-> i64)
+  (let [d (primitive/make-dyn NodeOps p)
+        obj (enc-reg encoder (n-in! d BARRIER-OBJ))
+        val (enc-reg encoder (n-in! d BARRIER-VAL))
+        boxed (= (.barrier-kind p) BARRIER-KIND-BOXED)
+        instructions (if boxed 16 15)
+        (mut at) 0]
+    (if (or (< obj ARM64-X0) (> obj ARM64-X28))
+        (panic-i "arm64 barrier: owner is not a GPR" obj)
+        0)
+    (if (or (< val ARM64-X0) (> val ARM64-X28))
+        (panic-i "arm64 barrier: value is not a GPR" val)
+        0)
+    ;; X15/X16/X17 are fixed scratch kills. Metadata's high 56 bits encode the card-byte
+    ;; address; zero means nursery. Its low byte records raw or boxed scan layout.
+    (if boxed
+        0
+        (do
+          (arm64-encode-immediate-to-reg! encoder (.barrier-kind p) 15)
+          (set! (mut at) (+ (load at) 1))))
+    (enc-add4! encoder
+               (| 0xf8400000
+                  (| (primitive/ishl 0x1f0 12) (| (primitive/ishl obj 5) 16))))
+    (set! (mut at) (+ (load at) 1))
+    (if boxed
+        0
+        (do
+          (enc-add4! encoder (arm64-enc-r3 0xaa000000 16 16 15))
+          (set! (mut at) (+ (load at) 1))
+          (enc-add4! encoder
+                     (| 0xf8000000
+                        (| (primitive/ishl 0x1f0 12) (| (primitive/ishl obj 5) 16))))
+          (set! (mut at) (+ (load at) 1))))
+    (enc-add4! encoder (| 0xd348fc00 (| (primitive/ishl 16 5) 17)))
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder (arm64-barrier-branch 0xb4000000 (- instructions (load at)) 17))
+    (set! (mut at) (+ (load at) 1))
+    (if boxed
+        (do
+          (enc-add4! encoder (| 0xd370fc10 (primitive/ishl val 5)))
+          (set! (mut at) (+ (load at) 1))
+          (arm64-encode-immediate-to-reg! encoder 0x7fff 15)
+          (set! (mut at) (+ (load at) 1))
+          (enc-add4! encoder (arm64-enc-r3 0xeb00001f 31 16 15))
+          (set! (mut at) (+ (load at) 1))
+          (enc-add4! encoder (| 0x54000001 (primitive/ishl (- instructions (load at)) 5)))
+          (set! (mut at) (+ (load at) 1))
+          (enc-add4! encoder (| 0xd340bc10 (primitive/ishl val 5)))
+          (set! (mut at) (+ (load at) 1)))
+        (do
+          (enc-add4! encoder (arm64-enc-r3 0xaa0003e0 16 31 val))
+          (set! (mut at) (+ (load at) 1))))
+    (enc-add4! encoder (arm64-barrier-branch 0xb4000000 (- instructions (load at)) 16))
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder
+               (| 0xf8400000
+                  (| (primitive/ishl 0x1f0 12) (| (primitive/ishl 16 5) 16))))
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder (| 0xd348fc00 (| (primitive/ishl 16 5) 16)))
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder (arm64-barrier-branch 0xb5000000 (- instructions (load at)) 16))
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder (| 0x39400000 (| (primitive/ishl 17 5) 16)))
+    (set! (mut at) (+ (load at) 1))
+    (arm64-encode-immediate-to-reg! encoder (if boxed 1 2) 15)
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder (arm64-enc-r3 0x2a000000 16 16 15))
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder (| 0x39000000 (| (primitive/ishl 17 5) 16)))
+    (set! (mut at) (+ (load at) 1))
+    (if (!= (load at) instructions)
+        (panic-i "arm64 barrier: encoded size mismatch" (load at))
+        0)))
+
+(defn arm64-encode-allocation! [(encoder i64) (p (ptr Arm64CallNode))] (-> i64)
+  (let [d (primitive/make-dyn NodeOps p)
+        bytes (.alloc-bytes p)
+        total (& (+ bytes 31) -8)
+        words (/ (+ bytes 7) 8)
+        shape-insns (arm64-const-insns (.alloc-shape p))
+        map-insns (arm64-const-insns (.alloc-map-id p))
+        fast-insns (+ (+ 16 shape-insns) words)
+        slow-insns (+ (+ shape-insns map-insns) 2)
+        (mut at) 0
+        (mut word) 0]
+    ;; RtHeap ABI offsets are fixed by src/rt/rt.coil: from=0, capacity=72, used=88 and
+    ;; fast-disabled=144. X28 is initialized once by the process entry and is never allocatable.
+    (enc-add4! encoder
+               (| 0xf940000f
+                  (| (primitive/ishl 18 10) (primitive/ishl 28 5))))  ; ldr x15,[x28,#144]
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder
+               (arm64-barrier-branch 0xb5000000 (- fast-insns (load at)) 15))
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder (| 0xf9400010 (| (primitive/ishl 11 10) (primitive/ishl 28 5))))
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder
+               (| 0x91000011
+                  (| (primitive/ishl total 10) (primitive/ishl 16 5))))
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder (| 0xf940000f (| (primitive/ishl 9 10) (primitive/ishl 28 5))))
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder (arm64-enc-r3 0xeb00001f 31 17 15))
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder
+               (| 0x54000008 (primitive/ishl (- fast-insns (load at)) 5)))  ; b.hi slow
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder (| 0xf9000011 (| (primitive/ishl 11 10) (primitive/ishl 28 5))))
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder 0xf9400391)  ; ldr x17,[x28]
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder (arm64-enc-r3 0x8b000000 16 17 16))
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder (| 0xf9000000 (primitive/ishl 16 5)))  ; str x0,[x16]
+    (set! (mut at) (+ (load at) 1))
+    (arm64-encode-immediate-to-reg!
+      encoder
+      (if (!= (& (.alloc-shape p) 0x4000000000000000) 0) 0 1)
+      15)
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder (| 0xf900040f (primitive/ishl 16 5)))  ; str x15,[x16,#8]
+    (set! (mut at) (+ (load at) 1))
+    (arm64-encode-immediate-to-reg! encoder (.alloc-shape p) 15)
+    (set! (mut at) (+ (load at) shape-insns))
+    (enc-add4! encoder (| 0xf900080f (primitive/ishl 16 5)))  ; str x15,[x16,#16]
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder (| 0x91006200 (primitive/ishl 16 5)))  ; add x0,x16,#24
+    (set! (mut at) (+ (load at) 1))
+    (loop (if (>= (load word) words)
+              (break 0)
+              (do
+                (enc-add4! encoder
+                           (| 0xf900001f
+                              (| (primitive/ishl (load word) 10) (primitive/ishl 0 5))))
+                (set! (mut word) (+ (load word) 1))
+                (set! (mut at) (+ (load at) 1))
+                (continue))))
+    (enc-add4! encoder (| 0x14000000 (+ slow-insns 1)))
+    (set! (mut at) (+ (load at) 1))
+    (arm64-encode-immediate-to-reg! encoder (.alloc-shape p) 1)
+    (set! (mut at) (+ (load at) shape-insns))
+    (arm64-encode-immediate-to-reg! encoder (.alloc-map-id p) 2)
+    (set! (mut at) (+ (load at) map-insns))
+    (enc-add4! encoder 0x910003e3)  ; add x3,sp,#0
+    (set! (mut at) (+ (load at) 1))
+    (enc-add4! encoder 0x94000000)
+    (set! (mut at) (+ (load at) 1))
+    (enc-add-symbol-fixup-at!
+      encoder ENC-FIXUP-A64-BL26 d (- (.size p) 4) (.fidx p) (.symbol p))
+    (if (!= (* (load at) 4) (.size p))
+        (panic-i "arm64 allocation: encoded size mismatch" (load at))
+        0)))
+
 (defn arm64-encode-call! [(encoder i64) (p (ptr Arm64CallNode))] (-> i64)
   (let [d (primitive/make-dyn NodeOps p)
         op (.ideal-op p)]
@@ -345,96 +523,93 @@
                                          (- (.frame-adjust p) 16)
                                          30
                                          16)
+              0)
+          (if (arm64-fun-process-entry? p)
+              (do
+                ;; Preserve the platform caller's X28, then install the process-wide nursery state
+                ;; in the compiler-reserved callee-saved heap register.
+                (arm64-split-encode-stack! encoder false false (- (.frame-adjust p) 8) 28 16)
+                (enc-add4! encoder 0x94000000)
+                (enc-add-symbol-fixup-at!
+                  encoder ENC-FIXUP-A64-BL26 d (- (.size p) 8) -1 "aot_rt_heap_state")
+                (enc-add4! encoder 0xaa0003fc))  ; mov x28,x0
               0))
         (if (= (.size p) 0)
             0
             (if (= op OP-NEW)
-                (do
-                  ;; The graph supplies payload bytes in X0. Shape identity is immutable New
-                  ;; metadata, so materialize it directly into the runtime ABI's X1 argument.
-                  (arm64-encode-immediate-to-reg! encoder (.alloc-shape p) 1)
-                  (arm64-encode-immediate-to-reg! encoder (.alloc-map-id p) 2)
-                  (enc-add4! encoder 0x910003e3)  ; add x3,sp,#0
-                  (enc-add4! encoder 0x94000000)
-                  (enc-add-symbol-fixup-at!
-                    encoder
-                    ENC-FIXUP-A64-BL26
-                    d
-                    (- (.size p) 4)
-                    (.fidx p)
-                    (.symbol p)))
-                    (if (= op OP-JSOP)
-                        (do
-                          (if (> (.alloc-map-id p) 0)
-                              (do
-                                (arm64-encode-immediate-to-reg! encoder (.alloc-shape p) 2)
-                                (arm64-encode-immediate-to-reg! encoder (.alloc-map-id p) 3)
-                                (enc-add4! encoder 0x910003e4))  ; add x4,sp,#0
-                              0)
-                          (enc-add4! encoder 0x94000000)
-                          (enc-add-symbol-fixup-at! encoder
-                                                    ENC-FIXUP-A64-BL26
-                                                    d
-                                                    (- (.size p) 4)
-                                                    (.fidx p)
-                                                    (.symbol p)))
-                    (if (or (= op OP-CALL) (= op OP-BARRIER))
-                        (if (.direct p)
-                            (do
-                              (if (= op OP-BARRIER)
-                                  (arm64-encode-immediate-to-reg! encoder (.barrier-kind p) 2)
-                                  0)
-                              (enc-add4! encoder 0x94000000)
-                              (if (= op OP-BARRIER)
-                                  (enc-add-symbol-fixup-at! encoder
-                                                            ENC-FIXUP-A64-BL26
-                                                            d
-                                                            (- (.size p) 4)
-                                                            (.fidx p)
-                                                            (.symbol p))
+                (arm64-encode-allocation! encoder p)
+                (if (= op OP-JSOP)
+                    (do
+                      (if (> (.alloc-map-id p) 0)
+                          (do
+                            (arm64-encode-immediate-to-reg! encoder (.alloc-shape p) 2)
+                            (arm64-encode-immediate-to-reg! encoder (.alloc-map-id p) 3)
+                            (enc-add4! encoder 0x910003e4))  ; add x4,sp,#0
+                          0)
+                      (enc-add4! encoder 0x94000000)
+                      (enc-add-symbol-fixup-at! encoder
+                                                ENC-FIXUP-A64-BL26
+                                                d
+                                                (- (.size p) 4)
+                                                (.fidx p)
+                                                (.symbol p)))
+                    (if (= op OP-BARRIER)
+                        (arm64-encode-barrier! encoder p)
+                        (if (= op OP-CALL)
+                            (if (.direct p)
+                                (do
+                                  (enc-add4! encoder 0x94000000)
                                   (if (enc-has-veneer-route? d)
                                       ;; BL establishes LR once; each veneer hop is B and preserves it.
                                       (enc-add-planned-veneer-fixup! encoder d 0)
                                       (enc-add-symbol-fixup!
-                                        encoder ENC-FIXUP-A64-BL26 d (.fidx p) (.symbol p)))))
-                        (let [target (n-in! d (- (n-nins d) 1))
-                              rn (enc-reg encoder target)]
-                          (if (or (< rn ARM64-X0) (> rn ARM64-X28))
-                              (panic-i "arm64-encode-call!: indirect target is not a GPR" rn)
-                              (enc-add4! encoder (| 0xd63f0000 (primitive/ishl rn 5))))))
-                    (if (= op OP-RETURN)
-                        (let [fun (enc-enclosing-fun d)
-                              frame (arm64-fun-frame-adjust fun)]
-                          (if (.entry-return p)
-                              (do
-                                ;; Host `main` returns an integer status, while JavaScript functions
-                                ;; return a NaN-boxed Number in X0. Preserve the internal ABI and adapt
-                                ;; only at the process boundary: signed-48 payloads sign-extend, doubles
-                                ;; truncate toward zero through D0.
-                                (enc-add4! encoder 0xd370fc10)  ; lsr x16,x0,#48
-                                (enc-add4! encoder 0xd28fff31)  ; mov x17,#0x7ff9
-                                (enc-add4! encoder 0xeb11021f)  ; cmp x16,x17
-                                (enc-add4! encoder 0x54000061)  ; b.ne double-arm
-                                (enc-add4! encoder 0x9340bc00)  ; sbfx x0,x0,#0,#48
-                                (enc-add4! encoder 0x14000003)  ; b done
-                                (enc-add4! encoder 0x9e670000)  ; fmov d0,x0
-                                (enc-add4! encoder 0x9e780000)  ; fcvtzs x0,d0
-                                0)
-                              0)
-                          (if (arm64-fun-has-calls? fun)
-                              (arm64-split-encode-stack! encoder
-                                                         true
-                                                         false
-                                                         (arm64-fun-saved-rpc-offset fun)
-                                                         30
-                                                         16)
-                              0)
-                          (arm64-encode-sp-adjust! encoder frame false)
-                          (enc-add4! encoder 0xd65f03c0)
-                          (enc-end-definition! encoder fun d))
-                        (do
-                          (panic-i "arm64-encode-call!: unsupported nonzero call-family node" op)
-                          0)))))))))
+                                        encoder ENC-FIXUP-A64-BL26 d (.fidx p) (.symbol p))))
+                                (let [target (n-in! d (- (n-nins d) 1))
+                                      rn (enc-reg encoder target)]
+                                  (if (or (< rn ARM64-X0) (> rn ARM64-X28))
+                                      (panic-i "arm64-encode-call!: indirect target is not a GPR" rn)
+                                      (enc-add4! encoder (| 0xd63f0000 (primitive/ishl rn 5))))))
+                            (if (= op OP-RETURN)
+                                (let [fun (enc-enclosing-fun d)
+                                      frame (arm64-fun-frame-adjust fun)]
+                                  (if (.entry-return p)
+                                      (do
+                                        ;; Host `main` returns an integer status, while JavaScript
+                                        ;; functions return a NaN-boxed Number in X0.
+                                        (enc-add4! encoder 0xd370fc10)  ; lsr x16,x0,#48
+                                        (enc-add4! encoder 0xd28fff31)  ; mov x17,#0x7ff9
+                                        (enc-add4! encoder 0xeb11021f)  ; cmp x16,x17
+                                        (enc-add4! encoder 0x54000061)  ; b.ne double-arm
+                                        (enc-add4! encoder 0x9340bc00)  ; sbfx x0,x0,#0,#48
+                                        (enc-add4! encoder 0x14000003)  ; b done
+                                        (enc-add4! encoder 0x9e670000)  ; fmov d0,x0
+                                        (enc-add4! encoder 0x9e780000)  ; fcvtzs x0,d0
+                                        0)
+                                      0)
+                                  (if (arm64-fun-has-calls? fun)
+                                      (arm64-split-encode-stack!
+                                        encoder
+                                        true
+                                        false
+                                        (arm64-fun-saved-rpc-offset fun)
+                                        30
+                                        16)
+                                      0)
+                                  (if (arm64-fun-process-entry? (arm64-call-node fun))
+                                      (arm64-split-encode-stack!
+                                        encoder
+                                        true
+                                        false
+                                        (- frame 8)
+                                        28
+                                        16)
+                                      0)
+                                  (arm64-encode-sp-adjust! encoder frame false)
+                                  (enc-add4! encoder 0xd65f03c0)
+                                  (enc-end-definition! encoder fun d))
+                                (do
+                                  (panic-i "arm64-encode-call!: unsupported nonzero call-family node" op)
+                                  0))))))))))
 
 (impl NodeOps Arm64CallNode
   (hdr [(self (ptr Arm64CallNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))

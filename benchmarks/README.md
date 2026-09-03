@@ -69,3 +69,8 @@ unset AOT_RT_HEAP_BYTES
 build/release/aot run benchmarks/binarytrees-aot.ts /tmp/aot-take-2-binarytrees.o /tmp/aot-take-2-binarytrees
 hyperfine --warmup 3 --runs 15 /tmp/aot-take-2-binarytrees 'node benchmarks/binarytrees-node.js'
 ```
+
+Set `AOT_RT_GC_STATS=1` on the generated AOT executable to print machine-readable collection,
+allocation, promotion, and remembered-card counters to standard error at process exit. The flag is
+off by default and does not change collection policy. Statistics mode deliberately routes
+allocations through the instrumented slow path, so benchmark elapsed time without that flag.

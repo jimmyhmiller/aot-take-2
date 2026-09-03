@@ -41,19 +41,19 @@ so layout and emission continue to agree exactly.
 
 ## 2026-08-31, amended 2026-09-02 — Generational collection uses a non-collecting post-write barrier
 
-Simple has no garbage collector and therefore fixes no write-barrier policy. Our first executable
-moving collector is stop-the-world and generational: allocation enters a copying nursery, every
-minor survivor is promoted into the active old generation, and major collection compacts reachable
+Simple has no garbage collector and therefore fixes no write-barrier policy. Our executable moving
+collector is stop-the-world and generational: allocation enters one of two copying nursery spaces,
+a first survivor ages in the other nursery space, a second survivor promotes into the active old
+generation, and major collection compacts reachable
 young and old objects into the other old-generation semispace. A Store whose value is a raw managed reference or a
 boxed word that may contain one is followed by a pinned Barrier. The Barrier consumes the Store's
 new alias-memory state plus `(object, value)` and returns that same memory type, placing remembered-
 set maintenance after the heap write in the memory SSA chain.
 
-Arm64 lowers the Barrier to the project runtime ABI symbol `aot_rt_write_barrier`, with object/value
-in X0/X1 and ordinary caller-save kills. The runtime entry is explicitly non-collecting, so this call
-is not a safepoint and needs no relocation dance or stack map. Selection passes an explicit raw or
-boxed value kind in X2; the runtime never guesses representation from bits. An old-to-young write
-dirties the owner's 512-byte old-space card. Each old semispace owns a byte card table and an
+Arm64 lowers the Barrier inline with arbitrary allocated object/value GPRs and fixed X15–X17 scratch
+kills. There is no call, caller-save clobber, safepoint, or relocation. The object's header embeds
+its owning card-byte address; zero identifies a nursery owner. An old-to-young write dirties the
+owner's 512-byte old-space card with the compiler-proven raw or boxed value kind. Each old semispace owns a byte card table and an
 object-start table, so minor collection begins at the first object intersecting each dirty card,
 scans the affected objects with the recorded raw/boxed card kinds, and clears the card before
 completing the promotion closure. Repeated writes coalesce by OR-ing card-kind bits. A future concurrent or SATB collector
@@ -124,6 +124,20 @@ other function's ABI masks, symbol, and frame ownership.
 Function ownership therefore participates directly in Return equality and hashing here. This
 makes explicit a fact Simple normally obtains from the RPC edge and remains valid after concrete
 RPC construction: a Return is a function exit, not a freely shareable tuple expression.
+
+## 2026-09-03 — Nursery allocation uses a reserved heap register and an outlined slow path
+
+Simple does not supply a garbage-collected allocation ABI. Generated AArch64 reserves callee-saved
+X28 for the `RtHeap` address and removes it from every ordinary, split, and save register mask. The
+compiler-owned process entry preserves the platform caller's X28, calls the Coil runtime once to
+boot and obtain the heap state, installs it for the closed-world program, and restores it on exit.
+
+Constant-size `New` operations compare and advance `RtHeap.used` against nursery capacity, write
+the runtime-owned header, and zero payload words inline. Exhaustion branches to the existing
+`aot_rt_alloc` safepoint with its stack-map identity and caller SP. GC stress and statistics modes
+set `fast-disabled`, forcing the same slow path so collection-on-every-allocation and exact counters
+remain authoritative. Allocation policy, root discovery, and collection remain entirely in Coil;
+the inline sequence is only the non-collecting realization of a successful nursery reservation.
 
 ## 2026-08-31 — Atomic loop finalization keeps the entry Scope alive
 

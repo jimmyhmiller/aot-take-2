@@ -85,10 +85,10 @@ FPR data registers. Memory/control lattice constants become zero-byte, non-LRG p
 selected graph. `New` now exists as final Simple's fresh-pointer/private-memory Multi, with an
 additional public-memory ordering input because JavaScript object initialization and publication
 may contain adjacent allocations. Shape identity remains distinct from its referent struct type;
-arm64 selects it as the two-instruction
-`aot_rt_alloc(bytes,shape,map-id,caller-sp)` boundary with X0 input, immediate X1/X2 metadata,
-an X3 caller-SP snapshot, X0 projection, and
-caller-save kills. MemMerge and MemPhi
+arm64 selects a constant-size nursery bump path plus the
+`aot_rt_alloc(bytes,shape,map-id,caller-sp)` exhaustion path. X28 holds the runtime heap state,
+X0 carries bytes and the resulting payload, and the slow path materializes shape/map identity in
+X1/X2 plus caller SP in X3. MemMerge and MemPhi
 cross selection as zero-register memory pseudos; Safepoint and post-write Barrier have explicit
 selected forms.
 
@@ -251,19 +251,18 @@ dominance: an earlier use is legal, while a same-block-later, dominated-block, o
 use of the pre-relocation value is rejected.
 
 Reference-bearing Stores are also rewritten through one idempotent post-write Barrier. Arm64 lowers
-the boundary to a non-collecting Coil-runtime `BL`: object/value use X0/X1, caller-save kills enter
-the IFG, functions preserve LR, and encoding retains a typed symbol relocation. Scalar Stores remain
+the boundary inline using header-embedded generation/card metadata and fixed scratch kills; it has
+no call, relocation, or safepoint. Scalar Stores remain
 barrier-free.
 
-`New` crosses the same Coil-owned runtime ABI as
-`aot_rt_alloc(bytes,shape,map-id,caller-sp)`. Generated code passes payload bytes in X0, selection
-materializes the immutable shape and stack-map identity in X1/X2, snapshots caller SP in X3, and
-the runtime returns the first payload byte in X0. The runtime owns a three-word header immediately before that address
-(payload size, collector metadata, then shape) and zeroes the payload. Consequently shape field offset zero remains the
+`New` normally compares and advances the nursery cursor inline through the compiler-reserved X28
+heap-state register, writes the three-word header, and zeroes its constant-size payload. Exhaustion,
+GC stress, and statistics mode branch to `aot_rt_alloc(bytes,shape,map-id,caller-sp)`, which remains
+the collecting safepoint. Consequently shape field offset zero remains the
 first user-visible word; generated code has no host-allocator symbol or header arithmetic.
 
 Allocation uses a Coil-owned copying nursery and a compacting two-semispace old generation. Minor
-collection promotes nursery survivors, scans dirty 512-byte old-space cards through a per-card
+collection ages first survivors in the other nursery semispace, promotes repeated survivors, scans dirty 512-byte old-space cards through a per-card
 object-start table, and clears the nursery. The post-write ABI carries a compiler-proven raw/boxed
 kind so remembered raw references and NaN-boxed references take their respective forwarding paths. Major
 collection copies the reachable young-and-old closure into the other old space. On exhaustion the Darwin runtime discovers the

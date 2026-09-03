@@ -182,6 +182,9 @@ When a `--fix` suggestion looks wrong, check it rather than accepting it. Report
 ## Working here
 
 - `coil test` is the gate. Green is the contract; nothing is committed red.
+- When the user asks to see compiler or IR graphs, use this repository's Graphviz machinery
+  (`aot.print.dot` and the Coil tools built on it). Do not use pad or substitute a generic
+  visualization: these graphs have project-specific node, edge, control, and memory conventions.
 - `coil check FILE` typechecks a single file; `coil namespace coil.X` is how you learn a stdlib API.
   Never guess a stdlib signature — ask the compiler.
 - Read `docs/LAYOUT.md` before adding a file. If a file exists with no row in that table, either add
