@@ -1,6 +1,7 @@
 ;; Safepoints redefine every live managed value through ordinary tuple projections.
 (module aot.tests.gc)
 (import "coil.assert" :use *)
+(import "coil.primitive" :as primitive)
 (import "aot.node.boot" :use *)
 (import "aot.node.node" :use *)
 (import "aot.node.constant" :use *)
@@ -8,7 +9,135 @@
 (import "aot.node.memory" :use *)
 (import "aot.codegen.gcmeta" :use *)
 (import "aot.type.type" :use *)
+(import "aot.shape" :use *)
 (import "aot.verify" :use *)
+(import "aot.rt.rt" :use *)
+
+(defn gc-test-string2 [(a i64) (b i64)] (-> i64)
+  (let [string (rt-alloc 12 SHAPE-STRING 0 0)]
+    (set! (primitive/cast (ptr i64) string) 2)
+    (rt-string-set-code-unit! string 0 a)
+    (rt-string-set-code-unit! string 1 b)
+    string))
+
+(deftest runtime_allocator_owns_headers_shapes_and_zeroed_payloads
+         (do
+         (rt-heap-reset! 1024)
+         (let [payload (rt-alloc 24 37 0 0)
+               bytes (primitive/cast (ptr u8) payload)]
+           (assert (!= payload 0))
+           (assert-eq (rt-payload-bytes payload) 24)
+           (assert-eq (rt-payload-shape payload) 37)
+           (assert-eq (primitive/cast i64 (load (primitive/index bytes 0))) 0)
+           (assert-eq (primitive/cast i64 (load (primitive/index bytes 12))) 0)
+           (assert-eq (primitive/cast i64 (load (primitive/index bytes 23))) 0)
+           (set! (primitive/index bytes 12) (primitive/cast u8 91))
+           (assert-eq (primitive/cast i64 (load (primitive/index bytes 12))) 91))))
+
+(deftest objects_larger_than_the_nursery_allocate_directly_in_old_space
+         (do
+           (rt-heap-reset-generational! 64 256)
+           (let [payload (rt-alloc 80 37 0 0)]
+             (assert (rt-in-old-space? payload))
+             (assert-eq (rt-payload-bytes payload) 80)
+             (assert-eq (rt-payload-shape payload) 37))))
+
+(deftest moving_runtime_collection_rewrites_roots_and_boxed_object_edges
+         (do
+           (rt-heap-reset! 256)
+           (let [child (rt-alloc 8 2 0 0)
+                 parent (rt-alloc 16 3 0 0)
+                 parent-words (primitive/cast (ptr i64) parent)
+                 root (primitive/alloc-stack i64)]
+             (set! (primitive/index parent-words 0)
+                   (| (primitive/ishl 0x7fff 48) child))
+             (set! root parent)
+             (let [before parent live-bytes (rt-collect-one-root! root) moved (load root)]
+               (assert (!= moved before))
+               (assert-eq live-bytes 72)
+               (assert-eq (rt-payload-shape moved) 3)
+               (let [boxed-child (load (primitive/cast (ptr i64) moved))
+                     moved-child (& boxed-child 0x0000ffffffffffff)]
+                 (assert (!= moved-child child))
+                 (assert-eq (primitive/ishr boxed-child 48) 0x7fff)
+                 (assert-eq (rt-payload-shape moved-child) 2))))))
+
+(deftest moving_runtime_collection_does_not_scan_utf16_string_payload_words
+         (do
+           (rt-heap-reset! 256)
+           (let [coincidental-target (rt-alloc 8 2 0 0)
+                 string (rt-alloc 8 SHAPE-STRING 0 0)
+                 string-word (primitive/cast (ptr i64) string)
+                 root (primitive/alloc-stack i64)
+                 boxed-looking-word
+                   (| (primitive/ishl 0x7fff 48) coincidental-target)]
+             ;; UTF-16 data is arbitrary bits. Even if a packed word looks exactly like a boxed
+             ;; object reference, the string layout's no-scan shape must leave it untouched.
+             (set! string-word boxed-looking-word)
+             (set! root string)
+             (assert-eq (rt-collect-one-root! root) 32)
+             (assert-eq (rt-payload-shape (load root)) SHAPE-STRING)
+             (assert-eq (load (primitive/cast (ptr i64) (load root))) boxed-looking-word))))
+
+(deftest minor_collection_uses_the_old_to_young_remembered_set
+         (do
+           (rt-heap-reset! 256)
+           (let [initial-child (rt-alloc 8 2 0 0)
+                 parent (rt-alloc 8 3 0 0)
+                 root (primitive/alloc-stack i64)]
+             (set! (primitive/cast (ptr i64) parent)
+                   (| (primitive/ishl 0x7fff 48) initial-child))
+             (set! root parent)
+             (rt-collect-one-root! root)
+             (let [old-parent (load root)
+                   young-child (rt-alloc 8 4 0 0)
+                   parent-word (primitive/cast (ptr i64) old-parent)]
+               (set! parent-word (| (primitive/ishl 0x7fff 48) young-child))
+               (aot-rt-write-barrier old-parent (load parent-word))
+               (rt-collect-one-root! root)
+               (let [moved-child (& (load parent-word) 0x0000ffffffffffff)]
+                 (assert (!= moved-child young-child))
+                 (assert-eq (rt-payload-shape moved-child) 4))))))
+
+(deftest major_collection_compacts_old_and_young_reachable_objects_together
+         (do
+           (rt-heap-reset! 128)
+           (let [child (rt-alloc 8 2 0 0)
+                 parent (rt-alloc 8 3 0 0)
+                 root (primitive/alloc-stack i64)]
+             (set! (primitive/cast (ptr i64) parent)
+                   (| (primitive/ishl 0x7fff 48) child))
+             (set! root parent)
+             (rt-collect-one-root! root)
+             (let [old-parent (load root)]
+               (rt-alloc 48 4 0 0)
+               (rt-collect-one-root! root)
+               (assert (!= (load root) old-parent))
+               (let [moved-child
+                       (& (load (primitive/cast (ptr i64) (load root)))
+                          0x0000ffffffffffff)]
+                 (assert-eq (rt-payload-shape (load root)) 3)
+                 (assert-eq (rt-payload-shape moved-child) 2))))))
+
+(deftest runtime_string_capabilities_use_utf16_code_unit_semantics
+         (do
+           (rt-heap-reset! 1024)
+           (let [ab (gc-test-string2 65 66)
+                 ab-again (gc-test-string2 65 66)
+                 ac (gc-test-string2 65 67)
+                 astral (gc-test-string2 0xd83d 0xde00)]
+             (assert-eq (rt-string-length astral) 2)
+             (assert-eq (rt-string-eq ab ab-again) 1)
+             (assert-eq (rt-string-eq ab ac) 0)
+             (assert-eq (rt-string-compare ab ac) -1)
+             (assert-eq (rt-string-compare ac ab) 1)
+             (assert-eq (rt-string-compare ab ab-again) 0)
+             (let [joined (rt-string-concat ab ac SHAPE-STRING 0 0)]
+               (assert-eq (rt-string-length joined) 4)
+               (assert-eq (rt-string-code-unit joined 0) 65)
+               (assert-eq (rt-string-code-unit joined 1) 66)
+               (assert-eq (rt-string-code-unit joined 2) 65)
+               (assert-eq (rt-string-code-unit joined 3) 67)))))
 
 (deftest safepoints_preserve_control_memory_and_relocate_each_live_reference
          (do
@@ -81,4 +210,19 @@
                  off (con-make (ty-int-con 8))
                  initial (con-make (ty-mem 10 (ty-int-bot)))]
              (store-make ctrl initial obj off value 10 (ty-int-bot))
+             (assert-eq (gc-lower-barriers!) 0))))
+
+(deftest non_reference_dynamic_singletons_do_not_gain_a_write_barrier
+         (do
+           (boot! 1)
+           (let [ctrl (con-make TY-CTRL)
+                 obj (con-make (ty-memptr false (ty-struct "DynamicOwner")))
+                 initial (con-make (ty-mem 11 (ty-dyn TAG-ANY)))]
+             (store-make ctrl
+                         initial
+                         obj
+                         (con-make (ty-int-con 0))
+                         (con-make (ty-dyn TAG-NULL))
+                         11
+                         (ty-dyn TAG-ANY))
              (assert-eq (gc-lower-barriers!) 0))))

@@ -17,14 +17,16 @@
 ;;       - - Split uncolourable LRGs
 ;;
 ;; "Attempt, split, retry" IS the algorithm. An allocator that cannot iterate cannot handle a
-;; program that genuinely needs spills. Simple caps it at 8 rounds and hard-errors past that rather
-;; than looping forever — a budget that is exceeded is a bug in splitting, not a reason to keep
-;; going.
+;; program that genuinely needs spills. Simple caps its scalar language at 8 rounds and hard-errors
+;; past that rather than looping forever. Our moving-GC divergence adds two fixed stack boundaries
+;; per live root (Safepoint input and relocation projection); the native relocation regression
+;; requires 14 deterministic rounds. We retain the same hard convergence guard with a 16-round
+;; budget rather than omitting those GC splits.
 ;;
 ;; ## Two economies worth preserving
 ;;
 ;; **Liveness and the interference graph are built in ONE pass.** One fewer traversal per round,
-;; and there are up to eight rounds.
+;; and there are up to sixteen rounds in the moving-GC target.
 ;;
 ;; **A single-register def or use DENIES rather than INTERFERES.** If a live range can only live in
 ;; RAX, then instead of adding interference edges to every neighbour, it simply removes RAX from
@@ -71,6 +73,10 @@
 ;; machine definition when its output mask overlaps the constrained use. Its `insertBefore` also
 ;; bypasses an older same-block Split when installing a replacement. Together these rules prevent
 ;; Split(Box), Split(Split(Box)), ... from reproducing the same conflict in every retry round.
+;; Simple's structural `insertBefore` also preserves that clone's position. Our dependency-driven
+;; local rescheduler may legally float a pure clone above a later register clobber. When that would
+;; invalidate the constrained use again, we retain a real Split: its broad input can live in a
+;; spill location across the clobber while its narrow result is materialized on the use side.
 ;;
 ;; ## Safepoint liveness carries KINDS, not just liveness  (our addition — Simple has no GC)
 ;;
@@ -99,8 +105,8 @@
 (import "aot.codegen.regmask" :use *)
 (import "aot.type.type" :use *)
 
-;; Simple gives up after 8 rounds. Exceeding it means splitting is not making progress.
-(const RA-MAX-ROUNDS 8)
+;; Simple's scalar cap is 8. Explicit moving-root stack boundaries require 14 in the native proof.
+(const RA-MAX-ROUNDS 16)
 
 ;; Live-range kinds, for the stack map. Not in Simple; required by a moving collector.
 (const LRG-SCALAR 0)
@@ -108,6 +114,10 @@
 (const LRG-RAW-REF 1)
 
 (const LRG-BOXED 2)
+
+;; A NaN-boxed word proven not to contain a heap reference still benefits from an addressable spill
+;; home across calls, but must not be reported to the collector as a relocatable root.
+(const LRG-BOXED-SCALAR 3)
 
 ;; Per-block backwards liveness. `defs` stores the representative definition nid for a live LRG;
 ;; `ids` is the sparse iteration order and retains a key after it is killed, so reinsertion never
@@ -185,14 +195,22 @@
 
 (defn ra-kind-of-node [(n (dyn NodeOps))] (-> i64)
   (let [t (n-ty n)]
-    (if (ty-memptr? t) LRG-RAW-REF (if (ty-dyn? t) LRG-BOXED LRG-SCALAR))))
+    (if (ty-memptr? t)
+        LRG-RAW-REF
+        (if (ty-dyn? t)
+            (if (ty-dyn-may-reference? t) LRG-BOXED LRG-BOXED-SCALAR)
+            LRG-SCALAR))))
 
 (defn ra-kind-join [(a i64) (b i64)] (-> i64)
   (if (= a b)
       a
       ;; A boxed word needs conservative stack-map treatment if a malformed or transitional LRG
       ;; also contains scalar evidence. Raw references remain precise only when every member agrees.
-      (if (or (= a LRG-BOXED) (= b LRG-BOXED)) LRG-BOXED LRG-RAW-REF)))
+      (if (or (= a LRG-BOXED) (= b LRG-BOXED))
+          LRG-BOXED
+          (if (or (= a LRG-RAW-REF) (= b LRG-RAW-REF))
+              LRG-RAW-REF
+              LRG-BOXED-SCALAR))))
 
 (defn ra-reset-state! [(round i64)] (-> i64)
   (let [a (alloc/malloc-allocator)
@@ -351,6 +369,9 @@
 
 (defn ra-lrg-kind [(id i64)] (-> i64)
   (get (.kinds (ra-state)) (ra-find! id)))
+
+(defn ra-lrg-reg [(id i64)] (-> i64)
+  (get (.regs (ra-state)) (ra-find! id)))
 
 (defn ra-lrg-and-mask! [(id i64) (mask (ptr RegMask))] (-> bool)
   (let [leader (ra-find! id)
@@ -914,24 +935,43 @@
       0))
 
 (defn ra-ifg-kills! [(mach (dyn MachNode)) (live (mut RaLive))] (-> i64)
-  (match (m-killmap mach)
-    (None [] 0)
-    (Some [kills]
+  (do
+    ;; Calls and allocations may enter the collector, while an explicit Safepoint describes the
+    ;; same relocatable state without emitting a call itself. Every managed value live across any
+    ;; of those boundaries receives a stable stack home which the runtime can find and update
+    ;; through the frame chain. Scalars retain the ordinary register policy; Barrier is explicitly
+    ;; non-collecting and therefore does not pay this constraint.
+    (let [op (m-ideal-op mach)]
+      (if (or (= op OP-CALL) (= op OP-NEW) (= op OP-JSOP) (= op OP-SAFEPOINT))
           (let [(mut i) 0]
             (loop (if (>= (load i) (len (.ids live)))
                       (break 0)
                       (let [lrg (ra-find! (get (.ids live) (load i)))]
-                        (if (!= (ra-live-get (mut live) lrg) 0)
-                            (match (ra-lrg-mask lrg)
-                              (Some [allowed]
-                                    (if (mask-overlap? allowed kills)
-                                        (do (ra-lrg-sub-mask! lrg kills) 0)
-                                        0))
-                              (None [] 0))
+                        (if (and (!= (ra-live-get (mut live) lrg) 0)
+                                 (!= (ra-lrg-kind lrg) LRG-SCALAR))
+                            (do (ra-lrg-and-mask! lrg (selected-gc-root-mask)) 0)
                             0)
                         (set! (mut i) (+ (load i) 1))
-                        (continue))))
-            0))))
+                        (continue)))))
+          0))
+    (match (m-killmap mach)
+      (None [] 0)
+      (Some [kills]
+            (let [(mut i) 0]
+              (loop (if (>= (load i) (len (.ids live)))
+                        (break 0)
+                        (let [lrg (ra-find! (get (.ids live) (load i)))]
+                          (if (!= (ra-live-get (mut live) lrg) 0)
+                              (match (ra-lrg-mask lrg)
+                                (Some [allowed]
+                                      (if (mask-overlap? allowed kills)
+                                          (do (ra-lrg-sub-mask! lrg kills) 0)
+                                          0))
+                                (None [] 0))
+                              0)
+                          (set! (mut i) (+ (load i) 1))
+                          (continue))))
+              0)))))
 
 (defn ra-ifg-node! [(n (dyn NodeOps)) (live (mut RaLive))] (-> i64)
   (match (mach-of n)
@@ -1287,22 +1327,17 @@
     (ra-insert-callee-saves!)
     (loop (if (ra-graph-colour! (load round))
               (break 0)
-              (let [count (ra-split-all! (load round))]
-                (if (= count 0)
-                    (panic-i "ra-run!: failed round produced no split" (load round))
-                    0)
+              (let [leader (ra-find! (ra-first-failed))
+                    sample (ra-lrg-sample-nid leader)]
                 (if (>= (load round) (- RA-MAX-ROUNDS 1))
-                    (let [sample (ra-lrg-sample-nid (ra-first-failed))]
-                      (match (arena-node sample)
-                        (Some [failed]
-                              (panic-i "ra-run!: allocator exceeded budget; ideal-op*100000+nid"
-                                       (+ (* (ra-ideal-op failed) 100000) sample)))
-                        (None []
-                              (panic-i "ra-run!: allocator exceeded budget; missing sample nid"
-                                       sample))))
+                    (panic-i "ra-run!: allocator exceeded budget; sample nid" sample)
                     0)
-                (set! (mut round) (+ (load round) 1))
-                (continue))))
+                (let [count (ra-split-all! (load round))]
+                  (if (= count 0)
+                      (panic-i "ra-run!: failed round produced no split; sample nid" sample)
+                      0)
+                  (set! (mut round) (+ (load round) 1))
+                  (continue)))))
     (ra-post-colour!)
     (load round)))
 
@@ -1451,7 +1486,8 @@
       (None [] (None [(dyn NodeOps)])))))
 
 (defn ra-build-function-areas! [] (-> i64)
-  (let [state (ra-state) (mut ci) 0]
+  (let [state (ra-state)
+        (mut ci) 0]
     (if (not (.function-area-ready state))
         (do
           (loop (if (>= (load ci) (code-cfg-count))
@@ -1551,7 +1587,8 @@
             (- 1000 (if (get (.multi-uses state) leader) 100 0))))))
 
 (defn ra-colour-has-split? [(id i64)] (-> bool)
-  (let [state (ra-state) leader (ra-find! id)]
+  (let [state (ra-state)
+        leader (ra-find! id)]
     (or (!= (get (.split-defs state) leader) 0)
         (!= (get (.split-uses state) leader) 0))))
 
@@ -1575,7 +1612,8 @@
                 (< best-size candidate-size))))))
 
 (defn ra-colour-low-sift-up! [(start i64)] (-> i64)
-  (let [work (.colour-low-work (ra-state)) (mut child) start]
+  (let [work (.colour-low-work (ra-state))
+        (mut child) start]
     (loop (if (<= (load child) 0)
               (break 0)
               (let [parent (/ (- (load child) 1) 2)
@@ -1591,7 +1629,8 @@
     0))
 
 (defn ra-colour-low-sift-down! [(start i64)] (-> i64)
-  (let [work (.colour-low-work (ra-state)) (mut root) start]
+  (let [work (.colour-low-work (ra-state))
+        (mut root) start]
     (loop (let [left (+ (* (load root) 2) 1)]
             (if (>= left (len work))
                 (break 0)
@@ -1935,6 +1974,16 @@
     (n-set-early-nid! copy (n-nid block))
     0))
 
+(defn ra-anchor-before-use! [(copy (dyn NodeOps))
+                             (value (dyn NodeOps))
+                             (use_ (dyn NodeOps))
+                             (block (dyn NodeOps))] (-> i64)
+  ;; Final Simple's `Node.insertBefore` edits the basic block's authoritative ordered list. Our
+  ;; local schedule is a separate durable table, so record the same exact relation there; adding
+  ;; graph dependencies cannot represent adjacency and allows later scheduling rounds to drift.
+  (do value block 0)
+  (if (ra-phi? use_) 0 (code-record-before-use! copy use_)))
+
 ;; Final Simple's makeSplit clones cheap machine definitions when their output mask can satisfy the
 ;; constrained use. This is not an optional peephole: repeatedly inserting a Split after a
 ;; cloneable Box leaves the same short fixed-register conflict for the next round. Re-materializing
@@ -1952,8 +2001,76 @@
                     (None [] false)
                     (Some [use-mask] (mask-overlap? value-mask use-mask))))))))
 
+(defn ra-clone-crosses-use-clobber? [(value (dyn NodeOps))
+                                     (use_ (dyn NodeOps))
+                                     (idx i64)] (-> bool)
+  (if (= (n-block-nid value) 0)
+      false
+      (let [value-block (ra-ifg-block-of value)
+            use-block (ra-split-block-for-use use_ idx)]
+        (if (or (not (n-same? value-block use-block))
+                (not (code-schedule-ready? value-block)))
+            false
+            (match (mach-of use_)
+              (None [] false)
+              (Some [use-mach]
+                    (match (m-regmap use-mach idx)
+                      (None [] false)
+                      (Some [required]
+                            (match (mach-of value)
+                              (None [] false)
+                              (Some [value-mach]
+                                    (match (m-outregmap value-mach)
+                                      (None [] false)
+                                      (Some [produced]
+                                            (let [from
+                                                    (ra-block-schedule-index value-block
+                                                                             (n-nid value))
+                                                  to
+                                                    (ra-block-schedule-index use-block
+                                                                             (n-nid use_))
+                                                  managed
+                                                    (or (ty-memptr? (n-ty value))
+                                                        (ty-dyn? (n-ty value)))
+                                                  (mut remaining) (mask-and produced required)
+                                                  (mut i) (+ from 1)]
+                                              (if (or (< from 0) (<= to from))
+                                                  false
+                                                  (do
+                                                    (loop (if (or (>= (load i) to)
+                                                                  (mask-empty? (load remaining)))
+                                                              (break 0)
+                                                              (do
+                                                                (match (mach-of (code-schedule-at use-block
+                                                                                                  (load i)))
+                                                                  (Some [between]
+                                                                        (do
+                                                                          (if (and managed
+                                                                                   (or (= (m-ideal-op between)
+                                                                                          OP-CALL)
+                                                                                       (= (m-ideal-op between)
+                                                                                          OP-NEW)
+                                                                                       (= (m-ideal-op between)
+                                                                                          OP-SAFEPOINT)))
+                                                                              (set! (mut remaining)
+                                                                                    (mask-and (load remaining)
+                                                                                              (selected-gc-root-mask)))
+                                                                              0)
+                                                                          (match (m-killmap between)
+                                                                            (Some [kills]
+                                                                                  (set! (mut remaining)
+                                                                                        (mask-sub (load remaining)
+                                                                                                  kills)))
+                                                                            (None [] 0))))
+                                                                  (None [] 0))
+                                                                (set! (mut i) (+ (load i) 1))
+                                                                (continue))))
+                                                    (mask-empty? (load remaining)))))))))))))))))
+
 (defn ra-bind-clone-at! [(copy (dyn NodeOps))
                          (value (dyn NodeOps))
+                         (value-mach (dyn MachNode))
+                         (use_ (dyn NodeOps))
                          (block (dyn NodeOps))] (-> i64)
   (do
     ;; Target clones copy their raw input slots but have no output edges. Rebind through NodeOps so
@@ -1969,9 +2086,15 @@
       (loop (if (>= (load input) (n-nins value))
                 (break 0)
                 (do
-                  (n-add-def! copy (n-in value (load input)))
+                  ;; Do not inherit a scheduling-only anchor from an older rematerialization.
+                  ;; Machine register inputs are the semantic operands; input zero is replaced by
+                  ;; the placement control above.
+                  (match (m-regmap value-mach (load input))
+                    (Some [_] (n-add-def! copy (n-in value (load input))))
+                    (None [] 0))
                   (set! (mut input) (+ (load input) 1))
                   (continue)))))
+    (ra-anchor-before-use! copy value use_ block)
     (ra-place-copy! copy block)
     0))
 
@@ -1983,7 +2106,8 @@
     (None [] (None [(dyn NodeOps)]))
     (Some [value-mach]
           (if (or (not (m-clone-cheap? value-mach))
-                  (not (ra-clone-compatible-with-use? value-mach use_ idx)))
+                  (not (ra-clone-compatible-with-use? value-mach use_ idx))
+                  (ra-clone-crosses-use-clobber? value use_ idx))
               (None [(dyn NodeOps)])
               (match (m-clone value-mach)
                 (None []
@@ -1992,7 +2116,7 @@
                         (None [(dyn NodeOps)])))
                 (Some [copy]
                       (do
-                        (ra-bind-clone-at! copy value block)
+                        (ra-bind-clone-at! copy value value-mach use_ block)
                         (Some copy))))))))
 
 (defn ra-split-before-use-node-mode! [(round i64)
@@ -2005,16 +2129,32 @@
       (do
         (panic-i "ra-split-before-use-node-mode!: input index out of range" idx)
         (unreachable-node))
-      (let [value (n-in! use_ idx)
+      (let [value
+              (match (n-in use_ idx)
+                (Some [input] input)
+                (None []
+                      (do
+                        (panic-i "ra-split-before-use-node-mode!: selected input disappeared"
+                                 (n-nid use_))
+                        (unreachable-node))))
             block (ra-split-block-for-use use_ idx)]
         (match (ra-clone-for-use value use_ idx block)
           (Some [copy]
                 (do
                   (n-set-def! use_ idx (Some copy))
+                  ;; Replacing the final use of an earlier cheap rematerialization leaves that
+                  ;; definition in the durable schedule unless we retire it explicitly. A dead
+                  ;; clone would otherwise be rediscovered as a register-bearing definition in
+                  ;; every allocation round and be rematerialized forever. Cheap machine nodes
+                  ;; are pure by contract, so an empty output multiset makes this value dead.
+                  (if (= (n-nouts value) 0) (n-kill! value) 0)
                   copy))
           (None []
                 (let [split (mach-make-split lrg kind round block value)]
                   (ra-place-copy! split block)
+                  (if (ra-clone-crosses-use-clobber? value use_ idx)
+                      (ra-anchor-before-use! split value use_ block)
+                      0)
                   (n-set-def! use_ idx (Some split))
                   ;; Simple's insertBefore bypasses an older same-block Split after placing the new
                   ;; one. Rebinding after the use moves preserves the old Split until the new input
@@ -2061,6 +2201,7 @@
           split (mach-make-split lrg kind round block def)
           (mut i) 0]
       (ra-place-copy! split block)
+      (code-record-after-def! split def)
       (loop (if (>= (load i) (len (load uses)))
                 (break 0)
                 (do
@@ -2208,7 +2349,7 @@
     ;; Final Simple removes the Split from the block's authoritative output list immediately.
     ;; Our schedule is durable and separate from def-use outs, so refresh it after graph removal;
     ;; otherwise dead zero-input Split entries reach layout and dereference a missing value input.
-    (if (> (len (load remove)) 0) (sched-run!) 0)
+    (if (> (len (load remove)) 0) (code-schedule-compact!) 0)
     (ra-success?)))
 
 ;; Colour: remove trivially-colourable nodes first, then any, until the graph is empty; then assign
@@ -2608,22 +2749,26 @@
               (do
                 (match (arena-node (get (load members) (load index)))
                   (Some [n]
-                        (if (= (ra-lrg-of! n) leader)
-                            (do
-                              (let [(mut ii) 0]
-                                (loop (if (>= (load ii) (n-nins n))
-                                          (break 0)
-                                          (do
-                                            (match (n-in n (load ii))
-                                              (Some [def]
-                                                    (if (= (ra-lrg-of! def) leader)
-                                                        (ra-lrg-member-push! (mut members)
-                                                                             (mut seen)
-                                                                             (n-nid def))
-                                                        0))
-                                              (None [] 0))
-                                            (set! (mut ii) (+ (load ii) 1))
-                                            (continue)))))
+                        (do
+                          ;; A representative machine use need not itself define this LRG. Always
+                          ;; cross its matching input edges so input-only global/rematerializable
+                          ;; definitions enter the component. Output expansion, by contrast, is
+                          ;; meaningful only for a node that actually defines the range.
+                          (let [(mut ii) 0]
+                            (loop (if (>= (load ii) (n-nins n))
+                                      (break 0)
+                                      (do
+                                        (match (n-in n (load ii))
+                                          (Some [def]
+                                                (if (= (ra-lrg-of! def) leader)
+                                                    (ra-lrg-member-push! (mut members)
+                                                                         (mut seen)
+                                                                         (n-nid def))
+                                                    0))
+                                          (None [] 0))
+                                        (set! (mut ii) (+ (load ii) 1))
+                                        (continue)))))
+                          (if (= (ra-lrg-of! n) leader)
                               (let [(mut oi) 0]
                                 (loop (if (>= (load oi) (n-nouts n))
                                           (break 0)
@@ -2635,8 +2780,8 @@
                                                                          (n-nid use_)))
                                               (None [] 0))
                                             (set! (mut oi) (+ (load oi) 1))
-                                            (continue))))))
-                            0))
+                                            (continue)))))
+                              0)))
                   (None [] 0))
                 (set! (mut index) (+ (load index) 1))
                 (continue))))
@@ -2815,16 +2960,19 @@
                               (let [idx (get (load indices) (load i))]
                                 (if (and (not (n-dead? use_))
                                          (< idx (n-nins use_))
-                                         (or (= (load min-depth) (load max-depth))
-                                             (match (mach-of (n-in! use_ idx))
-                                               (Some [input-mach]
-                                                     (m-clone-cheap? input-mach))
-                                               (None [] false))
-                                             (if empty-multi
-                                                 (>= (get (load use-depths) (load i))
-                                                     (load max-depth))
-                                                 (<= (get (load use-depths) (load i))
-                                                     (load min-depth)))))
+                                         (and (match (n-in use_ idx)
+                                                (Some [_] true)
+                                                (None [] false))
+                                              (or (= (load min-depth) (load max-depth))
+                                                  (match (mach-of (n-in! use_ idx))
+                                                    (Some [input-mach]
+                                                          (m-clone-cheap? input-mach))
+                                                    (None [] false))
+                                                  (if empty-multi
+                                                      (>= (get (load use-depths) (load i))
+                                                          (load max-depth))
+                                                      (<= (get (load use-depths) (load i))
+                                                          (load min-depth))))))
                                     ;; Generic ordinary uses deliberately pass skip=false, exactly
                                     ;; as Simple does, so a use-side cut is not bypassed back to the
                                     ;; failing same-block Split. Phi edges retain the safe bypass.
@@ -3079,7 +3227,10 @@
                                                   (Some [use_]
                                                         (let [idx (get (load indices) (load ui))]
                                                           (if (and (< idx (n-nins use_))
-                                                                   (n-same? (n-in! use_ idx) def)
+                                                                   (match (n-in use_ idx)
+                                                                     (Some [input]
+                                                                           (n-same? input def))
+                                                                     (None [] false))
                                                                    (mask-overlap? (get (load masks) (load ui))
                                                                                   class))
                                                               (do
@@ -3097,6 +3248,144 @@
                                     (continue))))
                         (load changed)))))))))
 
+(defn ra-split-managed-root-def! [(round i64) (lrg i64)] (-> bool)
+  ;; Phi coalescing may join a managed loop value, whose legal GC home is a stack slot, to a
+  ;; register-only producer such as Box or Load. Split exactly one such producer per allocation
+  ;; round. The Phi remains in the rooted stack range while the producer gets the ordinary broad
+  ;; input side of an after-definition copy. This is the definition-side counterpart to the
+  ;; register-only consumer boundary below.
+  (let [leader (ra-find! lrg)
+        members (ra-find-all-lrg leader)
+        roots (selected-gc-root-mask)
+        (mut mi) 0
+        (mut found) 0]
+    (loop (if (>= (load mi) (len members))
+              (break 0)
+              (do
+                (match (arena-node (get members (load mi)))
+                  (Some [def]
+                        (if (and (not (ra-phi? def))
+                                 (and (> (ra-lrg-of! def) 0)
+                                      (= (ra-find! (ra-lrg-of! def)) leader)))
+                            (match (mach-of def)
+                              (Some [mach]
+                                    (match (m-outregmap mach)
+                                      (Some [produced]
+                                            (if (not (mask-overlap? roots produced))
+                                                (do
+                                                  (set! (mut found) (n-nid def))
+                                                  (break 0))
+                                                0))
+                                      (None [] 0)))
+                              (None [] 0))
+                            0))
+                  (None [] 0))
+                (set! (mut mi) (+ (load mi) 1))
+                (continue))))
+    (if (= (load found) 0)
+        false
+        (match (arena-node (load found))
+          (Some [def]
+                (do
+                  (ra-split-after-def-node! round leader def SPLIT-KIND-AFTER-DEF)
+                  true))
+          (None []
+                (do
+                  (panic "ra-split-managed-root-def!: selected definition disappeared")
+                  false))))))
+
+(defn ra-split-managed-root-uses! [(round i64) (lrg i64)] (-> bool)
+  ;; A managed value live across Call/New is intentionally restricted to the target's addressable
+  ;; root homes. A later register-only consumer therefore needs a reload boundary; treating this
+  ;; as ordinary pressure and splitting the definition side merely reproduces the empty range.
+  (let [leader (ra-find! lrg)
+        members (ra-find-all-lrg leader)
+        roots (selected-gc-root-mask)
+        (mut mi) 0
+        (mut changed) false]
+    (loop (if (>= (load mi) (len members))
+              (break 0)
+              (do
+                (match (arena-node (get members (load mi)))
+                  (Some [use_]
+                        (match (mach-of use_)
+                          (Some [mach]
+                                (let [(mut idx) 1]
+                                  (loop (if (>= (load idx) (n-nins use_))
+                                            (break 0)
+                                            (do
+                                              (match (n-in use_ (load idx))
+                                                (Some [value]
+                                                      (if (and (> (ra-lrg-of! value) 0)
+                                                               (= (ra-find! (ra-lrg-of! value))
+                                                                  leader))
+                                                          (match (m-regmap mach (load idx))
+                                                            (Some [required]
+                                                                  (if (not (mask-overlap? roots required))
+                                                                      (do
+                                                                        (ra-split-before-use-node! round
+                                                                                                   leader
+                                                                                                   use_
+                                                                                                   (load idx)
+                                                                                                   SPLIT-KIND-BEFORE-USE)
+                                                                        (set! (mut changed) true))
+                                                                      0))
+                                                            (None [] 0))
+                                                          0))
+                                                (None [] 0))
+                                              (set! (mut idx) (+ (load idx) 1))
+                                              (continue))))))
+                          (None [] 0)))
+                  (None [] 0))
+                (set! (mut mi) (+ (load mi) 1))
+                (continue))))
+    (load changed)))
+
+(defn ra-split-pressure-use! [(round i64) (lrg i64)] (-> bool)
+  ;; A range can fail coloring because its interference clique consumes every allowed color even
+  ;; when no loop-depth boundary distinguishes a cheaper side. Snapshot-based splitting permits
+  ;; every ordinary use boundary to be cut in the same retry, as Simple's splitLRG does after it
+  ;; has selected the failed range.
+  (let [leader (ra-find! lrg)
+        members (ra-find-all-lrg leader)
+        (mut mi) 0
+        (mut changed) false]
+    (loop (if (>= (load mi) (len members))
+              (break 0)
+              (do
+                (match (arena-node (get members (load mi)))
+                  (Some [use_]
+                        (match (mach-of use_)
+                          (Some [mach]
+                                (let [(mut idx) 1]
+                                  (loop (if (>= (load idx) (n-nins use_))
+                                            (break 0)
+                                            (do
+                                              (match (n-in use_ (load idx))
+                                                (Some [input]
+                                                      (if (and (> (ra-lrg-of! input) 0)
+                                                               (= (ra-find! (ra-lrg-of! input))
+                                                                  leader))
+                                                          (match (m-regmap mach (load idx))
+                                                            (Some [_]
+                                                                  (do
+                                                                    (ra-split-before-use-node! round
+                                                                                               leader
+                                                                                               use_
+                                                                                               (load idx)
+                                                                                               SPLIT-KIND-BEFORE-USE)
+                                                                    (set! (mut changed) true)))
+                                                            (None [] 0))
+                                                          0))
+                                                (None [] 0))
+                                              (set! (mut idx) (+ (load idx) 1))
+                                              (continue))))))
+                          (None [] 0)))
+                  (None [] 0))
+                (set! (mut mi) (+ (load mi) 1))
+                (continue))))
+    (load changed)))
+
 (defn ra-split-one! [(round i64) (lrg i64)] (-> bool)
   (if (ra-lrg-has-self-conflict? lrg)
       (ra-split-self-conflict! round lrg)
@@ -3108,22 +3397,29 @@
                 fixed-uses (get (.fixed-use-counts state) leader)
                 empty (ra-lrg-mask-empty? leader)]
             (if (and empty
-                     (and (<= fixed-defs 1)
-                          (and (<= fixed-uses 1) (> (+ fixed-defs fixed-uses) 0))))
-                (ra-split-empty-simple! round leader)
+                     (and (!= (ra-lrg-kind leader) LRG-SCALAR)
+                          (or (ra-split-managed-root-def! round leader)
+                              (ra-split-managed-root-uses! round leader))))
+                true
                 (if (and empty
-                         (and (not (get (.multi-defs state) leader))
-                              (and (<= fixed-defs 1) (> fixed-uses 2))))
-                    (if (ra-split-empty-by-use-class! round leader)
-                        true
-                        (ra-split-by-loop-boundary! round leader))
+                         (and (<= fixed-defs 1)
+                              (and (<= fixed-uses 1) (> (+ fixed-defs fixed-uses) 0))))
+                    (ra-split-empty-simple! round leader)
                     (if (and empty
-                             (and (get (.multi-defs state) leader)
-                                  (and (> fixed-uses 1) (<= fixed-defs 1))))
-                        (if (ra-split-empty-single-uses! round leader)
+                             (and (not (get (.multi-defs state) leader))
+                                  (and (<= fixed-defs 1) (> fixed-uses 1))))
+                        (if (ra-split-empty-by-use-class! round leader)
                             true
                             (ra-split-by-loop-boundary! round leader))
-                        (ra-split-by-loop-boundary! round leader))))))))
+                        (if (and empty
+                                 (and (get (.multi-defs state) leader)
+                                      (and (> fixed-uses 1) (<= fixed-defs 1))))
+                            (if (ra-split-empty-single-uses! round leader)
+                                true
+                                (ra-split-by-loop-boundary! round leader))
+                            (if (ra-split-by-loop-boundary! round leader)
+                                true
+                                (ra-split-pressure-use! round leader))))))))))
 
 ;; A live range that conflicts with ITSELF — typically a Phi whose inputs need different registers.
 ;; Loop Phis are split cold-edges-first; see the header.
@@ -3323,6 +3619,7 @@
                                         (if (or (= op OP-CALL)
                                                 (= op OP-CALLEND)
                                                 (= op OP-NEW)
+                                                (= op OP-JSOP)
                                                 (= op OP-BARRIER))
                                             (set! (mut call-functions) owner true)
                                             0))))
@@ -3412,24 +3709,24 @@
     ;; input, so discovery and mutation must not share an output-list traversal.
     (let [(mut i) 0]
       (loop (if (>= (load i) (len splits))
-              (break 0)
-              (do
-                (match (arena-node (get splits (load i)))
-                  (Some [split]
-                        (if (and (= (n-op split) OP-MACH-SPLIT) (> (n-nins split) 1))
-                            (let [defreg (n-reg split)
-                                  (mut usereg) (n-reg (n-in! split 1))]
-                              (if (and (!= defreg (load usereg))
-                                       (ra-post-colour-bypass! split defreg))
-                                  (set! (mut usereg) (n-reg (n-in! split 1)))
-                                  0)
-                              (if (= defreg (load usereg))
-                                  (push! [i64] (mut remove) (n-nid split))
-                                  0))
-                            0))
-                  (None [] 0))
-                (set! (mut i) (+ (load i) 1))
-                (continue)))))
+                (break 0)
+                (do
+                  (match (arena-node (get splits (load i)))
+                    (Some [split]
+                          (if (and (= (n-op split) OP-MACH-SPLIT) (> (n-nins split) 1))
+                              (let [defreg (n-reg split)
+                                    (mut usereg) (n-reg (n-in! split 1))]
+                                (if (and (!= defreg (load usereg))
+                                         (ra-post-colour-bypass! split defreg))
+                                    (set! (mut usereg) (n-reg (n-in! split 1)))
+                                    0)
+                                (if (= defreg (load usereg))
+                                    (push! [i64] (mut remove) (n-nid split))
+                                    0))
+                              0))
+                    (None [] 0))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
     (let [(mut i) 0]
       (loop (if (>= (load i) (len (load remove)))
                 (break 0)
@@ -3444,5 +3741,5 @@
                     (None [] 0))
                   (set! (mut i) (+ (load i) 1))
                   (continue)))))
-    (if (> (len (load remove)) 0) (sched-run!) 0)
+    (if (> (len (load remove)) 0) (code-schedule-compact!) 0)
     (len (load remove))))

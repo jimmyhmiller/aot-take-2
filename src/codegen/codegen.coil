@@ -62,6 +62,11 @@
    (schedule (ArrayList i64))
    (sched-lo (ArrayList i64))
    (sched-hi (ArrayList i64))
+   ;; Split/clone nid -> exact non-Phi use nid. Final Simple mutates the CFG block's ordered
+   ;; output list in `insertBefore`; our flattened schedule records that durable placement here.
+   (before-use (ArrayList i64))
+   ;; Split nid -> exact definition nid, mirroring Simple's `insertAfter` ordered-list mutation.
+   (after-def (ArrayList i64))
    (booted bool)])
 
 (defn code [] (-> (ptr CodeGen))
@@ -88,8 +93,42 @@
     (set! (.schedule (code)) (al-new [i64] a))
     (set! (.sched-lo (code)) (al-new [i64] a))
     (set! (.sched-hi (code)) (al-new [i64] a))
+    (set! (.before-use (code)) (al-new [i64] a))
+    (set! (.after-def (code)) (al-new [i64] a))
     (set! (.booted (code)) true)
     0))
+
+(defn code-record-after-def! [(n (dyn NodeOps)) (def (dyn NodeOps))] (-> i64)
+  (let [id (n-nid n)]
+    (loop (if (> (len (.after-def (code))) id)
+              (break 0)
+              (do
+                (push! [i64] (mut (.after-def (code))) 0)
+                (continue))))
+    (set! (mut (.after-def (code))) id (n-nid def))
+    0))
+
+(defn code-record-before-use! [(n (dyn NodeOps)) (use_ (dyn NodeOps))] (-> i64)
+  (let [id (n-nid n)]
+    (loop (if (> (len (.before-use (code))) id)
+              (break 0)
+              (do
+                (push! [i64] (mut (.before-use (code))) 0)
+                (continue))))
+    (set! (mut (.before-use (code))) id (n-nid use_))
+    0))
+
+(defn code-before-use-target [(n (dyn NodeOps))] (-> i64)
+  (let [id (n-nid n)]
+    (if (or (< id 0) (>= id (len (.before-use (code)))))
+        0
+        (get (.before-use (code)) id))))
+
+(defn code-after-def-target [(n (dyn NodeOps))] (-> i64)
+  (let [id (n-nid n)]
+    (if (or (< id 0) (>= id (len (.after-def (code)))))
+        0
+        (get (.after-def (code)) id))))
 
 (defn code-set-roots! [(start (dyn NodeOps)) (stop (dyn NodeOps))] (-> i64)
   (do
@@ -160,12 +199,16 @@
         (panic-i "code-schedule-end-block!: block is not open" id)
         (do (set! (mut (.sched-hi (code))) id (len (.schedule (code)))) 0))))
 
+(defn code-schedule-ready? [(block (dyn NodeOps))] (-> bool)
+  (let [id (n-nid block)]
+    (and (>= id 0)
+         (and (< id (len (.sched-lo (code))))
+              (and (>= (get (.sched-lo (code)) id) 0)
+                   (>= (get (.sched-hi (code)) id) 0))))))
+
 (defn code-schedule-count [(block (dyn NodeOps))] (-> i64)
   (let [id (n-nid block)]
-    (if (or (< id 0)
-            (>= id (len (.sched-lo (code))))
-            (< (get (.sched-lo (code)) id) 0)
-            (< (get (.sched-hi (code)) id) 0))
+    (if (not (code-schedule-ready? block))
         (panic-i "code-schedule-count: block has no completed schedule" id)
         (- (get (.sched-hi (code)) id) (get (.sched-lo (code)) id)))))
 
@@ -178,6 +221,133 @@
           (Some [n] n)
           (None [] (do (panic "code-schedule-at: scheduled node is missing")
                        (unreachable-node)))))))
+
+(defn code-schedule-compact! [] (-> i64)
+  ;; Post-colouring may subsume no-op Split nodes. Their removal cannot invalidate the established
+  ;; instruction order, whereas running the dependency scheduler again can: register assignment is
+  ;; already fixed, so an otherwise independent definition may no longer move into a proven
+  ;; no-clobber interval. Compact the authoritative schedule in place, preserving every survivor's
+  ;; relative order exactly as final Simple's ordered block-output removal does.
+  (let [a (alloc/malloc-allocator)
+        (mut next) (al-new [i64] a)
+        (mut ci) 0
+        (mut removed) 0]
+    (loop (if (>= (load ci) (len (.cfg (code))))
+              (break 0)
+              (do
+                (match (arena-node (get (.cfg (code)) (load ci)))
+                  (Some [block]
+                        (if (code-schedule-ready? block)
+                            (let [id (n-nid block)
+                                  old-lo (get (.sched-lo (code)) id)
+                                  old-hi (get (.sched-hi (code)) id)
+                                  (mut at) old-lo]
+                              (set! (mut (.sched-lo (code))) id (len (load next)))
+                              (loop (if (>= (load at) old-hi)
+                                        (break 0)
+                                        (do
+                                          (match (arena-node (get (.schedule (code)) (load at)))
+                                            (Some [n]
+                                                  (if (n-dead? n)
+                                                      (set! (mut removed) (+ (load removed) 1))
+                                                      (push! [i64] (mut next) (n-nid n))))
+                                            (None []
+                                                  (panic "code-schedule-compact!: scheduled node disappeared")))
+                                          (set! (mut at) (+ (load at) 1))
+                                          (continue))))
+                              (set! (mut (.sched-hi (code))) id (len (load next))))
+                            0))
+                  (None [] (panic "code-schedule-compact!: CFG block disappeared")))
+                (set! (mut ci) (+ (load ci) 1))
+                (continue))))
+    (set! (.schedule (code)) (load next))
+    (load removed)))
+
+(defn code-schedule-honor-before-uses! [(block (dyn NodeOps))] (-> i64)
+  ;; Stable-move every recorded copy to the slot immediately preceding its use. The dependency
+  ;; scheduler has already proved def-before-copy-before-use; this changes no semantic order and
+  ;; exactly mirrors Simple's authoritative `cfg._outputs.insert(copy, use-index)` placement.
+  (let [lo (get (.sched-lo (code)) (n-nid block))
+        count (code-schedule-count block)
+        (mut use-index) 1
+        (mut moved) 0]
+    (loop (if (>= (load use-index) count)
+              (break 0)
+              (let [use-id (get (.schedule (code)) (+ lo (load use-index)))
+                    (mut copy-index) 1
+                    (mut found) -1]
+                (loop (if (or (>= (load copy-index) (load use-index)) (>= (load found) 0))
+                          (break 0)
+                          (let [copy-id (get (.schedule (code)) (+ lo (load copy-index)))]
+                            (if (and (< copy-id (len (.before-use (code))))
+                                     (= (get (.before-use (code)) copy-id) use-id))
+                                (set! (mut found) (load copy-index))
+                                0)
+                            (set! (mut copy-index) (+ (load copy-index) 1))
+                            (continue))))
+                (if (and (>= (load found) 0) (!= (load found) (- (load use-index) 1)))
+                    (let [copy-id (get (.schedule (code)) (+ lo (load found)))
+                          (mut i) (load found)]
+                      (loop (if (>= (load i) (- (load use-index) 1))
+                                (break 0)
+                                (do
+                                  (set! (mut (.schedule (code)))
+                                        (+ lo (load i))
+                                        (get (.schedule (code)) (+ lo (+ (load i) 1))))
+                                  (set! (mut i) (+ (load i) 1))
+                                  (continue))))
+                      (set! (mut (.schedule (code))) (+ lo (- (load use-index) 1)) copy-id)
+                      (set! (mut moved) (+ (load moved) 1)))
+                    0)
+                (set! (mut use-index) (+ (load use-index) 1))
+                (continue))))
+    (load moved)))
+
+(defn code-schedule-honor-after-defs! [(block (dyn NodeOps)) (entry-prefix-end i64)] (-> i64)
+  ;; Stable-move each after-definition split back to the slot directly following its definition.
+  ;; Multiple copies after the same definition retain scheduler order and remain adjacent.
+  (let [lo (get (.sched-lo (code)) (n-nid block))
+        count (code-schedule-count block)
+        (mut copy-index) 1
+        (mut moved) 0]
+    (loop (if (>= (load copy-index) count)
+              (break 0)
+              (let [copy-id (get (.schedule (code)) (+ lo (load copy-index)))]
+                (if (and (< copy-id (len (.after-def (code))))
+                         (!= (get (.after-def (code)) copy-id) 0))
+                    (let [def-id (get (.after-def (code)) copy-id)
+                          (mut def-index) 0
+                          (mut found) -1]
+                      (loop (if (or (>= (load def-index) (load copy-index))
+                                    (>= (load found) 0))
+                                (break 0)
+                                (do
+                                  (if (= (get (.schedule (code)) (+ lo (load def-index))) def-id)
+                                      (set! (mut found) (load def-index))
+                                      0)
+                                  (set! (mut def-index) (+ (load def-index) 1))
+                                  (continue))))
+                      (let [insert-index
+                              (if (< (load found) entry-prefix-end)
+                                  entry-prefix-end
+                                  (+ (load found) 1))]
+                      (if (and (>= (load found) 0) (> (load copy-index) insert-index))
+                          (let [(mut i) (load copy-index)]
+                            (loop (if (<= (load i) insert-index)
+                                      (break 0)
+                                      (do
+                                        (set! (mut (.schedule (code)))
+                                              (+ lo (load i))
+                                              (get (.schedule (code)) (+ lo (- (load i) 1))))
+                                        (set! (mut i) (- (load i) 1))
+                                        (continue))))
+                            (set! (mut (.schedule (code))) (+ lo insert-index) copy-id)
+                            (set! (mut moved) (+ (load moved) 1)))
+                          0)))
+                    0)
+                (set! (mut copy-index) (+ (load copy-index) 1))
+                (continue))))
+    (load moved)))
 
 ;; Run the pipeline up to and including `upto`. The whole compiler is this function.
 (defn code-drive! [(upto i64)] (-> i64)

@@ -29,10 +29,28 @@
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
+(import "coil.slice" :use [subslice])
 (import "aot.util.panic" :use *)
 
 ;; The field-less root. Every object starts here.
 (const SHAPE-EMPTY 1)
+
+;; Runtime-reserved immutable layout. The high descriptor bit says the payload contains no boxed
+;; reference slots; its low identity remains distinct from every compiler-created transition.
+(const SHAPE-STRING 0x4000000000000001)
+
+(const ALIAS-STRING-LENGTH 2)
+(const ALIAS-STRING-DATA 3)
+
+;; Every ordinary object payload begins with two boxed references. Keeping property storage behind
+;; an independently movable backing object preserves JavaScript identity when a shape transition
+;; grows the property set; the collector traces both slots like any other boxed object edge.
+(const ALIAS-OBJECT-PROTOTYPE 4)
+(const ALIAS-OBJECT-PROPERTIES 5)
+(const ALIAS-OBJECT-SHAPE 6)
+(const OFFSET-OBJECT-PROTOTYPE 0)
+(const OFFSET-OBJECT-PROPERTIES 8)
+(const OBJECT-PAYLOAD-BYTES 16)
 
 (const SHAPE-WORD-BYTES 8)
 
@@ -40,15 +58,26 @@
   [(parent (ArrayList i64))
    (nameoff (ArrayList i64))
    (namelen (ArrayList i64))
+   (keyid (ArrayList i64))
    (alias (ArrayList i64))
    (offset (ArrayList i64))
    (field-count (ArrayList i64))
    (bytes (ArrayList u8))
+   (key-nameoff (ArrayList i64))
+   (key-namelen (ArrayList i64))
    (next-alias i64)
    (booted bool)])
 
 (defn shape-table [] (-> (ptr ShapeTable))
   (primitive/alloc-static ShapeTable))
+
+;; Shape and property-key identities are compilation-local metadata. Reusing their numeric IDs
+;; across `boot!` would let a JSL representation dispatch compiled for one source unit observe
+;; transition rows left by another unit in the same compiler process.
+(defn shape-reset! [] (-> i64)
+  (let [t (shape-table)]
+    (set! (.booted t) false)
+    (shape-boot!)))
 
 (defn shape-boot! [] (-> i64)
   (let [t (shape-table)]
@@ -58,29 +87,102 @@
           (set! (.parent t) (al-new [i64] a))
           (set! (.nameoff t) (al-new [i64] a))
           (set! (.namelen t) (al-new [i64] a))
+          (set! (.keyid t) (al-new [i64] a))
           (set! (.alias t) (al-new [i64] a))
           (set! (.offset t) (al-new [i64] a))
           (set! (.field-count t) (al-new [i64] a))
           (set! (.bytes t) (al-new [u8] a))
+          (set! (.key-nameoff t) (al-new [i64] a))
+          (set! (.key-namelen t) (al-new [i64] a))
           ;; Slot zero is invalid; slot one is the field-less root.
           (push! [i64] (mut (.parent t)) 0)
           (push! [i64] (mut (.nameoff t)) 0)
           (push! [i64] (mut (.namelen t)) 0)
+          (push! [i64] (mut (.keyid t)) 0)
           (push! [i64] (mut (.alias t)) 0)
           (push! [i64] (mut (.offset t)) 0)
           (push! [i64] (mut (.field-count t)) 0)
           (push! [i64] (mut (.parent t)) 0)
           (push! [i64] (mut (.nameoff t)) 0)
           (push! [i64] (mut (.namelen t)) 0)
+          (push! [i64] (mut (.keyid t)) 0)
           (push! [i64] (mut (.alias t)) 0)
           (push! [i64] (mut (.offset t)) 0)
           (push! [i64] (mut (.field-count t)) 0)
-          (set! (.next-alias t) 2)  ; alias 1 is bulk memory
+          ;; Property-key ID zero is invalid. IDs are canonical on exact UTF-8 bytes.
+          (push! [i64] (mut (.key-nameoff t)) 0)
+          (push! [i64] (mut (.key-namelen t)) 0)
+          ;; Alias 1 is bulk; 2/3 strings; 4/5 object slots; 6 is the runtime shape header.
+          (set! (.next-alias t) 7)
           (set! (.booted t) true)
           0))))
 
+(defn shape-key-name-eq? [(key i64) (name (slice u8))] (-> bool)
+  (let [t (shape-table)
+        off (get (.key-nameoff t) key)
+        ln (get (.key-namelen t) key)]
+    (if (!= ln (len name))
+        false
+        (let [(mut i) 0 (mut same) true]
+          (loop (if (or (>= (load i) ln) (not (load same)))
+                    (break 0)
+                    (do
+                      (if (!= (get (.bytes t) (+ off (load i))) (get name (load i)))
+                          (set! (mut same) false)
+                          0)
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (load same)))))
+
+(defn shape-key-intern [(name (slice u8))] (-> i64)
+  (do
+    (shape-boot!)
+    (if (= (len name) 0) (panic "shape-key-intern: empty property key") 0)
+    (let [t (shape-table) (mut key) 1 (mut found) 0]
+      (loop (if (>= (load key) (len (.key-nameoff t)))
+                (break 0)
+                (if (shape-key-name-eq? (load key) name)
+                    (do (set! (mut found) (load key)) (break 0))
+                    (do (set! (mut key) (+ (load key) 1)) (continue)))))
+      (if (!= (load found) 0)
+          (load found)
+          (let [id (len (.key-nameoff t)) off (len (.bytes t)) (mut i) 0]
+            (loop (if (>= (load i) (len name))
+                      (break 0)
+                      (do
+                        (push! [u8] (mut (.bytes t)) (get name (load i)))
+                        (set! (mut i) (+ (load i) 1))
+                        (continue))))
+            (push! [i64] (mut (.key-nameoff t)) off)
+            (push! [i64] (mut (.key-namelen t)) (len name))
+            id)))))
+
+(defn shape-key-count [] (-> i64)
+  (do (shape-boot!) (- (len (.key-nameoff (shape-table))) 1)))
+
+(defn shape-key-name [(key i64)] (-> (slice u8))
+  (do
+    (shape-boot!)
+    (if (or (<= key 0) (> key (shape-key-count)))
+        (do (panic-i "shape-key-name: invalid property key" key) "")
+        (let [t (shape-table) off (get (.key-nameoff t) key) ln (get (.key-namelen t) key)]
+          (subslice [u8] (al-slice (.bytes t)) off (+ off ln))))))
+
+(defn shape-field-key [(shape i64)] (-> i64)
+  (do
+    (if (or (<= shape SHAPE-EMPTY) (not (shape-valid? shape)))
+        (panic-i "shape-field-key: shape introduces no field" shape)
+        0)
+    (get (.keyid (shape-table)) shape)))
+
+(defn shape-count [] (-> i64)
+  (do (shape-boot!) (len (.parent (shape-table)))))
+
 (defn shape-valid? [(shape i64)] (-> bool)
-  (do (shape-boot!) (and (>= shape SHAPE-EMPTY) (< shape (len (.parent (shape-table)))))))
+  (do
+    (shape-boot!)
+    (or (= shape SHAPE-STRING)
+        (and (>= shape SHAPE-EMPTY) (< shape (len (.parent (shape-table))))))))
 
 (defn shape-name-eq? [(shape i64) (name (slice u8))] (-> bool)
   (let [t (shape-table)
@@ -110,6 +212,47 @@
                   (do (set! (mut shape) (get (.parent (shape-table)) (load shape))) (continue)))))
     (load found)))
 
+(defn shape-find-field-key [(shape0 i64) (key i64)] (-> i64)
+  (let [(mut shape) shape0 (mut found) 0]
+    (if (or (<= key 0) (> key (shape-key-count)))
+        (panic-i "shape-find-field-key: invalid property key" key)
+        0)
+    (loop (if (= (load shape) SHAPE-EMPTY)
+              (break 0)
+              (if (= (get (.keyid (shape-table)) (load shape)) key)
+                  (do (set! (mut found) (load shape)) (break 0))
+                  (do (set! (mut shape) (get (.parent (shape-table)) (load shape))) (continue)))))
+    (load found)))
+
+(defn shape-has-key? [(shape i64) (key i64)] (-> bool)
+  (do
+    (if (not (shape-valid? shape)) (panic-i "shape-has-key?: invalid shape" shape) 0)
+    (!= (shape-find-field-key shape key) 0)))
+
+(defn shape-alias-key [(shape i64) (key i64)] (-> i64)
+  (let [field (shape-find-field-key shape key)]
+    (if (= field 0)
+        (do (panic "shape-alias-key: key is not in shape") 0)
+        (get (.alias (shape-table)) field))))
+
+(defn shape-offset-key [(shape i64) (key i64)] (-> i64)
+  (let [field (shape-find-field-key shape key)]
+    (if (= field 0)
+        (do (panic "shape-offset-key: key is not in shape") 0)
+        (get (.offset (shape-table)) field))))
+
+(defn shape-field-alias-at [(shape0 i64) (index i64)] (-> i64)
+  (do
+    (if (or (< index 0) (>= index (shape-field-count shape0)))
+        (panic-i "shape-field-alias-at: invalid field index" index)
+        0)
+    (let [(mut shape) shape0]
+      (loop (if (= (get (.offset (shape-table)) (load shape)) (* index SHAPE-WORD-BYTES))
+                (break (get (.alias (shape-table)) (load shape)))
+                (do
+                  (set! (mut shape) (get (.parent (shape-table)) (load shape)))
+                  (continue)))))))
+
 ;; Follow (or create) the transition that adds `name` to `from`. Memoised.
 (defn shape-transition [(from i64) (name (slice u8))] (-> i64)
   (do
@@ -134,19 +277,29 @@
           (if (!= (load found) 0)
               (load found)
               (let [id (len (.parent t))
+                    key (shape-key-intern name)
+                    keyoff (get (.key-nameoff t) key)
+                    keylen (get (.key-namelen t) key)
                     nameoff (len (.bytes t))
                     count (get (.field-count t) from)
                     alias (.next-alias t)
                     (mut i) 0]
-                (loop (if (>= (load i) (len name))
+                ;; `name` is commonly the slice returned by shape-key-name and can therefore
+                ;; alias this ArrayList's backing allocation. Appending may reallocate it. Copy
+                ;; through the canonical key offset and re-read the current ArrayList each
+                ;; iteration instead of retaining that potentially stale slice.
+                (loop (if (>= (load i) keylen)
                           (break 0)
                           (do
-                            (push! [u8] (mut (.bytes t)) (get name (load i)))
+                            (push! [u8]
+                                   (mut (.bytes t))
+                                   (get (.bytes t) (+ keyoff (load i))))
                             (set! (mut i) (+ (load i) 1))
                             (continue))))
                 (push! [i64] (mut (.parent t)) from)
                 (push! [i64] (mut (.nameoff t)) nameoff)
-                (push! [i64] (mut (.namelen t)) (len name))
+                (push! [i64] (mut (.namelen t)) keylen)
+                (push! [i64] (mut (.keyid t)) key)
                 (push! [i64] (mut (.alias t)) alias)
                 ;; Offsets are relative to the first object payload word. Runtime object headers
                 ;; are not shape fields and the allocator adds its header size exactly once.

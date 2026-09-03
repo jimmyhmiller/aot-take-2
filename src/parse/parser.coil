@@ -45,6 +45,7 @@
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
+(import "coil.slice" :use [subslice])
 (import "coil.str" :use [str->cstr])
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
@@ -56,6 +57,7 @@
 (import "aot.node.memory" :use *)
 (import "aot.node.scope" :use *)
 (import "aot.type.type" :use *)
+(import "aot.shape" :use *)
 (import "aot.jsl.lower" :use *)
 (import "aot.parse.lexer" :use *)
 
@@ -72,6 +74,14 @@
 (const SX-CALL 6)
 
 (const SX-CONDITIONAL 7)
+
+(const SX-STRING 8)
+
+(const SX-MEMBER 9)
+
+(const SX-OBJECT 10)
+
+(const SX-LT 11)
 
 (const SS-LET 1)
 
@@ -112,6 +122,7 @@
 (defstruct SyntaxStmt
   [(kind i64)
    (name (slice u8))
+   (target i64)
    (expr i64)
    (final bool)
    (body (ArrayList i64))
@@ -197,6 +208,78 @@
 (defn syntax-at [(id i64)] (-> SyntaxExpr)
   (get (.exprs (parser-state)) (- id 1)))
 
+;; Declare the closed-world hidden-class transition universe before lowering reusable JSL graphs.
+;; Key interning alone is insufficient: representation-level own-property dispatch enumerates
+;; shapes, and source object literals create their ordered transition paths only during body
+;; lowering. Walking the already complete syntax table here makes those layouts available to JSL
+;; without moving any JavaScript semantic decision out of JSL.
+(defn syntax-declare-object-shapes! [] (-> i64)
+  (let [(mut i) 0
+        (mut declared) 0
+        (mut write-keys) (al-new [i64] (alloc/malloc-allocator))]
+    (loop (if (>= (load i) (len (.exprs (parser-state))))
+              (break 0)
+              (let [x (get (.exprs (parser-state)) (load i))]
+                (if (= (.kind x) SX-OBJECT)
+                    (let [(mut shape) SHAPE-EMPTY (mut entry) 0]
+                      (loop (if (>= (load entry) (len (.args x)))
+                                (break 0)
+                                (do
+                                  ;; The object-initializer `__proto__` setter mutates the stable
+                                  ;; prototype slot; it does not define a data property or create a
+                                  ;; hidden-class transition.
+                                  (let [key (get (.args x) (load entry))]
+                                    (if (= (shape-key-name key) "__proto__")
+                                        0
+                                        (set! (mut shape)
+                                              (shape-transition (load shape)
+                                                                (shape-key-name key)))))
+                                  (set! (mut entry) (+ (load entry) 2))
+                                  (continue))))
+                      (set! (mut declared) (+ (load declared) 1)))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    ;; A named assignment can execute against any ordinary-object shape reachable at that site,
+    ;; including a shape produced by an earlier loop iteration. Close the finite transition graph
+    ;; over every source-visible write key before JSL emits its runtime shape dispatch.
+    (set! (mut i) 0)
+    (loop (if (>= (load i) (len (.stmts (parser-state))))
+              (break 0)
+              (let [stmt (get (.stmts (parser-state)) (load i))]
+                (if (and (= (.kind stmt) SS-ASSIGN) (> (.target stmt) 0))
+                    (let [target (syntax-at (.target stmt))]
+                      (if (= (.kind target) SX-MEMBER)
+                          (push! [i64] (mut write-keys) (shape-key-intern (.name target)))
+                          0))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (let [(mut changed) true]
+      (loop (if (not (load changed))
+                (break 0)
+                (let [before (shape-count) (mut shape) SHAPE-EMPTY]
+                  (set! (mut changed) false)
+                  (loop (if (>= (load shape) before)
+                            (break 0)
+                            (if (= (load shape) SHAPE-STRING)
+                                (do (set! (mut shape) (+ (load shape) 1)) (continue))
+                                (let [(mut key-index) 0]
+                                  (loop (if (>= (load key-index) (len (load write-keys)))
+                                            (break 0)
+                                            (do
+                                              (shape-transition
+                                                (load shape)
+                                                (shape-key-name
+                                                  (get (load write-keys) (load key-index))))
+                                              (set! (mut key-index) (+ (load key-index) 1))
+                                              (continue))))
+                                  (set! (mut shape) (+ (load shape) 1))
+                                  (continue)))))
+                  (if (> (shape-count) before) (set! (mut changed) true) 0)
+                  (continue)))))
+    (load declared)))
+
 (defn syntax-stmt-new [(kind i64) (lo i64) (hi i64)] (-> SyntaxStmt)
   (let [(mut s) (primitive/zeroed SyntaxStmt)]
     (set! (.kind (mut s)) kind)
@@ -244,18 +327,53 @@
             (let [(mut x) (syntax-expr-new SX-NAME (.start t) (.end t))]
               (set! (.name (mut x)) (token-text t))
               (syntax-add! (load x)))
-            (if (token-is t "(")
-                (let [x (parse-syntax-conditional)] (do (require-token ")") x))
-                (do
-                  ;; Strings and object literals are lexically recognized but not admitted until
-                  ;; their runtime representations and memory nodes exist. Refusal is immediate.
-                  (parse-fail "parser: primary is outside the admitted subset at byte" t)
-                  0))))))
+            (if (= (.kind t) TOK-STRING)
+                (let [text (token-text t)
+                      (mut x) (syntax-expr-new SX-STRING (.start t) (.end t))
+                      (mut i) 1]
+                  ;; Escape decoding is a lexical operation and must precede JSL's UTF-16
+                  ;; allocation semantics. Refuse escapes until the complete ECMAScript decoder
+                  ;; lands; accepting the backslash bytes as characters would be miscompilation.
+                  (loop (if (>= (load i) (- (len text) 1))
+                            (break 0)
+                            (if (= (get text (load i)) (cast u8 92))
+                                (break (parse-fail "parser: string escapes are not yet admitted at byte" t))
+                                (do (set! (mut i) (+ (load i) 1)) (continue)))))
+                  (set! (.name (mut x)) (subslice [u8] text 1 (- (len text) 1)))
+                  (syntax-add! (load x)))
+                (if (token-is t "(")
+                    (let [x (parse-syntax-conditional)] (do (require-token ")") x))
+                    (if (token-is t "{")
+                        (let [(mut entries) (al-new [i64] (alloc/malloc-allocator))
+                              (mut saw-prototype-setter) false
+                              (mut x) (syntax-expr-new SX-OBJECT (.start t) (.end t))]
+                          (if (not (take-is "}"))
+                              (loop (let [key-token (require-ident)
+                                          key-name (token-text key-token)
+                                          key (shape-key-intern key-name)]
+                                      (if (= key-name "__proto__")
+                                          (if (load saw-prototype-setter)
+                                              (parse-fail
+                                                "parser: duplicate __proto__ object-literal setter at byte"
+                                                key-token)
+                                              (set! (mut saw-prototype-setter) true))
+                                          0)
+                                      (require-token ":")
+                                      (push! [i64] (mut entries) key)
+                                      (push! [i64] (mut entries) (parse-syntax-conditional))
+                                      (if (take-is ",")
+                                          (if (take-is "}") (break 0) (continue))
+                                          (break (do (require-token "}") 0)))))
+                              0)
+                          (set! (.args (mut x)) (load entries))
+                          (syntax-add! (load x)))
+                        (do
+                          (parse-fail "parser: primary is outside the admitted subset at byte" t)
+                          0))))))))
 
 (defn parse-syntax-postfix [] (-> i64)
   (let [(mut base) (parse-syntax-primary)]
-    (loop (if (not (take-is "("))
-              (break 0)
+    (loop (if (take-is "(")
               (let [(mut args) (al-new [i64] (alloc/malloc-allocator))]
                 (if (not (take-is ")"))
                     (loop (do
@@ -273,7 +391,16 @@
                   (set! (.name (mut x)) (.name callee))
                   (set! (.args (mut x)) (load args))
                   (set! (mut base) (syntax-add! (load x)))
-                  (continue)))))
+                  (continue)))
+              (if (take-is ".")
+                  (let [member (require-ident)
+                        owner (syntax-at (load base))
+                        (mut x) (syntax-expr-new SX-MEMBER (.lo owner) (.end member))]
+                    (set! (.left (mut x)) (load base))
+                    (set! (.name (mut x)) (token-text member))
+                    (set! (mut base) (syntax-add! (load x)))
+                    (continue))
+                  (break 0))))
     (load base)))
 
 (defn parse-syntax-mul [] (-> i64)
@@ -308,8 +435,22 @@
                     (continue))))))
     (load lhs)))
 
+(defn parse-syntax-relational [] (-> i64)
+  (let [(mut lhs) (parse-syntax-add)]
+    (loop (if (not (take-is "<"))
+              (break 0)
+              (let [rhs (parse-syntax-add)
+                    l (syntax-at (load lhs))
+                    r (syntax-at rhs)
+                    (mut x) (syntax-expr-new SX-LT (.lo l) (.hi r))]
+                (set! (.left (mut x)) (load lhs))
+                (set! (.right (mut x)) rhs)
+                (set! (mut lhs) (syntax-add! (load x)))
+                (continue))))
+    (load lhs)))
+
 (defn parse-syntax-conditional [] (-> i64)
-  (let [condition (parse-syntax-add)]
+  (let [condition (parse-syntax-relational)]
     (if (not (take-is "?"))
         condition
         (let [when-true (parse-syntax-conditional)]
@@ -421,15 +562,17 @@
                         (let [lhs (parse-syntax-conditional)
                               lhs-expr (syntax-at lhs)]
                           (if (take-is "=")
-                              (if (!= (.kind lhs-expr) SX-NAME)
+                              (if (and (!= (.kind lhs-expr) SX-NAME)
+                                       (!= (.kind lhs-expr) SX-MEMBER))
                                   (do
-                                    (parse-fail "parser: assignment target is not a name at byte" first)
+                                    (parse-fail "parser: assignment target is not assignable at byte" first)
                                     0)
                                   (let [rhs (parse-syntax-conditional)
                                         parsed (syntax-at rhs)
                                         (mut stmt) (syntax-stmt-new SS-ASSIGN (.lo lhs-expr) (.hi parsed))]
                                     (parse-statement-end!)
                                     (set! (.name (mut stmt)) (.name lhs-expr))
+                                    (set! (.target (mut stmt)) lhs)
                                     (set! (.expr (mut stmt)) rhs)
                                     (syntax-stmt-add! (load stmt))))
                               (let [(mut stmt) (syntax-stmt-new SS-EXPR (.lo lhs-expr) (.hi lhs-expr))]
@@ -581,6 +724,58 @@
       (scope-set-mem! scope (proj-make end RETURN-MEM "js-truthy.mem"))
       (proj-make end RETURN-VALUE "js-truthy.value"))))
 
+(defn lower-object-literal [(x SyntaxExpr)] (-> (dyn NodeOps))
+  (let [scope (parser-node (.current-scope (parser-state)))
+        (mut no-args) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))
+        created
+          (jsl-lower-macro-values "JsNewObjectRaw"
+                                  (load no-args)
+                                  (parser-node (.current-ctrl (parser-state)))
+                                  (scope-mem scope))
+        (mut object-nid) (n-nid (.value created))
+        (mut i) 0]
+    (parser-set-current-ctrl! (.ctrl created))
+    (scope-set-mem! scope (.mem created))
+    (loop (if (>= (load i) (len (.args x)))
+              (break 0)
+              (let [key (get (.args x) (load i))
+                    value (lower-syntax-expr (get (.args x) (+ (load i) 1)))
+                    (mut args) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))]
+                (push! [(dyn NodeOps)]
+                       (mut args)
+                       (match (arena-node (load object-nid))
+                         (Some [n] n)
+                         (None [] (unreachable-node))))
+                (if (= (shape-key-name key) "__proto__")
+                    0
+                    (push! [(dyn NodeOps)] (mut args) (con-int key)))
+                (push! [(dyn NodeOps)] (mut args) value)
+                (let [defined
+                        (jsl-lower-macro-values
+                          (if (= (shape-key-name key) "__proto__")
+                              "JsSetObjectLiteralPrototype"
+                              "JsCreateDataPropertyNamed")
+                          (load args)
+                          (parser-node (.current-ctrl (parser-state)))
+                          (scope-mem scope))]
+                  (set! (mut object-nid) (n-nid (.value defined)))
+                  (parser-set-current-ctrl! (.ctrl defined))
+                  (scope-set-mem! scope (.mem defined)))
+                (set! (mut i) (+ (load i) 2))
+                (continue))))
+    (let [(mut finish-args) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))]
+      (push! [(dyn NodeOps)]
+             (mut finish-args)
+             (match (arena-node (load object-nid))
+               (Some [n] n)
+               (None [] (unreachable-node))))
+      (let [finished
+              (jsl-lower-macro-values "JsFinishObjectLiteral"
+                                      (load finish-args)
+                                      (parser-node (.current-ctrl (parser-state)))
+                                      (scope-mem scope))]
+        (.value finished)))))
+
 (defn lower-syntax-expr [(id i64)] (-> (dyn NodeOps))
   (let [x (syntax-at id)]
     (if (= (.kind x) SX-NUMBER)
@@ -590,7 +785,18 @@
                      (if (= (.number-rep x) REP-INT)
                          (con-int (.number x))
                          (con-flt (.number-float x))))
-        (if (= (.kind x) SX-NAME)
+        (if (= (.kind x) SX-OBJECT)
+            (lower-object-literal x)
+            (if (= (.kind x) SX-STRING)
+            (let [scope (parser-node (.current-scope (parser-state)))
+                  lowered
+                    (jsl-lower-string-literal (.name x)
+                                              (parser-node (.current-ctrl (parser-state)))
+                                              (scope-mem scope))]
+              (parser-set-current-ctrl! (.ctrl lowered))
+              (scope-set-mem! scope (.mem lowered))
+              (box-make-at (Some (.ctrl lowered)) (.value lowered)))
+            (if (= (.kind x) SX-NAME)
             (lower-name (.name x))
             (if (= (.kind x) SX-ADD)
                 (lower-js-binary (lower-syntax-expr (.left x))
@@ -604,7 +810,11 @@
                         (lower-js-binary (lower-syntax-expr (.left x))
                                          (lower-syntax-expr (.right x))
                                          "JsMul")
-                        (if (= (.kind x) SX-CONDITIONAL)
+                        (if (= (.kind x) SX-LT)
+                            (lower-js-binary (lower-syntax-expr (.left x))
+                                             (lower-syntax-expr (.right x))
+                                             "JsLt")
+                            (if (= (.kind x) SX-CONDITIONAL)
                             (let [condition (lower-js-truthy (lower-syntax-expr (.left x)))
                                   iff (if-make (parser-node (.current-ctrl (parser-state))) condition)
                                   arms (if-arms! iff)
@@ -639,7 +849,24 @@
                                     (n-unkeep! yes)
                                     (n-unkeep! no)
                                     phi))))
-                            (if (= (.kind x) SX-CALL)
+                            (if (= (.kind x) SX-MEMBER)
+                                (let [owner (lower-syntax-expr (.left x))
+                                      scope (parser-node (.current-scope (parser-state)))
+                                      key (shape-key-intern (.name x))
+                                      (mut args)
+                                        (al-new [(dyn NodeOps)] (alloc/malloc-allocator))]
+                                  (push! [(dyn NodeOps)] (mut args) owner)
+                                  (push! [(dyn NodeOps)] (mut args) (con-int key))
+                                  (let [lowered
+                                          (jsl-lower-macro-values
+                                            "JsGetNamed"
+                                            (load args)
+                                            (parser-node (.current-ctrl (parser-state)))
+                                            (scope-mem scope))]
+                                    (parser-set-current-ctrl! (.ctrl lowered))
+                                    (scope-set-mem! scope (.mem lowered))
+                                    (.value lowered)))
+                                (if (= (.kind x) SX-CALL)
                                 (let [target-idx (syntax-find-fun (.name x))]
                                   (if (< target-idx 0)
                                       (do
@@ -683,7 +910,7 @@
                                             (proj-make end RETURN-VALUE "call.value"))))))
                                 (do
                                   (panic "parser: unknown syntax expression")
-                                  (unreachable-node)))))))))))
+                                  (unreachable-node)))))))))))))))
 
 ;; Final Simple's `Parser.addReturn` accumulates a pruned return Scope holding control, memory, and
 ;; `$expr`, then kills the current control. Later exits merge into that accumulator and function
@@ -779,15 +1006,36 @@
                                        value))
                       (if (= (.kind stmt) SS-ASSIGN)
                           (let [scope (parser-node (.current-scope (parser-state)))
-                                bound (>= (scope-find scope (.name stmt)) 0)
-                                value (lower-syntax-expr (.expr stmt))]
+                                target (syntax-at (.target stmt))]
+                            (if (= (.kind target) SX-MEMBER)
+                                (let [owner (lower-syntax-expr (.left target))
+                                      value (lower-syntax-expr (.expr stmt))
+                                      key (shape-key-intern (.name target))
+                                      (mut args)
+                                        (al-new [(dyn NodeOps)] (alloc/malloc-allocator))]
+                                  ;; PutValue evaluates the reference base before the RHS. The JSL
+                                  ;; macro owns the JavaScript-visible object guard and property
+                                  ;; definition semantics; the parser supplies syntax order only.
+                                  (push! [(dyn NodeOps)] (mut args) owner)
+                                  (push! [(dyn NodeOps)] (mut args) (con-int key))
+                                  (push! [(dyn NodeOps)] (mut args) value)
+                                  (let [stored
+                                          (jsl-lower-macro-values
+                                            "JsDefineOwnNamed"
+                                            (load args)
+                                            (parser-node (.current-ctrl (parser-state)))
+                                            (scope-mem scope))]
+                                    (parser-set-current-ctrl! (.ctrl stored))
+                                    (scope-set-mem! scope (.mem stored))))
+                                (let [bound (>= (scope-find scope (.name stmt)) 0)
+                                      value (lower-syntax-expr (.expr stmt))]
                             ;; This admitted source slice is non-strict. The global `undefined`
                             ;; binding is non-writable: PutValue has no effect, but JavaScript still
                             ;; evaluates the complete RHS first. A lexical binding named
                             ;; `undefined` takes the ordinary update path, including `const` checks.
                             (if (and (not bound) (= (.name stmt) "undefined"))
                                 0
-                                (scope-update! scope (.name stmt) value)))
+                                (scope-update! scope (.name stmt) value)))))
                           (if (= (.kind stmt) SS-RETURN)
                               (set! (mut terminated)
                                     (parser-record-return! (if (= (.expr stmt) 0)
@@ -922,7 +1170,6 @@
 (defn parse-program [(src (slice u8))] (-> (dyn NodeOps))
   (do
     (parser-reset!)
-    (jsl-lower-index! "jsl/compiler/index")
     (lex-init! src)
     ;; Syntax pass: collect every declaration before graph construction. This is the hoisting
     ;; boundary; no semantic node is built while the cover grammar is still ambiguous.
@@ -930,6 +1177,11 @@
             (if (= (.kind t) TOK-EOF)
                 (break 0)
                 (do (parse-syntax-function!) (continue)))))
+    ;; Syntax collection declares every closed-world property key and ordered hidden-class path
+    ;; before JSL graphs are built. Runtime-key representation dispatch can therefore enumerate
+    ;; the complete layout universe while JavaScript prototype traversal remains recursive JSL.
+    (syntax-declare-object-shapes!)
+    (jsl-lower-index! "jsl/compiler/index")
     (let [start (start-make (ty-int-bot))
           stop (stop-make)
           (mut fi) 0]

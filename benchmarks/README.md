@@ -16,6 +16,25 @@ three warmups produced:
 The generated AArch64 executable was **1.09 ± 0.02 times faster** in this whole-process benchmark.
 This is one small recursive numeric workload, not a general JavaScript performance claim.
 
+## Managed binary trees
+
+`binarytrees-aot.ts` and `binarytrees-node.js` run the same supported-language adaptation of the
+Benchmarks Game allocation pattern at depth 15: one stretch tree, one retained long-lived tree, and
+the usual batches of temporary trees. Both validate the complete 6,444,382 checksum. The AOT run
+uses the runtime's default 8 MiB nursery and 64 MiB old-generation semispaces; no GC environment
+override is present.
+
+On the same machine and Node 26.5.0, 15 measured whole-process runs after three warmups produced:
+
+| Runtime | Mean | Standard deviation | Range |
+| --- | ---: | ---: | ---: |
+| aot-take-2 | 251.6 ms | 3.6 ms | 247.5–259.4 ms |
+| Node | 116.3 ms | 4.1 ms | 112.4–130.0 ms |
+
+Node was **2.16 ± 0.08 times faster**. Unlike the Fibonacci workload, this comparison exercises
+managed object allocation, recursive traversal, repeated default-policy collections, and a root
+retained across the full temporary-tree workload.
+
 ## Warm-JIT comparison
 
 `fib-warm-aot.ts` and `fib-warm-node.js` each execute one explicit `fib(35)` warmup and then twenty
@@ -45,4 +64,8 @@ hyperfine --warmup 3 --runs 15 /tmp/aot-take-2-fib 'node benchmarks/fib-node.js'
 build/release/aot compile benchmarks/fib-warm-aot.ts /tmp/aot-take-2-fib-warm.o
 cc /tmp/aot-take-2-fib-warm.o -o /tmp/aot-take-2-fib-warm
 hyperfine --warmup 1 --runs 10 /tmp/aot-take-2-fib-warm 'node benchmarks/fib-warm-node.js'
+
+unset AOT_RT_HEAP_BYTES
+build/release/aot run benchmarks/binarytrees-aot.ts /tmp/aot-take-2-binarytrees.o /tmp/aot-take-2-binarytrees
+hyperfine --warmup 3 --runs 15 /tmp/aot-take-2-binarytrees 'node benchmarks/binarytrees-node.js'
 ```

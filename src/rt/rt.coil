@@ -9,20 +9,687 @@
 ;; runtime functions: which registers carry what, how a NaN-boxed word crosses the boundary, how a
 ;; safepoint hands the collector its stack map, and how a thrown value unwinds.
 ;;
-;; SCAFFOLD: signatures are final; bodies hard-error. Filled in at S8.
+;; Allocation and the stop-the-world semispace collector are live. The generated allocation ABI
+;; supplies a stack-map identity and caller SP; the runtime discovers the linked stack-map section,
+;; relocates every described root, scans managed boxed edges, swaps semispaces, and retries the
+;; allocation. Throwing retains its named hard-error body.
 (module aot.rt.rt)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.mem" :as mem)
 (import "aot.util.panic" :use *)
 
-(defn rt-alloc [(bytes i64) (shape i64)] (-> i64)
-  (do (unimplemented "rt-alloc" "S8 — src/rt/rt.coil") 0))
+;; Darwin publishes the main executable header and libSystem's section lookup routine. This keeps
+;; stack-map discovery inside Coil while avoiding an unresolved generated-data symbol in the
+;; separately compiled runtime object. The generated object already contributes the authoritative
+;; `__DATA,__aot_stackmaps` section.
+(extern getsectiondata :cc c [(ptr u8) (ptr i8) (ptr i8) (ptr u64)] (-> (ptr u8)))
 
-(defn rt-collect [] (-> i64)
-  (do (unimplemented "rt-collect" "S8 — src/rt/rt.coil") 0))
+(extern getenv :cc c [(ptr i8)] (-> (ptr i8)))
 
-;; Non-collecting post-write remembered-set boundary. The object and stored word arrive in X0/X1
-;; on arm64; this routine never initiates collection, so the call site is not a safepoint.
+(extern strtoll :cc c [(ptr i8) (ptr (ptr i8)) i32] (-> i64))
+
+(const RT-HEADER-BYTES 24)
+
+(const RT-MAX-PAYLOAD-BYTES 0x7fffffffffffffef)
+
+(const RT-STACKMAP-HEADER-BYTES 16)
+
+(const RT-STACKMAP-RECORD-BYTES 32)
+
+(const RT-STACKMAP-SLOT-BYTES 8)
+
+(const RT-DEFAULT-HEAP-BYTES 0x4000000)
+
+(const RT-DEFAULT-NURSERY-BYTES 0x800000)
+
+(const RT-META-REMEMBERED 1)
+
+(const RT-DYNAMIC-PREFIX-OBJECT 0x7fff)
+
+(const RT-DYNAMIC-PAYLOAD-MASK 0x0000ffffffffffff)
+
+(const RT-SHAPE-NOSCAN-BIT 0x4000000000000000)
+
+(defstruct RtHeap
+  [(from (ptr u8))
+   (to (ptr u8))
+   (old-other (ptr u8))
+   (capacity i64)
+   (old-capacity i64)
+   (used i64)
+   (to-used i64)
+   (scan i64)
+   (copied-used i64)
+   (major bool)
+   (force-major bool)
+   (stress bool)
+   (booted bool)])
+
+(defn rt-heap [] (-> (ptr RtHeap))
+  (primitive/alloc-static RtHeap))
+
+(defn rt-heap-reset-generational! [(nursery-capacity i64) (old-capacity i64)] (-> i64)
+  (do
+    (if (< nursery-capacity 64)
+        (alloc/oom-at c"rt-heap-reset-generational!: nursery capacity" nursery-capacity)
+        0)
+    (if (< old-capacity 64)
+        (alloc/oom-at c"rt-heap-reset-generational!: old capacity" old-capacity)
+        0)
+    (let [heap (rt-heap)]
+      (set! (.from heap)
+            (primitive/cast (ptr u8) (alloc/malloc (primitive/cast isize nursery-capacity))))
+      (set! (.to heap)
+            (primitive/cast (ptr u8) (alloc/malloc (primitive/cast isize old-capacity))))
+      (set! (.old-other heap)
+            (primitive/cast (ptr u8) (alloc/malloc (primitive/cast isize old-capacity))))
+      (if (or (= (primitive/cast i64 (.from heap)) 0)
+              (= (primitive/cast i64 (.to heap)) 0)
+              (= (primitive/cast i64 (.old-other heap)) 0))
+          (alloc/oom-at c"rt-heap-reset-generational!" old-capacity)
+          0)
+      (set! (.capacity heap) nursery-capacity)
+      (set! (.old-capacity heap) old-capacity)
+      (set! (.used heap) 0)
+      (set! (.to-used heap) 0)
+      (set! (.scan heap) 0)
+      (set! (.copied-used heap) 0)
+      (set! (.major heap) false)
+      (set! (.force-major heap) false)
+      (set! (.stress heap) false)
+      (set! (.booted heap) true)
+      0)))
+
+(defn rt-heap-reset! [(capacity i64)] (-> i64)
+  (rt-heap-reset-generational! capacity capacity))
+
+(defn rt-heap-boot! [] (-> i64)
+  (if (.booted (rt-heap))
+      0
+      (let [configured (getenv c"AOT_RT_HEAP_BYTES")]
+        (do
+          (if (= (primitive/cast i64 configured) 0)
+              (rt-heap-reset-generational! RT-DEFAULT-NURSERY-BYTES RT-DEFAULT-HEAP-BYTES)
+              (let [end (primitive/alloc-stack (ptr i8))
+                    bytes (strtoll configured end 10)]
+                (if (or (= (primitive/cast i64 (load end)) (primitive/cast i64 configured))
+                        (< bytes 64))
+                    (alloc/oom-at c"AOT_RT_HEAP_BYTES" bytes)
+                    (rt-heap-reset-generational! bytes bytes))))
+          (set! (.stress (rt-heap))
+                (!= (primitive/cast i64 (getenv c"AOT_RT_GC_STRESS")) 0))
+          0))))
+
+(defn rt-align8 [(bytes i64)] (-> i64)
+  (& (+ bytes 7) -8))
+
+(defn rt-heap-used [] (-> i64)
+  (do (rt-heap-boot!) (.used (rt-heap))))
+
+(defn rt-in-from-space? [(payload i64)] (-> bool)
+  (let [heap (rt-heap)
+        base (primitive/cast i64 (.from heap))]
+    (and (>= payload (+ base RT-HEADER-BYTES)) (< payload (+ base (.used heap))))))
+
+(defn rt-in-old-space? [(payload i64)] (-> bool)
+  (let [heap (rt-heap)
+        base (primitive/cast i64 (.to heap))]
+    (and (>= payload (+ base RT-HEADER-BYTES)) (< payload (+ base (.to-used heap))))))
+
+(defn rt-in-collect-space? [(payload i64)] (-> bool)
+  (or (rt-in-from-space? payload) (and (.major (rt-heap)) (rt-in-old-space? payload))))
+
+(defn rt-heap-allocate-active [(bytes i64) (shape i64)] (-> i64)
+  (let [heap (rt-heap)
+        total (rt-align8 (+ bytes RT-HEADER-BYTES))]
+    (if (> (+ (.used heap) total) (.capacity heap))
+        0
+        (let [base (primitive/index (.from heap) (.used heap))
+              payload (primitive/index base RT-HEADER-BYTES)
+              header (primitive/cast (ptr i64) base)]
+          (set! (.used heap) (+ (.used heap) total))
+          (set! (primitive/index header 0) bytes)
+          (set! (primitive/index header 1) 0)
+          (set! (primitive/index header 2) shape)
+          (mem/mem-zero [u8] payload bytes)
+          (primitive/cast i64 payload)))))
+
+(defn rt-heap-allocate-old [(bytes i64) (shape i64)] (-> i64)
+  (let [heap (rt-heap) total (rt-align8 (+ bytes RT-HEADER-BYTES))]
+    (if (> (+ (.to-used heap) total) (.old-capacity heap))
+        0
+        (let [base (primitive/index (.to heap) (.to-used heap))
+              payload (primitive/index base RT-HEADER-BYTES)
+              header (primitive/cast (ptr i64) base)]
+          (set! (.to-used heap) (+ (.to-used heap) total))
+          (set! (primitive/index header 0) bytes)
+          (set! (primitive/index header 1) 0)
+          (set! (primitive/index header 2) shape)
+          (mem/mem-zero [u8] payload bytes)
+          (primitive/cast i64 payload)))))
+
+(defn rt-forward [(payload i64)] (-> i64)
+  (if (or (= payload 0) (not (rt-in-collect-space? payload)))
+      payload
+      (let [heap (rt-heap)
+            old-header (primitive/index (primitive/cast (ptr i64) payload) -3)
+            bytes (load (primitive/index old-header 0))
+            shape (load (primitive/index old-header 2))]
+        (if (< shape 0)
+            (- 0 shape)
+            (let [total (rt-align8 (+ bytes RT-HEADER-BYTES))]
+              (if (> (+ (.copied-used heap) total) (.old-capacity heap))
+                  (alloc/oom-at c"rt-forward: live heap exceeds old generation" total)
+                  0)
+              (let [destination (if (.major heap) (.old-other heap) (.to heap))
+                    new-base (primitive/index destination (.copied-used heap))
+                    new-payload (primitive/index new-base RT-HEADER-BYTES)]
+                (mem/mem-copy [u8] new-base (primitive/cast (ptr u8) old-header) total)
+                (set! (.copied-used heap) (+ (.copied-used heap) total))
+                (set! (primitive/index (primitive/cast (ptr i64) new-base) 1) 0)
+                (set! (primitive/index old-header 2) (- 0 (primitive/cast i64 new-payload)))
+                (primitive/cast i64 new-payload)))))))
+
+(defn rt-word-object? [(word i64)] (-> bool)
+  (= (primitive/ishr word 48) RT-DYNAMIC-PREFIX-OBJECT))
+
+(defn rt-forward-boxed [(word i64)] (-> i64)
+  (if (not (rt-word-object? word))
+      word
+      (| (primitive/ishl RT-DYNAMIC-PREFIX-OBJECT 48)
+         (& (rt-forward (& word RT-DYNAMIC-PAYLOAD-MASK)) RT-DYNAMIC-PAYLOAD-MASK))))
+
+(defn rt-scan-copied! [] (-> i64)
+  (let [heap (rt-heap)]
+    (loop (if (>= (.scan heap) (.copied-used heap))
+              (break 0)
+              (let [space (if (.major heap) (.old-other heap) (.to heap))
+                    base (primitive/index space (.scan heap))
+                    header (primitive/cast (ptr i64) base)
+                    bytes (load (primitive/index header 0))
+                    payload (primitive/cast (ptr i64) (primitive/index base RT-HEADER-BYTES))
+                    shape (load (primitive/index header 2))
+                    words (if (!= (& shape RT-SHAPE-NOSCAN-BIT) 0) 0 (/ bytes 8))
+                    (mut i) 0]
+                ;; Current ordinary-object payload slots are all JavaScript values. String and
+                ;; typed-array layouts will carry explicit scan descriptors before entering this
+                ;; collector, rather than being conservatively mistaken for boxed fields.
+                (loop (if (>= (load i) words)
+                          (break 0)
+                          (do
+                            (set! (primitive/index payload (load i))
+                                  (rt-forward-boxed (load (primitive/index payload (load i)))))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (set! (.scan heap) (+ (.scan heap) (rt-align8 (+ bytes RT-HEADER-BYTES))))
+                (continue))))))
+
+(defn rt-scan-remembered! [] (-> i64)
+  (let [heap (rt-heap)
+        (mut cursor) 0]
+    (loop (if (>= (load cursor) (.to-used heap))
+              (break 0)
+              (let [base (primitive/index (.to heap) (load cursor))
+                    header (primitive/cast (ptr i64) base)
+                    bytes (load (primitive/index header 0))
+                    meta (load (primitive/index header 1))
+                    shape (load (primitive/index header 2))
+                    payload (primitive/cast (ptr i64) (primitive/index base RT-HEADER-BYTES))
+                    words (if (!= (& shape RT-SHAPE-NOSCAN-BIT) 0) 0 (/ bytes 8))
+                    (mut i) 0]
+                (if (!= (& meta RT-META-REMEMBERED) 0)
+                    (do
+                      (loop (if (>= (load i) words)
+                                (break 0)
+                                (do
+                                  (set! (primitive/index payload (load i))
+                                        (rt-forward-boxed (load (primitive/index payload (load i)))))
+                                  (set! (mut i) (+ (load i) 1))
+                                  (continue))))
+                      (set! (primitive/index header 1) (& meta (- 0 (+ RT-META-REMEMBERED 1))))
+                      0)
+                    0)
+                (set! (mut cursor) (+ (load cursor) (rt-align8 (+ bytes RT-HEADER-BYTES))))
+                (continue))))))
+
+(defn rt-begin-collection! [] (-> i64)
+  (let [heap (rt-heap)
+        major (or (.force-major heap)
+                  (> (+ (.to-used heap) (.used heap)) (.old-capacity heap)))]
+    (set! (.major heap) major)
+    (set! (.scan heap) (if major 0 (.to-used heap)))
+    (set! (.copied-used heap) (if major 0 (.to-used heap)))
+    0))
+
+(defn rt-finish-collection! [] (-> i64)
+  (let [heap (rt-heap)]
+    (if (.major heap)
+        (let [old-active (.to heap)]
+          (set! (.to heap) (.old-other heap))
+          (set! (.old-other heap) old-active))
+        0)
+    (set! (.to-used heap) (.copied-used heap))
+    (set! (.used heap) 0)
+    (set! (.scan heap) 0)
+    (set! (.copied-used heap) 0)
+    (set! (.major heap) false)
+    (set! (.force-major heap) false)
+    (.used heap)))
+
+(defn rt-collect-one-root! [(root (ptr i64))] (-> i64)
+  (let [heap (rt-heap)]
+    (rt-begin-collection!)
+    (set! root (rt-forward (load root)))
+    (if (not (.major heap)) (rt-scan-remembered!) 0)
+    (rt-scan-copied!)
+    (rt-finish-collection!)
+    (.to-used heap)))
+
+(defn rt-collect-from-maps! [(maps (ptr u8))
+                             (map-bytes i64)
+                             (map-id i64)
+                             (caller-sp i64)] (-> i64)
+  (rt-collect-from-maps-with-roots! maps
+                                    map-bytes
+                                    map-id
+                                    caller-sp
+                                    (primitive/cast (ptr i64) 0)
+                                    (primitive/cast (ptr i64) 0)))
+
+(defn rt-scan-stackmap-frame! [(maps (ptr u8)) (record i64) (sp i64)] (-> i64)
+  (let [slots (rt-stackmap-slot-count maps record)
+        (mut i) 0]
+    (loop (if (>= (load i) slots)
+              (break 0)
+              (let [root
+                      (primitive/cast (ptr i64)
+                                      (+ sp (rt-stackmap-slot-location maps record (load i))))
+                    kind (rt-stackmap-slot-kind maps record (load i))]
+                (if (= kind 1)
+                    (set! root (rt-forward (load root)))
+                    (if (= kind 2)
+                        (set! root (rt-forward-boxed (load root)))
+                        (panic-i "rt-scan-stackmap-frame!: invalid root kind" kind)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+;; Runtime helpers that allocate may hold raw managed arguments in their own Coil frame. Generated
+;; stack maps describe the caller but deliberately know nothing about that runtime frame, so the
+;; helper supplies up to two explicit root addresses to the same collection before scanning starts.
+;; A null address means no extra root. Keeping this inside the collector avoids a second collection
+;; protocol and ensures every root participates in one forwarding closure.
+(defn rt-collect-from-maps-with-roots! [(maps (ptr u8))
+                                        (map-bytes i64)
+                                        (map-id i64)
+                                        (caller-sp i64)
+                                        (root-a (ptr i64))
+                                        (root-b (ptr i64))] (-> i64)
+  (rt-collect-from-maps-with-roots-at! maps map-bytes map-id caller-sp root-a root-b 0 false))
+
+(defn rt-collect-from-maps-with-roots-at! [(maps (ptr u8))
+                                           (map-bytes i64)
+                                           (map-id i64)
+                                           (caller-sp i64)
+                                           (root-a (ptr i64))
+                                           (root-b (ptr i64))
+                                           (text-base i64)
+                                           (walk-callers bool)] (-> i64)
+  (let [record (rt-stackmap-find maps map-bytes map-id)]
+    (if (< record 0)
+        (do (panic-i "rt-collect-from-maps-with-roots!: missing safepoint map" map-id) 0)
+        (let [heap (rt-heap)]
+          (rt-begin-collection!)
+          (if (!= (primitive/cast i64 root-a) 0)
+              (set! root-a (rt-forward (load root-a)))
+              0)
+          (if (!= (primitive/cast i64 root-b) 0)
+              (set! root-b (rt-forward (load root-b)))
+              0)
+          (let [(mut current-record) record
+                (mut current-sp) caller-sp
+                (mut frames) 0
+                count (rt-read-u32 maps 12)]
+            (loop (if (< (load current-record) 0)
+                      (break 0)
+                      (do
+                        (rt-scan-stackmap-frame! maps (load current-record) (load current-sp))
+                        (if walk-callers
+                            (let [return-address
+                                    (load (primitive/cast (ptr i64)
+                                                          (+ (load current-sp)
+                                                             (rt-stackmap-rpc-offset maps
+                                                                                     (load current-record)))))
+                                  parent-sp
+                                    (+ (load current-sp)
+                                       (rt-stackmap-frame-size maps (load current-record)))]
+                              (set! (mut current-record)
+                                    (rt-stackmap-find-return-pc maps
+                                                                map-bytes
+                                                                (- return-address text-base)))
+                              (set! (mut current-sp) parent-sp))
+                            (set! (mut current-record) -1))
+                        (set! (mut frames) (+ (load frames) 1))
+                        (if (> (load frames) count)
+                            (panic "rt-collect-from-maps-with-roots-at!: cyclic frame walk")
+                            (continue))))))
+          (if (not (.major heap)) (rt-scan-remembered!) 0)
+          (rt-scan-copied!)
+          (rt-finish-collection!)))))
+
+(defn rt-linked-stackmaps [(size (ptr u64))] (-> (ptr u8))
+  (getsectiondata (primitive/cast (ptr u8) (primitive/linker-address _mh_execute_header))
+                  c"__DATA"
+                  c"__aot_stackmaps"
+                  size))
+
+(defn rt-linked-text [(size (ptr u64))] (-> (ptr u8))
+  (getsectiondata (primitive/cast (ptr u8) (primitive/linker-address _mh_execute_header))
+                  c"__TEXT"
+                  c"__text"
+                  size))
+
+(defn rt-collect-linked! [(map-id i64) (caller-sp i64)] (-> i64)
+  (let [size (primitive/alloc-stack u64)
+        text-size (primitive/alloc-stack u64)
+        maps (rt-linked-stackmaps size)
+        linked-text (rt-linked-text text-size)]
+    (if (or (= (primitive/cast i64 maps) 0) (= (primitive/cast i64 linked-text) 0))
+        (do (panic "rt-collect-linked!: executable has no __aot_stackmaps section") 0)
+        (rt-collect-from-maps-with-roots-at! maps
+                                             (primitive/cast i64 (load size))
+                                             map-id
+                                             caller-sp
+                                             (primitive/cast (ptr i64) 0)
+                                             (primitive/cast (ptr i64) 0)
+                                             (primitive/cast i64 linked-text)
+                                             true))))
+
+(defn rt-collect-linked-with-roots! [(map-id i64)
+                                     (caller-sp i64)
+                                     (root-a (ptr i64))
+                                     (root-b (ptr i64))] (-> i64)
+  (let [size (primitive/alloc-stack u64)
+        text-size (primitive/alloc-stack u64)
+        maps (rt-linked-stackmaps size)
+        linked-text (rt-linked-text text-size)]
+    (if (or (= (primitive/cast i64 maps) 0) (= (primitive/cast i64 linked-text) 0))
+        (do (panic "rt-collect-linked-with-roots!: executable has no __aot_stackmaps section") 0)
+        (rt-collect-from-maps-with-roots-at! maps
+                                             (primitive/cast i64 (load size))
+                                             map-id
+                                             caller-sp
+                                             root-a
+                                             root-b
+                                             (primitive/cast i64 linked-text)
+                                             true))))
+
+(defn rt-read-u32 [(p (ptr u8)) (off i64)] (-> i64)
+  (| (primitive/cast i64 (load (primitive/index p off)))
+     (| (primitive/ishl (primitive/cast i64 (load (primitive/index p (+ off 1)))) 8)
+        (| (primitive/ishl (primitive/cast i64 (load (primitive/index p (+ off 2)))) 16)
+           (primitive/ishl (primitive/cast i64 (load (primitive/index p (+ off 3)))) 24)))))
+
+(defn rt-read-u64 [(p (ptr u8)) (off i64)] (-> i64)
+  (| (rt-read-u32 p off) (primitive/ishl (rt-read-u32 p (+ off 4)) 32)))
+
+(defn rt-stackmap-header-valid? [(maps (ptr u8)) (bytes i64)] (-> bool)
+  (and (>= bytes RT-STACKMAP-HEADER-BYTES)
+       (and (= (rt-read-u64 maps 0) 0x0050414d53544f41)
+            (= (rt-read-u32 maps 8) 3))))
+
+;; Return the byte offset of `map-id`'s record, or -1. Bounds are checked before every variable-size
+;; advance so malformed object metadata cannot turn collection into an arbitrary memory walk.
+(defn rt-stackmap-find [(maps (ptr u8)) (bytes i64) (map-id i64)] (-> i64)
+  (if (not (rt-stackmap-header-valid? maps bytes))
+      -1
+      (let [count (rt-read-u32 maps 12)
+            (mut record) RT-STACKMAP-HEADER-BYTES
+            (mut i) 0]
+        (loop (if (>= (load i) count)
+                  (break -1)
+                  (if (> (+ (load record) RT-STACKMAP-RECORD-BYTES) bytes)
+                      (break -1)
+                      (let [slots (rt-read-u32 maps (+ (load record) 16))
+                            size (+ RT-STACKMAP-RECORD-BYTES (* slots RT-STACKMAP-SLOT-BYTES))]
+                        (if (> (+ (load record) size) bytes)
+                            (break -1)
+                            (if (= (rt-read-u64 maps (load record)) map-id)
+                                (break (load record))
+                                (do
+                                  (set! (mut record) (+ (load record) size))
+                                  (set! (mut i) (+ (load i) 1))
+                                  (continue)))))))))))
+
+(defn rt-stackmap-find-return-pc [(maps (ptr u8)) (bytes i64) (return-pc i64)] (-> i64)
+  (if (not (rt-stackmap-header-valid? maps bytes))
+      -1
+      (let [count (rt-read-u32 maps 12)
+            (mut record) RT-STACKMAP-HEADER-BYTES
+            (mut i) 0]
+        (loop (if (>= (load i) count)
+                  (break -1)
+                  (if (> (+ (load record) RT-STACKMAP-RECORD-BYTES) bytes)
+                      (break -1)
+                      (let [slots (rt-read-u32 maps (+ (load record) 16))
+                            size (+ RT-STACKMAP-RECORD-BYTES (* slots RT-STACKMAP-SLOT-BYTES))]
+                        (if (> (+ (load record) size) bytes)
+                            (break -1)
+                            (if (= (rt-read-u64 maps (+ (load record) 8)) return-pc)
+                                (break (load record))
+                                (do
+                                  (set! (mut record) (+ (load record) size))
+                                  (set! (mut i) (+ (load i) 1))
+                                  (continue)))))))))))
+
+(defn rt-stackmap-frame-size [(maps (ptr u8)) (record i64)] (-> i64)
+  (rt-read-u32 maps (+ record 20)))
+
+(defn rt-stackmap-rpc-offset [(maps (ptr u8)) (record i64)] (-> i64)
+  (rt-read-u32 maps (+ record 24)))
+
+(defn rt-stackmap-slot-count [(maps (ptr u8)) (record i64)] (-> i64)
+  (rt-read-u32 maps (+ record 16)))
+
+(defn rt-stackmap-slot-location [(maps (ptr u8)) (record i64) (slot i64)] (-> i64)
+  (rt-read-u32 maps (+ (+ record RT-STACKMAP-RECORD-BYTES) (* slot RT-STACKMAP-SLOT-BYTES))))
+
+(defn rt-stackmap-slot-kind [(maps (ptr u8)) (record i64) (slot i64)] (-> i64)
+  (primitive/cast i64
+                  (load (primitive/index maps
+                                         (+ (+ (+ record RT-STACKMAP-RECORD-BYTES)
+                                               (* slot RT-STACKMAP-SLOT-BYTES))
+                                            4)))))
+
+;; Every managed pointer names the first payload byte. The three words immediately before it are
+;; runtime-owned and never participate in shape offsets:
+;;
+;;   payload[-24] = payload byte count
+;;   payload[-16] = collector metadata
+;;   payload[ -8] = hidden-class shape ID
+;;
+;; Keeping the public pointer payload-relative makes offset zero mean the first field, exactly as
+;; `shape-offset` and the ideal Load/Store nodes require. `malloc` is only the runtime's backing
+;; store; generated code never calls a host allocator and never knows this header representation.
+(defn rt-alloc [(bytes i64) (shape i64) (map-id i64) (caller-sp i64)] (-> i64)
+  (do
+    ;; `map-id` and `caller-sp` identify the writable roots at this allocation. They become active
+    ;; when nursery exhaustion invokes the moving collector; accepting them here makes omission at
+    ;; any generated allocation impossible even before the collector policy starts collecting.
+    map-id
+    caller-sp
+    (if (or (< bytes 0) (> bytes RT-MAX-PAYLOAD-BYTES))
+        (alloc/oom-at c"aot_rt_alloc: invalid payload size" bytes)
+        0)
+    (if (<= shape 0)
+        (alloc/oom-at c"aot_rt_alloc: invalid shape" shape)
+        0)
+    (rt-heap-boot!)
+    (if (and (.stress (rt-heap)) (> map-id 0)) (rt-collect-linked! map-id caller-sp) 0)
+    (if (> (rt-align8 (+ bytes RT-HEADER-BYTES)) (.capacity (rt-heap)))
+        (let [payload (rt-heap-allocate-old bytes shape)]
+          (if (!= payload 0)
+              payload
+              (do
+                (set! (.force-major (rt-heap)) true)
+                (rt-collect-linked! map-id caller-sp)
+                (let [retry (rt-heap-allocate-old bytes shape)]
+                  (if (= retry 0)
+                      (alloc/oom-at c"aot_rt_alloc: large object exceeds old generation" bytes)
+                      retry)))))
+        (let [payload (rt-heap-allocate-active bytes shape)]
+          (if (= payload 0)
+              (do
+                (rt-collect-linked! map-id caller-sp)
+                (let [retry (rt-heap-allocate-active bytes shape)]
+                  (if (= retry 0)
+                      (alloc/oom-at c"aot_rt_alloc: object does not fit nursery" bytes)
+                      retry)))
+              payload)))))
+
+(defn rt-payload-bytes [(payload i64)] (-> i64)
+  (load (primitive/index (primitive/cast (ptr i64) payload) -3)))
+
+(defn rt-payload-shape [(payload i64)] (-> i64)
+  (load (primitive/index (primitive/cast (ptr i64) payload) -1)))
+
+(defn rt-string-length [(string i64)] (-> i64)
+  (load (primitive/cast (ptr i64) string)))
+
+(defn rt-string-code-unit [(string i64) (index i64)] (-> i64)
+  (primitive/cast i64
+                  (load (primitive/index (primitive/cast (ptr u16) string) (+ 4 index)))))
+
+(defn rt-string-set-code-unit! [(string i64) (index i64) (unit i64)] (-> i64)
+  (do
+    (set! (primitive/index (primitive/cast (ptr u16) string) (+ 4 index))
+          (primitive/cast u16 unit))
+    unit))
+
+(defn rt-string-eq [(left i64) (right i64)] (-> i64)
+  (let [left-length (rt-string-length left)
+        right-length (rt-string-length right)]
+    (if (!= left-length right-length)
+        0
+        (let [(mut i) 0
+              (mut equal) 1]
+          (loop (if (or (= (load equal) 0) (>= (load i) left-length))
+                    (break 0)
+                    (do
+                      (if (!= (rt-string-code-unit left (load i))
+                              (rt-string-code-unit right (load i)))
+                          (set! (mut equal) 0)
+                          0)
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (load equal)))))
+
+;; ECMA-262's abstract relational comparison on two strings is lexicographic over UTF-16 code
+;; units. Return -1/0/1 so JSL decides which relational operator it is implementing.
+(defn rt-string-compare [(left i64) (right i64)] (-> i64)
+  (let [left-length (rt-string-length left)
+        right-length (rt-string-length right)
+        limit (if (< left-length right-length) left-length right-length)
+        (mut i) 0
+        (mut answer) 0]
+    (loop (if (or (!= (load answer) 0) (>= (load i) limit))
+              (break 0)
+              (let [a (rt-string-code-unit left (load i))
+                    b (rt-string-code-unit right (load i))]
+                (if (< a b)
+                    (set! (mut answer) -1)
+                    (if (> a b) (set! (mut answer) 1) 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (if (!= (load answer) 0)
+        (load answer)
+        (if (< left-length right-length) -1 (if (> left-length right-length) 1 0)))))
+
+(defn rt-string-concat [(left i64)
+                        (right i64)
+                        (shape i64)
+                        (map-id i64)
+                        (caller-sp i64)] (-> i64)
+  (let [left-root (primitive/alloc-stack i64)
+        right-root (primitive/alloc-stack i64)]
+    (set! left-root left)
+    (set! right-root right)
+    (rt-heap-boot!)
+    (if (and (.stress (rt-heap)) (> map-id 0))
+        (rt-collect-linked-with-roots! map-id caller-sp left-root right-root)
+        0)
+    (let [left-length (rt-string-length left)
+          right-length (rt-string-length right)
+          length (+ left-length right-length)]
+      (if (or (< length left-length)
+              (> length (/ (- RT-MAX-PAYLOAD-BYTES 8) 2)))
+          (alloc/oom-at c"aot_rt_string_concat: string is too large" length)
+          0)
+      (let [bytes (+ 8 (* length 2))
+            large (> (rt-align8 (+ bytes RT-HEADER-BYTES)) (.capacity (rt-heap)))
+            initial (if large
+                        (rt-heap-allocate-old bytes shape)
+                        (rt-heap-allocate-active bytes shape))
+            result
+              (if (!= initial 0)
+                  initial
+                  (do
+                    (if large (set! (.force-major (rt-heap)) true) 0)
+                    (rt-collect-linked-with-roots! map-id caller-sp left-root right-root)
+                    (let [retry (if large
+                                    (rt-heap-allocate-old bytes shape)
+                                    (rt-heap-allocate-active bytes shape))]
+                      (if (= retry 0)
+                          (alloc/oom-at c"aot_rt_string_concat: object exceeds generation" bytes)
+                          retry))))]
+        (set! (primitive/cast (ptr i64) result) length)
+        (let [(mut i) 0]
+          (loop (if (>= (load i) left-length)
+                    (break 0)
+                    (do
+                      (rt-string-set-code-unit! result
+                                                (load i)
+                                                (rt-string-code-unit (load left-root) (load i)))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (set! (mut i) 0)
+          (loop (if (>= (load i) right-length)
+                    (break 0)
+                    (do
+                      (rt-string-set-code-unit! result
+                                                (+ left-length (load i))
+                                                (rt-string-code-unit (load right-root) (load i)))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue)))))
+        result))))
+
+(defn rt-collect [(map-id i64) (caller-sp i64)] (-> i64)
+  (rt-collect-linked! map-id caller-sp))
+
+;; Non-collecting post-write boundary. An old object that receives a young reference is marked for
+;; exact rescan during the next minor collection. The bit lives in the runtime-only metadata word,
+;; leaving JavaScript-visible hidden-class identity unchanged.
 (defn aot-rt-write-barrier [(obj i64) (val i64)] (-> i64)
-  (do obj val (unimplemented "aot-rt-write-barrier" "S8 — collector remembered set") 0))
+  (let [payload (if (rt-word-object? obj) (& obj RT-DYNAMIC-PAYLOAD-MASK) obj)
+        value-payload (if (rt-word-object? val) (& val RT-DYNAMIC-PAYLOAD-MASK) 0)]
+    (if (and (rt-in-old-space? payload) (rt-in-from-space? value-payload))
+        (let [meta (primitive/index (primitive/cast (ptr i64) payload) -2)]
+          (set! meta (| (load meta) RT-META-REMEMBERED)))
+        0)
+    0))
 
 (defn rt-throw [(val i64)] (-> i64)
   (do (unimplemented "rt-throw" "S8 — src/rt/rt.coil") 0))
+
+;; Generated objects speak a deliberately small C-ABI-shaped boundary to the Coil runtime object.
+;; These names are part of the object format: target selection emits relocations against them, so
+;; namespace-mangled Coil symbols would make a correct runtime body unreachable at final link.
+(export-c [rt-alloc :as "aot_rt_alloc"]
+          [rt-collect :as "aot_rt_collect"]
+          [rt-string-length :as "aot_rt_string_length"]
+          [rt-string-code-unit :as "aot_rt_string_code_unit"]
+          [rt-string-eq :as "aot_rt_string_eq"]
+          [rt-string-compare :as "aot_rt_string_compare"]
+          [rt-string-concat :as "aot_rt_string_concat"]
+          [aot-rt-write-barrier :as "aot_rt_write_barrier"]
+          [rt-throw :as "aot_rt_throw"])

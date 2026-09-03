@@ -4,6 +4,28 @@ This file records deliberate architecture choices that differ from Simple or set
 fixed by the reference implementation. Code contradicting a decision here is a bug unless this
 file is amended at the same time.
 
+## 2026-09-02 — Boxed non-references get spill homes but are not roots
+
+NaN-boxing makes null, undefined, booleans and compact integers machine words with the same storage
+width as boxed object references. Values live across collecting calls need addressable spill homes
+for allocator convergence, but a word whose lattice tag excludes string, symbol, object and
+function cannot require relocation.
+
+Register allocation therefore carries a distinct boxed-scalar live-range kind. Call boundaries may
+place it in the stack namespace, while stack-map construction omits it. Reference-bearing dynamic
+unions retain the conservative boxed-root kind. This distinction is derived from the shared dynamic
+tag lattice rather than from individual opcode names.
+
+## 2026-09-02 — Moving-root stack boundaries extend the allocator convergence budget
+
+Final Simple caps iterative graph-coloring allocation at eight rounds for its scalar language.
+This compiler's moving-GC divergence gives every live root two additional fixed stack boundaries:
+the Safepoint input and the post-safepoint relocation projection. The linked forced-collection
+regression converges deterministically in fourteen rounds while preserving those R2 boundaries.
+
+The allocator therefore retains Simple's hard failure policy with a sixteen-round cap. This is not
+permission to retry without bound: reaching round sixteen is still a splitting bug and hard-errors.
+
 ## 2026-08-31 — AArch64 stack-to-stack splits use a proved IP0 scratch
 
 Final Simple models a split as accepting any physical register or stack slot at either endpoint,
@@ -17,19 +39,24 @@ value is live in X16 across a split, while X16 remains allocatable in regions wi
 selected size is four bytes for every ordinary split and eight bytes for stack-to-stack expansion,
 so layout and emission continue to agree exactly.
 
-## 2026-08-31 — The first collector uses a non-collecting post-write barrier
+## 2026-08-31, amended 2026-09-02 — Generational collection uses a non-collecting post-write barrier
 
-Simple has no garbage collector and therefore fixes no write-barrier policy. Our initial moving
-collector is stop-the-world and generational. A Store whose value is a raw managed reference or a
+Simple has no garbage collector and therefore fixes no write-barrier policy. Our first executable
+moving collector is stop-the-world and generational: allocation enters a copying nursery, every
+minor survivor is promoted into the active old generation, and major collection compacts reachable
+young and old objects into the other old-generation semispace. A Store whose value is a raw managed reference or a
 boxed word that may contain one is followed by a pinned Barrier. The Barrier consumes the Store's
 new alias-memory state plus `(object, value)` and returns that same memory type, placing remembered-
 set maintenance after the heap write in the memory SSA chain.
 
 Arm64 lowers the Barrier to the project runtime ABI symbol `aot_rt_write_barrier`, with object/value
 in X0/X1 and ordinary caller-save kills. The runtime entry is explicitly non-collecting, so this call
-is not a safepoint and needs no relocation dance or stack map. A future concurrent or SATB collector
-would require amending this decision and changing placement semantics; it must not silently reuse
-this post-write boundary as though the policies were equivalent.
+is not a safepoint and needs no relocation dance or stack map. An old-to-young write sets a
+runtime-only remembered bit in the owning object's header; minor collection scans and clears every
+marked old object before completing the promotion closure. A future concurrent or SATB collector
+would require amending this decision and changing
+placement semantics; it must not silently reuse this post-write boundary as though the policies
+were equivalent.
 
 ## 2026-09-01 — Hoisted functions measure inlining cost over their own body window
 

@@ -23,10 +23,12 @@
 (import "aot.codegen.regmask" :use *)
 (import "aot.node.cpus.arm64.base" :use *)
 (import "aot.node.cpus.arm64.branch" :use *)
+(import "aot.node.cpus.arm64.split" :use *)
 
 (defstruct Arm64CallNode
   [(hdr NodeHdr) (ideal-op i64) (result-ty i64) (block-head bool) (direct bool) (fidx i64)
    (symbol (slice u8)) (size i64) (entry-return bool)
+   (alloc-shape i64) (alloc-map-id i64) (js-prim i64)
    (max-arg-slot i64) (frame-adjust i64) (has-calls bool)
    (input-masks (ArrayList (Option (ptr RegMask))))
    (output-mask (Option (ptr RegMask)))
@@ -77,6 +79,9 @@
     (set! (.symbol p) "")
     (set! (.size p) size)
     (set! (.entry-return p) false)
+    (set! (.alloc-shape p) 0)
+    (set! (.alloc-map-id p) 0)
+    (set! (.js-prim p) 0)
     (set! (.max-arg-slot p) 0)
     (set! (.frame-adjust p) 0)
     (set! (.has-calls p) false)
@@ -103,6 +108,35 @@
 
 (defn arm64-call-set-entry-return! [(n (dyn NodeOps))] (-> i64)
   (do (set! (.entry-return (arm64-call-node n)) true) 0))
+
+(defn arm64-call-set-alloc-shape! [(n (dyn NodeOps)) (shape i64)] (-> i64)
+  (do (set! (.alloc-shape (arm64-call-node n)) shape) 0))
+
+(defn arm64-call-set-alloc-map-id! [(n (dyn NodeOps)) (map-id i64)] (-> i64)
+  (let [p (arm64-call-node n)]
+    (set! (.alloc-map-id p) map-id)
+    ;; X1 materializes shape, X2 materializes the stable safepoint id, X3 snapshots caller SP,
+    ;; then BL enters the runtime. This size is part of layout and stack-map return-PC identity.
+    (set! (.size p)
+          (+ (* (+ (arm64-const-insns (.alloc-shape p)) (arm64-const-insns map-id)) 4) 8))
+    0))
+
+(defn arm64-call-set-jsop! [(n (dyn NodeOps))
+                            (prim i64)
+                            (shape i64)
+                            (map-id i64)
+                            (transitioning bool)] (-> i64)
+  (let [p (arm64-call-node n)]
+    (set! (.js-prim p) prim)
+    (set! (.alloc-shape p) shape)
+    (set! (.alloc-map-id p) map-id)
+    (set! (.size p)
+          (if transitioning
+              ;; StringConcat materializes shape in X2 and map identity in X3, snapshots SP in X4,
+              ;; then calls. Other admitted JsOps are non-collecting one-instruction calls.
+              (+ (* (+ (arm64-const-insns shape) (arm64-const-insns map-id)) 4) 8)
+              4))
+    0))
 
 (defn arm64-call-set-input-mask! [(n (dyn NodeOps)) (i i64) (mask (ptr RegMask))] (-> i64)
   (let [p (arm64-call-node n)]
@@ -166,6 +200,11 @@
 (defn arm64-fun-has-calls? [(fun (dyn NodeOps))] (-> bool)
   (.has-calls (arm64-call-node fun)))
 
+(defn arm64-fun-saved-rpc-offset [(fun (dyn NodeOps))] (-> i64)
+  (if (arm64-fun-has-calls? fun)
+      (- (arm64-fun-frame-adjust fun) 16)
+      (panic-i "arm64-fun-saved-rpc-offset: leaf function has no saved return PC" (n-nid fun))))
+
 (const ARM64-FRAME-IMMEDIATE-MAX 16777215)  ; 4095<<12 plus 4095
 
 (defn arm64-frame-adjust-insns [(bytes i64)] (-> i64)
@@ -228,12 +267,21 @@
   (let [p (arm64-call-node fun)
         incoming (.max-arg-slot p)
         seen-slots (if (> (- max-location 65) incoming) (- max-location 65) incoming)
-        raw (* (- seen-slots incoming) 8)
+        raw (+ (* (- seen-slots incoming) 8) (if has-calls 16 0))
         adjusted (if (> raw 0) (* (/ (+ raw 15) 16) 16) 0)]
     (set! (.has-calls p) has-calls)
     (set! (.frame-adjust p) adjusted)
-    (set! (.size p) (* 4 (arm64-frame-adjust-insns adjusted)))
-    (arm64-set-return-size! fun (+ 4 (* 4 (arm64-frame-adjust-insns adjusted))))
+    (set! (.size p)
+          (+ (* 4 (arm64-frame-adjust-insns adjusted))
+             (if has-calls
+                 (* 4 (arm64-split-stack-insns (- adjusted 16)))
+                 0)))
+    (arm64-set-return-size! fun
+                            (+ 4
+                               (+ (* 4 (arm64-frame-adjust-insns adjusted))
+                                  (if has-calls
+                                      (* 4 (arm64-split-stack-insns (- adjusted 16)))
+                                      0))))
     adjusted))
 
 (defn arm64-fun-stack-offset [(fun (dyn NodeOps)) (location i64)] (-> i64)
@@ -278,17 +326,47 @@
     (if (= op OP-FUN)
         (do
           (enc-add-definition! encoder d (.fidx p) (.symbol p))
-          (arm64-encode-sp-adjust! encoder (.frame-adjust p) true))
+          (arm64-encode-sp-adjust! encoder (.frame-adjust p) true)
+          (if (.has-calls p)
+              (arm64-split-encode-stack! encoder
+                                         false
+                                         false
+                                         (- (.frame-adjust p) 16)
+                                         30
+                                         16)
+              0))
         (if (= (.size p) 0)
             0
             (if (= op OP-NEW)
                 (do
-                  ;; calloc(1,size): selection fixes the size in X1 and this instruction
-                  ;; materializes the first argument without a hidden allocator live range.
-                  (enc-add4! encoder 0xd2800020)
+                  ;; The graph supplies payload bytes in X0. Shape identity is immutable New
+                  ;; metadata, so materialize it directly into the runtime ABI's X1 argument.
+                  (arm64-encode-immediate-to-reg! encoder (.alloc-shape p) 1)
+                  (arm64-encode-immediate-to-reg! encoder (.alloc-map-id p) 2)
+                  (enc-add4! encoder 0x910003e3)  ; add x3,sp,#0
                   (enc-add4! encoder 0x94000000)
-              (enc-add-symbol-fixup-at!
-                encoder ENC-FIXUP-A64-BL26 d 4 (.fidx p) (.symbol p)))
+                  (enc-add-symbol-fixup-at!
+                    encoder
+                    ENC-FIXUP-A64-BL26
+                    d
+                    (- (.size p) 4)
+                    (.fidx p)
+                    (.symbol p)))
+                    (if (= op OP-JSOP)
+                        (do
+                          (if (> (.alloc-map-id p) 0)
+                              (do
+                                (arm64-encode-immediate-to-reg! encoder (.alloc-shape p) 2)
+                                (arm64-encode-immediate-to-reg! encoder (.alloc-map-id p) 3)
+                                (enc-add4! encoder 0x910003e4))  ; add x4,sp,#0
+                              0)
+                          (enc-add4! encoder 0x94000000)
+                          (enc-add-symbol-fixup-at! encoder
+                                                    ENC-FIXUP-A64-BL26
+                                                    d
+                                                    (- (.size p) 4)
+                                                    (.fidx p)
+                                                    (.symbol p)))
                     (if (or (= op OP-CALL) (= op OP-BARRIER))
                         (if (.direct p)
                             (do
@@ -322,12 +400,20 @@
                                 (enc-add4! encoder 0x9e780000)  ; fcvtzs x0,d0
                                 0)
                               0)
+                          (if (arm64-fun-has-calls? fun)
+                              (arm64-split-encode-stack! encoder
+                                                         true
+                                                         false
+                                                         (arm64-fun-saved-rpc-offset fun)
+                                                         30
+                                                         16)
+                              0)
                           (arm64-encode-sp-adjust! encoder frame false)
                           (enc-add4! encoder 0xd65f03c0)
                           (enc-end-definition! encoder fun d))
                         (do
                           (panic-i "arm64-encode-call!: unsupported nonzero call-family node" op)
-                          0))))))))
+                          0)))))))))
 
 (impl NodeOps Arm64CallNode
   (hdr [(self (ptr Arm64CallNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))

@@ -87,11 +87,17 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 - Named/keyed property and array access nodes.
 - Closures and captured environments.
 - Exceptional control edges.
-- The collector implementation and its runtime metadata consumer. Explicit relocation
-  nodes/projections, schedule- and dominance-sensitive R2 verification, post-write barriers, and
-  typed maps from allocator liveness to final call/allocation return-PC offsets exist; Mach-O and
-  ELF carry aligned stack-map sections.
-- Coil runtime allocation, collection and throw paths.
+- The Coil generational moving core, nursery promotion, compacting old-generation semispaces,
+  remembered old-to-young edges, boxed-edge tracing, serialized-map parser,
+  SP-relative raw/boxed root rewriting and automatic collection on semispace exhaustion are
+  implemented. On Darwin the Coil runtime discovers the linked `__DATA,__aot_stackmaps` section
+  through the executable Mach-O header. Explicit relocation nodes/projections, schedule- and
+  dominance-sensitive R2 verification, post-write barriers, and typed maps from allocator liveness
+  to final call/allocation return-PC offsets exist; Mach-O and ELF carry aligned stack-map sections.
+  ELF runtime section discovery remains before linked Linux collection can claim parity.
+- Coil throw paths. The Coil-owned `aot_rt_alloc(bytes,shape,map-id,caller-sp)` path, runtime header,
+  zeroed payload, generational allocation, per-allocation stress collection and generated-code ABI
+  are implemented.
 
 ## Unwritten optimizer, backend and compilation infrastructure
 

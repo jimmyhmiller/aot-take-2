@@ -28,7 +28,10 @@
 (import "aot.node.call" :use *)
 (import "aot.node.control" :use *)
 (import "aot.node.gc" :use *)
+(import "aot.node.jsops" :use *)
 (import "aot.node.dynamic" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.shape" :use *)
 (import "aot.node.cpus.arm64.base" :use *)
 (import "aot.node.cpus.arm64.arith" :use *)
 (import "aot.node.cpus.arm64.bits" :use *)
@@ -226,34 +229,41 @@
                                             (arm64-call-set-output-mask! selected (arm64-ret-mask sig)))
                                           (if (and (= (n-op multi) OP-NEW) (= (proj-idx n) 0))
                                               (arm64-call-set-output-mask! selected (mask-of ARM-X0))
-                                              (if (and (= (n-op multi) OP-SAFEPOINT)
-                                                       (>= (proj-idx n) SAFEPOINT-LIVE))
+                                              (if (and (= (n-op multi) OP-JSOP)
+                                                       (= (proj-idx n) 2))
                                                   (arm64-call-set-output-mask! selected
-                                                                               (arm64-gpr-mask))
-                                                  0))))
+                                                                               (mask-of ARM-X0))
+                                                  (if (and (= (n-op multi) OP-SAFEPOINT)
+                                                           (>= (proj-idx n) SAFEPOINT-LIVE))
+                                                      (arm64-call-set-output-mask! selected
+                                                                                   (mask-stack ARM-MAX-REG))
+                                                      0)))))
                                 (None [] 0))
                               selected)
                             (do (panic-i "arm64-call-select: unsupported ideal opcode" op)
                                 (unreachable-node))))))))))
 
 (defn arm64-new-select [(n (dyn NodeOps))] (-> (dyn NodeOps))
-  (let [selected (arm64-call-alloc n false true 0 8)]
-    ;; calloc(1,size): MOVZ materializes the constant first argument in X0; the graph's byte-size
-    ;; operand is the second C ABI argument in X1. The returned fresh pointer is projection zero.
-    (arm64-call-set-input-mask! selected 1 (mask-of ARM-X1))
+  (let [shape (new-shape n) selected (arm64-call-alloc n false true -1 0)]
+    ;; aot_rt_alloc(bytes,shape,map-id,caller-sp): the graph supplies bytes in X0; selection
+    ;; materializes immutable shape and safepoint identity in X1/X2 and snapshots SP into X3.
+    ;; The runtime returns the first payload byte in X0.
+    (arm64-call-set-input-mask! selected 1 (mask-of ARM-X0))
     (arm64-call-set-projection-mask! selected 0 (mask-of ARM-X0))
     (arm64-call-set-kill-mask! selected (arm64-caller-save))
-    (arm64-call-set-symbol! selected "calloc")
+    (arm64-call-set-alloc-shape! selected shape)
+    (arm64-call-set-alloc-map-id! selected (n-nid selected))
+    (arm64-call-set-symbol! selected "aot_rt_alloc")
     selected))
 
 (defn arm64-safepoint-select [(n (dyn NodeOps))] (-> (dyn NodeOps))
   (let [selected (arm64-call-alloc n false false 0 0) (mut i) SAFEPOINT-LIVE]
-    ;; A safepoint emits no instruction by itself. Its live inputs and relocation projections are
-    ;; nevertheless real GPR live ranges, so allocation cannot erase or class-mismatch them.
+    ;; A safepoint emits no instruction by itself. Live inputs and relocation projections occupy
+    ;; writable stack homes, which is the exact addressable state consumed by runtime stack maps.
     (loop (if (>= (load i) (n-nins n))
               (break 0)
               (do
-                (arm64-call-set-input-mask! selected (load i) (arm64-gpr-mask))
+                (arm64-call-set-input-mask! selected (load i) (mask-stack ARM-MAX-REG))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
     selected))
@@ -266,6 +276,37 @@
     (arm64-call-set-symbol! selected "aot_rt_write_barrier")
     selected))
 
+(defn arm64-jsop-select [(n (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [prim (jsop-prim n)
+        transitioning (jsop-transitioning? prim)
+        selected (arm64-call-alloc n false true -1 4)
+        (mut i) JSOP-ARG0]
+    (loop (if (>= (load i) (n-nins n))
+              (break 0)
+              (do
+                (arm64-call-set-input-mask! selected
+                                             (load i)
+                                             (mask-of (- (load i) JSOP-ARG0)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (arm64-call-set-projection-mask! selected 2 (mask-of ARM-X0))
+    (arm64-call-set-kill-mask! selected (arm64-caller-save))
+    (arm64-call-set-jsop! selected
+                          prim
+                          (if transitioning SHAPE-STRING 0)
+                          (if transitioning (n-nid selected) 0)
+                          transitioning)
+    (arm64-call-set-symbol!
+      selected
+      (case prim
+            JS-STRING-LEN "aot_rt_string_length"
+            JS-STRING-CONCAT "aot_rt_string_concat"
+            JS-STRING-CHARCODE "aot_rt_string_code_unit"
+            JS-STRING-EQ "aot_rt_string_eq"
+            JS-STRING-COMPARE "aot_rt_string_compare"
+            (do (panic-i "arm64-jsop-select: primitive has no runtime ABI" prim) "")))
+    selected))
+
 (defn arm64-install-hooks! [] (-> i64)
   (do
     ;; One target-wide CFG dispatcher owns both machine control families. Constructors must not
@@ -273,6 +314,7 @@
     ;; queried by dominance, scheduling, allocation, or encoding.
     (set-selected-cfg-ext! (primitive/fnptr-of arm64-call-cfg-hook))
     (set-selected-machine-hook! (primitive/fnptr-of arm64-mach-hook))
+    (set-selected-gc-root-mask! (mask-stack ARM-MAX-REG))
     (set-selected-split-hook! (primitive/fnptr-of arm64-split-factory))
     (set-selected-layout-hook! (primitive/fnptr-of arm64-layout-jump)
                                (primitive/fnptr-of arm64-layout-set-inverted!)
@@ -288,7 +330,9 @@
                             (primitive/fnptr-of arm64-active-max-reg)
                             (primitive/fnptr-of arm64-callee-save-make)
                             (primitive/fnptr-of arm64-fun-finalize-frame!)
-                            (primitive/fnptr-of arm64-fun-stack-offset))
+                            (primitive/fnptr-of arm64-fun-stack-offset)
+                            (primitive/fnptr-of arm64-fun-frame-adjust)
+                            (primitive/fnptr-of arm64-fun-saved-rpc-offset))
     0))
 
 (defn arm64-active-max-reg [] (-> i64) ARM-MAX-REG)
@@ -326,6 +370,8 @@
                 (arm64-mem-select n)
                 (if (= op OP-NEW)
                     (arm64-new-select n)
+                    (if (= op OP-JSOP)
+                        (arm64-jsop-select n)
                     (if (= op OP-BARRIER)
                         (arm64-barrier-select n)
                     (if (= op OP-SAFEPOINT)
@@ -344,13 +390,36 @@
                     (if (or (= op OP-FUN) (= op OP-PARM) (= op OP-CALL) (= op OP-CALLEND)
                             (= op OP-RETURN) (= op OP-PROJ))
                         (arm64-call-select n)
+                        (if (= op OP-MEMMERGE)
+                            (let [pseudo
+                                    (arm64-scalar-make n
+                                                       OP-MEMMERGE
+                                                       ARM64-FORM-CONST
+                                                       0
+                                                       ARM64-CLASS-NONE
+                                                       ARM64-CLASS-NONE
+                                                       0
+                                                       false
+                                                       false)]
+                              ;; MemMerge is a compile-time bundle of alias slices. It carries no
+                              ;; register value and emits no bytes, but remains an ordinary selected
+                              ;; dependency so loads/stores retain their exact memory edges.
+                              (arm64-scalar-set-size! pseudo 0)
+                              pseudo)
                         (if (= op OP-CON)
                         (let [t (con-ty-of n)]
                           (if (ty-constant? t)
-                              (let [dynamic-undefined
+                              (let [dynamic-immediate
                                       (and (ty-dyn? t)
                                            (and (not (ty-dyn-high? t))
-                                                (= (ty-dyn-tags t) TAG-UNDEFINED)))
+                                                (or (= (ty-dyn-tags t) TAG-UNDEFINED)
+                                                    (= (ty-dyn-tags t) TAG-NULL))))
+                                    dynamic-word
+                                      (if dynamic-immediate
+                                          (primitive/ishl
+                                            (dynamic-prefix-for-tag (ty-dyn-tags t))
+                                            48)
+                                          0)
                                     selected
                                       (arm64-scalar-make n
                                                          op
@@ -359,8 +428,8 @@
                                                              (ty-int-lo t)
                                                              (if (ty-flt? t)
                                                                  (flt--bits (ty-flt-value t))
-                                                                 (if dynamic-undefined
-                                                                     DYNAMIC-UNDEFINED-WORD
+                                                                 (if dynamic-immediate
+                                                                     dynamic-word
                                                                      0)))
                                                          ARM64-CLASS-NONE
                                                          (if (ty-flt? t)
@@ -369,13 +438,13 @@
                                                          0
                                                          false
                                                          true)]
-                                (if (or (ty-int? t) dynamic-undefined)
+                                (if (or (ty-int? t) dynamic-immediate)
                                     (arm64-scalar-set-size!
                                       selected
                                       (* 4
                                          (arm64-const-insns
-                                           (if dynamic-undefined
-                                               DYNAMIC-UNDEFINED-WORD
+                                           (if dynamic-immediate
+                                               dynamic-word
                                                (ty-int-lo t)))))
                                     (arm64-scalar-set-size! selected 4))
                                 selected)
@@ -392,7 +461,7 @@
                                 (arm64-scalar-set-size! pseudo 0)
                                 pseudo)))
                             (do (panic-i "arm64-select: unsupported ideal opcode" op)
-                                (unreachable-node)))))))))))))))
+                                (unreachable-node)))))))))))))))))
 
 ;; Cycle-safe ideal -> machine mapping.  The selected shell enters `map` before its inputs are
 ;; visited, matching final Simple's `_instSelect`; loops and phis therefore terminate once their

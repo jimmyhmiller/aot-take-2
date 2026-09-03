@@ -3,6 +3,8 @@
 (module aot.tests.jsl)
 (import "coil.assert" :use *)
 (import "coil.reader" :as rd)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
 (import "aot.node.boot" :use *)
 (import "aot.node.node" :use *)
 (import "aot.node.constant" :use *)
@@ -11,6 +13,9 @@
 (import "aot.node.phi" :use *)
 (import "aot.node.call" :use *)
 (import "aot.node.dynamic" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.node.jsops" :use *)
+(import "aot.shape" :use *)
 (import "aot.codegen.iterpeeps" :use *)
 (import "aot.codegen.opto" :use *)
 (import "aot.verify" :use *)
@@ -18,6 +23,33 @@
 (import "aot.jsl.reader" :use *)
 (import "aot.jsl.check" :use *)
 (import "aot.jsl.lower" :use *)
+(import "aot.jsl.prims" :use *)
+
+(deftest production_primitive_table_admits_only_implemented_capabilities
+         (do
+           (assert-eq (prim-lookup "%StringConcat") JS-STRING-CONCAT)
+           (assert-eq (prim-lookup "%StringEq") JS-STRING-EQ)
+           (assert-eq (prim-lookup "%GetPrototype") JS-GET-PROTOTYPE)
+           (assert-eq (prim-lookup "%UnimplementedCapability") 0)
+           (assert-eq (prim-arity JS-STRING-CONCAT) 2)
+           (assert (prim-transitioning? JS-STRING-CONCAT))
+           (assert (not (prim-transitioning? JS-STRING-EQ)))))
+
+(deftest jsop_is_one_typed_pinned_multi_for_the_runtime_capability_family
+         (do
+           (boot! 49)
+           (let [ctrl (con-make TY-CTRL)
+                 mem (con-make (ty-mem 1 TY-BOT))
+                 left (con-make (raw-string-ty))
+                 right (con-make (raw-string-ty))
+                 op (jsop-make ctrl mem JS-STRING-CONCAT)]
+             (jsop-add-arg! op left)
+             (jsop-add-arg! op right)
+             (assert-eq (jsop-prim op) JS-STRING-CONCAT)
+             (assert-eq (n-nins op) 4)
+             (assert (is-pinned? op))
+             (assert (ty-tuple? (n-ty op)))
+             (assert-eq (ty-tuple-at (n-ty op) 2) (raw-string-ty)))))
 
 (defn load-production-sub [] (-> i64)
   (do
@@ -36,8 +68,8 @@
     (jsl-reset!)
     (let [unit (jsl-read-source! source "semantic-check.jsl")
           form (jsl-form unit form-index)
-          params (rd/sexp-nth form 3)
-          body (rd/sexp-nth form 6)]
+          params (jsl-form-params form)
+          body (jsl-form-body form)]
       ;; Structural admission and semantic typing are deliberately separate so negative tests can
       ;; inspect the typed refusal without terminating the test process through `jsl-refuse`.
       (jsl-check-expr body params)
@@ -59,9 +91,22 @@
 (deftest jsl_checker_accepts_the_current_production_numeric_subset
          (let [unit (load-production-sub)]
            (let [form (jsl-form unit 0)]
-             (assert-eq (jsl-check-expr-type (rd/sexp-nth form 6) (rd/sexp-nth form 3))
+             (assert-eq (jsl-check-expr-type (jsl-form-body form) (jsl-form-params form))
                         (jsl-check-dyn-type TAG-DOUBLE)))
            (assert-eq (jsl-check-unit unit) 1)))
+
+(deftest jsl_checker_admits_explicit_transition_metadata_without_positional_drift
+         (do
+           (jsl-reset!)
+           (let [unit
+                   (jsl-read-source!
+                     "(builtin TransitionIdentity :transitioning true :params [(x int)] :ret dyn (%Box x))"
+                     "transition.jsl")
+                 form (jsl-form unit 0)]
+             (assert (jsl-form-transitioning? form))
+             (assert-eq (rd/sexp-count (jsl-form-params form)) 1)
+             (assert (rd/sexp-sym-is (jsl-form-ret form) "dyn"))
+             (assert-eq (jsl-check-unit unit) 1))))
 
 (deftest jsl_semantic_checker_covers_every_admitted_primitive_signature
          (do
@@ -234,23 +279,129 @@
          (jsl-lower-unit! (jsl-read-file "jsl/compiler/add.jsl"))
          (jsl-lower-unit! (jsl-read-file "jsl/compiler/mul.jsl"))
          (assert-eq (jsl-test-boxed-body-op "JsSub") OP-SUB)
-         (assert-eq (jsl-test-boxed-body-op "JsAdd") OP-ADD)
+         ;; Add now first selects the ECMA-262 String/String branch. Its numeric operation remains
+         ;; in the guarded fallback instead of being the Return's immediate boxed producer.
+         (assert-eq (n-op (n-in! (match (fun-ret (jsl-graph-of "JsAdd"))
+                                  (Some [ret] ret)
+                                  (None [] (unreachable-node)))
+                                RETURN-VALUE))
+                    OP-PHI)
          (assert-eq (jsl-test-boxed-body-op "JsMul") OP-MUL)
          (assert-eq (verify-all) VERR-OK))
 
+(deftest production_object_creation_lowers_through_jsl_to_new_and_object_boxing
+         (boot! 49)
+         (jsl-reset!)
+         (jsl-lower-reset!)
+         (let [unit (jsl-read-file "jsl/compiler/new-object.jsl")]
+           (assert (jsl-form-transitioning? (jsl-form unit 0)))
+           (assert (jsl-form-transitioning? (jsl-form unit 2)))
+           (assert-eq
+             (jsl-check-expr-type
+               (rd/sexp-nth (jsl-form-body (jsl-form unit 2)) 1)
+               (jsl-form-params (jsl-form unit 2)))
+             JSL-CHECK-TY-RAW-OBJECT)
+           (assert-eq (jsl-check-expr-type (jsl-form-body (jsl-form unit 2))
+                                           (jsl-form-params (jsl-form unit 2)))
+                      (jsl-check-dyn-type TAG-ANY))
+           (assert-eq (jsl-check-unit unit) 3)
+           (assert-eq (jsl-lower-unit! unit) 3))
+         (let [(mut args) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))
+               lowered
+                 (jsl-lower-macro-values "JsNewObject"
+                                         (load args)
+                                         (con-make TY-CTRL)
+                                         (con-make (ty-mem ALIAS-BULK TY-BOT)))
+               box (.value lowered)
+               ptr_ (n-in! box 1)
+               fresh (n-in! ptr_ 0)]
+           (assert-eq (n-op box) OP-BOX)
+           (assert-eq (n-op ptr_) OP-PROJ)
+           (assert-eq (proj-idx ptr_) 0)
+           (assert-eq (n-op fresh) OP-NEW)
+           (assert-eq (new-shape fresh) SHAPE-EMPTY)
+           (assert-eq (new-object-ty fresh) (ty-struct "JsObjectPayload"))
+           (assert-eq (n-ty (n-in! fresh 1)) (ty-int-con OBJECT-PAYLOAD-BYTES))
+           (let [merged (.mem lowered)
+                 prototype-store (memmerge-alias merged ALIAS-OBJECT-PROTOTYPE)
+                 properties-store (memmerge-alias merged ALIAS-OBJECT-PROPERTIES)]
+             (assert-eq (n-op merged) OP-MEMMERGE)
+             (assert-eq (n-op prototype-store) OP-STORE)
+             (assert-eq (n-op properties-store) OP-STORE)
+             (assert-eq (mem-alias-of-node prototype-store) ALIAS-OBJECT-PROTOTYPE)
+             (assert-eq (mem-alias-of-node properties-store) ALIAS-OBJECT-PROPERTIES)
+             (assert-eq (n-ty (n-in! prototype-store STORE-VAL)) (ty-dyn TAG-NULL))
+             (assert-eq (n-ty (n-in! properties-store STORE-VAL)) (ty-dyn TAG-NULL)))
+           (assert-eq (verify-all) VERR-OK)))
+
+(deftest transitioning_jsl_string_literals_lower_to_utf16_managed_strings
+         (do
+           (boot! 50)
+           (jsl-reset!)
+           (jsl-lower-reset!)
+           (let [units (jsl-string-utf16-units "Aé😀")]
+             (assert-eq (len units) 4)
+             (assert-eq (get units 0) 0x41)
+             (assert-eq (get units 1) 0xe9)
+             (assert-eq (get units 2) 0xd83d)
+             (assert-eq (get units 3) 0xde00))
+           (let [unit
+                   (jsl-read-source!
+                     "(builtin JsStringWitness :transitioning true :params [] :ret dyn (%Box \"A\\x1f600;\"))"
+                     "string-witness.jsl")
+                 form (jsl-form unit 0)]
+             (assert-eq (jsl-check-expr-type (jsl-form-body form) (jsl-form-params form))
+                        (jsl-check-dyn-type TAG-STRING))
+             (assert-eq (jsl-check-unit unit) 1)
+             (assert-eq (jsl-lower-unit! unit) 1)
+             (let [fun (jsl-graph-of "JsStringWitness")
+                   ret (match (fun-ret fun) (Some [r] r) (None [] (unreachable-node)))
+                   box (n-in! ret RETURN-VALUE)
+                   ptr_ (n-in! box 1)
+                   fresh (n-in! ptr_ 0)]
+               (assert-eq (n-op box) OP-BOX)
+               (assert-eq (n-op fresh) OP-NEW)
+               (assert-eq (new-shape fresh) SHAPE-STRING)
+               (assert-eq (new-object-ty fresh) (ty-struct "JsStringPayload"))
+               (assert-eq (n-op (n-in! ret RETURN-MEM)) OP-MEMMERGE)
+               (assert-eq (verify-all) VERR-OK)))))
+
+(deftest jsl_string_length_reads_the_managed_utf16_length_slice
+         (do
+           (boot! 51)
+           (jsl-reset!)
+           (jsl-lower-reset!)
+           (let [unit
+                   (jsl-read-source!
+                     "(builtin JsStringLengthWitness :transitioning true :params [] :ret int (%StringLength \"A\\x1f600;\"))"
+                     "string-length-witness.jsl")]
+             (assert-eq (jsl-check-unit unit) 1)
+             (assert-eq (jsl-lower-unit! unit) 1)
+             (let [fun (jsl-graph-of "JsStringLengthWitness")
+                   ret (match (fun-ret fun) (Some [r] r) (None [] (unreachable-node)))
+                   length (n-in! ret RETURN-VALUE)]
+               (assert-eq (n-op length) OP-LOAD)
+               (assert-eq (mem-alias-of-node length) ALIAS-STRING-LENGTH)
+               (assert-eq (verify-all) VERR-OK)
+               (iter-run!)
+               (assert-eq (n-ty (n-in! ret RETURN-VALUE)) (ty-int-con 3))
+               (assert-eq (verify-all) VERR-OK)))))
+
 (deftest compiler_index_assigns_stable_function_indices_and_closes_the_world
          (boot! 44)
-         (assert-eq (jsl-lower-index! "jsl/compiler/index") 7)
+           (assert-eq (jsl-lower-index! "jsl/compiler/index") 11)
          (assert-eq (jsl-fidx-of "JsSub") 0)
          (assert-eq (jsl-fidx-of "JsAdd") 1)
          (assert-eq (jsl-fidx-of "JsMul") 2)
-         (assert-eq (jsl-fidx-of "JsChoose") 3)
-         (assert-eq (jsl-fidx-of "JsIdentity") 4)
-         (assert-eq (jsl-fidx-of "JsIncrementIntOrIdentity") 5)
+         (assert-eq (jsl-fidx-of "JsLt") 3)
+         (assert-eq (jsl-fidx-of "JsChoose") 4)
+         (assert-eq (jsl-fidx-of "JsIdentity") 5)
+         (assert-eq (jsl-fidx-of "JsIncrementIntOrIdentity") 6)
          ;; Loading declarations reserves identities even when no FunPtr happened to name the
          ;; highest JSL function. Source and inline identities therefore begin after the library.
-         (assert-eq (jsl-fidx-of "JsTruthy") 6)
-         (assert-eq (next-inline-fidx!) 7)
+         (assert-eq (jsl-fidx-of "JsTruthy") 7)
+         (assert-eq (jsl-fidx-of "JsGetNamedObject") 8)
+         (assert-eq (next-inline-fidx!) 9)
          (jsl-close-world!)
          (assert (not (fun-unknown-callers? (jsl-graph-of "JsSub"))))
          (assert (not (fun-unknown-callers? (jsl-graph-of "JsAdd"))))
@@ -262,7 +413,7 @@
 
 (deftest structured_jsl_let_and_if_lower_to_ordinary_control_and_phi
          (boot! 45)
-         (assert-eq (jsl-lower-index! "jsl/compiler/index") 7)
+           (assert-eq (jsl-lower-index! "jsl/compiler/index") 11)
          (let [fun (jsl-graph-of "JsChoose")
                ret (match (fun-ret fun) (Some [r] r) (None [] (unreachable-node)))
                value (n-in! ret RETURN-VALUE)
@@ -290,9 +441,57 @@
            (assert (not (call-linked? call (jsl-graph-of "JsIdentity"))))
            (assert-eq (verify-all) VERR-OK)))
 
+(deftest jsl_macros_expand_at_the_call_site_without_a_function_boundary
+         (do
+           (boot! 52)
+           (jsl-reset!)
+           (jsl-lower-reset!)
+           (let [unit
+                   (jsl-read-source!
+                     "(macro AddOne :params [(value int)] :ret int (%Add value 1))
+                      (builtin UsesAddOne :params [(value int)] :ret int (AddOne value))"
+                     "macro-expansion.jsl")]
+             (assert (jsl-form-macro? (jsl-form unit 0)))
+             (assert-eq (jsl-check-unit unit) 2)
+             (assert-eq (jsl-lower-unit! unit) 2)
+             (let [fun (jsl-graph-of "UsesAddOne")
+                   ret (match (fun-ret fun) (Some [r] r) (None [] (unreachable-node)))
+                   value (n-in! ret RETURN-VALUE)]
+               (assert-eq (n-op value) OP-ADD)
+               (assert-eq (n-op (n-in! value 1)) OP-PARM)
+               (assert-eq (n-op (n-in! value 2)) OP-CON)
+               (assert-eq (verify-all) VERR-OK)))))
+
+(deftest jsl_owns_guarded_named_own_property_semantics
+         (do
+           (boot! 53)
+           (jsl-reset!)
+           (jsl-lower-reset!)
+           (let [key (shape-key-intern "jsl-own-property")
+                 shaped (shape-transition SHAPE-EMPTY "jsl-own-property")]
+             (assert-eq key (shape-field-key shaped))
+             (assert-eq key 1)
+             (let [unit
+                     (jsl-read-source!
+                       "(macro GetOwnNamed :params [(object dyn) (key int)] :ret dyn
+                          (if (%IsObject object)
+                              (%PropLoadOwnNamed (%UnboxObject object) key)
+                              (%Undefined)))
+                        (builtin UsesGetOwnNamed :params [(object dyn)] :ret dyn
+                          (GetOwnNamed object 1))"
+                       "own-property-macro.jsl")]
+               (assert-eq (jsl-check-unit unit) 2)
+               (assert-eq (jsl-lower-unit! unit) 2)
+               (let [fun (jsl-graph-of "UsesGetOwnNamed")
+                     ret (match (fun-ret fun) (Some [r] r) (None [] (unreachable-node)))
+                     value (n-in! ret RETURN-VALUE)]
+                 (assert-eq (n-op value) OP-PHI)
+                 (assert-eq (n-ty value) (ty-dyn TAG-ANY))
+                 (assert-eq (verify-all) VERR-OK))))))
+
 (deftest jsl_tag_test_installs_a_branch_local_cast_before_unboxing
          (boot! 46)
-         (assert-eq (jsl-lower-index! "jsl/compiler/index") 7)
+           (assert-eq (jsl-lower-index! "jsl/compiler/index") 11)
          (let [fun (jsl-graph-of "JsIncrementIntOrIdentity")
                ret (match (fun-ret fun) (Some [r] r) (None [] (unreachable-node)))
                result (n-in! ret RETURN-VALUE)
@@ -357,7 +556,7 @@
 
 (deftest unknown_dynamic_input_retains_the_guarded_jsl_fallback_after_opto
          (boot! 47)
-         (assert-eq (jsl-lower-index! "jsl/compiler/index") 7)
+           (assert-eq (jsl-lower-index! "jsl/compiler/index") 11)
          (let [fun (jsl-graph-of "JsIncrementIntOrIdentity")
                caller-start (start-make (ty-int-bot))
                caller-fun
@@ -396,7 +595,7 @@
 
 (deftest boxed_integer_call_specializes_the_guarded_jsl_definition
          (boot! 48)
-         (assert-eq (jsl-lower-index! "jsl/compiler/index") 7)
+           (assert-eq (jsl-lower-index! "jsl/compiler/index") 11)
          (let [fun (jsl-graph-of "JsIncrementIntOrIdentity")
                caller-start (start-make (ty-int-bot))
                caller-fun
@@ -407,7 +606,7 @@
                c (call-make caller-fun)]
            (n-keep! unused)
            (call-add-arg! c (box-make (con-int 9)))
-           (call-set-fptr! c (funptr-make fun 5))
+           (call-set-fptr! c (funptr-make fun (jsl-fidx-of "JsIncrementIntOrIdentity")))
            (let [end (callend-make c)
                  result (proj-make end RETURN-VALUE "increment.result")
                  ret

@@ -82,9 +82,13 @@ selects scaled unsigned imm12, unscaled signed imm9, or register-offset addressi
 offset constants from allocator inputs, distinguishes control/memory edges from base/index/value
 register edges, preserves precise aliases through the generic MemOps hook, and selects GPR versus
 FPR data registers. Memory/control lattice constants become zero-byte, non-LRG pseudo-values in a
-selected graph. `New` now exists as final Simple's fresh-pointer/private-memory Multi, with shape
-identity kept distinct from its referent struct type; arm64 selects it as the two-instruction
-`calloc(1,size)` boundary with X1 input, X0 projection, and caller-save kills. MemMerge and MemPhi
+selected graph. `New` now exists as final Simple's fresh-pointer/private-memory Multi, with an
+additional public-memory ordering input because JavaScript object initialization and publication
+may contain adjacent allocations. Shape identity remains distinct from its referent struct type;
+arm64 selects it as the two-instruction
+`aot_rt_alloc(bytes,shape,map-id,caller-sp)` boundary with X0 input, immediate X1/X2 metadata,
+an X3 caller-SP snapshot, X0 projection, and
+caller-save kills. MemMerge and MemPhi
 cross selection as zero-register memory pseudos; Safepoint and post-write Barrier have explicit
 selected forms.
 
@@ -176,14 +180,15 @@ Allocation is iterative graph coloring, not a one-pass greedy assignment:
 6. Coalesce noninterfering copies without violating masks.
 7. Simplify trivially colorable ranges first using Simple's fixed/ordinary/Split reverse-color
    priority, then optimistic ranges; assign colors in reverse with biased Split-chain choices.
-8. Split every failed range deterministically and retry, with an eight-round hard limit.
+8. Split every failed range deterministically and retry, with the documented sixteen-round hard
+   limit required by explicit moving-root boundaries.
 9. Number spill slots after physical registers so split copies use one location namespace.
 10. Remove no-op copies after coloring and finalize frame size, callee saves, and stack arguments.
 
-Our extension carries a liveness kind on every live range: scalar, raw managed reference, or boxed
-word that may contain a reference. The kind at every safepoint is the source of truth for stack-map
-generation. Coalescing and splitting must preserve it, and incompatible kinds may not silently
-merge.
+Our extension carries a liveness kind on every live range: scalar, raw managed reference, boxed
+word that may contain a reference, or boxed word proven not to contain one. Both boxed families can
+receive addressable spill homes across calls, but only reference-bearing kinds enter relocation
+maps. Coalescing and splitting preserve the conservative join of this evidence.
 
 Current producer: `regmask.coil` represents arbitrary fixed locations plus the infinite spill tail
 and is covered beyond location 512. `regalloc.coil` builds and unions LRGs, carries conservative GC
@@ -228,8 +233,9 @@ targets and branch relocations; its typed subprocess path links Mach-O with `cc`
 executes a selected `main` returning 42.
 
 `gcmeta.coil` now reconstructs liveness backwards from the allocator's final block live-outs,
-recognizes calls and allocations as safepoints, and records raw-reference or boxed-word locations at
-their final encoded return PCs. Scalars are deliberately omitted. Direct tests cover both an empty
+recognizes calls and allocations as safepoints, and records raw-reference or reference-bearing
+boxed-word locations at their final encoded return PCs. Scalars and proven non-reference boxed
+words are deliberately omitted. Direct tests cover both an empty
 call map keyed at byte four and a typed raw-reference register entry. It serializes one versioned,
 target-neutral little-endian format with text-relative return PCs and fixed-width typed location
 records. `objfile.coil` emits those identical bytes as aligned `__DATA,__aot_stackmaps` Mach-O and
@@ -249,9 +255,24 @@ the boundary to a non-collecting Coil-runtime `BL`: object/value use X0/X1, call
 the IFG, functions preserve LR, and encoding retains a typed symbol relocation. Scalar Stores remain
 barrier-free.
 
+`New` crosses the same Coil-owned runtime ABI as
+`aot_rt_alloc(bytes,shape,map-id,caller-sp)`. Generated code passes payload bytes in X0, selection
+materializes the immutable shape and stack-map identity in X1/X2, snapshots caller SP in X3, and
+the runtime returns the first payload byte in X0. The runtime owns a three-word header immediately before that address
+(payload size, collector metadata, then shape) and zeroes the payload. Consequently shape field offset zero remains the
+first user-visible word; generated code has no host-allocator symbol or header arithmetic.
+
+Allocation uses a Coil-owned copying nursery and a compacting two-semispace old generation. Minor
+collection promotes nursery survivors, scans remembered old objects, and clears the nursery. Major
+collection copies the reachable young-and-old closure into the other old space. On exhaustion the Darwin runtime discovers the
+linked `__DATA,__aot_stackmaps` section, selects the record by X2 identity, rewrites SP-relative
+raw and boxed roots, walks generated callers by saved return PC, traces boxed object fields, and
+retries the allocation. `AOT_RT_GC_STRESS` runs the same collection path before every generated
+allocation without changing normal policy when it is absent.
+
 Work outside this nine-stage backend slice remains: compilation-unit/serialized-IR sections,
-explicit loop-backedge safepoint placement, the collector implementation/runtime object, and
-cross-platform linked execution coverage. The source-to-object phase driver and execution suite
+explicit loop-backedge safepoint placement, and cross-platform linked execution coverage. The
+source-to-object phase driver and execution suite
 cover the complete implemented source-to-native arm64 path—parsing, optimization, selection, GCM,
 local scheduling, iterative allocation, frame finalization, encoding, Mach-O writing, linking and
 execution—without hand-assigned registers.

@@ -4,9 +4,13 @@
 (import "aot.node.boot" :use *)
 (import "aot.node.node" :use *)
 (import "aot.node.constant" :use *)
+(import "aot.node.arith" :use *)
 (import "aot.node.control" :use *)
 (import "aot.node.call" :use *)
 (import "aot.node.dynamic" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.node.gc" :use *)
+(import "aot.shape" :use *)
 (import "aot.type.type" :use *)
 (import "aot.codegen.codegen" :use *)
 (import "aot.codegen.machine" :use *)
@@ -17,10 +21,16 @@
 (import "aot.codegen.gcmeta" :use *)
 (import "aot.codegen.gcm" :use *)
 (import "aot.codegen.listsched" :use *)
+(import "aot.codegen.regalloc" :use *)
+(import "aot.codegen.encoding" :use *)
+(import "aot.codegen.objfile" :use *)
 (import "aot.codegen.pipeline" :use *)
 (import "aot.node.cpus.arm64" :use *)
 (import "aot.jsl.lower" :use *)
 (import "aot.parse.parser" :use *)
+
+(extern setenv :cc c [(ptr i8) (ptr i8) i32] (-> i32))
+(extern unsetenv :cc c [(ptr i8)] (-> i32))
 
 (defn pipeline-test-ideal-op [(n (dyn NodeOps))] (-> i64)
   (match (mach-of n) (Some [mach] (m-ideal-op mach)) (None [] (n-op n))))
@@ -99,7 +109,284 @@
                                                "/tmp/aot-take-2-phase-contract.o"
                                                29)
                       0))
+           ;; The production driver must freeze return-PC maps after layout and before export.
+           ;; Merely teaching the object writer about the section is insufficient if this phase
+           ;; edge never runs; the ordinary source-main call is a real safepoint witness.
+           (assert (> (gc-stackmap-count) 0))
            (assert-eq (code-phase) PHASE-EXPORT)))
+
+(deftest source_object_literal_properties_reach_native_execution_through_aotrt
+         (let [object-path "/tmp/aot-take-2-object-literal.o"
+               executable-path "/tmp/aot-take-2-object-literal"]
+           (assert (> (pipeline-compile-macho!
+                        "function main() {
+                           let node = { left: 1, right: 2, item: 3 };
+                           return node.item;
+                         }"
+                        object-path
+                        31)
+                      0))
+           (assert-eq (macho-link-runtime! object-path
+                                           "build/release/aot-runtime.o"
+                                           executable-path)
+                      0)
+           (assert-eq (run-executable! executable-path) 3)))
+
+(deftest source_generic_property_assignment_transitions_runtime_shapes_through_jsl
+         (let [object-path "/tmp/aot-take-2-property-assignment.o"
+               executable-path "/tmp/aot-take-2-property-assignment"]
+           (assert (> (pipeline-compile-macho!
+                        "function update(node) {
+                           node.item = 9;
+                           return node.item;
+                         }
+                         function main() {
+                           return update({ left: 1, item: 3 });
+                         }"
+                        object-path
+                        37)
+                      0))
+           (assert-eq (macho-link-runtime! object-path
+                                           "build/release/aot-runtime.o"
+                                           executable-path)
+                      0)
+           (assert-eq (run-executable! executable-path) 9)))
+
+(deftest source_string_concatenation_crosses_jsl_and_aotrt
+         (let [object-path "/tmp/aot-take-2-string-concat.o"
+               executable-path "/tmp/aot-take-2-string-concat"]
+           (assert (> (pipeline-compile-macho!
+                        "function main() {
+                           let joined = 'A' + '😀';
+                           return joined.length;
+                         }"
+                        object-path
+                        40)
+                      0))
+           (assert-eq (macho-link-runtime! object-path
+                                           "build/release/aot-runtime.o"
+                                           executable-path)
+                      0)
+           ;; `A` is one UTF-16 code unit and the supplementary scalar is a surrogate pair.
+           (assert-eq (run-executable! executable-path) 3)))
+
+(deftest source_object_literal_prototype_traversal_crosses_jsl_and_aotrt
+         (let [object-path "/tmp/aot-take-2-object-prototype.o"
+               executable-path "/tmp/aot-take-2-object-prototype"]
+           (assert (> (pipeline-compile-macho!
+                        "function main() {
+                           let prototype = { answer: 42 };
+                           let child = { __proto__: prototype };
+                           return child.answer;
+                         }"
+                        object-path
+                        45)
+                      0))
+           (assert-eq (macho-link-runtime! object-path
+                                           "build/release/aot-runtime.o"
+                                           executable-path)
+                      0)
+           (assert-eq (run-executable! executable-path) 42)))
+
+(deftest recursive_binary_trees_allocate_and_collect_managed_object_graphs
+         (let [object-path "/tmp/aot-take-2-binary-trees.o"
+               executable-path "/tmp/aot-take-2-binary-trees"]
+           (assert (> (pipeline-compile-macho!
+                        "function makeTree(depth) {
+                           if (depth < 1) {
+                             return { left: undefined, right: undefined, item: 1 };
+                           }
+                           let next = depth - 1;
+                           return { left: makeTree(next), right: makeTree(next), item: 1 };
+                         }
+                         function check(node) {
+                           if (node.left) {
+                             return check(node.left) + check(node.right) + 1;
+                           }
+                           return 1;
+                         }
+                         function main() { return check(makeTree(15)); }"
+                        object-path
+                        41)
+                      0))
+           (assert-eq (macho-link-runtime! object-path
+                                           "build/release/aot-runtime.o"
+                                           executable-path)
+                      0)
+           ;; 2^(15+1)-1 live nodes require about 4.7 MiB after their discarded transition
+           ;; backings die, but create about 8.4 MiB cumulatively. A 6 MiB semispace therefore
+           ;; makes collection necessary while still leaving enough room for the live tree and
+           ;; the remainder of construction. Process status retains the checksum's low byte.
+           (assert-eq (setenv c"AOT_RT_HEAP_BYTES" c"6291456" 1) 0)
+           (let [status (run-executable! executable-path)]
+             (unsetenv c"AOT_RT_HEAP_BYTES")
+             (assert-eq status 255))))
+
+(deftest benchmarksgame_lifetime_pattern_preserves_the_long_lived_tree_with_default_gc
+         (let [object-path "/tmp/aot-take-2-binary-trees-default.o"
+               executable-path "/tmp/aot-take-2-binary-trees-default"]
+           (assert (> (pipeline-compile-macho!
+                        "function bottomUpTree(depth) {
+                           if (depth < 1) {
+                             return { left: undefined, right: undefined };
+                           }
+                           let next = depth - 1;
+                           return { left: bottomUpTree(next), right: bottomUpTree(next) };
+                         }
+                         function itemCheck(node) {
+                           if (node.left) {
+                             return 1 + itemCheck(node.left) + itemCheck(node.right);
+                           }
+                           return 1;
+                         }
+                         function work(iterations, depth) {
+                           let i = 0;
+                           let check = 0;
+                           while (i < iterations) {
+                             check = check + itemCheck(bottomUpTree(depth));
+                             i = i + 1;
+                           }
+                           return check;
+                         }
+                         function powerOfTwo(exponent) {
+                           if (exponent < 1) { return 1; }
+                           return 2 * powerOfTwo(exponent - 1);
+                         }
+                         function main() {
+                           let maxDepth = 15;
+                           let total = itemCheck(bottomUpTree(maxDepth + 1));
+                           let longLivedTree = bottomUpTree(maxDepth);
+                           let depth = 4;
+                           while (depth < maxDepth + 1) {
+                             let iterations = powerOfTwo(maxDepth - depth + 4);
+                             total = total + work(iterations, depth);
+                             depth = depth + 2;
+                           }
+                           return total + itemCheck(longLivedTree);
+                         }"
+                        object-path
+                        46)
+                      0))
+           (assert-eq (macho-link-runtime! object-path
+                                           "build/release/aot-runtime.o"
+                                           executable-path)
+                      0)
+           (unsetenv c"AOT_RT_HEAP_BYTES")
+           ;; Complete checksum 6,444,382 modulo the process-status byte.
+           (assert-eq (run-executable! executable-path) 94)))
+
+(deftest gc_stress_collects_before_every_allocation_and_preserves_recursive_trees
+         (let [object-path "/tmp/aot-take-2-gc-stress.o"
+               executable-path "/tmp/aot-take-2-gc-stress"]
+           (assert (> (pipeline-compile-macho!
+                        "function tree(depth) {
+                           if (depth < 1) {
+                             return { left: undefined, right: undefined };
+                           }
+                           let next = depth - 1;
+                           return { left: tree(next), right: tree(next) };
+                         }
+                         function check(node) {
+                           if (node.left) {
+                             return 1 + check(node.left) + check(node.right);
+                           }
+                           return 1;
+                         }
+                         function main() { return check(tree(8)) - 511; }"
+                        object-path
+                        47)
+                      0))
+           (assert-eq (macho-link-runtime! object-path
+                                           "build/release/aot-runtime.o"
+                                           executable-path)
+                      0)
+           (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) 0)
+           (let [status (run-executable! executable-path)]
+             (unsetenv c"AOT_RT_GC_STRESS")
+             (assert-eq status 0))))
+
+(deftest generated_new_reaches_aot_runtime_allocation_in_a_linked_process
+         (do
+           (boot! 43)
+           (code-reset! 43)
+           (let [start (start-make (ty-int-bot))
+                 signature (ty-tuple-of2 (ty-int-bot) (ty-int-bot))
+                 fun (fun-make start signature "main")
+                 rpc (parm-make-slot fun 0 (ty-int-bot) "$rpc")
+                 shape (shape-transition SHAPE-EMPTY "value")
+                 object-ty (ty-struct "LinkedRuntimeObject")
+                 allocation
+                   (new-make fun
+                             (con-make (ty-int-con 24))
+                             (con-make (ty-mem 1 TY-BOT))
+                             shape
+                             object-ty)
+                 pointer (proj-make allocation 0 "object.payload")
+                 boxed-pointer (box-make-at (Some fun) pointer)
+                 unboxed-pointer (unbox-make boxed-pointer REP-OBJECT)
+                 private-memory (proj-make allocation 1 "object.private-memory")
+                 initialized (store-make fun
+                                         private-memory
+                                         unboxed-pointer
+                                         (con-make (ty-int-con 0))
+                                         (con-make (ty-int-con 91))
+                                         (shape-alias shape "value")
+                                         (ty-int-bot))
+                 safepoint (safepoint-make fun initialized)
+                 live-index (safepoint-add-live! safepoint boxed-pointer)
+                 relocated-box (safepoint-relocated safepoint live-index)
+                 second
+                   (new-make fun
+                             (con-make (ty-int-con 24))
+                             initialized
+                             shape
+                             object-ty)
+                 second-memory (proj-make second 1 "second.private-memory")
+                 relocated-pointer (unbox-make relocated-box REP-OBJECT)
+                 loaded (load-make fun
+                                   initialized
+                                   relocated-pointer
+                                   (con-make (ty-int-con 0))
+                                   (shape-alias shape "value")
+                                   (ty-int-bot))
+                 ret (return-make fun
+                                  (Some second-memory)
+                                  (sub-make loaded (con-make (ty-int-con 49)))
+                                  (Some rpc)
+                                  (Some fun))
+                 stop (stop-make)]
+             (fun-set-ret! fun ret)
+             ;; Preserve allocation order while retaining New's private-memory semantics. Each
+             ;; allocation occupies 40 header-inclusive bytes, so the first object's pointer is
+             ;; live when the second allocation forces collection in a 64-byte semispace.
+             (n-add-def! second (Some safepoint))
+             (n-add-def! relocated-pointer (Some second))
+             (stop-add-return! stop ret)
+             (typecheck-run! stop)
+             (looptree-build! start stop)
+             (gc-lower-barriers-from! stop)
+             (call-unlink-all!)
+             (let [selected-stop (arm64-select-graph stop)
+                   selected-start (pipeline-find-selected-start selected-stop)]
+               (code-set-roots! selected-start selected-stop)
+               (gcm-build-cfg!)
+               (sched-run!)
+               (let [rounds (ra-run!)]
+                 (assert (> rounds 0))
+                 (assert (< rounds RA-MAX-ROUNDS)))
+               (enc-layout!)
+               (gc-build-stackmaps!)
+               (enc-emit!)
+               (enc-relocate!)
+               (assert (> (macho-write "/tmp/aot-take-2-runtime-allocation.o") 0))
+               (assert-eq (macho-link-runtime! "/tmp/aot-take-2-runtime-allocation.o"
+                                               "build/release/aot-runtime.o"
+                                               "/tmp/aot-take-2-runtime-allocation")
+                          0)
+               (assert-eq (setenv c"AOT_RT_HEAP_BYTES" c"64" 1) 0)
+               (let [status (run-executable! "/tmp/aot-take-2-runtime-allocation")]
+                 (unsetenv c"AOT_RT_HEAP_BYTES")
+                 (assert-eq status 42))))))
 
 (deftest forward_declaration_pipeline_is_independent_of_seeded_worklist_order
          (let [source

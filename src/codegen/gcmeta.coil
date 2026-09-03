@@ -35,6 +35,8 @@
 (defstruct GcMetaState
   [(safepoint-nids (ArrayList i64))
    (return-pcs (ArrayList i64))
+   (frame-sizes (ArrayList i64))
+   (rpc-offsets (ArrayList i64))
    (slot-los (ArrayList i64))
    (slot-his (ArrayList i64))
    (locations (ArrayList i64))
@@ -48,6 +50,8 @@
   (let [a (alloc/malloc-allocator) state (gcmeta-state)]
     (set! (.safepoint-nids state) (al-new [i64] a))
     (set! (.return-pcs state) (al-new [i64] a))
+    (set! (.frame-sizes state) (al-new [i64] a))
+    (set! (.rpc-offsets state) (al-new [i64] a))
     (set! (.slot-los state) (al-new [i64] a))
     (set! (.slot-his state) (al-new [i64] a))
     (set! (.locations state) (al-new [i64] a))
@@ -77,8 +81,9 @@
 
 ;; One target-neutral section format is consumed by both object writers and the runtime:
 ;;   magic[8] = "AOTSMAP\0", u32 version, u32 record-count;
-;;   record = u64 text-relative-return-pc, u32 slot-count, u32 reserved;
-;;   slot = u32 machine-location, u8 kind, u8[3] reserved.
+;;   record = u64 safepoint-id, u64 text-relative-return-pc, u32 slot-count,
+;;            u32 frame-size, u32 saved-rpc-offset, u32 reserved;
+;;   slot = u32 caller-SP-relative-byte-offset, u8 kind, u8[3] reserved.
 ;; Fixed-width records keep parsing allocation-free and make malformed-section bounds checks exact.
 (defn gc-stackmap-bytes [] (-> (slice u8))
   (let [a (alloc/malloc-allocator) (mut out) (al-new [u8] a) (mut i) 0]
@@ -93,13 +98,16 @@
           (gcmeta-put1! (mut out) 0x41)
           (gcmeta-put1! (mut out) 0x50)
           (gcmeta-put1! (mut out) 0)
-          (gcmeta-put4! (mut out) 1)
+          (gcmeta-put4! (mut out) 3)
           (gcmeta-put4! (mut out) (gc-stackmap-count))
           (loop (if (>= (load i) (gc-stackmap-count))
                     (break 0)
                     (do
+                      (gcmeta-put8! (mut out) (gc-stackmap-safepoint-nid (load i)))
                       (gcmeta-put8! (mut out) (gc-stackmap-return-pc (load i)))
                       (gcmeta-put4! (mut out) (gc-stackmap-slot-count (load i)))
+                      (gcmeta-put4! (mut out) (gc-stackmap-frame-size (load i)))
+                      (gcmeta-put4! (mut out) (gc-stackmap-rpc-offset (load i)))
                       (gcmeta-put4! (mut out) 0)
                       (let [(mut slot) 0]
                         (loop (if (>= (load slot) (gc-stackmap-slot-count (load i)))
@@ -127,6 +135,12 @@
 (defn gc-stackmap-slot-count [(i i64)] (-> i64)
   (- (get (.slot-his (gcmeta-state)) i) (get (.slot-los (gcmeta-state)) i)))
 
+(defn gc-stackmap-frame-size [(i i64)] (-> i64)
+  (get (.frame-sizes (gcmeta-state)) i))
+
+(defn gc-stackmap-rpc-offset [(i i64)] (-> i64)
+  (get (.rpc-offsets (gcmeta-state)) i))
+
 (defn gc-stackmap-location [(map-index i64) (slot-index i64)] (-> i64)
   (get (.locations (gcmeta-state))
        (+ (get (.slot-los (gcmeta-state)) map-index) slot-index)))
@@ -138,7 +152,10 @@
   (match (mach-of n)
     (Some [mach]
           (let [op (m-ideal-op mach)]
-            (or (= op OP-CALL) (= op OP-NEW) (= op OP-SAFEPOINT))))
+            (or (= op OP-CALL)
+                (= op OP-NEW)
+                (= op OP-JSOP)
+                (= op OP-SAFEPOINT))))
     (None [] false)))
 
 (defn gc-explicit-safepoint? [(n (dyn NodeOps))] (-> bool)
@@ -286,7 +303,7 @@
     (None [] 0)
     (Some [mach]
           (do
-            (if (!= (n-lrg n) 0) (set! (mut live) (n-lrg n) 0) 0)
+            (if (!= (n-lrg n) 0) (set! (mut live) (ra-find! (n-lrg n)) 0) 0)
             (let [(mut i) 1]
               (loop (if (>= (load i) (n-nins n))
                         (break 0)
@@ -296,7 +313,9 @@
                                   (match (n-in n (load i))
                                     (Some [def]
                                           (if (!= (n-lrg def) 0)
-                                              (set! (mut live) (n-lrg def) (n-nid def))
+                                              (set! (mut live)
+                                                    (ra-find! (n-lrg def))
+                                                    (n-nid def))
                                               0))
                                     (None [] 0)))
                             (None [] 0))
@@ -304,26 +323,49 @@
                           (continue)))))
             0))))
 
+(defn gc-safepoint-fun [(safepoint (dyn NodeOps))] (-> (dyn NodeOps))
+  (if (!= (n-block-nid safepoint) 0)
+      (enc-enclosing-fun safepoint)
+      (if (> (code-cfg-count) 0)
+          (code-cfg-at 0)
+          (do
+            (panic-i "gc-safepoint-fun: safepoint has no owning function" (n-nid safepoint))
+            safepoint))))
+
 (defn gc-record-stackmap! [(safepoint (dyn NodeOps)) (live (ArrayList i64))] (-> i64)
-  (let [state (gcmeta-state) lo (len (.locations state)) (mut lrg) 1]
+  (let [state (gcmeta-state)
+        fun (gc-safepoint-fun safepoint)
+        lo (len (.locations state))
+        (mut lrg) 1]
     (push! [i64] (mut (.safepoint-nids state)) (n-nid safepoint))
     (push! [i64]
            (mut (.return-pcs state))
            (+ (enc-op-start safepoint) (enc-op-length safepoint)))
+    (push! [i64] (mut (.frame-sizes state)) (mach-active-frame-size fun))
+    (push! [i64] (mut (.rpc-offsets state)) (mach-active-saved-rpc-offset fun))
     (push! [i64] (mut (.slot-los state)) lo)
     (loop (if (> (load lrg) (ra-lrg-count))
               (break 0)
               (let [nid (get live (load lrg)) kind (ra-lrg-kind (load lrg))]
-                (if (and (!= nid 0) (!= kind LRG-SCALAR))
+                (if (and (= (ra-find! (load lrg)) (load lrg))
+                         (and (!= nid 0)
+                              (or (= kind LRG-RAW-REF) (= kind LRG-BOXED))))
                     (match (arena-node nid)
                       (Some [value]
-                            (if (< (n-reg value) 0)
+                            (let [location (ra-lrg-reg (load lrg))]
+                            (if (< location (mach-active-max-reg))
                                 (panic-i "gc-record-stackmap!: live reference has no location" nid)
                                 (do
-                                  (push! [i64] (mut (.locations state)) (n-reg value))
+                                  (push! [i64]
+                                         (mut (.locations state))
+                                         (if (= (n-block-nid safepoint) 0)
+                                             (* (- location (mach-active-max-reg)) 8)
+                                             (mach-active-stack-offset
+                                               (enc-enclosing-fun safepoint)
+                                               location)))
                                   (push! [i64]
                                          (mut (.kinds state))
-                                         (if (= kind LRG-RAW-REF) SLOT-RAW-REF SLOT-BOXED)))))
+                                         (if (= kind LRG-RAW-REF) SLOT-RAW-REF SLOT-BOXED))))))
                       (None [] (panic-i "gc-record-stackmap!: missing live value" nid)))
                     0)
                 (set! (mut lrg) (+ (load lrg) 1))
@@ -339,17 +381,30 @@
     (gcmeta-reset!)
     (let [(mut ci) 0]
       (loop (if (>= (load ci) (code-cfg-count))
-                (break 0)
-                (let [block (code-cfg-at (load ci))
-                      (mut live) (gc-live-new block)
-                      (mut i) (- (code-schedule-count block) 1)]
-                  (loop (if (< (load i) 0)
-                            (break 0)
-                            (let [n (code-schedule-at block (load i))]
-                              (gc-live-step! n (mut live))
-                              (if (gc-safepoint-op? n) (gc-record-stackmap! n (load live)) 0)
-                              (set! (mut i) (- (load i) 1))
-                              (continue))))
+              (break 0)
+              (let [block (code-cfg-at (load ci))
+                    (mut live) (gc-live-new block)
+                    (mut i) (if (code-schedule-ready? block)
+                                (- (code-schedule-count block) 1)
+                                -1)]
+                  ;; GCM's CFG table may retain a target-global or dead block which deliberately
+                  ;; has no durable local schedule. It emits no instructions and therefore cannot
+                  ;; own a return-PC stack map. Only executable scheduled blocks participate.
+                  (if (code-schedule-ready? block)
+                      (loop (if (< (load i) 0)
+                                (break 0)
+                                (let [n (code-schedule-at block (load i))]
+                                  ;; A return-PC map describes the state AFTER the safepoint
+                                  ;; instruction. Snapshot reverse liveness before stepping across
+                                  ;; the instruction; stepping first incorrectly records call
+                                  ;; arguments that die in the call as resumed roots.
+                                  (if (gc-safepoint-op? n)
+                                      (gc-record-stackmap! n (load live))
+                                      0)
+                                  (gc-live-step! n (mut live))
+                                  (set! (mut i) (- (load i) 1))
+                                  (continue))))
+                      0)
                   (set! (mut ci) (+ (load ci) 1))
                   (continue)))))
     (gc-stackmap-count)))
@@ -369,6 +424,9 @@
                       (set! (mut i) (+ (load i) 1))
                       (continue))))))))
 
+(defn gc-value-may-reference? [(t i64)] (-> bool)
+  (or (ty-memptr? t) (ty-dyn-may-reference? t)))
+
 (defn gc-lower-barriers-marked! [(reachable (ArrayList bool))] (-> i64)
   (let [a (alloc/malloc-allocator) (mut nid) 1 (mut inserted) 0]
     ;; Snapshot the arena bound. Newly created Barriers are results, never candidate Stores.
@@ -381,7 +439,7 @@
                           (if (and (or (= (len reachable) 0) (get reachable (n-nid store)))
                                    (and (= (n-op store) OP-STORE)
                                    (let [t (n-ty (n-in! store STORE-VAL))]
-                                     (or (ty-memptr? t) (ty-dyn? t)))))
+                                     (gc-value-may-reference? t))))
                               (let [(mut oi) 0 (mut already) false]
                                 (loop (if (or (>= (load oi) (n-nouts store)) (load already))
                                           (break 0)
