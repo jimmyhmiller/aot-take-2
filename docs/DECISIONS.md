@@ -51,9 +51,12 @@ set maintenance after the heap write in the memory SSA chain.
 
 Arm64 lowers the Barrier to the project runtime ABI symbol `aot_rt_write_barrier`, with object/value
 in X0/X1 and ordinary caller-save kills. The runtime entry is explicitly non-collecting, so this call
-is not a safepoint and needs no relocation dance or stack map. An old-to-young write sets a
-runtime-only remembered bit in the owning object's header; minor collection scans and clears every
-marked old object before completing the promotion closure. A future concurrent or SATB collector
+is not a safepoint and needs no relocation dance or stack map. Selection passes an explicit raw or
+boxed value kind in X2; the runtime never guesses representation from bits. An old-to-young write
+dirties the owner's 512-byte old-space card. Each old semispace owns a byte card table and an
+object-start table, so minor collection begins at the first object intersecting each dirty card,
+scans the affected objects with the recorded raw/boxed card kinds, and clears the card before
+completing the promotion closure. Repeated writes coalesce by OR-ing card-kind bits. A future concurrent or SATB collector
 would require amending this decision and changing
 placement semantics; it must not silently reuse this post-write boundary as though the policies
 were equivalent.

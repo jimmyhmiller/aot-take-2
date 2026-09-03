@@ -263,7 +263,9 @@ the runtime returns the first payload byte in X0. The runtime owns a three-word 
 first user-visible word; generated code has no host-allocator symbol or header arithmetic.
 
 Allocation uses a Coil-owned copying nursery and a compacting two-semispace old generation. Minor
-collection promotes nursery survivors, scans remembered old objects, and clears the nursery. Major
+collection promotes nursery survivors, scans dirty 512-byte old-space cards through a per-card
+object-start table, and clears the nursery. The post-write ABI carries a compiler-proven raw/boxed
+kind so remembered raw references and NaN-boxed references take their respective forwarding paths. Major
 collection copies the reachable young-and-old closure into the other old space. On exhaustion the Darwin runtime discovers the
 linked `__DATA,__aot_stackmaps` section, selects the record by X2 identity, rewrites SP-relative
 raw and boxed roots, walks generated callers by saved return PC, traces boxed object fields, and

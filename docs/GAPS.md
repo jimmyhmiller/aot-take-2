@@ -88,7 +88,7 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 - Closures and captured environments.
 - Exceptional control edges.
 - The Coil generational moving core, nursery promotion, compacting old-generation semispaces,
-  remembered old-to-young edges, boxed-edge tracing, serialized-map parser,
+  raw/boxed card-table remembered edges, per-card object starts, boxed-edge tracing, serialized-map parser,
   SP-relative raw/boxed root rewriting and automatic collection on semispace exhaustion are
   implemented. On Darwin the Coil runtime discovers the linked `__DATA,__aot_stackmaps` section
   through the executable Mach-O header. Explicit relocation nodes/projections, schedule- and
