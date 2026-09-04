@@ -85,6 +85,17 @@ runtime — allocation, the collector, string primitives, host I/O — is Coil c
 binary or machine code we emit. `cc` is used as a linker, never as a compiler for our code. Nothing
 in this design gets to fall back on "just write that bit in C".
 
+### Narrow exception: the browser graph visualizer
+
+The GitHub Pages graph visualizer may contain authored HTML, CSS, and JavaScript for its browser
+shell, editor integration, interaction, and rendering. Coil compiled to WebAssembly remains the
+driver and the sole implementation of parsing, JSL lowering, optimization, compiler phase
+transitions, graph semantics, filtering facts, and graph-data production. Browser code may present
+and navigate those results; it must not duplicate, approximate, or replace compiler semantics.
+
+This exception applies only to the browser graph visualizer. It does not permit JavaScript tooling,
+runtime implementation, generated-data preprocessing, or compiler logic elsewhere in the project.
+
 ---
 
 ## The one reference you MAY read
