@@ -226,6 +226,7 @@ aot-take-2/
 │   │   ├── ir.coil          ; the pretty printer                          IRPrinter
 │   │   ├── asm.coil         ; the disassembly printer                     ASMPrinter
 │   │   ├── dot.coil         ; Graphviz                                    GraphVisualizer
+│   │   ├── web.coil         ; structured semantic snapshots for the browser visualizer
 │   │   └── text.coil        ; ✦ round-trippable graph and type text
 │   │
 │   ├── verify.coil          ; ✦ the graph verifier, one named code per check
@@ -244,8 +245,10 @@ aot-take-2/
 │   ├── execution-test.coil          ; cases that must RUN, not merely compile
 │   └── differential-test.coil       ; compiled output vs. a JavaScript engine
 ├── benchmarks/              ; JavaScript/TypeScript input fixtures for native comparisons
+├── web/                     ; GitHub Pages graph playground; HTML/CSS/JS presentation over Coil/Wasm
 └── tools/
-    └── dot-dump.coil
+    ├── dot-dump.coil
+    └── graph-wasm.coil      ; browser Wasm entry: source → phase snapshot
 ```
 
 `✦` marks something Simple does not have. Names in the right-hand column of the comments are the
