@@ -216,8 +216,8 @@ export class GraphView {
     this.visible = new Set();
     this.selected = null;
     this.focus = null;
-    this.preset = 'control';
-    this.edgeMode = 'related';
+    this.preset = 'all';
+    this.edgeMode = 'all';
     this.pins = new Map();
     this.scale = 1;
     this.tx = 0; this.ty = 0;
