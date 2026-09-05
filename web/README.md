@@ -15,6 +15,11 @@ only reveals non-structural edges around the selected node. Dragging a node pins
 the rest of the automatic layout intact. The Coil serializer—not browser code—owns every semantic
 classification.
 
+Source ranges are compiler provenance, not a browser heuristic. Clicking or selecting source text
+highlights every graph node whose retained origin overlaps that range; selecting a graph node
+selects its source range. Provenance is carried through graph construction, GVN commoning,
+subsumption, instruction selection, and allocator-created machine nodes.
+
 The phase selector mirrors all thirteen production phases: Parse, Iter, Opto, Typecheck, Looptree,
 Serialize, Unlink, Select, Schedule, LocalSched, Regalloc, Encoding, and Export. A phase is shown
 even when it validates or packages the current graph rather than changing topology. Every snapshot
@@ -33,3 +38,8 @@ loads the production `jsl/compiler/index` and its indexed JSL units into the bro
 Each compile uses a fresh Wasm instance. Coil compilation state is process-scoped, so reusing one
 mutated instance across phase or source changes is invalid. The browser-host smoke check exercises
 every included example through all thirteen phases.
+
+Encoding and Export snapshots also include an authoritative machine-code stream. The Machine code
+tab shows each scheduled instruction's text-relative address, exact emitted bytes, target mnemonic,
+and originating graph node. Selecting a row, graph node, or source range cross-highlights the other
+representations.

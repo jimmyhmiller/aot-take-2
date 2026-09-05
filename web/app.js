@@ -208,13 +208,15 @@ export class WasmHost {
 }
 
 export class GraphView {
-  constructor(canvas) {
+  constructor(canvas, source) {
     this.canvas = canvas;
+    this.source = source;
     this.ctx = canvas.getContext('2d');
     this.graph = null;
     this.positions = new Map();
     this.visible = new Set();
     this.selected = null;
+    this.sourceSelection = new Set();
     this.focus = null;
     this.preset = 'all';
     this.edgeMode = 'all';
@@ -278,8 +280,8 @@ export class GraphView {
 
   setGraph(graph) {
     this.graph = graph;
-    this.selected = null; this.focus = null;
-    this.rebuild(); this.fit();
+    this.selected = null; this.sourceSelection.clear(); this.focus = null;
+    this.renderMachine(); this.rebuild(); this.fit();
   }
 
   setPreset(preset) { this.preset = preset; this.focus = null; this.rebuild(); this.fit(); }
@@ -355,12 +357,53 @@ export class GraphView {
 
   selectAt(x, y, focus) {
     const hit = this.hitAt(x, y);
-    this.selected = hit;
     if (focus && hit !== null) { this.focus = hit; this.rebuild(); this.fit(); }
-    this.inspect(); this.draw();
+    if (hit === null) {
+      this.selected = null; this.sourceSelection.clear(); this.inspect(); this.updateMachineSelection(); this.draw();
+    } else this.select(hit);
   }
 
-  select(id) { if (!this.visible.has(id)) { this.focus = id; this.rebuild(); this.fit(); } this.selected = id; this.inspect(); this.draw(); }
+  select(id) {
+    if (!this.visible.has(id)) { this.focus = id; this.rebuild(); this.fit(); }
+    this.selected = id; this.sourceSelection.clear();
+    const node = this.graph?.nodes.find((item) => item.id === id);
+    if (node?.sourceLo >= 0) this.source.setSelectionRange(node.sourceLo, node.sourceHi);
+    this.inspect(); this.updateMachineSelection(); this.draw();
+  }
+
+  selectSource(lo, hi) {
+    if (!this.graph) return;
+    const point = lo === hi;
+    this.selected = null;
+    this.sourceSelection = new Set(this.graph.nodes
+      .filter((node) => node.sourceLo >= 0 && (point
+        ? node.sourceLo <= lo && lo < node.sourceHi
+        : node.sourceLo < hi && node.sourceHi > lo))
+      .map((node) => node.id));
+    this.inspect(); this.updateMachineSelection(); this.draw();
+  }
+
+  renderMachine() {
+    const panel = document.getElementById('machine');
+    if (!this.graph?.machine?.length) {
+      panel.innerHTML = '<div class="machine-empty">Machine code is available after the Encoding phase.</div>';
+      return;
+    }
+    panel.innerHTML = `<div class="machine-heading"><span>Address</span><span>Bytes</span><span>Instruction</span></div>${this.graph.machine.map((instruction) => {
+      const bytes = instruction.bytes.match(/.{1,2}/g)?.join(' ') || '';
+      return `<button class="machine-row" data-machine-node="${instruction.node}"><span>${instruction.address.toString(16).padStart(8, '0')}</span><code>${bytes}</code><strong>${escapeHtml(instruction.mnemonic)}</strong><small>#${instruction.node}</small></button>`;
+    }).join('')}`;
+    panel.querySelectorAll('[data-machine-node]').forEach((row) => row.onclick = () => this.select(Number(row.dataset.machineNode)));
+  }
+
+  updateMachineSelection() {
+    document.querySelectorAll('[data-machine-node]').forEach((row) => {
+      const id = Number(row.dataset.machineNode);
+      const active = id === this.selected || this.sourceSelection.has(id);
+      row.classList.toggle('active', active);
+      if (id === this.selected) row.scrollIntoView({ block: 'nearest' });
+    });
+  }
 
   inspect() {
     const panel = document.getElementById('inspector');
@@ -392,10 +435,11 @@ export class GraphView {
       const a = this.positions.get(edge.def), b = this.positions.get(edge.use);
       if (!a || !b) continue;
       const related = edge.use === this.selected || edge.def === this.selected;
+      const sourceRelated = this.sourceSelection.has(edge.use) || this.sourceSelection.has(edge.def);
       const structural = edge.kind === 'control' || edge.style === 'dotted';
       if (this.edgeMode === 'structure' && !structural) continue;
       if (this.edgeMode === 'related' && !structural && !related) continue;
-      const highlighted = this.selected === null || related;
+      const highlighted = this.sourceSelection.size ? sourceRelated : this.selected === null || related;
       ctx.globalAlpha = highlighted ? .82 : .08;
       ctx.strokeStyle = edgeColors[edge.kind] || edgeColors.value;
       ctx.fillStyle = ctx.strokeStyle;
@@ -419,10 +463,14 @@ export class GraphView {
     ctx.setLineDash([]);
     for (const node of this.graph.nodes) {
       const p = this.positions.get(node.id); if (!p) continue;
-      const selected = node.id === this.selected, dim = this.selected !== null && !selected && !selectedNear.has(node.id);
+      const selected = node.id === this.selected;
+      const sourceMatched = this.sourceSelection.has(node.id);
+      const dim = this.sourceSelection.size
+        ? !sourceMatched
+        : this.selected !== null && !selected && !selectedNear.has(node.id);
       ctx.globalAlpha = dim ? .24 : 1;
       const fill = nodeColors[node.color] || nodeColors.unknown;
-      ctx.fillStyle = fill; ctx.strokeStyle = selected ? '#ffffff' : '#18202b'; ctx.lineWidth = selected ? 3 : 1.25;
+      ctx.fillStyle = fill; ctx.strokeStyle = selected || sourceMatched ? '#ffffff' : '#18202b'; ctx.lineWidth = selected || sourceMatched ? 3 : 1.25;
       if (node.shape === 'phi' || node.shape === 'value') {
         ctx.beginPath(); ctx.ellipse(p.x, p.y, p.w / 2, p.h / 2, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
       } else {
@@ -583,7 +631,7 @@ async function startGraphLab() {
   const status = document.getElementById('status');
   const compileButton = document.getElementById('compile');
   const empty = document.getElementById('empty-state');
-  const view = new GraphView(document.getElementById('graph'));
+  const view = new GraphView(document.getElementById('graph'), source);
   const host = new WasmHost();
   const phaseTrack = document.getElementById('phase');
   const phaseButtons = [];
@@ -631,6 +679,11 @@ async function startGraphLab() {
 
   compileButton.onclick = compile;
   source.addEventListener('keydown', (event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); compile(); } });
+  source.addEventListener('click', () => view.selectSource(source.selectionStart, source.selectionEnd));
+  source.addEventListener('keyup', (event) => {
+    if (event.key.startsWith('Arrow') || event.key === 'Home' || event.key === 'End')
+      view.selectSource(source.selectionStart, source.selectionEnd);
+  });
   async function setPhase(next) {
     phase = Math.max(1, Math.min(PHASES.length, next)); showPhase();
     await compile();
@@ -653,6 +706,10 @@ async function startGraphLab() {
   document.getElementById('relayout').onclick = () => { view.rebuild(); view.fit(); };
   document.getElementById('reset-pins').onclick = () => view.resetPins();
   document.getElementById('clear-focus').onclick = () => { view.focus = null; view.rebuild(); view.fit(); };
+  document.querySelectorAll('[data-detail]').forEach((button) => button.onclick = () => {
+    document.querySelectorAll('[data-detail]').forEach((item) => item.classList.toggle('active', item === button));
+    document.querySelectorAll('.detail-content').forEach((panel) => { panel.hidden = panel.id !== button.dataset.detail; });
+  });
   document.getElementById('search').addEventListener('keydown', (event) => {
     if (event.key !== 'Enter' || !view.graph) return;
     const query = event.target.value.trim().toLowerCase();
