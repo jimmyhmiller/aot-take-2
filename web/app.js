@@ -1,15 +1,39 @@
-const INITIAL_SOURCE = `function main() {
+const EXAMPLES = {
+  object: `function main() {
   let node = { left: 1, right: 2, item: 3 };
   return node.item;
-}`;
-
-const colors = {
-  control: '#f0a44b', value: '#89a8d8', memory: '#56c2b5', dynamic: '#c18be0',
-  property: '#dd83a4', gc: '#f06f6f', call: '#7ebc76', projection: '#8996a8'
+}`,
+  branch: `function main(condition) {
+  return condition ? 20 : 30;
+}`,
+  arithmetic: `function main() {
+  return 2 + 3 * 4;
+}`,
+  guard: `function main(value) {
+  return value ? value + 1 : 0;
+}`
 };
 
-class WasmHost {
-  constructor() {
+// Simple's graph vocabulary, adjusted only for contrast on the dark browser surface.
+const nodeColors = {
+  control: '#f4cf4f', integer: '#91c9f7', float: '#65d8df', memory: '#477ed1',
+  pointer: '#67bd73', function: '#eea64d', rpc: '#ead9bd', nil: '#b7bec8',
+  dynamic: '#c99bea', shape: '#79c58d', string: '#72c7b6', new: '#86ce79', unknown: '#ef7777'
+};
+const edgeColors = { control: '#ef5b5b', memory: '#568ee8', gc: '#f06f6f', value: '#aab6c8', projection: '#aab6c8' };
+const PHASES = [
+  ['Parse', 'source → ideal graph'], ['Iter', 'pessimistic peepholes'],
+  ['Opto', 'interprocedural optimization'], ['Typecheck', 'final semantic validation'],
+  ['Looptree', 'loop discovery'], ['Serialize', 'cross-unit boundary and barriers'],
+  ['Unlink', 'detach calls for lowering'], ['Select', 'ideal → ARM64 machine graph'],
+  ['Schedule', 'global code motion'], ['LocalSched', 'block-local instruction order'],
+  ['Regalloc', 'register allocation'], ['Encoding', 'layout and relocations'],
+  ['Export', 'object-file boundary']
+];
+
+export class WasmHost {
+  constructor(baseUrl = new URL('.', import.meta.url)) {
+    this.baseUrl = baseUrl;
     this.instance = null;
     this.memory = null;
     this.heapTop = 0;
@@ -19,6 +43,7 @@ class WasmHost {
     this.nextFd = 3;
     this.result = null;
     this.output = '';
+    this.wasmBytes = null;
     this.encoder = new TextEncoder();
     this.decoder = new TextDecoder();
   }
@@ -136,22 +161,40 @@ class WasmHost {
   }
 
   async load() {
-    const indexText = await fetch('../jsl/compiler/index').then((response) => response.text());
+    const indexUrl = new URL('../jsl/compiler/index', this.baseUrl);
+    const indexResponse = await fetch(indexUrl);
+    if (!indexResponse.ok) throw new Error(`Unable to load ${indexUrl.pathname}: ${indexResponse.status}`);
+    const indexText = await indexResponse.text();
     this.files.set('jsl/compiler/index', this.encoder.encode(indexText));
     const paths = indexText.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith('#'));
     await Promise.all(paths.map(async (path) => {
-      const response = await fetch(`../${path}`);
+      const response = await fetch(new URL(`../${path}`, this.baseUrl));
       if (!response.ok) throw new Error(`Unable to load ${path}: ${response.status}`);
       this.files.set(path, new Uint8Array(await response.arrayBuffer()));
     }));
-    const bytes = await fetch('aot-graph.wasm').then((response) => response.arrayBuffer());
-    const { instance } = await WebAssembly.instantiate(bytes, this.imports());
+    const wasmUrl = new URL('aot-graph.wasm', this.baseUrl);
+    const wasmResponse = await fetch(wasmUrl);
+    if (!wasmResponse.ok) throw new Error(`Unable to load ${wasmUrl.pathname}: ${wasmResponse.status}`);
+    this.wasmBytes = await wasmResponse.arrayBuffer();
+    await this.resetRuntime();
+  }
+
+  async resetRuntime() {
+    this.heapTop = 0;
+    this.freeBins.clear();
+    this.fds.clear();
+    this.nextFd = 3;
+    const { instance } = await WebAssembly.instantiate(this.wasmBytes, this.imports());
     this.instance = instance;
     this.memory = instance.exports.memory;
     this.heapTop = Number(instance.exports.__heap_base.value);
   }
 
-  compile(source, phase) {
+  async compile(source, phase) {
+    // A compilation owns all Coil static state and allocator metadata. A fresh instance gives the
+    // browser the same process boundary as the native driver and makes phase/source recompilation
+    // deterministic instead of retaining stale parser/JSL pointers in Wasm linear memory.
+    await this.resetRuntime();
     this.result = null;
     this.output = '';
     const encoded = this.encoder.encode(source);
@@ -164,7 +207,7 @@ class WasmHost {
   }
 }
 
-class GraphView {
+export class GraphView {
   constructor(canvas) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
@@ -174,9 +217,12 @@ class GraphView {
     this.selected = null;
     this.focus = null;
     this.preset = 'control';
+    this.edgeMode = 'related';
+    this.pins = new Map();
     this.scale = 1;
     this.tx = 0; this.ty = 0;
     this.drag = null;
+    this.drawFrame = null;
     this.bind();
     new ResizeObserver(() => this.resize()).observe(canvas.parentElement);
   }
@@ -184,13 +230,22 @@ class GraphView {
   bind() {
     this.canvas.addEventListener('pointerdown', (event) => {
       this.canvas.setPointerCapture(event.pointerId);
-      this.drag = { x: event.clientX, y: event.clientY, tx: this.tx, ty: this.ty, moved: false };
+      const node = this.hitAt(event.offsetX, event.offsetY);
+      const position = node === null ? null : this.positions.get(node);
+      this.drag = { x: event.clientX, y: event.clientY, tx: this.tx, ty: this.ty,
+        node, px: position?.x, py: position?.y, moved: false };
     });
     this.canvas.addEventListener('pointermove', (event) => {
       if (!this.drag) return;
       const dx = event.clientX - this.drag.x, dy = event.clientY - this.drag.y;
       if (Math.abs(dx) + Math.abs(dy) > 3) this.drag.moved = true;
-      this.tx = this.drag.tx + dx; this.ty = this.drag.ty + dy; this.draw();
+      if (this.drag.node !== null) {
+        const position = this.positions.get(this.drag.node);
+        position.x = this.drag.px + dx / this.scale; position.y = this.drag.py + dy / this.scale;
+        this.pins.set(this.drag.node, { x: position.x, y: position.y });
+        document.getElementById('reset-pins').disabled = false;
+      } else { this.tx = this.drag.tx + dx; this.ty = this.drag.ty + dy; }
+      this.requestDraw();
     });
     this.canvas.addEventListener('pointerup', (event) => {
       if (this.drag && !this.drag.moved) this.selectAt(event.offsetX, event.offsetY, event.detail > 1);
@@ -202,8 +257,17 @@ class GraphView {
       const factor = Math.exp(-event.deltaY * .0012);
       const next = Math.max(.08, Math.min(3, this.scale * factor));
       const wx = (event.offsetX - this.tx) / this.scale, wy = (event.offsetY - this.ty) / this.scale;
-      this.scale = next; this.tx = event.offsetX - wx * next; this.ty = event.offsetY - wy * next; this.draw();
+      this.scale = next; this.tx = event.offsetX - wx * next; this.ty = event.offsetY - wy * next;
+      this.requestDraw();
     }, { passive: false });
+  }
+
+  requestDraw() {
+    if (this.drawFrame !== null) return;
+    this.drawFrame = requestAnimationFrame(() => {
+      this.drawFrame = null;
+      this.draw();
+    });
   }
 
   resize() {
@@ -219,6 +283,15 @@ class GraphView {
   }
 
   setPreset(preset) { this.preset = preset; this.focus = null; this.rebuild(); this.fit(); }
+  setEdgeMode(mode) { this.edgeMode = mode; this.draw(); }
+  resetPins() { this.pins.clear(); document.getElementById('reset-pins').disabled = true; this.rebuild(); this.fit(); }
+
+  hitAt(x, y) {
+    const wx = (x - this.tx) / this.scale, wy = (y - this.ty) / this.scale;
+    let hit = null;
+    for (const [id, p] of this.positions) if (Math.abs(wx - p.x) <= p.w / 2 && Math.abs(wy - p.y) <= p.h / 2) hit = id;
+    return hit;
+  }
 
   baseVisible(node) {
     if (this.preset === 'all') return true;
@@ -230,9 +303,15 @@ class GraphView {
   rebuild() {
     if (!this.graph) return;
     const nodes = new Map(this.graph.nodes.map((node) => [node.id, node]));
-    this.visible = new Set(this.graph.nodes.filter((node) => this.baseVisible(node)).map((node) => node.id));
+    const owner = new Map();
+    for (const node of this.graph.nodes) if (node.shape === 'projection') {
+      const edge = this.graph.edges.find((item) => item.use === node.id && item.index === 0);
+      if (edge) owner.set(node.id, edge.def);
+    }
+    const displayId = (id) => owner.get(id) ?? id;
+    this.visible = new Set(this.graph.nodes.filter((node) => node.shape !== 'projection' && this.baseVisible(node)).map((node) => node.id));
     if (this.preset === 'control') {
-      for (const edge of this.graph.edges) if (this.visible.has(edge.use) && edge.index > 0) this.visible.add(edge.def);
+      for (const edge of this.graph.edges) if (this.visible.has(displayId(edge.use)) && edge.index > 0) this.visible.add(displayId(edge.def));
     }
     if (this.focus !== null) {
       const near = new Set([this.focus]);
@@ -241,41 +320,22 @@ class GraphView {
       }
       this.visible = near;
     }
-    const visibleNodes = this.graph.nodes.filter((node) => this.visible.has(node.id));
-    const visibleEdges = this.graph.edges.filter((edge) => this.visible.has(edge.use) && this.visible.has(edge.def));
-    const rank = new Map(visibleNodes.map((node) => [node.id, 0]));
-    for (let pass = 0; pass < Math.min(visibleNodes.length, 28); pass++) {
-      let changed = false;
-      for (const edge of visibleEdges) {
-        if (edge.index === 2 && ['Phi', 'Loop'].includes(nodes.get(edge.use)?.label)) continue;
-        const next = Math.min(24, (rank.get(edge.def) || 0) + 1);
-        if (next > (rank.get(edge.use) || 0)) { rank.set(edge.use, next); changed = true; }
-      }
-      if (!changed) break;
+    const visibleNodes = this.graph.nodes.filter((node) => this.visible.has(node.id))
+      .map((node) => ({ ...node, anchor: displayId(node.anchor) }));
+    const visibleEdges = this.graph.edges
+      .filter((edge) => edge.index !== 0 || nodes.get(edge.use)?.shape !== 'projection')
+      .map((edge) => ({ ...edge, use: displayId(edge.use), def: displayId(edge.def) }))
+      .filter((edge) => edge.use !== edge.def && this.visible.has(edge.use) && this.visible.has(edge.def));
+    this.displayEdges = visibleEdges;
+    this.projections = new Map();
+    for (const [projection, parent] of owner) {
+      if (!this.visible.has(parent)) continue;
+      if (!this.projections.has(parent)) this.projections.set(parent, []);
+      this.projections.get(parent).push(nodes.get(projection));
     }
-    const rows = new Map();
-    for (const node of visibleNodes) {
-      const r = rank.get(node.id) || 0;
-      if (!rows.has(r)) rows.set(r, []);
-      rows.get(r).push(node);
-    }
-    this.positions.clear();
-    const rowGap = 105, colGap = 150, maxColumns = 8;
-    let displayRow = 0;
-    for (const [, row] of [...rows].sort((a, b) => a[0] - b[0])) {
-      row.sort((a, b) => a.kind.localeCompare(b.kind) || a.id - b.id);
-      for (let offset = 0; offset < row.length; offset += maxColumns) {
-        const group = row.slice(offset, offset + maxColumns);
-        const width = (group.length - 1) * colGap;
-        group.forEach((node, index) => this.positions.set(node.id, {
-          x: index * colGap - width / 2,
-          y: -displayRow * rowGap,
-          w: 112,
-          h: 38
-        }));
-        displayRow++;
-      }
-    }
+    for (const ports of this.projections.values()) ports.sort((a, b) => a.projectionIndex - b.projectionIndex || a.id - b.id);
+
+    this.positions = controlIslandLayout(visibleNodes, visibleEdges, this.projections, this.pins);
     document.getElementById('counts').textContent = `${visibleNodes.length} / ${this.graph.nodes.length} nodes · ${visibleEdges.length} edges`;
     document.getElementById('clear-focus').disabled = this.focus === null;
     this.draw();
@@ -294,9 +354,7 @@ class GraphView {
   }
 
   selectAt(x, y, focus) {
-    const wx = (x - this.tx) / this.scale, wy = (y - this.ty) / this.scale;
-    let hit = null;
-    for (const [id, p] of this.positions) if (Math.abs(wx - p.x) <= p.w / 2 && Math.abs(wy - p.y) <= p.h / 2) hit = id;
+    const hit = this.hitAt(x, y);
     this.selected = hit;
     if (focus && hit !== null) { this.focus = hit; this.rebuild(); this.fit(); }
     this.inspect(); this.draw();
@@ -317,7 +375,7 @@ class GraphView {
       return `<button class="edge-link" data-node="${other.id}"><span>#${other.id} ${escapeHtml(other.label)}</span><span>${input ? edge.index : edge.kind}</span></button>`;
     }).join('') || '<div class="inspector-empty">none</div>';
     panel.innerHTML = `<div class="node-heading"><span class="badge">#${node.id}</span><strong>${escapeHtml(node.label)}</strong></div>
-      <dl class="property-list"><dt>kind</dt><dd>${node.kind}</dd><dt>opcode</dt><dd>${node.op}</dd><dt>phase</dt><dd>${this.graph.phase}</dd></dl>
+      <dl class="property-list"><dt>kind</dt><dd>${node.kind}</dd><dt>opcode</dt><dd>${node.op}</dd><dt>phase</dt><dd>${this.graph.phase}</dd><dt>status</dt><dd>${escapeHtml(this.graph.status)}</dd></dl>
       <div class="edge-list-title">Inputs</div>${links(incoming, true)}
       <div class="edge-list-title">Uses</div>${links(uses, false)}`;
     panel.querySelectorAll('[data-node]').forEach((button) => button.onclick = () => this.select(Number(button.dataset.node)));
@@ -328,29 +386,64 @@ class GraphView {
     ctx.clearRect(0, 0, rect.width, rect.height);
     if (!this.graph) return;
     const selectedNear = new Set();
-    if (this.selected !== null) for (const edge of this.graph.edges) if (edge.use === this.selected || edge.def === this.selected) { selectedNear.add(edge.use); selectedNear.add(edge.def); }
+    if (this.selected !== null) for (const edge of this.displayEdges || []) if (edge.use === this.selected || edge.def === this.selected) { selectedNear.add(edge.use); selectedNear.add(edge.def); }
     ctx.save(); ctx.translate(this.tx, this.ty); ctx.scale(this.scale, this.scale);
-    for (const edge of this.graph.edges) {
+    for (const edge of this.displayEdges || []) {
       const a = this.positions.get(edge.def), b = this.positions.get(edge.use);
       if (!a || !b) continue;
-      const highlighted = this.selected === null || edge.use === this.selected || edge.def === this.selected;
-      ctx.globalAlpha = highlighted ? .58 : .07;
-      ctx.strokeStyle = colors[edge.kind] || colors.value;
-      ctx.lineWidth = highlighted ? 1.35 / this.scale ** .2 : .8;
-      if (edge.kind === 'memory') ctx.setLineDash([5, 4]); else ctx.setLineDash([]);
-      ctx.beginPath(); ctx.moveTo(a.x, a.y - a.h / 2);
-      const mid = (a.y + b.y) / 2;
-      ctx.bezierCurveTo(a.x, mid, b.x, mid, b.x, b.y + b.h / 2); ctx.stroke();
+      const related = edge.use === this.selected || edge.def === this.selected;
+      const structural = edge.kind === 'control' || edge.style === 'dotted';
+      if (this.edgeMode === 'structure' && !structural) continue;
+      if (this.edgeMode === 'related' && !structural && !related) continue;
+      const highlighted = this.selected === null || related;
+      ctx.globalAlpha = highlighted ? .82 : .08;
+      ctx.strokeStyle = edgeColors[edge.kind] || edgeColors.value;
+      ctx.fillStyle = ctx.strokeStyle;
+      ctx.lineWidth = highlighted ? 1.6 / this.scale ** .2 : .9;
+      ctx.setLineDash(edge.style === 'dotted' ? [2, 5] : edge.style === 'dashed' ? [7, 5] : []);
+      const sx = b.x, sy = b.y - b.h / 2, ex = a.x, ey = a.y + a.h / 2;
+      const direction = edge.kind === 'control' ? -1 : edge.kind === 'memory' ? 1 : 0;
+      const lane = direction ? direction * (90 + (edge.index % 5) * 18) : 0;
+      const bend = edge.rank ? (sy + ey) / 2 : Math.max(sy, ey) + 90 + (edge.index % 4) * 18;
+      ctx.beginPath(); ctx.moveTo(sx, sy);
+      if (lane) {
+        const channel = (direction < 0 ? Math.min(sx, ex) : Math.max(sx, ex)) + lane;
+        ctx.lineTo(channel, sy); ctx.lineTo(channel, ey); ctx.lineTo(ex, ey);
+      } else { ctx.bezierCurveTo(sx, bend, ex, bend, ex, ey); }
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.beginPath(); ctx.moveTo(ex, ey); ctx.lineTo(ex - 4, ey + 8); ctx.lineTo(ex + 4, ey + 8); ctx.closePath(); ctx.fill();
+      ctx.font = '9px ui-monospace, SFMono-Regular, Menlo, monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
+      ctx.fillText(String(edge.index), sx + 5, sy - 2);
     }
     ctx.setLineDash([]);
     for (const node of this.graph.nodes) {
       const p = this.positions.get(node.id); if (!p) continue;
       const selected = node.id === this.selected, dim = this.selected !== null && !selected && !selectedNear.has(node.id);
       ctx.globalAlpha = dim ? .24 : 1;
-      ctx.fillStyle = '#131b26'; ctx.strokeStyle = colors[node.kind] || colors.value; ctx.lineWidth = selected ? 3 : 1.25;
-      roundRect(ctx, p.x - p.w / 2, p.y - p.h / 2, p.w, p.h, node.kind === 'control' ? 4 : 12); ctx.fill(); ctx.stroke();
-      ctx.fillStyle = '#dce5f2'; ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      const label = `${node.label} #${node.id}`; ctx.fillText(label.length > 18 ? `${label.slice(0, 17)}…` : label, p.x, p.y);
+      const fill = nodeColors[node.color] || nodeColors.unknown;
+      ctx.fillStyle = fill; ctx.strokeStyle = selected ? '#ffffff' : '#18202b'; ctx.lineWidth = selected ? 3 : 1.25;
+      if (node.shape === 'phi' || node.shape === 'value') {
+        ctx.beginPath(); ctx.ellipse(p.x, p.y, p.w / 2, p.h / 2, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      } else {
+        roundRect(ctx, p.x - p.w / 2, p.y - p.h / 2, p.w, p.h, 3); ctx.fill(); ctx.stroke();
+        if (node.shape === 'function') { roundRect(ctx, p.x - p.w / 2 + 4, p.y - p.h / 2 + 4, p.w - 8, p.h - 8, 2); ctx.stroke(); }
+      }
+      const ports = this.projections.get(node.id) || [];
+      if (ports.length) {
+        const portWidth = p.w / ports.length, top = p.y + p.h / 2 - 22;
+        ctx.strokeStyle = '#263141'; ctx.lineWidth = 1;
+        ports.forEach((port, index) => {
+          const left = p.x - p.w / 2 + index * portWidth;
+          ctx.fillStyle = nodeColors[port.color] || fill; ctx.fillRect(left, top, portWidth, 22); ctx.strokeRect(left, top, portWidth, 22);
+          ctx.fillStyle = '#17202a'; ctx.font = '9px ui-monospace, SFMono-Regular, Menlo, monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+          const text = port.label.length > 10 ? `${port.label.slice(0, 9)}…` : port.label;
+          ctx.fillText(text, left + portWidth / 2, top + 11);
+        });
+      }
+      ctx.fillStyle = '#17202a'; ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      const label = `${node.label} #${node.id}`;
+      ctx.fillText(label.length > 22 ? `${label.slice(0, 21)}…` : label, p.x, p.y - (ports.length ? 10 : 0));
     }
     ctx.restore(); ctx.globalAlpha = 1;
   }
@@ -361,56 +454,220 @@ function roundRect(ctx, x, y, w, h, radius) {
 }
 function escapeHtml(value) { const span = document.createElement('span'); span.textContent = value; return span.innerHTML; }
 
-const source = document.getElementById('source');
-const status = document.getElementById('status');
-const compileButton = document.getElementById('compile');
-const empty = document.getElementById('empty-state');
-const view = new GraphView(document.getElementById('graph'));
-const host = new WasmHost();
-let phase = 1;
+function controlIslandLayout(nodes, edges, projections, pins) {
+  const positions = new Map();
+  const controls = nodes.filter((node) => node.kind === 'control' || node.kind === 'call');
+  const controlIds = new Set(controls.map((node) => node.id));
+  const controlEdges = edges.filter((edge) => controlIds.has(edge.use) && controlIds.has(edge.def));
+  const ranks = semanticRanks(controls, controlEdges);
+  const rows = new Map();
+  for (const node of controls) {
+    const rank = ranks.get(node.id) || 0;
+    if (!rows.has(rank)) rows.set(rank, []);
+    rows.get(rank).push(node);
+  }
+  orderRows(rows, controlEdges);
+  for (const [rank, row] of [...rows].sort((a, b) => a[0] - b[0])) {
+    const gap = 330;
+    row.forEach((node, index) => {
+      const ports = projections.get(node.id)?.length || 0;
+      positions.set(node.id, { x: (index - (row.length - 1) / 2) * gap, y: rank * 250,
+        w: Math.max(126, ports * 78), h: ports ? 66 : 46 });
+    });
+  }
 
-source.value = INITIAL_SOURCE;
-document.getElementById('reset-source').onclick = () => { source.value = INITIAL_SOURCE; };
+  // Floating values live in compact islands owned by the compiler-published control anchor. The
+  // layout never guesses ownership from opcode names. Islands use dependency rank and median order
+  // locally, keeping most value edges short while control edges retain a readable global spine.
+  const islands = new Map();
+  for (const node of nodes) if (!controlIds.has(node.id)) {
+    const anchor = controlIds.has(node.anchor) ? node.anchor : -1;
+    if (!islands.has(anchor)) islands.set(anchor, []);
+    islands.get(anchor).push(node);
+  }
+  let orphanX = 0;
+  for (const [anchor, island] of islands) {
+    const ids = new Set(island.map((node) => node.id));
+    const localEdges = edges.filter((edge) => ids.has(edge.use) && ids.has(edge.def));
+    const localRanks = semanticRanks(island, localEdges);
+    const localRows = new Map();
+    for (const node of island) {
+      const rank = localRanks.get(node.id) || 0;
+      if (!localRows.has(rank)) localRows.set(rank, []);
+      localRows.get(rank).push(node);
+    }
+    orderRows(localRows, localEdges);
+    const base = positions.get(anchor) || { x: orphanX, y: -230 };
+    let depth = 0;
+    for (const [, row] of [...localRows].sort((a, b) => a[0] - b[0])) {
+      row.forEach((node, index) => {
+        const ports = projections.get(node.id)?.length || 0;
+        positions.set(node.id, { x: base.x + 185 + index * 145, y: base.y - 72 - depth * 82,
+          w: Math.max(112, ports * 76), h: ports ? 62 : 42 });
+      });
+      depth++;
+    }
+    if (anchor === -1) orphanX += Math.max(360, ...[...localRows.values()].map((row) => row.length * 145));
+  }
+  for (const [id, pin] of pins) {
+    const position = positions.get(id);
+    if (position) { position.x = pin.x; position.y = pin.y; position.pinned = true; }
+  }
+  return positions;
+}
 
-async function compile() {
+function semanticRanks(nodes, edges) {
+  const ids = nodes.map((node) => node.id), outgoing = new Map(ids.map((id) => [id, []]));
+  for (const edge of edges) if (edge.rank && edge.style !== 'dotted') outgoing.get(edge.def)?.push(edge.use);
+  let nextIndex = 0;
+  const index = new Map(), low = new Map(), stack = [], onStack = new Set(), components = [];
+  function visit(id) {
+    index.set(id, nextIndex); low.set(id, nextIndex++); stack.push(id); onStack.add(id);
+    for (const use of outgoing.get(id) || []) {
+      if (!index.has(use)) { visit(use); low.set(id, Math.min(low.get(id), low.get(use))); }
+      else if (onStack.has(use)) low.set(id, Math.min(low.get(id), index.get(use)));
+    }
+    if (low.get(id) === index.get(id)) {
+      const component = [];
+      while (stack.length) { const member = stack.pop(); onStack.delete(member); component.push(member); if (member === id) break; }
+      components.push(component);
+    }
+  }
+  for (const id of ids) if (!index.has(id)) visit(id);
+  const componentOf = new Map();
+  components.forEach((members, component) => members.forEach((id) => componentOf.set(id, component)));
+  const dag = new Map(components.map((_, component) => [component, new Set()]));
+  const indegree = new Map(components.map((_, component) => [component, 0]));
+  for (const [def, uses] of outgoing) for (const use of uses) {
+    const from = componentOf.get(def), to = componentOf.get(use);
+    if (from !== to && !dag.get(from).has(to)) { dag.get(from).add(to); indegree.set(to, indegree.get(to) + 1); }
+  }
+  const queue = [...indegree].filter(([, degree]) => degree === 0).map(([component]) => component).sort((a, b) => a - b);
+  const componentRank = new Map(components.map((_, component) => [component, 0]));
+  while (queue.length) {
+    const component = queue.shift();
+    for (const use of dag.get(component)) {
+      componentRank.set(use, Math.max(componentRank.get(use), componentRank.get(component) + 1));
+      indegree.set(use, indegree.get(use) - 1);
+      if (indegree.get(use) === 0) queue.push(use);
+    }
+  }
+  return new Map(ids.map((id) => [id, componentRank.get(componentOf.get(id)) || 0]));
+}
+
+function orderRows(rows, edges) {
+  for (const row of rows.values()) row.sort((a, b) => a.kind.localeCompare(b.kind) || a.id - b.id);
+  const neighbors = new Map();
+  for (const edge of edges) {
+    if (!neighbors.has(edge.use)) neighbors.set(edge.use, []);
+    if (!neighbors.has(edge.def)) neighbors.set(edge.def, []);
+    neighbors.get(edge.use).push(edge.def); neighbors.get(edge.def).push(edge.use);
+  }
+  const ordered = [...rows.entries()].sort((a, b) => a[0] - b[0]);
+  for (let sweep = 0; sweep < 6; sweep++) {
+    const sequence = sweep % 2 ? [...ordered].reverse() : ordered;
+    const positions = new Map();
+    for (const [, row] of ordered) row.forEach((node, at) => positions.set(node.id, at));
+    for (const [, row] of sequence) row.sort((a, b) => {
+      const center = (node) => {
+        const ns = (neighbors.get(node.id) || []).filter((id) => positions.has(id));
+        return ns.length ? ns.reduce((sum, id) => sum + positions.get(id), 0) / ns.length : positions.get(node.id);
+      };
+      return center(a) - center(b) || a.id - b.id;
+    });
+  }
+}
+
+async function startGraphLab() {
+  const source = document.getElementById('source');
+  const status = document.getElementById('status');
+  const compileButton = document.getElementById('compile');
+  const empty = document.getElementById('empty-state');
+  const view = new GraphView(document.getElementById('graph'));
+  const host = new WasmHost();
+  const phaseTrack = document.getElementById('phase');
+  const phaseButtons = [];
+  PHASES.forEach(([name, description], index) => {
+    const button = document.createElement('button');
+    button.type = 'button'; button.className = 'phase-step'; button.dataset.phase = String(index + 1);
+    button.setAttribute('role', 'option'); button.title = description;
+    button.innerHTML = `<span>${index + 1}</span><strong>${name}</strong>`;
+    phaseTrack.append(button); phaseButtons.push(button);
+  });
+  let phase = 3;
+
+  function showPhase() {
+    phaseButtons.forEach((button, index) => {
+      const active = index + 1 === phase;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-selected', String(active));
+      if (active) button.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    });
+  }
+  showPhase();
+
+  source.value = EXAMPLES.object;
+  document.getElementById('example').onchange = async (event) => {
+    view.pins.clear(); document.getElementById('reset-pins').disabled = true;
+    source.value = EXAMPLES[event.target.value];
+    await compile();
+  };
+
+  async function compile() {
   compileButton.disabled = true; status.textContent = 'Compiling in Coil/Wasm…';
   await new Promise((resolve) => requestAnimationFrame(resolve));
   try {
     const started = performance.now();
-    const graph = host.compile(source.value, phase);
+    const graph = await host.compile(source.value, phase);
     view.setGraph(graph); empty.hidden = true;
-    status.textContent = `${graph.phase} · ${graph.nodes.length} nodes · ${(performance.now() - started).toFixed(0)} ms`;
+    status.textContent = graph.status === 'complete'
+      ? `${graph.phase} · ${graph.nodes.length} nodes · ${(performance.now() - started).toFixed(0)} ms`
+      : `${graph.phase} · ${graph.status}`;
   } catch (error) {
     status.textContent = 'Compilation failed';
     empty.hidden = false; empty.textContent = error.message;
   } finally { compileButton.disabled = false; }
+  }
+
+  compileButton.onclick = compile;
+  source.addEventListener('keydown', (event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); compile(); } });
+  async function setPhase(next) {
+    phase = Math.max(1, Math.min(PHASES.length, next)); showPhase();
+    await compile();
+  }
+  phaseTrack.onclick = (event) => {
+    const button = event.target.closest('[data-phase]');
+    if (button) setPhase(Number(button.dataset.phase));
+  };
+  document.getElementById('previous-phase').onclick = () => setPhase(phase - 1);
+  document.getElementById('next-phase').onclick = () => setPhase(phase + 1);
+  document.querySelectorAll('[data-preset]').forEach((button) => button.onclick = () => {
+    document.querySelectorAll('[data-preset]').forEach((item) => item.classList.toggle('active', item === button));
+    view.setPreset(button.dataset.preset);
+  });
+  document.querySelectorAll('[data-edges]').forEach((button) => button.onclick = () => {
+    document.querySelectorAll('[data-edges]').forEach((item) => item.classList.toggle('active', item === button));
+    view.setEdgeMode(button.dataset.edges);
+  });
+  document.getElementById('fit').onclick = () => view.fit();
+  document.getElementById('relayout').onclick = () => { view.rebuild(); view.fit(); };
+  document.getElementById('reset-pins').onclick = () => view.resetPins();
+  document.getElementById('clear-focus').onclick = () => { view.focus = null; view.rebuild(); view.fit(); };
+  document.getElementById('search').addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' || !view.graph) return;
+    const query = event.target.value.trim().toLowerCase();
+    const node = view.graph.nodes.find((item) => String(item.id) === query.replace(/^#/, '') || item.label.toLowerCase().includes(query));
+    if (node) view.select(node.id);
+  });
+
+  try {
+    await host.load();
+    status.textContent = 'Coil/Wasm ready';
+    compileButton.disabled = false;
+    await compile();
+  } catch (error) {
+    status.textContent = 'Unable to load compiler'; empty.textContent = error.message; console.error(error);
+  }
 }
 
-compileButton.onclick = compile;
-source.addEventListener('keydown', (event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); compile(); } });
-document.querySelectorAll('[data-phase]').forEach((button) => button.onclick = () => {
-  phase = Number(button.dataset.phase);
-  document.querySelectorAll('[data-phase]').forEach((item) => item.classList.toggle('active', item === button));
-  compile();
-});
-document.querySelectorAll('[data-preset]').forEach((button) => button.onclick = () => {
-  document.querySelectorAll('[data-preset]').forEach((item) => item.classList.toggle('active', item === button));
-  view.setPreset(button.dataset.preset);
-});
-document.getElementById('fit').onclick = () => view.fit();
-document.getElementById('clear-focus').onclick = () => { view.focus = null; view.rebuild(); view.fit(); };
-document.getElementById('search').addEventListener('keydown', (event) => {
-  if (event.key !== 'Enter' || !view.graph) return;
-  const query = event.target.value.trim().toLowerCase();
-  const node = view.graph.nodes.find((item) => String(item.id) === query.replace(/^#/, '') || item.label.toLowerCase().includes(query));
-  if (node) view.select(node.id);
-});
-
-try {
-  await host.load();
-  status.textContent = 'Coil/Wasm ready';
-  compileButton.disabled = false;
-  await compile();
-} catch (error) {
-  status.textContent = 'Unable to load compiler'; empty.textContent = error.message; console.error(error);
-}
+if (typeof document !== 'undefined') await startGraphLab();
