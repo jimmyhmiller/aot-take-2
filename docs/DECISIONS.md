@@ -1,5 +1,21 @@
 # Decisions
 
+## 2026-09-06 — Source string escapes preserve UTF-16 and raw directive spelling
+
+Final Simple copies ordinary string characters and decodes backslashes before constructing a
+value. We extend that lexical step with the
+[ECMA-262 StringLiteral grammar](https://tc39.es/ecma262/multipage/ecmascript-language-lexical-grammar.html#sec-string-literals).
+The syntax record owns a UTF-16 buffer, including unpaired surrogates, and retains the original
+quote-stripped spelling for directive recognition. Hexadecimal and braced Unicode escapes,
+legacy octal and decimal escapes, identity escapes and line continuations share this decoder.
+Scope validation rejects legacy escapes in strict code after discovering the directive prologue.
+An escaped spelling of `use strict` does not enable strictness.
+
+The frontend passes decoded units to the existing JSL string allocation/memory lowering. JSL
+text literals retain their UTF-8 entry point and use the same graph construction. Raw UTF-8 runs
+append into the destination buffer without temporary per-run buffers. Parser reset frees source
+literal buffers; the JSL text wrapper frees its temporary units after graph construction.
+
 ## 2026-09-06 — Strict early errors follow syntax scope
 
 [ECMA-262 strict-mode restrictions](https://tc39.es/ecma262/multipage/strict-mode-of-ecmascript.html)

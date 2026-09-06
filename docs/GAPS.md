@@ -60,9 +60,9 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 The syntax-only driver shares the production syntax pass and reports proven early errors through
 a versioned typed result, without lowering or execution. Test262 parse negatives use this path.
 Strict validation covers the admitted grammar: directive scope and inheritance, binding names,
-identifier references, assignment targets, duplicate simple parameters and legacy numeric literals.
-Unknown grammar and compiler failures cannot count as SyntaxError results. String escapes,
-non-simple parameters and nested function syntax remain outside the admitted grammar. Strict
+identifier references, assignment targets, duplicate simple parameters and legacy numeric/string literals.
+Unknown grammar and compiler failures cannot count as SyntaxError results. Non-simple parameters
+and nested function syntax remain outside the admitted grammar. Strict
 runtime binding, receiver and arguments behavior remains an explicit compilation refusal.
 Global initialization and runtime exceptions remain outside this parse result channel.
 
@@ -74,6 +74,12 @@ boxing requires an exact binary64 round trip, so fractional literals retain thei
 BigInt value lowering remains an explicit refusal. Unicode numeric/identifier boundaries beyond
 recognized whitespace remain unsupported. Strict validation rejects legacy literals from their
 original source spelling. No numeric-token test establishes full lexical or runtime conformance.
+
+String literals decode character, identity, hexadecimal, Unicode and legacy escapes into UTF-16
+before JSL allocation. Lone surrogates remain individual code units. Line continuations contribute
+no characters; the lexer counts CRLF as one source line. Strict checks reject legacy escapes,
+including before a later directive in the same prologue. Directive checks use raw spelling.
+Template literals, escaped identifiers and string-named object literal keys remain unsupported.
 
 ### 2026-09-06 — Switch selection, fallthrough and unlabelled break
 
@@ -194,13 +200,12 @@ Script goal now has a separate source execution root: top-level statements run i
 source `main` is not implicitly called, top-level `return` is rejected, and the host ignores
 ordinary expression completion values. Source positions are preserved without wrapping text in
 a function. This is not a complete Global Environment Record: function access to Script lexical
-bindings and access before initialization explicitly refuse compilation. `var`, strict-mode
+bindings and access before initialization explicitly refuse compilation. Script `var`, strict-mode
 semantics, exceptions, and harness-defined assertion functions remain absent. The Coil test262
 runner now records full-suite outcomes; its unsupported shared-global-script host prevents
 execution of the standard assertion harness. See `docs/TEST262.md` for the measured baseline.
 An actual `use strict` directive explicitly refuses compilation rather than executing sloppily.
-Numeric literal scanning still admits decimal integer spellings only; strings
-still refuse escape decoding. Identifier Unicode/escapes and reserved-word validation remain
+Numeric and string literal support is described above. Identifier Unicode/escapes and reserved-word validation remain
 incomplete. Recognizing a multi-character punctuator does not admit its expression semantics.
 
 Arithmetic still lacks full ToNumber/ToPrimitive: strings and objects cannot in
