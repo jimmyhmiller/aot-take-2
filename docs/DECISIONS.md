@@ -103,6 +103,24 @@ number of nodes allocated in that body's lowering window. The independent live-n
 checked at the decision point. This preserves Simple's heuristic while adapting its construction-
 order assumption to JavaScript declaration hoisting.
 
+## 2026-09-06 — Lexical binding creation precedes initializer evaluation
+
+Final Simple defines a variable by checking the current lexical level, appending its Var metadata
+and adding its value edge. JavaScript requires a separate creation step before the statement list
+runs. The frontend predeclares direct let/const bindings on entry to the function, Script or block
+scope, then initializes each slot at its declaration. An initializer-free let obtains undefined
+from JSL. ScopeNode remains the sole binding environment.
+
+An uninitialized binding occupies a TOP-valued graph slot with Var.uninit set. TOP denotes the
+absence of a value; source reads and writes refuse with a named unsupported ReferenceError before
+resolving the slot. Branch duplication copies the marker, and loop duplication leaves these slots
+without lazy sentinels. The admitted structured grammar cannot initialize a surviving outer binding
+on one branch alone; a merge that encounters inconsistent markers refuses instead of losing TDZ
+state. Runtime TDZ checks and exception completions remain required for closures and wider syntax.
+
+Blocks pop the active Scope after lowering their bodies. A loop replaces that Scope with its exit
+environment, so popping the pre-loop handle would leave the inner bindings visible after the block.
+
 ## 2026-09-01 — The process entry is a wrapper around boxed source `main`
 
 Amendment, 2026-09-06: this entry convention applies to `compile`/`run` function-entry mode.

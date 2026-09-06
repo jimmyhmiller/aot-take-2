@@ -55,6 +55,20 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-06 — Lexical instantiation and initializer-free let
+
+The frontend creates direct let/const bindings before evaluating a function, Script or block body.
+Reads and writes before initialization now refuse compilation instead of accessing an outer binding
+or a singleton global. Initializer-free let obtains undefined through JSL at declaration execution.
+Statement-only if/while bodies reject bare lexical declarations; const requires an initializer.
+Block exit after a loop now removes bindings from the live exit Scope.
+
+Executable TDZ ReferenceError completions remain absent. The compiler also lacks captured lexical
+environments and a complete early-error walk over unreachable nested syntax. These refusals are
+compiler outcomes, not successful Test262 runtime-negative results. Scope merges check matching
+initialization markers; path-dependent initialization outside the admitted grammar must hard-error
+until the graph carries executable TDZ state.
+
 ### 2026-09-06 — Division, unary numbers and numeric globals
 
 The frontend now lowers `/`, unary `+` and unary `-` through JSL. Shared primitive Number

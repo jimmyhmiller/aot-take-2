@@ -42,6 +42,12 @@
 ;; parser: declarations are hoisted, so every Fun header exists before any body is lowered. The
 ;; semantic graph remains the only typed IR; syntax nodes carry spans and grammar shape, never
 ;; inferred types.
+;;
+;; Lexical declarations differ from Simple's declaration-at-use rule: instantiate the direct
+;; let/const declarations of each actual lexical scope before lowering any initializer. ScopeNode
+;; owns both the binding and its initialization state. Statement-only if/while bodies cannot
+;; introduce lexical declarations without braces. TDZ reads/writes explicitly refuse compilation
+;; until ReferenceError completions exist; they never resolve to an outer name or undefined.
 (module aot.parse.parser)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
@@ -619,6 +625,11 @@
               0)
           (parse-syntax-statement-inner)))))
 
+(defn parse-syntax-controlled-statement [] (-> i64)
+  (if (or (token-is (peek-token) "let") (token-is (peek-token) "const"))
+      (do (panic "parser: lexical declaration requires a block in a statement-only context") 0)
+      (parse-syntax-statement)))
+
 (defn parse-syntax-statement-inner [] (-> i64)
   (let [first (peek-token)]
     (if (token-is first "while")
@@ -626,7 +637,7 @@
           (require-token "(")
           (let [condition (parse-syntax-conditional)]
             (require-token ")")
-            (let [body-stmt (parse-syntax-statement)
+            (let [body-stmt (parse-syntax-controlled-statement)
                   parsed (syntax-stmt-at body-stmt)
                   (mut body) (al-new [i64] (alloc/malloc-allocator))
                   (mut stmt) (syntax-stmt-new SS-WHILE (.start keyword) (.hi parsed))]
@@ -639,12 +650,12 @@
               (require-token "(")
               (let [condition (parse-syntax-conditional)]
                 (require-token ")")
-                (let [yes (parse-syntax-statement)
+                (let [yes (parse-syntax-controlled-statement)
                       (mut yes-body) (al-new [i64] (alloc/malloc-allocator))
                       (mut no-body) (al-new [i64] (alloc/malloc-allocator))]
                   (push! [i64] (mut yes-body) yes)
                   (if (take-is "else")
-                      (push! [i64] (mut no-body) (parse-syntax-statement))
+                      (push! [i64] (mut no-body) (parse-syntax-controlled-statement))
                       0)
                   (let [last
                           (if (> (len (load no-body)) 0)
@@ -659,10 +670,14 @@
                 (let [keyword (take-token)
                       name (require-ident)
                       annotation (parse-optional-annotation)]
-                  (require-token "=")
-                  (let [expr (parse-syntax-conditional)
-                        parsed (syntax-at expr)
-                        (mut stmt) (syntax-stmt-new SS-LET (.start keyword) (.hi parsed))]
+                  (let [expr
+                          (if (take-is "=")
+                              (parse-syntax-conditional)
+                              (if (token-is keyword "const")
+                                  (do (panic "parser: const declaration requires an initializer") 0)
+                                  0))
+                        hi (if (= expr 0) (.end name) (let [parsed (syntax-at expr)] (.hi parsed)))
+                        (mut stmt) (syntax-stmt-new SS-LET (.start keyword) hi)]
                     (parse-statement-end!)
                     (set! (.name (mut stmt)) (token-text name))
                     (set! (.expr (mut stmt)) expr)
@@ -1253,6 +1268,16 @@
 
 ;; Return 1 when every path through this statement list has exited and 0 when a fallthrough path
 ;; remains. Each exit has already transferred ownership into the function return accumulator.
+(defn lower-instantiate-lexicals! [(stmts (ArrayList i64))] (-> i64)
+  (do
+    (al-for [id stmts]
+            (let [stmt (syntax-stmt-at id)]
+              (if (= (.kind stmt) SS-LET)
+                  (scope-declare! (parser-node (.current-scope (parser-state)))
+                                  (.name stmt) (ty-dyn TAG-ANY) (.final stmt))
+                  0)))
+    0))
+
 (defn lower-syntax-statements [(stmts (ArrayList i64))] (-> i64)
   (let [(mut i) 0
         (mut terminated) 0]
@@ -1261,12 +1286,11 @@
               (do
                 (let [stmt (syntax-stmt-at (get stmts (load i)))]
                   (if (= (.kind stmt) SS-LET)
-                      (let [value (lower-syntax-expr (.expr stmt))]
-                        (scope-define! (parser-node (.current-scope (parser-state)))
-                                       (.name stmt)
-                                       (ty-dyn TAG-ANY)
-                                       (.final stmt)
-                                       value))
+                      (let [value (if (= (.expr stmt) 0)
+                                      (lower-singleton "JsUndefined")
+                                      (lower-syntax-expr (.expr stmt)))]
+                        (scope-initialize! (parser-node (.current-scope (parser-state)))
+                                           (.name stmt) value))
                       (if (= (.kind stmt) SS-ASSIGN)
                           (let [scope (parser-node (.current-scope (parser-state)))
                                 target (syntax-at (.target stmt))]
@@ -1309,8 +1333,11 @@
                                   (if (= (.kind stmt) SS-BLOCK)
                                       (let [scope (parser-node (.current-scope (parser-state)))]
                                         (scope-push! scope)
+                                        (lower-instantiate-lexicals! (.body stmt))
                                         (let [nested-return (lower-syntax-statements (.body stmt))]
-                                          (scope-pop! scope)
+                                          ;; A loop replaces the active Scope with its exit Scope.
+                                          ;; Pop the live environment, never the stale entry handle.
+                                          (scope-pop! (parser-node (.current-scope (parser-state))))
                                           (if (!= nested-return 0)
                                               (set! (mut terminated) 1)
                                               0)))
@@ -1595,6 +1622,7 @@
                                     0)
                                 (set! (mut i) (+ (load i) 1))
                                 (continue)))))
+                  (lower-instantiate-lexicals! (.body f))
                   (let [terminated (lower-syntax-statements (.body f))]
                     ;; JavaScript functions return undefined when control reaches the closing brace.
                     (if (= terminated 0)
