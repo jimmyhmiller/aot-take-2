@@ -55,6 +55,21 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-06 — typeof value classification
+
+The frontend lowers typeof through JsTypeof in production JSL. The native regression covers
+undefined, null, booleans, strings, objects and both Number representations, including NaN,
+infinities and signed zero. It also covers operand effects, nested typeof, local shadowing and
+deliberately false TypeScript annotations. The JSL definition classifies the represented Symbol
+and Function tags, but the frontend still lacks their constructors/first-class value production.
+BigInt and HTMLDDA production remain absent.
+
+Unresolved names require a complete global environment. The compiler refuses this path by name,
+including parenthesized references, instead of treating unimplemented globals such as JSON as
+absent. Declared uninitialized names take the existing TDZ refusal. Result strings use managed
+literal allocation and the JSL function declares that effect; a constant-string pool remains
+required to remove repeated allocation. The regression reuses its compiled binary under GC stress.
+
 ### 2026-09-06 — Lexical instantiation and initializer-free let
 
 The frontend creates direct let/const bindings before evaluating a function, Script or block body.
