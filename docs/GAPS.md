@@ -55,6 +55,25 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-06 — Function var instantiation and declaration lists
+
+The frontend hoists function-local var names from blocks and branches, including unreachable
+statements, into the function Scope. New bindings obtain undefined through JSL. Repeated var
+declarations and declarations matching simple parameters preserve the existing value; initializers
+execute at their source position. Comma-separated var, let and const declarations retain source
+order without creating a block scope. Lexical lists instantiate their names before any initializer.
+
+Declaration-name validation now precedes graph construction and visits unreachable nested blocks.
+It rejects duplicate lexical names, lexical/var conflicts and function-body lexical/parameter
+conflicts. This closes the previously recorded unreachable declaration-name checking gap; it does
+not provide typed SyntaxError reporting or claim complete early-error coverage for absent syntax.
+
+Script var still refuses with a named GlobalDeclarationInstantiation diagnostic. Such bindings
+must belong to the shared global object, not the Script execution Fun. An unshadowed implicit
+arguments object also remains unsupported; a var declaration must not replace it with undefined.
+Destructuring, parameter defaults, nested function declarations and captured environments remain
+outside this admitted slice.
+
 ### 2026-09-06 — typeof value classification
 
 The frontend lowers typeof through JsTypeof in production JSL. The native regression covers
@@ -78,8 +97,8 @@ or a singleton global. Initializer-free let obtains undefined through JSL at dec
 Statement-only if/while bodies reject bare lexical declarations; const requires an initializer.
 Block exit after a loop now removes bindings from the live exit Scope.
 
-Executable TDZ ReferenceError completions remain absent. The compiler also lacks captured lexical
-environments and a complete early-error walk over unreachable nested syntax. These refusals are
+Executable TDZ ReferenceError completions and captured lexical environments remain absent.
+Declaration-name validation now covers unreachable nested blocks as described above. These refusals are
 compiler outcomes, not successful Test262 runtime-negative results. Scope merges check matching
 initialization markers; path-dependent initialization outside the admitted grammar must hard-error
 until the graph carries executable TDZ state.
