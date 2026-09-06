@@ -1,5 +1,17 @@
 # Decisions
 
+## 2026-09-06 — Literal function-pointer copies preserve identity; body clones rename it
+
+Simple retains the FunPtr constant payload during shallow copy, then assigns a fresh function
+index in Fun.copyBody and constructs the entering call pointer in CallEnd.doInline. We store
+the tuple signature and function index separately. A generic copy therefore preserves a literal
+FunPtr's owner edge even if its owner also appears in the selected set. Remapping that edge alone
+would leave its index naming one function and its signature updates following another.
+
+The body-cloning operation assigns a fresh index and replaces selected recursive callee literals
+with pointers to the private Fun. The entering call uses that same index. This keeps literal-copy
+semantics separate from private-body identity changes and keeps the owner registry consistent.
+
 ## 2026-09-06 — Finite call targets use a compilation-local owner registry
 
 Final Simple keeps a function-index-to-Fun table in CodeGen. During SCCP it checks call arity,
