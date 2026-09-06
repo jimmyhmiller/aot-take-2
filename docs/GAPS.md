@@ -55,6 +55,18 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-06 — Strict equality
+
+The frontend lowers `===` and `!==` through production JSL. Number comparison covers both
+numeric representations, NaN and signed zero; strings compare UTF-16 contents, while the
+remaining represented tags use identity. BigInt production and comparison remain unsupported.
+Loose equality and the wider conversion operations remain absent. The native regression combines
+generic calls, fresh allocations, mixed tags, precedence and left-to-right operand effects.
+
+The checker now separates numeric `%Eq`/`%Ne` from dynamic `%SameBits`. It previously admitted
+dynamic operands to numeric comparisons even though lowering could not settle their machine mode.
+The new primitive compares representation words; JavaScript equality policy stays in JSL.
+
 ### 2026-09-06 — Logical expressions and lexical boundaries
 
 `&&`, `||`, `??`, `!`, `void`, `true`, `false`, and `null` now lower through production JSL
@@ -67,7 +79,9 @@ source `main` is not implicitly called, top-level `return` is rejected, and the 
 ordinary expression completion values. Source positions are preserved without wrapping text in
 a function. This is not a complete Global Environment Record: function access to Script lexical
 bindings and access before initialization explicitly refuse compilation. `var`, strict-mode
-semantics, exceptions, harness-defined assertion functions, and a test262 runner remain absent.
+semantics, exceptions, and harness-defined assertion functions remain absent. The Coil test262
+runner now records full-suite outcomes; its unsupported shared-global-script host prevents
+execution of the standard assertion harness. See `docs/TEST262.md` for the measured baseline.
 An actual `use strict` directive explicitly refuses compilation rather than executing sloppily.
 Numeric literal scanning still admits decimal integer spellings only; strings
 still refuse escape decoding. Identifier Unicode/escapes and reserved-word validation remain

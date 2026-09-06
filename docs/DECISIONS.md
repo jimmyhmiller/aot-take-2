@@ -4,6 +4,20 @@ This file records deliberate architecture choices that differ from Simple or set
 fixed by the reference implementation. Code contradicting a decision here is a bug unless this
 file is amended at the same time.
 
+## 2026-09-06 — Tagged identity and empty-mask split progress
+
+JSL `%SameBits` accepts two dynamic words and lowers to integer-mode EQ. Simple's `BoolNode`
+mode 1 permits non-integer lattice operands and returns BOOL until identity or range evidence
+proves an answer. We reuse that machine-word comparison without assigning JavaScript semantics
+to the node. JSL strict equality first handles Number and String, then uses tagged identity for
+the remaining represented tags. Numeric `%Eq`/`%Ne` accept numeric operands only.
+
+Final Simple's `RegAlloc.splitEmptyMaskSimple` returns true even if its insertion guards skip
+both endpoints. Our generic equality regression reaches that case with a cloneable, fixed-XZR
+zero constant shared across nonconstant Phi results. We require an actual edit before treating
+the cheap split as progress; otherwise allocation uses the existing loop-boundary splitter.
+The convergence cap and register constraints remain unchanged.
+
 ## 2026-09-02 — Boxed non-references get spill homes but are not roots
 
 NaN-boxing makes null, undefined, booleans and compact integers machine words with the same storage
