@@ -135,6 +135,7 @@ aot-take-2/
 │   ├── DECISIONS.md     ; law: load-bearing choices with their reasoning
 │   ├── BACKEND.md       ; backend consumer assumptions and their ideal-graph producers
 │   ├── GAPS.md          ; complete inventory of absent and partial implementation
+│   ├── TEST262.md       ; pinned conformance campaign, denominator and runner contract
 │   ├── JSL.md           ; the runtime-library language
 │   └── JOURNAL.md       ; why something looks the way it does
 ├── jsl/                 ; the JavaScript runtime library, in JSL — already written
@@ -241,6 +242,7 @@ aot-take-2/
 │   ├── opto-test.coil  gcm-test.coil  sched-test.coil  regalloc-test.coil
 │   ├── encode-test.coil  compunit-test.coil  verify-test.coil  text-test.coil
 │   ├── lex-test.coil  parse-test.coil  tstype-test.coil  jsl-test.coil
+│   ├── test262-test.coil            ; metadata, runner policy and accounting regressions
 │   ├── harness.coil                 ; source in → linked binary out → node's answer beside it
 │   ├── execution-test.coil          ; cases that must RUN, not merely compile
 │   └── differential-test.coil       ; compiled output vs. a JavaScript engine
@@ -248,6 +250,8 @@ aot-take-2/
 ├── web/                     ; GitHub Pages graph playground; HTML/CSS/JS presentation over Coil/Wasm
 └── tools/
     ├── dot-dump.coil
+    ├── test262-metadata.coil ; test262 frontmatter, required variants and include ordering
+    ├── test262.coil          ; pinned-suite inventory and sequential conformance runner
     └── graph-wasm.coil      ; browser Wasm entry: source → phase snapshot
 ```
 
