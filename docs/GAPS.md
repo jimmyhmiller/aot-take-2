@@ -55,6 +55,32 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-06 — Division, unary numbers and numeric globals
+
+The frontend now lowers `/`, unary `+` and unary `-` through JSL. Shared primitive Number
+conversion handles booleans, null and undefined across arithmetic. Numeric operations preserve
+IEEE infinities, NaN and signed zeros. `Infinity` and `NaN` resolve after lexical bindings and
+ignore writes in the admitted non-strict mode, while still evaluating the assignment RHS.
+Strict-mode writes still require strict-mode and exception support. String-to-number conversion,
+object ToPrimitive, Symbol conversion exceptions and BigInt remain unsupported; their values
+cannot pass the numeric Unbox proof check. String/string addition retains concatenation.
+
+The native regression exposed two graph defects now corrected: comparison pull-down used the
+Boolean result bound for floating operand Phis, and Box retained representation zero after an
+initially untyped producer acquired a raw type. Neither fix weakens the type invariants.
+Shared conversion stays in a JSL function so arithmetic remains below the existing inlining-size
+limit. This exposed a false recursion report from traversing a CallEnd-to-Return edge and a
+borrowed-control lifetime error while folding Box(TOP); both now have regressions. Existing
+constant-folding expectations remain unchanged. Top-level Script lexical/function declarations
+over the three restricted globals now refuse compilation, but typed exception reporting remains
+unimplemented. Local and parameter shadowing remains valid.
+Graph copying now preserves explicit Box tags as well: the previous shell constructor lost
+Boolean/null/undefined tags by trying to infer them from an already-boxed dynamic value.
+The long-lived-tree regression also exposed an illegal accumulator hoist: early scheduling saw
+an unvisited inner-loop Phi without its cached Region placement. GCM now publishes that structural
+placement while skipping Phi recursion, matching Simple's cfg0 lookup. The focused GCM regression
+schedules the consumer before the Phi, and the original native workload remains unchanged.
+
 ### 2026-09-06 — Strict equality
 
 The frontend lowers `===` and `!==` through production JSL. Number comparison covers both
@@ -87,7 +113,7 @@ Numeric literal scanning still admits decimal integer spellings only; strings
 still refuse escape decoding. Identifier Unicode/escapes and reserved-word validation remain
 incomplete. Recognizing a multi-character punctuator does not admit its expression semantics.
 
-Arithmetic still lacks full ToNumber/ToPrimitive: strings, booleans, null, and objects cannot in
+Arithmetic still lacks full ToNumber/ToPrimitive: strings and objects cannot in
 general cross its numeric Unbox boundary. Generic property reads can retain every dynamic tag;
 arithmetic on those results is rejected even for programs whose stored property happens to be
 numeric. This is a semantic implementation gap, not evidence that such JavaScript is invalid.

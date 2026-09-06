@@ -4,6 +4,22 @@ This file records deliberate architecture choices that differ from Simple or set
 fixed by the reference implementation. Code contradicting a decision here is a bug unless this
 file is amended at the same time.
 
+## 2026-09-06 — Operand bounds and delayed representation settlement
+
+Final Simple constructs the operand Phis in `drop_same_op` from operand types. Our constructor
+stores a declared bound before filling the inputs, so we meet the corresponding operand types
+before construction. Reusing the result bound is invalid for comparisons, whose Boolean result
+has a different type family from floating operands.
+
+Box follows Simple's one-shot mode discipline for initially unknown raw producers: once the
+input lattice type determines a representation, Box unlocks its GVN identity and records that
+representation. Explicit tags remain unchanged. JSL keeps borrowed control across eager unary
+folds because removing a temporary Box must not kill the enclosing expression's control.
+
+The pre-dominator recursion check walks caller control only. It visits Region predecessors,
+but traverses CallEnd through its Call, excluding the callee Return edge. This preserves final
+Simple's caller-ownership test while call-graph discovery is still constructing dominators.
+
 ## 2026-09-06 — Tagged identity and empty-mask split progress
 
 JSL `%SameBits` accepts two dynamic words and lowers to integer-mode EQ. Simple's `BoolNode`
