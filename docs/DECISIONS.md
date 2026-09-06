@@ -75,6 +75,15 @@ order assumption to JavaScript declaration hoisting.
 
 ## 2026-09-01 — The process entry is a wrapper around boxed source `main`
 
+Amendment, 2026-09-06: this entry convention applies to `compile`/`run` function-entry mode.
+`compile-script`/`run-script` select JavaScript Script grammar. Their platform wrapper calls the
+private zero-argument Script execution root and returns zero on normal completion, independent
+of expression completion values. Source `main` remains an ordinary declaration. The compiler
+parses the original source, rejects top-level Return, and preserves source spans; it does not
+wrap source text in a function. The private Fun supplies AOT execution storage, not function-scope
+language semantics. Global lexical captures and strict-mode directives currently hard-error
+until their semantics exist. This amendment does not claim a complete global environment.
+
 Source `main` is an ordinary JavaScript function with the internal dynamic-value ABI and the
 private symbol `$aot$.source_main`. The dot is outside the admitted source identifier grammar, so a
 user declaration cannot collide with this compiler-owned name. A distinct compiler-owned function

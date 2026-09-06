@@ -55,13 +55,56 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-06 — Logical expressions and lexical boundaries
+
+`&&`, `||`, `??`, `!`, `void`, `true`, `false`, and `null` now lower through production JSL
+predicates/singletons and ordinary Scope diamonds. Logical expressions return an operand, never
+a coerced Boolean. Unparenthesized mixing of `??` with `&&`/`||` is refused. Block comments,
+CR/CRLF/LF/LS/PS, ECMAScript whitespace, and maximal-munch punctuators are recognized.
+
+Script goal now has a separate source execution root: top-level statements run in source order,
+source `main` is not implicitly called, top-level `return` is rejected, and the host ignores
+ordinary expression completion values. Source positions are preserved without wrapping text in
+a function. This is not a complete Global Environment Record: function access to Script lexical
+bindings and access before initialization explicitly refuse compilation. `var`, strict-mode
+semantics, exceptions, harness-defined assertion functions, and a test262 runner remain absent.
+An actual `use strict` directive explicitly refuses compilation rather than executing sloppily.
+Numeric literal scanning still admits decimal integer spellings only; strings
+still refuse escape decoding. Identifier Unicode/escapes and reserved-word validation remain
+incomplete. Recognizing a multi-character punctuator does not admit its expression semantics.
+
+Arithmetic still lacks full ToNumber/ToPrimitive: strings, booleans, null, and objects cannot in
+general cross its numeric Unbox boundary. Generic property reads can retain every dynamic tag;
+arithmetic on those results is rejected even for programs whose stored property happens to be
+numeric. This is a semantic implementation gap, not evidence that such JavaScript is invalid.
+The broader `jsl/index` is not the production registry; `jsl/compiler/index` is.
+
+### TypeScript evidence
+
+Function-entry mode retains primitive and parenthesized union annotations on parameters, local
+bindings, and returns. These are unproven claims; runtime parameters remain fully dynamic, even
+when annotations disagree with actual values. `never` denotes the empty union, and `void` does
+not assert an undefined return payload. Annotation-driven discharge, use-site diagnostics,
+structural types, generics, type aliases, and literal/function/array type syntax remain absent.
+JavaScript Script mode rejects TypeScript annotations rather than silently changing its grammar.
+
+Native regressions exposed three implementation defects now corrected: JSL conditional arm
+lifetimes, Split reuse across different Phi predecessor blocks, and obsolete spill-placement
+anchors after allocation rewires a copy's input. They are correctness fixes, not new permissions
+to relax representation or scheduling checks.
+
+Referenced architecture documents `docs/DESIGN.md` and `docs/JSL.md` are missing in this checkout.
+`docs/FRONTEND.md`, `docs/BACKEND.md`, implementation headers and `docs/DECISIONS.md` are the
+available current contracts; missing documents must not be treated as reviewed evidence.
+
 - The lexer/parser lower named functions, hoisted calls, decimal integer spellings with full
   binary64 Number semantics, arithmetic calls, bindings, assignment, lexical blocks, conditional
   expressions, statement `if`/`else`, and nested `while`. Bare returns and live function
   fallthrough produce boxed `undefined`; early and loop-body returns merge through the function
   exit accumulator. Function parameter and return annotations are optional, admitting the
-  corresponding ordinary JavaScript syntax. Strings, objects, classes, `for`, loop exits,
-  exceptions, properties, closures, and most expressions remain.
+  corresponding ordinary JavaScript syntax. The frontend also admits UTF-16 string literals,
+  object literals, and named property reads/writes through production JSL. Classes, `for`, loop
+  exits, exceptions, closures, computed property syntax, and many expressions remain.
 - Scope SSA bindings, lazy Phis, branch merges, loop closure, memory binding, and guard machinery
   exist. The frontend uses binding/branch merge and atomic lazy-Phi loop closure today;
   source-level narrowing and nonlocal loop exits remain.
@@ -121,7 +164,8 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
   every currently admitted source form.
 - Ideal-graph serialization, compilation units and dependency resolution.
 - Assembly and ordinary IR printers. Graphviz is implemented.
-- CLI `compile` and `run` are implemented; a user-facing IR/assembly dump command remains.
+- CLI `compile`, `run`, `compile-script`, and `run-script` are implemented; a user-facing
+  IR/assembly dump command remains.
 
 ## Current Simple comparison boundary
 

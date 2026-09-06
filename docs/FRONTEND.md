@@ -1,5 +1,19 @@
 # The frontend contract: source → tree → graph → JSL
 
+## Current executable boundary (2026-09-06)
+
+The production registry is `jsl/compiler/index`; the broader surface described below is a design
+contract, not a claim that every listed operation is executable. Logical operators use `JsTruthy`,
+`JsNullish`, `JsLogicalNot`, and `JsVoid`; Boolean/null literals use JSL singleton macros. The
+frontend constructs short-circuit Scope/control/memory merges while JSL supplies predicates.
+
+`compile-script` and `run-script` select JavaScript Script grammar and execute top-level code.
+They do not call a source function named `main` or reinterpret expression completion as an exit
+code. The existing `compile`/`run` commands retain the function-entry convention and optional
+TypeScript annotations. Annotation records are evidence only, never trusted runtime types.
+Neither path is a test262 harness. See `docs/GAPS.md` for explicit global-environment, strict-mode,
+exception, and annotation-checking limitations.
+
 Two questions this document settles, because everything in `src/parse/` and `src/jsl/` depends on
 the answers and neither can be decided locally:
 
