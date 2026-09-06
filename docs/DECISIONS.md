@@ -1,5 +1,19 @@
 # Decisions
 
+## 2026-09-06 — Parse results precede runtime initialization
+
+[ECMA-262 ParseScript](https://tc39.es/ecma262/multipage/ecmascript-language-scripts-and-modules.html#sec-parse-script)
+checks source syntax and early errors before ScriptEvaluation and GlobalDeclarationInstantiation.
+The syntax-only driver shares production syntax collection and declaration checks but performs
+neither graph lowering nor execution. It reports proven SyntaxErrors through a versioned parse
+protocol. The Test262 worker validates the entire record and matching process status.
+
+Unknown grammar, compiler panics and missing capabilities remain outside this channel. Strict
+source can fail a proven mode-independent check, but otherwise remains unsupported until its
+strict early-error validation is complete. Global restricted-property checks belong to
+initialization, so syntax-only validation excludes them. The compiler's ordinary compilation
+diagnostics and runtime abrupt-completion host still need typed reporting beyond this parse API.
+
 ## 2026-09-06 — Literal function-pointer copies preserve identity; body clones rename it
 
 Simple retains the FunPtr constant payload during shallow copy, then assigns a fresh function

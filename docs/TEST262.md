@@ -63,13 +63,44 @@ has a two-second deadline. Captured stdout/stderr have 64 KiB limits. A timeout 
 capture cannot pass. Native self-tests exercise this path and confirm that a compiler panic does
 not satisfy a negative SyntaxError expectation.
 
+Parse-negative Script variants now use `aot parse-script` on the test source alone. They do not
+load or evaluate harness code. The syntax-only command shares the production syntax collection
+and early-error checks, and never enters JSL lowering, global initialization or native execution.
+The worker requires the complete `AOT-PARSE/1 SyntaxError` record plus exit 73; neither one alone
+establishes an error. Normal parse completion requires its own record plus exit zero.
+
+Only proven early errors enter that channel: Script return, duplicate switch default, missing
+const initializer, lexical-name conflicts and an unlabelled break without an enclosing target.
+Unknown grammar still fails outside the syntax-error channel. Strict-source validation can report
+these mode-independent errors, but otherwise refuses because strict early-error checks remain
+incomplete. Global restricted-property failures belong to initialization and cannot count as
+parse errors. Runtime negative tests still lack a typed abrupt-completion protocol.
+
 The compiler still lacks the shared global environment and exception/function-expression support
-needed by the upstream assertion harness. Multi-Script plans, module plans, and async tests receive
+needed by the upstream assertion harness. Multi-Script evaluation, module plans, and async execution receive
 explicit unsupported results and remain in the denominator. Typed JavaScript abrupt-completion
-reporting and realm host bindings remain unimplemented. Do not convert a nonzero native exit into
+reporting at runtime and realm host bindings remain unimplemented. Do not convert a nonzero native exit into
 an expected exception by parsing its diagnostics.
 
-## Measured baseline, 2026-09-06
+## Latest measured campaign, 2026-09-06
+
+The syntax-only campaign measured **39 / 53,582 files passing (about 0.07%)**. All 39 are
+parse-negative tests, with both required variants passing. Across 102,926 variants, the report
+records 78 passes, 3 failures, 94,544 unsupported results and 8,301 compiler errors. It records
+zero crashes, timeouts, harness errors or unexecuted variants. Compiler-error counts grew because
+the runner now attempts parse negatives that previously stopped at the shared-harness boundary;
+those errors do not count as passes.
+
+Evidence: `build/test262-parse-negative-campaign/results.tsv` and `summary.txt`. The pinned suite
+revision remains unchanged. Git blob fingerprints:
+
+- Compiler: `a7b1dee218270a683a66d648e5668163be2c63ef`
+- Coil runtime: `34e337f669de579135ca399eddd16f782dc6307c`
+
+The full sequential development gate passed 563 tests. This campaign does not establish working
+assertion-harness evaluation or meet the 10% target.
+
+## Initial measured baseline, 2026-09-06
 
 The first campaign measured **0 / 53,582 files passing (0%)**. Across 102,926 required variants,
 102,896 were unsupported and 30 produced compiler errors. No compiler error counted as an expected

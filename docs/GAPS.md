@@ -55,6 +55,19 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-06 — Syntax-only Script validation
+
+The syntax-only driver shares the production syntax pass and reports selected proven early errors
+through a versioned typed result, without lowering or execution. Test262 parse negatives use this
+path. Strict validation still refuses a source with no already-proven error; its remaining early
+errors are incomplete. Unknown grammar and compiler failures cannot count as SyntaxError results.
+Global initialization and runtime exceptions remain outside this parse result channel.
+
+The first syntax campaign also exposed three accepted-invalid numeric spellings: `10._1`,
+`10._e1` and `10._`. The digit-only number scan in `src/parse/lexer.coil` stops before the dot;
+postfix parsing then treats the suffix as a property name. Decimal maximal-munch tokenization
+and separator rules require implementation. These rows count as failures, not conformance passes.
+
 ### 2026-09-06 — Switch selection, fallthrough and unlabelled break
 
 Switch evaluates its discriminant once, before entering the shared CaseBlock lexical scope.
