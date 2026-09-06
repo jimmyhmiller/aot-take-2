@@ -55,6 +55,28 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-06 — Switch selection, fallthrough and unlabelled break
+
+Switch evaluates its discriminant once, before entering the shared CaseBlock lexical scope.
+Case selectors run in order on the unmatched path and use JSL strict equality. Default receives
+the final unmatched path regardless of its source position. Body lowering merges selected entries
+with fallthrough, without repeating selector evaluation. Empty switches preserve discriminant
+effects, and all-returning cases stop subsequent statement lowering.
+
+Unlabelled break now merges a pruned Scope snapshot into the nearest switch or while exit, using
+Simple's jumpTo order. Syntax validation rejects breaks outside a breakable statement, including
+in unreachable code. Nested loops/switches maintain separate targets. If lowering now merges the
+live branch exit Scopes instead of stale entry Scopes after nested loops replace them.
+
+Labelled break, continue and finally unwinding remain absent. Runtime TDZ state across case paths
+with different initialization states still triggers the named Scope refusal. Case declarations
+share one lexical scope and the early-error walk rejects duplicate names/defaults and var conflicts.
+
+The native switch matrix exposed missing JsOp copying during JSL body cloning. The copier now
+preserves the runtime-capability index and ordered edges, following Simple's subclass-payload
+copy contract. No inlining limit or representation check changed. Focused graph coverage checks
+that payload, and the switch matrix also reuses its binary under GC stress.
+
 ### 2026-09-06 — Function var instantiation and declaration lists
 
 The frontend hoists function-local var names from blocks and branches, including unreachable

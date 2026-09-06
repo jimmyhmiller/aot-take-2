@@ -16,7 +16,8 @@
 ;;   ?:               a full Scope diamond with a value Phi pinned to the merged Region
 ;;
 ;; Logical expressions use the same Scope diamond and keep their original operand value.
-;; Nonlocal loop exits, exceptions and source-level narrowing remain unimplemented.
+;; Unlabelled break exits loops/switches through pruned Scope merges. Continue, labelled jumps,
+;; exception unwinding and source-level narrowing remain unimplemented.
 ;;
 ;; Final Simple's `parseTrinary` builds the If and both CProjs, duplicates the current Scope for the
 ;; false arm before parsing the true arm, keeps each arm result across the opposing construction
@@ -127,6 +128,14 @@
 
 (const SS-DECL-LIST 10)
 
+(const SS-BREAK 11)
+
+(const SS-SWITCH 12)
+
+(const SS-CASE 13)
+
+(defstruct BreakTarget [(scope i64) (count i64)])
+
 (defstruct SyntaxExpr
   [(kind i64)
    (lo i64)
@@ -173,6 +182,7 @@
    (return-ctrls (ArrayList i64))
    (return-mems (ArrayList i64))
    (return-values (ArrayList i64))
+   (break-targets (ArrayList BreakTarget))
    (entry-fun-nid i64)
    (script-mode bool)
    (script-index i64)
@@ -192,6 +202,7 @@
           (set! (.return-ctrls p) (al-new [i64] (alloc/malloc-allocator)))
           (set! (.return-mems p) (al-new [i64] (alloc/malloc-allocator)))
           (set! (.return-values p) (al-new [i64] (alloc/malloc-allocator)))
+          (set! (.break-targets p) (al-new [BreakTarget] (alloc/malloc-allocator)))
           (set! (.entry-fun-nid p) 0)
           (set! (.booted p) true)
           0)
@@ -202,6 +213,7 @@
           (al-clear! [i64] (mut (.return-ctrls p)))
           (al-clear! [i64] (mut (.return-mems p)))
           (al-clear! [i64] (mut (.return-values p)))
+          (al-clear! [BreakTarget] (mut (.break-targets p)))
           (set! (.entry-fun-nid p) 0)
           0))))
 
@@ -623,13 +635,58 @@
 
 (defn parse-syntax-statement [] (-> i64)
   (let [t (peek-token)]
+    (if (token-is t "switch")
+        (parse-syntax-switch)
+    (if (take-is "break")
+        (let [next (peek-token)]
+          (if (and (not (.nl-before next)) (= (.kind next) TOK-IDENT))
+              (unimplemented "labelled break target resolution" "docs/GAPS.md — labelled statements") 0)
+          (parse-statement-end!)
+          (syntax-stmt-add! (syntax-stmt-new SS-BREAK (.start t) (.end t))))
     (if (take-is ";")
         (syntax-stmt-add! (syntax-stmt-new SS-EMPTY (.start t) (.end t)))
         (do
           (if (and (token-is t "return") (not (.parsing-function (parser-state))))
               (parse-fail "parser: return is not allowed in Script code at byte" t)
               0)
-          (parse-syntax-statement-inner)))))
+          (parse-syntax-statement-inner)))))))
+
+(defn parse-syntax-switch [] (-> i64)
+  (let [keyword (require-token "switch")
+        (mut cases) (al-new [i64] (alloc/malloc-allocator))
+        (mut has-default) false]
+    (require-token "(")
+    (let [value (parse-syntax-conditional)]
+      (require-token ")")
+      (require-token "{")
+      (loop (if (token-is (peek-token) "}")
+                (break 0)
+                (let [label (take-token)
+                      selector
+                        (if (token-is label "case")
+                            (parse-syntax-conditional)
+                            (if (token-is label "default")
+                                (do
+                                  (if (load has-default) (panic "parser: duplicate switch default") 0)
+                                  (set! (mut has-default) true)
+                                  0)
+                                (do (parse-fail "parser: expected switch case/default at byte" label) 0)))
+                      (mut body) (al-new [i64] (alloc/malloc-allocator))]
+                  (require-token ":")
+                  (loop (let [next (peek-token)]
+                          (if (or (token-is next "case") (token-is next "default") (token-is next "}"))
+                              (break 0)
+                              (do (push! [i64] (mut body) (parse-syntax-statement)) (continue)))))
+                  (let [(mut clause) (syntax-stmt-new SS-CASE (.start label) (lex-consumed-end))]
+                    (set! (.expr (mut clause)) selector)
+                    (set! (.body (mut clause)) (load body))
+                    (push! [i64] (mut cases) (syntax-stmt-add! (load clause))))
+                  (continue))))
+      (let [close (require-token "}")
+            (mut stmt) (syntax-stmt-new SS-SWITCH (.start keyword) (.end close))]
+        (set! (.expr (mut stmt)) value)
+        (set! (.body (mut stmt)) (load cases))
+        (syntax-stmt-add! (load stmt))))))
 
 (defn parse-syntax-controlled-statement [] (-> i64)
   (if (or (token-is (peek-token) "let") (token-is (peek-token) "const"))
@@ -848,7 +905,7 @@
     (al-for [id stmts]
             (let [stmt (syntax-stmt-at id)]
               (if (= (.kind stmt) kind) (push! [(slice u8)] (mut names) (.name stmt)) 0)
-              (if (or (= kind SS-VAR) (= (.kind stmt) SS-DECL-LIST))
+              (if (or (= kind SS-VAR) (= (.kind stmt) SS-DECL-LIST) (= (.kind stmt) SS-CASE))
                   (do
                     (syntax-collect-declarations! (.body stmt) kind (mut names))
                     (syntax-collect-declarations! (.else-body stmt) kind (mut names)))
@@ -890,8 +947,20 @@
     (let [empty (al-new [(slice u8)] (alloc/malloc-allocator))]
       (al-for [id stmts]
               (let [stmt (syntax-stmt-at id)]
-                (syntax-check-declarations! (.body stmt) empty (= (.kind stmt) SS-BLOCK))
+                (syntax-check-declarations! (.body stmt) empty
+                                             (or (= (.kind stmt) SS-BLOCK) (= (.kind stmt) SS-SWITCH)))
                 (syntax-check-declarations! (.else-body stmt) empty false))))
+    0))
+
+(defn syntax-check-breaks! [(stmts (ArrayList i64)) (depth i64)] (-> i64)
+  (do
+    (al-for [id stmts]
+            (let [stmt (syntax-stmt-at id)
+                  nested (if (or (= (.kind stmt) SS-WHILE) (= (.kind stmt) SS-SWITCH)) (+ depth 1) depth)]
+              (if (and (= (.kind stmt) SS-BREAK) (= depth 0))
+                  (panic "parser: break has no enclosing breakable statement") 0)
+              (syntax-check-breaks! (.body stmt) nested)
+              (syntax-check-breaks! (.else-body stmt) nested)))
     0))
 
 (defn syntax-restricted-global? [(name (slice u8))] (-> bool)
@@ -1318,6 +1387,41 @@
     (set! (.current-ctrl p) (n-nid dead))
     1))
 
+;; Final Simple jumpTo duplicates the current Scope, kills current control, pops lexical levels
+;; to the target depth and merges the pruned copy into the exit Scope. We retain that order and
+;; keep the target while nested loops replace the active Scope. Unlike a return, a break carries
+;; surviving variable bindings as well as control/memory. Labelled jumps and finally unwinding
+;; remain UNIMPLEMENTED. The current frontend does not install lexical guard stacks on loop exits.
+(defn parser-push-break! [(scope (dyn NodeOps))] (-> i64)
+  (let [(mut target) (primitive/zeroed BreakTarget)]
+    (set! (.scope (mut target)) (n-nid scope))
+    (n-keep! scope)
+    (push! [BreakTarget] (mut (.break-targets (parser-state))) (load target))))
+
+(defn parser-pop-break! [] (-> i64)
+  (match (pop! (mut (.break-targets (parser-state))))
+    (None [] (broken "parser-pop-break!: no target"))
+    (Some [target]
+          (let [saved target] (n-unkeep! (parser-node (.scope saved))) (.count saved)))))
+
+(defn parser-record-break! [] (-> i64)
+  (let [p (parser-state)
+        index (- (len (.break-targets p)) 1)]
+    (if (< index 0)
+        (broken "parser-record-break!: no target after syntax validation")
+        (let [target (get (.break-targets p) index)
+              exit (parser-node (.scope target))
+              outgoing (scope-dup (parser-node (.current-scope p)) false)
+              depth (len (.levels (scope-node exit)))]
+          (parser-set-current-ctrl! (xctrl-make))
+          (loop (if (<= (len (.levels (scope-node outgoing))) depth)
+                    (break 0)
+                    (do (scope-pop! outgoing) (continue))))
+          (scope-merge! exit outgoing)
+          (let [meta (al-elem [BreakTarget] (mut (.break-targets p)) index)]
+            (set! (.count meta) (+ (.count meta) 1)))
+          1))))
+
 (defn parser-release-return-keeps! [] (-> i64)
   (let [p (parser-state)
         (mut i) 0]
@@ -1373,7 +1477,7 @@
               (if (= (.kind stmt) SS-LET)
                   (scope-declare! (parser-node (.current-scope (parser-state)))
                                   (.name stmt) (ty-dyn TAG-ANY) (.final stmt))
-                  (if (= (.kind stmt) SS-DECL-LIST)
+                  (if (or (= (.kind stmt) SS-DECL-LIST) (= (.kind stmt) SS-CASE))
                       (lower-instantiate-lexicals! (.body stmt)) 0))))
     0))
 
@@ -1396,7 +1500,87 @@
                 0))
     0))
 
-;; Return 1 when every path exits; each exit has transferred ownership into the return accumulator.
+(defn parser-use-scope! [(scope (dyn NodeOps))] (-> i64)
+  (do
+    (set! (.current-scope (parser-state)) (n-nid scope))
+    (set! (.current-ctrl (parser-state)) (n-nid (scope-ctrl scope)))
+    0))
+
+;; Simple has no JavaScript CaseBlock. Its ordinary If/CProj/Scope diamonds and jumpTo exits
+;; provide the graph machinery; JSL IsStrictlyEqual supplies case matching. First evaluate the
+;; discriminant outside the switch lexical scope. Instantiate that scope once, then evaluate case
+;; selectors in source order on only the unmatched path. Default receives the final unmatched
+;; path even when it appears in the middle. Finally lower bodies in source order, merging each
+;; selected entry with the preceding fallthrough. Thus fallthrough never re-evaluates a selector.
+;; All clauses share one lexical scope. Runtime TDZ state across differently initialized case
+;; paths is still unsupported by Scope and must refuse, not join TOP as a JavaScript value.
+(defn lower-switch [(stmt SyntaxStmt)] (-> i64)
+  (let [value (lower-syntax-expr (.expr stmt))
+        outer (parser-node (.current-scope (parser-state)))
+        exit (scope-dup outer false)
+        (mut entries) (al-new [i64] (alloc/malloc-allocator))
+        (mut default-index) -1
+        (mut i) 0
+        (mut fallthrough) 0]
+    (n-keep! value)
+    (scope-set-ctrl! exit (xctrl-make))
+    (parser-push-break! exit)
+    (scope-push! outer)
+    (lower-instantiate-lexicals! (.body stmt))
+    (loop (if (>= (load i) (len (.body stmt)))
+              (break 0)
+              (let [clause (syntax-stmt-at (get (.body stmt) (load i)))]
+                (if (= (.expr clause) 0)
+                    (do
+                      (set! (mut default-index) (load i))
+                      ;; A parser-only pending entry, patched after all selectors, never a value.
+                      (push! [i64] (mut entries) 0))
+                    (let [selector (lower-syntax-expr (.expr clause))
+                          predicate (lower-js-truthy (lower-js-binary value selector "JsStrictEqual"))
+                          selected (parser-node (.current-scope (parser-state)))
+                          iff (if-make (scope-ctrl selected) predicate)
+                          arms (if-arms! iff)
+                          unmatched (scope-dup selected false)]
+                      (scope-set-ctrl! selected (arms-true arms))
+                      (scope-set-ctrl! unmatched (arms-false arms))
+                      (n-keep! selected)
+                      (push! [i64] (mut entries) (n-nid selected))
+                      (parser-use-scope! unmatched)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (n-unkeep! value)
+    (let [unmatched (parser-node (.current-scope (parser-state)))]
+      (if (>= (load default-index) 0)
+          (do
+            (n-keep! unmatched)
+            (set! (mut entries) (load default-index) (n-nid unmatched)))
+          (do (scope-pop! unmatched) (scope-merge! exit unmatched) 0)))
+    (set! (mut i) 0)
+    (loop (if (>= (load i) (len (.body stmt)))
+              (break 0)
+              (let [clause (syntax-stmt-at (get (.body stmt) (load i)))
+                    entry (parser-node (get (load entries) (load i)))]
+                (n-unkeep! entry)
+                (parser-use-scope! (if (= (load fallthrough) 0) entry
+                                      (scope-merge! entry (parser-node (load fallthrough)))))
+                (let [terminated (lower-syntax-statements (.body clause))
+                      current (parser-node (.current-scope (parser-state)))]
+                  (if (= terminated 0)
+                      (set! (mut fallthrough) (n-nid current))
+                      (do (set! (mut fallthrough) 0) (n-kill! current))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (if (!= (load fallthrough) 0)
+        (let [last (parser-node (load fallthrough))]
+          (scope-pop! last)
+          (scope-merge! exit last)
+          0)
+        0)
+    (let [breaks (parser-pop-break!)]
+      (parser-use-scope! exit)
+      (if (or (< (load default-index) 0) (!= (load fallthrough) 0) (> breaks 0)) 0 1))))
+
+;; Return 1 when every path exits; each exit has transferred ownership to its return/break target.
 
 (defn lower-syntax-statements [(stmts (ArrayList i64))] (-> i64)
   (let [(mut i) 0
@@ -1472,14 +1656,16 @@
                                             (scope-set-ctrl! true-scope (arms-true arms))
                                             (set! (.current-ctrl (parser-state))
                                                   (n-nid (arms-true arms)))
-                                            (let [true-return (lower-syntax-statements (.body stmt))]
+                                            (let [true-return (lower-syntax-statements (.body stmt))
+                                                  true-exit (parser-node (.current-scope (parser-state)))]
                                               (set! (.current-scope (parser-state))
                                                     (n-nid false-scope))
                                               (scope-set-ctrl! false-scope (arms-false arms))
                                               (set! (.current-ctrl (parser-state))
                                                     (n-nid (arms-false arms)))
                                               (let [false-return (lower-syntax-statements (.else-body stmt))
-                                                    merged (scope-merge! true-scope false-scope)]
+                                                    merged (scope-merge! true-exit
+                                                                         (parser-node (.current-scope (parser-state))))]
                                                 (set! (.current-scope (parser-state)) (n-nid merged))
                                                 (set! (.current-ctrl (parser-state))
                                                       (n-nid (scope-ctrl merged)))
@@ -1513,6 +1699,7 @@
                                                     (scope-set-ctrl! body-scope
                                                                      (arms-false arms))
                                                     (let [exit-scope (scope-dup body-scope false)]
+                                                      (parser-push-break! exit-scope)
                                                       (scope-set-ctrl! body-scope
                                                                        (arms-true arms))
                                                       (set! (.current-ctrl (parser-state))
@@ -1524,6 +1711,7 @@
                                                       (scope-end-loop! entry
                                                                        (parser-node (.current-scope (parser-state)))
                                                                        exit-scope)
+                                                      (parser-pop-break!)
                                                       (n-unkeep! entry)
                                                       (set! (.current-scope (parser-state))
                                                             (n-nid exit-scope))
@@ -1532,6 +1720,8 @@
                                                       0))))
                                               (case (.kind stmt)
                                                 SS-EMPTY 0
+                                                SS-BREAK (set! (mut terminated) (parser-record-break!))
+                                                SS-SWITCH (set! (mut terminated) (lower-switch stmt))
                                                 SS-VAR
                                                   (if (= (.expr stmt) 0) 0
                                                       (let [value (lower-syntax-expr (.expr stmt))]
@@ -1649,7 +1839,9 @@
                         (continue))))))
         0))
     (al-for [f (.funs (parser-state))]
-            (let [fun f] (syntax-check-declarations! (.body fun) (.params fun) true)))
+            (let [fun f]
+              (syntax-check-declarations! (.body fun) (.params fun) true)
+              (syntax-check-breaks! (.body fun) 0)))
     ;; Syntax collection declares every closed-world property key and ordered hidden-class path
     ;; before JSL graphs are built. Runtime-key representation dispatch can therefore enumerate
     ;; the complete layout universe while JavaScript prototype traversal remains recursive JSL.
