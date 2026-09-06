@@ -1,0 +1,137 @@
+;; Reusable sequential test262 process worker. Simple has no test262 equivalent.
+
+;; JavaScript semantics remain in the production compiler/JSL; this module only supervises
+;; compile, link, and execution stages and records their actual process outcomes.
+(module aot.tools.test262-worker)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.fs" :as fs)
+(import "coil.primitive" :as primitive)
+(import "coil.str" :use *)
+(import "coil.subprocess" :as subprocess)
+(import "coil.time" :as time)
+(import "aot.tools.test262-metadata" :use *)
+(import "aot.tools.test262-policy" :use *)
+(import "aot.util.panic" :use *)
+
+(defn t262-verdict-name [(verdict i64)] (-> (slice u8))
+  (case verdict T262-PASS
+        "pass" T262-FAIL
+        "fail" T262-UNSUPPORTED
+        "unsupported" T262-COMPILER-ERROR
+        "compiler-error" T262-CRASH
+        "crash" T262-TIMEOUT
+        "timeout" T262-HARNESS-ERROR
+        "harness-error" T262-NOT-RUN
+        "not-run" (do (panic "test262: unknown verdict") "")))
+
+(defn t262-concat [(left (slice u8)) (right (slice u8))] (-> (slice u8))
+  (match (str-concat (alloc/malloc-allocator) left right)
+    (Some [bytes] bytes)
+    (None [] (do (panic "test262: allocation failed") ""))))
+
+(defn t262-write! [(path (slice u8)) (bytes (slice u8))] (-> i64)
+  (try (try-or! (fs/write-file (alloc/malloc-allocator) path bytes)
+                (panic "test262: cannot persist campaign artifact"))))
+
+;; A bounded process with exact argv and no shell. Each invocation waits and reaps before the
+;; next begins. The stdlib drains both pipes and kills the entire process group on its deadline.
+;; Return a process-stage status, NOT a JS exception. Stage zero means normal exit zero only.
+(defn t262-process! [(program (slice u8))
+                     (argv (ArrayList (slice u8)))
+                     (artifact-prefix (slice u8))
+                     (seconds i64)] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        (mut options) (primitive/zeroed subprocess/RunOptions)
+        result (primitive/alloc-stack subprocess/RunResult)]
+    (set! (.program (mut options)) program)
+    (set! (.args (mut options)) (al-slice argv))
+    (set! (.cwd (mut options)) "")
+    (set! (.stdout-limit (mut options)) 65536)
+    (set! (.stderr-limit (mut options)) 65536)
+    (set! (.deadline (mut options))
+          (Some (try (try-or! (time/deadline-after (time/Duration :sec seconds :nsec 0))
+                              (do (panic "test262: clock failed") (primitive/zeroed time/Instant))))))
+    (try (let [_ (try-or! (subprocess/run a result (load options)) T262-HARNESS-ERROR)]
+           (let [out (t262-concat artifact-prefix ".stdout")
+                 err (t262-concat artifact-prefix ".stderr")
+                 verdict
+                   (if (.timed-out result)
+                       T262-TIMEOUT
+                       (if (or (.cancelled result) (.stdout-truncated result) (.stderr-truncated result))
+                           T262-HARNESS-ERROR
+                           (match (.status result)
+                             (subprocess/Signaled [_] T262-CRASH)
+                             (subprocess/Exited [code]
+                                                (if (= code 0)
+                                                    0
+                                                    (if (= code EXIT-UNIMPLEMENTED)
+                                                        T262-UNSUPPORTED
+                                                        T262-COMPILER-ERROR))))))]
+             (t262-write! out (.stdout result))
+             (t262-write! err (.stderr result))
+             (alloc/free [u8] a out)
+             (alloc/free [u8] a err)
+             (subprocess/run-result-free a result)
+             verdict)))))
+
+;; The current production frontend accepts one Script. Do not concatenate or independently
+;; execute a multi-Script plan: both would give the wrong Global Environment Record. These
+;; missing capabilities produce an explicit unsupported row, remain in the denominator, and
+;; must be replaced by shared-realm compilation rather than a harness-specific assertion shim.
+(defn t262-unavailable [(meta Test262Metadata) (mode i64) (units (ArrayList Test262Unit))] (-> (slice u8))
+  (if (= mode T262-MODULE)
+      "module-loader"
+      (if (t262-has (.flags meta) "async")
+          "async-host"
+          (if (> (len units) 1) "shared-global-scripts" ""))))
+
+(defn t262-execute-script! [(compiler (slice u8))
+                            (runtime (slice u8))
+                            (source (slice u8))
+                            (prefix (slice u8))
+                            (meta Test262Metadata)] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        input (t262-concat prefix ".js")
+        object (t262-concat prefix ".o")
+        executable (t262-concat prefix ".exe")
+        compile-log (t262-concat prefix ".compile")
+        link-log (t262-concat prefix ".link")
+        run-log (t262-concat prefix ".run")
+        (mut argv) (al-new [(slice u8)] a)
+        (mut verdict) T262-NOT-RUN]
+    (t262-write! input source)
+    (push! [(slice u8)] (mut argv) "compile-script")
+    (push! [(slice u8)] (mut argv) input)
+    (push! [(slice u8)] (mut argv) object)
+    (set! (mut verdict) (t262-process! compiler (load argv) compile-log 10))
+    (if (= (load verdict) 0)
+        (do
+          (al-clear! (mut argv))
+          (push! [(slice u8)] (mut argv) object)
+          (push! [(slice u8)] (mut argv) runtime)
+          (push! [(slice u8)] (mut argv) "-o")
+          (push! [(slice u8)] (mut argv) executable)
+          (set! (mut verdict) (t262-process! "cc" (load argv) link-log 10))
+          (if (= (load verdict) 0)
+              (do
+                (al-clear! (mut argv))
+                (let [status (t262-process! executable (load argv) run-log 2)]
+                  ;; There is no typed JS abrupt-completion protocol yet. A nonzero native
+                  ;; status cannot establish any negative expectation, regardless of its text.
+                  (set! (mut verdict)
+                        (if (= status 0)
+                            (t262-verdict meta (Normal 0 false))
+                            (if (or (= status T262-COMPILER-ERROR) (= status T262-UNSUPPORTED))
+                                T262-FAIL
+                                status)))))
+              0))
+        0)
+    (al-free! (mut argv))
+    (alloc/free [u8] a input)
+    (alloc/free [u8] a object)
+    (alloc/free [u8] a executable)
+    (alloc/free [u8] a compile-log)
+    (alloc/free [u8] a link-log)
+    (alloc/free [u8] a run-log)
+    (load verdict)))

@@ -57,9 +57,41 @@ required mode, rejecting missing or duplicate variants. The classifier distingui
 harness, timeout, and crash outcomes from JavaScript exceptions and checks negative phase/type.
 Its tests supply synthetic observations; they are not test262 execution results.
 
-The execution worker, campaign result persistence, realm host bindings, module loading, and async
-supervision are not implemented by this tool yet. The compiler's existing Script entry is necessary groundwork,
-but lacks the shared global environment and exception/function-expression support needed by
-the upstream assertion harness. No test262 execution or passing percentage has been established.
+The sequential worker now invokes the compiled AOT driver, links its object with the Coil runtime,
+and runs the native executable. Compile/link stages have ten-second deadlines; native execution
+has a two-second deadline. Captured stdout/stderr have 64 KiB limits. A timeout or truncated
+capture cannot pass. Native self-tests exercise this path and confirm that a compiler panic does
+not satisfy a negative SyntaxError expectation.
+
+The compiler still lacks the shared global environment and exception/function-expression support
+needed by the upstream assertion harness. Multi-Script plans, module plans, and async tests receive
+explicit unsupported results and remain in the denominator. Typed JavaScript abrupt-completion
+reporting and realm host bindings remain unimplemented. Do not convert a nonzero native exit into
+an expected exception by parsing its diagnostics.
+
+## Measured baseline, 2026-09-06
+
+The first campaign measured **0 / 53,582 files passing (0%)**. Across 102,926 required variants,
+102,896 were unsupported and 30 produced compiler errors. No compiler error counted as an expected
+JavaScript exception. The report contained no crashes, timeouts, or harness errors.
+
+The fingerprinted baseline is in `build/test262-fingerprinted-baseline/`. `results.tsv` contains
+one row per variant and artifact identifiers. `summary.txt` records the denominator, verdict
+totals, suite revision, and these Git blob fingerprints:
+
+- Compiler: `52d2fc238b8787e129bad257191f7f58fa9360d3`
+- Coil runtime: `2d18e5a94c92545f9e92decd5e4cf5b4c71446d8`
+
+Reproduce with a fresh output directory after building the manifest artifacts:
+
+```
+coil build
+coil build src/main.coil -o build/aot-test262-compiler
+coil run tools/test262.coil -- run /Users/jimmyhmiller/Documents/Code/open-source/test262 ./build/aot-test262-compiler build/release/aot-runtime.o build/test262-next-campaign
+```
+
+The runner refuses an existing output directory. It checks suite revision/cleanliness before
+execution and again before publishing results. It returns one when any test has not passed;
+this is the expected baseline exit status. Generated reports and diagnostics stay under `build/`.
 
 The goal remains a working runner and at least 10% passing across the denominator above.

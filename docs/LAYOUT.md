@@ -252,6 +252,7 @@ aot-take-2/
     ├── dot-dump.coil
     ├── test262-metadata.coil ; test262 frontmatter, required variants and include ordering
     ├── test262-policy.coil   ; independent source-unit plans and observed-result classification
+    ├── test262-worker.coil   ; bounded sequential compiler/linker/native process execution
     ├── test262.coil          ; pinned-suite inventory and sequential conformance runner
     └── graph-wasm.coil      ; browser Wasm entry: source → phase snapshot
 ```
