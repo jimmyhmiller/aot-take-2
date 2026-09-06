@@ -55,6 +55,26 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-06 — Assignment expressions and remaining property boundaries
+
+`=`, `+=`, `-=`, `*=` and `/=` now parse as right-associative expressions in initializers, calls,
+conditions, returns and expression statements. The lowering walk evaluates a named property base
+once, preserves it across RHS rebinding, and uses the live post-RHS Scope for stores. Compound
+updates read before evaluating the RHS and use production JSL arithmetic. Binary operands retain
+their values across RHS assignment, and while/call lowering follows conditional Scope replacement.
+Strict binding checks also visit nested assignment targets; const and TDZ checks remain active.
+
+Compound arithmetic on a generic property read still fails the unproven-Unbox check, even for
+`let o = { value: 2 }; o.value += 40`. A refusal regression records this missing conversion or
+memory-proof capability. It does not count as a semantic or Test262 pass. Logical/bitwise compound
+assignments, updates, destructuring and computed References remain unsupported.
+
+The existing `JsGetNamed`/`JsDefineOwnNamed` data-property model lacks accessors/descriptors and
+nullish-base exceptions; its non-object fallback is not full JavaScript `[[Get]]`/`[[Set]]`.
+The shape prepass also closes transitions across all source write keys, which can grow
+combinatorially. Tests reuse a property name where distinct names are irrelevant to the behavior
+under test. Restricting that closure with sound per-object reachability remains open.
+
 ### 2026-09-06 — Syntax-only Script validation
 
 The syntax-only driver shares the production syntax pass and reports proven early errors through

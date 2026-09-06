@@ -87,6 +87,22 @@ an expected exception by parsing its diagnostics.
 
 ## Latest measured campaign, 2026-09-06
 
+The assignment-expression campaign measured **257 / 53,582 files passing (about 0.48%)**, up from
+247. Of 102,926 required variants, 412 passed, 94,464 were unsupported and 8,050 produced compiler
+errors. Failure, crash, timeout, harness-error and unexecuted counts were zero. Passing files
+remain parse negatives with all required modes passing; the denominator still includes unsupported
+cases and compiler errors.
+
+Evidence: `build/test262-assignment-campaign/results.tsv` and `summary.txt`. Fingerprints:
+
+- Compiler: `5adbee421566b896170e54faf79286cea05009aa`
+- Coil runtime: `34e337f669de579135ca399eddd16f782dc6307c`
+
+The full sequential development gate passed 574 tests. Generic property arithmetic still has a
+representation-proof refusal. Shared assertion-harness execution and the 10% goal remain open.
+
+## String-escape campaign, 2026-09-06
+
 The string-escape campaign measured **247 / 53,582 files passing (about 0.46%)**, up from 205.
 All required variants passed for those files. Of 102,926 variants, 401 passed, 94,464 were
 unsupported and 8,061 produced compiler errors. The report records zero failure, crash, timeout,

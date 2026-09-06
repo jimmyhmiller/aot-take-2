@@ -1,5 +1,24 @@
 # Decisions
 
+## 2026-09-06 — Assignment expressions retain References across RHS evaluation
+
+Final Simple recursively parses assignment RHSs, retains old operands for compound updates,
+and retains field bases/offsets until storing through the post-RHS memory state. We follow that
+order in the syntax-to-JSL walk. `=`, `+=`, `-=`, `*=` and `/=` now have one expression path;
+expression statements discard its result. Assignments associate to the right and return the
+assigned value, including ignored non-strict writes to non-writable global primitive bindings.
+
+Following [ECMA-262 assignment evaluation](https://tc39.es/ecma262/multipage/ecmascript-language-expressions.html#sec-assignment-operators-runtime-semantics-evaluation),
+we retain the property base once, read the old value before a compound RHS, and pass the result
+through existing JSL arithmetic and property operations. RHS expressions can replace the active
+Scope, so assignment stores, argument completion and while predicates reacquire that Scope.
+Binary lowering keeps its left value across RHS updates. Simple obtains that graph ownership by
+attaching the left operand to an incomplete operator node before parsing the right operand.
+
+This change does not discharge generic property-load arithmetic or implement full `[[Set]]`.
+The representation checker still refuses unproven numeric/string unboxes; descriptor/accessor
+semantics and nullish-base exceptions remain missing from the property runtime.
+
 ## 2026-09-06 — Source string escapes preserve UTF-16 and raw directive spelling
 
 Final Simple copies ordinary string characters and decodes backslashes before constructing a
