@@ -49,8 +49,16 @@ features/locales, negative phase/type, and required variants. It accepts the flo
 and scalar syntax used by this pinned corpus. Unsupported execution-field YAML syntax produces
 a metadata error; this is not a general YAML library.
 
-Execution, result accounting, realm host bindings, module loading, and async supervision are
-not implemented by this tool yet. The compiler's existing Script entry is necessary groundwork,
+The source-unit planner and observation classifier now have policy tests. The inventory validates
+plans for all 102,926 required variants, with zero planning errors. Plans keep harness Scripts
+separate from the test, retain include order, and apply the strict prefix to the test alone.
+Raw inputs retain their exact bytes. File-success checks require one passing result for each
+required mode, rejecting missing or duplicate variants. The classifier distinguishes compiler,
+harness, timeout, and crash outcomes from JavaScript exceptions and checks negative phase/type.
+Its tests supply synthetic observations; they are not test262 execution results.
+
+The execution worker, campaign result persistence, realm host bindings, module loading, and async
+supervision are not implemented by this tool yet. The compiler's existing Script entry is necessary groundwork,
 but lacks the shared global environment and exception/function-expression support needed by
 the upstream assertion harness. No test262 execution or passing percentage has been established.
 
