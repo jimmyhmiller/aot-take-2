@@ -70,7 +70,8 @@ The worker requires the complete `AOT-PARSE/1 SyntaxError` record plus exit 73; 
 establishes an error. Normal parse completion requires its own record plus exit zero.
 
 Only proven early errors enter that channel: Script return, duplicate switch default, missing
-const initializer, lexical-name conflicts and an unlabelled break without an enclosing target.
+const initializer, lexical-name conflicts, malformed numeric tokens and an unlabelled break
+without an enclosing target.
 Unknown grammar still fails outside the syntax-error channel. Strict-source validation can report
 these mode-independent errors, but otherwise refuses because strict early-error checks remain
 incomplete. Global restricted-property failures belong to initialization and cannot count as
@@ -83,6 +84,22 @@ reporting at runtime and realm host bindings remain unimplemented. Do not conver
 an expected exception by parsing its diagnostics.
 
 ## Latest measured campaign, 2026-09-06
+
+The numeric-literal campaign measured **127 / 53,582 files passing (about 0.24%)**, up from 39.
+All are parse-negative tests with both required variants passing. Of 102,926 variants, 254 passed,
+94,542 were unsupported and 8,130 produced compiler errors. The report records zero failure,
+crash, timeout, harness-error or unexecuted rows. Unsupported results and compiler errors remain
+in the denominator; this does not establish working assertion-harness execution.
+
+Evidence: `build/test262-numeric-literals-campaign/results.tsv` and `summary.txt`. Fingerprints:
+
+- Compiler: `a1ac82a900401f5fd2f6dacb01ef0ba6ba11b378`
+- Coil runtime: `34e337f669de579135ca399eddd16f782dc6307c`
+
+The full sequential development gate passed 566 tests. The goal remains at least 5,359 passing
+files and a working harness; neither requirement is complete.
+
+## Parse-only introduction campaign, 2026-09-06
 
 The syntax-only campaign measured **39 / 53,582 files passing (about 0.07%)**. All 39 are
 parse-negative tests, with both required variants passing. Across 102,926 variants, the report

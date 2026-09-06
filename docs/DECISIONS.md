@@ -1,5 +1,21 @@
 # Decisions
 
+## 2026-09-06 — Numeric literals use maximal munch and one rounding step
+
+Final Simple scans digit strings, selects long or double syntax, and rejects leading-zero
+integers. We follow its cursor organization but use the
+[ECMA-262 numeric grammar](https://tc39.es/ecma262/multipage/ecmascript-language-lexical-grammar.html#sec-literals-numeric-literals).
+The scanner consumes the decimal point even with no following fractional digits, validates each
+separator between digits, and checks the next character after radix and BigInt suffix handling.
+Legacy octal tokens remain distinct from Annex-B leading-zero decimal tokens.
+
+Decimal conversion strips validated separators into an owned buffer and uses the existing
+binary64 conversion primitive. Radix conversion retains 53 significand bits, a guard bit and a
+sticky remainder, then rounds once with ties to even. This avoids accumulating a large integer
+through repeatedly rounded floating arithmetic. Literal lowering chooses the compact integer
+representation only after proving an exact round trip within its payload range. Operators on
+these literal values continue through the production JSL lowering path.
+
 ## 2026-09-06 — Parse results precede runtime initialization
 
 [ECMA-262 ParseScript](https://tc39.es/ecma262/multipage/ecmascript-language-scripts-and-modules.html#sec-parse-script)

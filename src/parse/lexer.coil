@@ -18,6 +18,10 @@
 ;; lexer contract: source spans are views into retained source, newlines are recorded for ASI, and
 ;; `/` is parameterized by parser context. Final Simple keeps the lexer as a cursor inside Parser;
 ;; we use the same cursor-and-one-token-lookahead organization, split into this final-layout file.
+;; Final Simple isLongOrDouble scans digits then recognizes dot/e and parseNumber chooses long
+;; or double, rejecting leading-zero integers. JavaScript instead requires maximal-munch decimal
+;; fractions/exponents, separators between digits, radix/BigInt suffixes and legacy octal forms.
+;; Numeric boundary checks below follow ECMA-262 12.9.3; separators never terminate a valid prefix.
 (module aot.parse.lexer)
 (import "coil.primitive" :as primitive)
 (import "coil.slice" :use *)
@@ -40,6 +44,8 @@
 (const TOK-KEYWORD 7)
 
 (const TOK-PRIVATE 8)
+(const TOK-LEGACY-NUMBER 9)
+(const TOK-BIGINT 10)
 
 (defstruct Token
   [(kind i64)
@@ -56,6 +62,7 @@
    (col i64)
    (consumed-end i64)
    (peeked bool)
+   (typed-diagnostics bool)
    (peek-token Token)])
 
 (defn lexer-state [] (-> (ptr LexerState))
@@ -79,6 +86,7 @@
     (set! (.col s) 1)
     (set! (.consumed-end s) 0)
     (set! (.peeked s) false)
+    (set! (.typed-diagnostics s) false)
     0))
 
 (defn lex-source [] (-> (slice u8))
@@ -130,6 +138,95 @@
 
 (defn lex-at [(i i64)] (-> u8)
   (get (.src (lexer-state)) i))
+
+(defn lex-number-error! [(message (slice u8))] (-> i64)
+  (if (.typed-diagnostics (lexer-state)) (parse-syntax-diagnostic! message) (panic message)))
+
+(defn lex-current-is? [(c u8)] (-> bool)
+  (and (< (.pos (lexer-state)) (len (lex-source))) (= (lex-at (.pos (lexer-state))) c)))
+
+(defn lex-digit-value [(c u8)] (-> i64)
+  (if (lex-digit? c) (- (cast i64 c) 48)
+      (if (and (>= c (cast u8 97)) (<= c (cast u8 102))) (- (cast i64 c) 87)
+          (if (and (>= c (cast u8 65)) (<= c (cast u8 70))) (- (cast i64 c) 55) -1))))
+
+(defn lex-radix-digit? [(c u8) (radix i64)] (-> bool)
+  (let [digit (lex-digit-value c)] (and (>= digit 0) (< digit radix))))
+
+;; `previous` accounts for an already consumed first digit. A separator requires digits on BOTH
+;; sides, including after a prefix, decimal point or exponent sign. EOF is not a digit.
+(defn lex-number-digits! [(radix i64) (separators bool) (previous bool)] (-> i64)
+  (let [s (lexer-state) size (len (lex-source)) (mut count) (if previous 1 0)]
+    (loop (if (>= (.pos s) size) (break 0)
+              (let [c (lex-at (.pos s))]
+                (if (lex-radix-digit? c radix)
+                    (do (lex-advance!) (set! (mut count) (+ (load count) 1)) (continue))
+                    (if (= c (cast u8 95))
+                        (do
+                          (if (and separators (> (load count) 0) (< (+ (.pos s) 1) size)
+                                   (lex-radix-digit? (lex-at (+ (.pos s) 1)) radix))
+                              0 (lex-number-error! "lexer: numeric separator must separate digits"))
+                          (lex-advance!)
+                          ;; Consume the required following digit, so consecutive underscores fail.
+                          (lex-advance!)
+                          (set! (mut count) (+ (load count) 1))
+                          (continue))
+                        (break 0))))))
+    (load count)))
+
+(defn lex-scan-number! [(start i64) (first u8)] (-> i64)
+  (let [s (lexer-state) size (len (lex-source))
+        (mut radix) 10 (mut kind) TOK-NUMBER (mut integer) true (mut leading-zero) false]
+    (if (and (= first (cast u8 48)) (< (.pos s) size))
+        (let [c (lex-at (.pos s))]
+          (set! (mut radix) (if (or (= c (cast u8 120)) (= c (cast u8 88))) 16
+                               (if (or (= c (cast u8 98)) (= c (cast u8 66))) 2
+                                   (if (or (= c (cast u8 111)) (= c (cast u8 79))) 8 10))))) 0)
+    (if (!= (load radix) 10)
+        (do (lex-advance!)
+            (if (= (lex-number-digits! (load radix) true false) 0)
+                (lex-number-error! "lexer: radix prefix requires a digit") 0))
+        (do
+          (if (= first (cast u8 46))
+              (do (set! (mut integer) false) (lex-number-digits! 10 true false) 0)
+              (let [count (lex-number-digits! 10 (!= first (cast u8 48)) true)]
+                (if (and (= first (cast u8 48)) (> count 1))
+                    (do
+                      (set! (mut leading-zero) true)
+                      (set! (mut kind) TOK-LEGACY-NUMBER)
+                      ;; A leading-zero spelling containing 8/9 is Annex-B decimal, not octal.
+                      (let [(mut i) start]
+                        (loop (if (>= (load i) (.pos s)) (break 0)
+                                  (do
+                                    (if (>= (lex-at (load i)) (cast u8 56))
+                                        (set! (mut kind) TOK-NUMBER) 0)
+                                    (set! (mut i) (+ (load i) 1)) (continue)))))) 0)))
+          (if (and (!= (load kind) TOK-LEGACY-NUMBER) (!= first (cast u8 46))
+                   (lex-current-is? (cast u8 46)))
+              (do (lex-advance!) (set! (mut integer) false) (lex-number-digits! 10 true false) 0) 0)
+          (if (and (!= (load kind) TOK-LEGACY-NUMBER)
+                   (or (lex-current-is? (cast u8 101)) (lex-current-is? (cast u8 69))))
+              (do
+                (lex-advance!) (set! (mut integer) false)
+                (if (or (lex-current-is? (cast u8 43)) (lex-current-is? (cast u8 45)))
+                    (do (lex-advance!) 0) 0)
+                (if (= (lex-number-digits! 10 true false) 0)
+                    (lex-number-error! "lexer: exponent requires a digit") 0)) 0)))
+    (if (lex-current-is? (cast u8 110))
+        (do
+          (if (or (not (load integer)) (load leading-zero))
+              (lex-number-error! "lexer: invalid decimal BigInt literal") 0)
+          (lex-advance!) (set! (mut kind) TOK-BIGINT)) 0)
+    (if (< (.pos s) size)
+        (let [c (lex-at (.pos s))]
+          (if (or (lex-alpha? c) (lex-digit? c) (= c (cast u8 92)))
+              (lex-number-error! "lexer: identifier or digit immediately follows numeric literal") 0)
+          ;; Unicode identifier classification is not implemented. Whitespace/line terminators
+          ;; are already recognized exactly; refuse other non-ASCII boundaries without guessing.
+          (if (and (>= c (cast u8 128)) (= (lex-space-width (.pos s)) 0)
+                   (= (lex-line-width (.pos s)) 0))
+              (unimplemented "Unicode numeric literal boundary" "src/parse/lexer.coil") 0)) 0)
+    (load kind)))
 
 ;; ECMAScript LineTerminator is LF, CR, LS or PS. Keep byte spans while recognizing the
 ;; UTF-8 encoding of the latter two; CRLF is one line terminator sequence.
@@ -273,13 +370,11 @@
                   (if (lex-reserved-word? t)
                       (token-new TOK-KEYWORD start (.pos s) line col nl)
                       t)))
-              (if (lex-digit? c)
-                  (do
-                    (loop (if (and (< (.pos s) (len (.src s)))
-                                   (lex-digit? (lex-at (.pos s))))
-                              (do (lex-advance!) (continue))
-                              (break 0)))
-                    (token-new TOK-NUMBER start (.pos s) line col nl))
+              (if (or (lex-digit? c)
+                      (and (= c (cast u8 46)) (< (.pos s) (len (.src s)))
+                           (lex-digit? (lex-at (.pos s)))))
+                  (let [kind (lex-scan-number! start c)]
+                    (token-new kind start (.pos s) line col nl))
                   (if (or (= c (cast u8 34)) (= c (cast u8 39)))
                       (let [quote c
                             (mut escaped) false]

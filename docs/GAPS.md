@@ -63,10 +63,14 @@ path. Strict validation still refuses a source with no already-proven error; its
 errors are incomplete. Unknown grammar and compiler failures cannot count as SyntaxError results.
 Global initialization and runtime exceptions remain outside this parse result channel.
 
-The first syntax campaign also exposed three accepted-invalid numeric spellings: `10._1`,
-`10._e1` and `10._`. The digit-only number scan in `src/parse/lexer.coil` stops before the dot;
-postfix parsing then treats the suffix as a property name. Decimal maximal-munch tokenization
-and separator rules require implementation. These rows count as failures, not conformance passes.
+The first syntax campaign exposed three accepted-invalid numeric spellings: `10._1`, `10._e1`
+and `10._`. Numeric maximal-munch scanning now rejects those spellings and validates separators,
+radix digits, exponents and BigInt suffix boundaries. Number conversion supports decimal fractions
+and exponents, binary/octal/hexadecimal integers and non-strict legacy forms. Compact integer
+boxing requires an exact binary64 round trip, so fractional literals retain their double payload.
+BigInt value lowering remains an explicit refusal. Unicode numeric/identifier boundaries beyond
+recognized whitespace remain unsupported; strict-mode legacy-literal checks remain part of the
+missing strict validation. No numeric-token test establishes full lexical or runtime conformance.
 
 ### 2026-09-06 — Switch selection, fallthrough and unlabelled break
 
