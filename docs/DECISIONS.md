@@ -1,5 +1,19 @@
 # Decisions
 
+## 2026-09-06 — Strict early errors follow syntax scope
+
+[ECMA-262 strict-mode restrictions](https://tc39.es/ecma262/multipage/strict-mode-of-ecmascript.html)
+apply to the relevant Script or function code. We derive strictness from each directive prologue
+and inherit Script strictness into its source functions. A sibling function's directive changes
+neither the Script nor another function. Blocks and grouped strings do not introduce strictness.
+
+Checks walk syntax before lowering so unreachable code still receives early errors. Binding and
+assignment checks distinguish identifier targets from property names; object keys remain keys,
+not identifier references. Numeric checks inspect original spellings to distinguish legacy forms
+from equal-valued modern literals. The syntax-only API can report normal strict parsing within
+the admitted grammar. Ordinary compilation still refuses strict runtime execution until its
+binding, receiver and arguments semantics are implemented.
+
 ## 2026-09-06 — Numeric literals use maximal munch and one rounding step
 
 Final Simple scans digit strings, selects long or double syntax, and rejects leading-zero
@@ -25,8 +39,8 @@ neither graph lowering nor execution. It reports proven SyntaxErrors through a v
 protocol. The Test262 worker validates the entire record and matching process status.
 
 Unknown grammar, compiler panics and missing capabilities remain outside this channel. Strict
-source can fail a proven mode-independent check, but otherwise remains unsupported until its
-strict early-error validation is complete. Global restricted-property checks belong to
+early-error validation now covers the admitted syntax as described above; runtime strict
+semantics remain unsupported. Global restricted-property checks belong to
 initialization, so syntax-only validation excludes them. The compiler's ordinary compilation
 diagnostics and runtime abrupt-completion host still need typed reporting beyond this parse API.
 

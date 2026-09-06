@@ -72,9 +72,11 @@ establishes an error. Normal parse completion requires its own record plus exit 
 Only proven early errors enter that channel: Script return, duplicate switch default, missing
 const initializer, lexical-name conflicts, malformed numeric tokens and an unlabelled break
 without an enclosing target.
-Unknown grammar still fails outside the syntax-error channel. Strict-source validation can report
-these mode-independent errors, but otherwise refuses because strict early-error checks remain
-incomplete. Global restricted-property failures belong to initialization and cannot count as
+Unknown grammar still fails outside the syntax-error channel. Strict validation also checks
+restricted bindings/assignments, reserved references, duplicate simple parameters and legacy
+numeric literals. It derives strictness from each body and Script inheritance, without leaking
+a function directive into siblings. Strict runtime compilation remains unsupported.
+Global restricted-property failures belong to initialization and cannot count as
 parse errors. Runtime negative tests still lack a typed abrupt-completion protocol.
 
 The compiler still lacks the shared global environment and exception/function-expression support
@@ -84,6 +86,22 @@ reporting at runtime and realm host bindings remain unimplemented. Do not conver
 an expected exception by parsing its diagnostics.
 
 ## Latest measured campaign, 2026-09-06
+
+The strict-validation campaign measured **205 / 53,582 files passing (about 0.38%)**, up from 127.
+All required variants passed for those files; the 78 added files are strict parse negatives.
+Of 102,926 variants, 332 passed, 94,464 were unsupported and 8,130 produced compiler errors.
+The report records zero failure, crash, timeout, harness-error or unexecuted rows. Unsupported
+results and compiler errors remain in the denominator.
+
+Evidence: `build/test262-strict-validation-campaign/results.tsv` and `summary.txt`. Fingerprints:
+
+- Compiler: `f71d37c6b56e878a6e7c40422e39b1c4f7d70d98`
+- Coil runtime: `34e337f669de579135ca399eddd16f782dc6307c`
+
+The full sequential development gate passed 568 tests. Strict runtime execution and shared
+assertion-harness evaluation remain unsupported. The 10% goal remains open.
+
+## Numeric-literal campaign, 2026-09-06
 
 The numeric-literal campaign measured **127 / 53,582 files passing (about 0.24%)**, up from 39.
 All are parse-negative tests with both required variants passing. Of 102,926 variants, 254 passed,

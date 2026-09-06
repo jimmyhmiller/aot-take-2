@@ -57,10 +57,13 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ### 2026-09-06 — Syntax-only Script validation
 
-The syntax-only driver shares the production syntax pass and reports selected proven early errors
-through a versioned typed result, without lowering or execution. Test262 parse negatives use this
-path. Strict validation still refuses a source with no already-proven error; its remaining early
-errors are incomplete. Unknown grammar and compiler failures cannot count as SyntaxError results.
+The syntax-only driver shares the production syntax pass and reports proven early errors through
+a versioned typed result, without lowering or execution. Test262 parse negatives use this path.
+Strict validation covers the admitted grammar: directive scope and inheritance, binding names,
+identifier references, assignment targets, duplicate simple parameters and legacy numeric literals.
+Unknown grammar and compiler failures cannot count as SyntaxError results. String escapes,
+non-simple parameters and nested function syntax remain outside the admitted grammar. Strict
+runtime binding, receiver and arguments behavior remains an explicit compilation refusal.
 Global initialization and runtime exceptions remain outside this parse result channel.
 
 The first syntax campaign exposed three accepted-invalid numeric spellings: `10._1`, `10._e1`
@@ -69,8 +72,8 @@ radix digits, exponents and BigInt suffix boundaries. Number conversion supports
 and exponents, binary/octal/hexadecimal integers and non-strict legacy forms. Compact integer
 boxing requires an exact binary64 round trip, so fractional literals retain their double payload.
 BigInt value lowering remains an explicit refusal. Unicode numeric/identifier boundaries beyond
-recognized whitespace remain unsupported; strict-mode legacy-literal checks remain part of the
-missing strict validation. No numeric-token test establishes full lexical or runtime conformance.
+recognized whitespace remain unsupported. Strict validation rejects legacy literals from their
+original source spelling. No numeric-token test establishes full lexical or runtime conformance.
 
 ### 2026-09-06 — Switch selection, fallthrough and unlabelled break
 
