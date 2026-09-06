@@ -1,5 +1,22 @@
 # Decisions
 
+## 2026-09-06 — Finite call targets use a compilation-local owner registry
+
+Final Simple keeps a function-index-to-Fun table in CodeGen. During SCCP it checks call arity,
+defers complemented target sets, and links each missing finite target. It uses a read-only lookup
+because unlinking unknown callers can leave a function temporarily unreachable before a new call
+revives it. Target evidence may come from a Phi, Parm or call result as well as a FunPtr literal.
+
+We keep the owner table beside the function-index allocator in NodeArena, avoiding an import cycle
+from graph constructors into CodeGen. FunPtr construction registers its owner; conflicting owners
+for one index hard-error. The table contains node IDs, adds no liveness edges, and resets with the
+compilation arena. Lookup does not delete an owner based on its current control type.
+
+An absent finite owner hard-errors as unresolved cross-unit support. Simple can classify that case
+through its external-function machinery; we cannot infer an external ABI from absence. This change
+covers graph linkage. JavaScript callable objects, closure environments, member-call receivers and
+escaping-pointer support remain separate requirements before admitting those source expressions.
+
 This file records deliberate architecture choices that differ from Simple or settle behavior not
 fixed by the reference implementation. Code contradicting a decision here is a bug unless this
 file is amended at the same time.

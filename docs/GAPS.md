@@ -11,7 +11,7 @@ this file owns completeness.
 |---|---|---|
 | Dynamic values | Box/Unbox construction and payload access beyond numeric tags | Every checker-admitted singleton TypeTest is selected and encoded; producing and consuming the remaining tagged payload families still requires their runtime nodes |
 | Return | Concrete RPC nodes/types for the final four-input shape | Source/JSL Returns carry concrete bulk memory; RPC is reconstructed as a Parm before code generation while Fun ownership remains separate metadata |
-| Calls | Multi-target SCCP lookup | Direct calls, clone inlining, arbitrary fixed arity and bulk-memory threading are complete; multi-target lookup awaits compilation units |
+| Calls | Escaping function pointers, cross-unit resolution and JavaScript callable objects | Finite multi-target SCCP lookup uses the compilation-local function registry; member-call receivers and callable object allocation remain absent |
 | Node API | Complete for every implemented node family | Includes cycle-safe two-pass selected-subgraph copy, payload preservation and Fun/Return + Call/CallEnd cross-link repair |
 | Phi | Memory-specific same-op guards and the dominance-walk null merge | MemPhi construction, unary/binary scalar pull-down and structural zero/truthy-Cast merging are complete; Load/Store/MemMerge exist |
 | Verification | Pointer/control/safepoint/unreachable-use checks | Core edge, dead-input, Phi arity, type and GVN checks are live; the remaining checks require their node families |
@@ -36,7 +36,7 @@ nodes for mixed numeric operands. FunPtr types refresh when their Fun signature 
 IterPeeps now performs Simple's unused-node cleanup and dependency wakeup after progress, and its
 fixpoint audit checks monotonic types, both worklists, unused live nodes, and unapplied peepholes.
 Optimistic SCCP now snapshots pessimistic types, resets to TOP, enforces both monotonicity bounds,
-propagates to a fixed point, links direct calls lazily, resolves recursive numeric modes, and exposes
+propagates to a fixed point, links finite function-target sets lazily, resolves recursive numeric modes, and exposes
 a node/input-cone fixed-point proof predicate. Branch-local JavaScript truthiness produces pinned
 Casts on each CProj for integer and dynamic-tag precision. Scalar Phi same-op pull-down and the
 zero/truthy-Cast merge are implemented. The core graph verifier is live.
