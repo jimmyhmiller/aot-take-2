@@ -55,6 +55,15 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-07 — Grammar-closure campaign follow-up
+
+The campaign in `docs/TEST262.md` (4,222 files) found 3 false accepts, one bug: escaped
+identifier StringValues were views into a growing lexer pool and dangled after reallocation.
+Tokens now own their decoded text. With that, the parse-negative space is closed except for phase
+imports (deliberate) and non-ASCII identifiers; progress on test262 from here means executing
+positive tests: multi-Script realms for the harness prelude, function values and closures,
+exceptions, constructors and prototypes, and the built-ins the harness touches.
+
 ### 2026-09-07 — Annex B for-in initializers and the fail-closed guard on unknown tokens
 
 `for (var x = 1 in o)` parses in sloppy code (B.3.5: a plain `var` binding with an initializer in a

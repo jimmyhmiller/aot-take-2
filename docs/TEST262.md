@@ -101,6 +101,24 @@ Evidence: `build/test262-assignment-campaign/results.tsv` and `summary.txt`. Fin
 The full sequential development gate passed 574 tests. Generic property arithmetic still has a
 representation-proof refusal. Shared assertion-harness execution and the 10% goal remain open.
 
+## Grammar-closure campaign, 2026-09-07
+
+After `for await`, sloppy `let`, Annex B function declarations and for-in initializers, and
+identifier escapes were admitted, the campaign in `build/test262-grammar-closure-campaign/`
+measured **4,222 / 53,582 files passing (about 7.87%)**, up from 4,006. Of 102,926 variants,
+8,011 passed, 438 produced compiler errors, 94,474 were unsupported and 3 failed. Fingerprints:
+compiler blob `fbee4fa5eb0f1a2866cb6718161220f1e1bd0f13`, runtime `09f5ef57b34d0aeadabc52c42c52eac6d100c4a7`.
+
+The 3 failures were one bug: the decoded StringValue of an escaped identifier lived in a lexer pool
+that later scanning reallocated, so `{ \u0069mplements }` as a strict assignment-pattern leaf
+compared against freed bytes. Escaped tokens now own a right-sized copy; fixed with lexer and
+parser regressions. The 438 compiler errors are phase imports (400, deliberate), non-ASCII regex
+group names (16), non-ASCII identifiers (6) and a handful of lexer fail-closed paths (block
+comments, regex flags, `#` names). The parser now proves or admits essentially every negative
+parse test; the remaining 94,474 unsupported variants are positive tests that need the harness
+prelude compiled into a shared realm (`shared-global-scripts`, 82,806), an async host (10,815)
+or a module loader (843).
+
 ## Patterns campaign, 2026-09-07
 
 With destructuring patterns and regular-expression pattern validation admitted as syntax, the
