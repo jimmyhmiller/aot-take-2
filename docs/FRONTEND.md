@@ -137,7 +137,8 @@ about *syntax*.
 
 ```
 source text
-   │  lexer                      line terminators feed ASI; unsupported regex context fails closed
+   │  lexer                      line terminators feed ASI; regex bodies rescanned from `/`
+   │  regex                      pattern early errors under the u / web-compat / v grammars
    ▼
 tokens
    │  parser                     constructs the admitted grammar without semantic typing

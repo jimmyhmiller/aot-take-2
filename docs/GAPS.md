@@ -55,6 +55,24 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-07 — Regular-expression pattern early errors
+
+`src/parse/regex.coil` validates every RegularExpressionLiteral body at parse time under the
+grammar its flags select: the strict `u` grammar, Annex B's web-compat grammar without `u`/`v`,
+and the `v` ClassSetExpression grammar; named groups switch on the N rules in every mode. Proven
+errors cover quantifiers with nothing to repeat and out-of-order bounds, quantified lookbehinds
+(and lookaheads under `u`), unterminated groups and classes, out-of-order and escape-bounded class
+ranges, invalid identity/control/hex/unicode escapes, `\u{…}` out of range, backreferences to
+nonexistent groups, `\k` without a named group, empty, malformed, escaped-surrogate and duplicate
+(same alternative) group names, `(?ims-ims:…)` modifier repeats and empty modifier pairs, `\p{…}`
+names and values checked against the Unicode 17 tables (exact spelling, no `Is`/`In` prefixes or
+loose matching), properties of strings only under `v` and never negated, and the `v` reserved
+syntax and double punctuators, mixed set operators and negated classes that may match strings.
+The syntax-only panic on any regex literal is gone. Not classified: a non-ASCII code point in a
+group name (ID_Start/ID_Continue tables are not in the compiler) fails closed as a compiler
+error. Regex objects still do not lower (`regular expression objects`); the pattern is validated,
+not compiled.
+
 ### 2026-09-07 — Destructuring patterns as syntax
 
 Binding and assignment patterns parse everywhere the grammar admits them: `let`/`const`/`var`
@@ -84,8 +102,8 @@ callees or `new` targets, `return` in a static block nested in a function, and n
 class heritage or computed keys are all proven errors. A required token that is missing is now a
 SyntaxError in Script code unless the offending token is lexically unknown (identifier escapes,
 non-ASCII identifiers, `@`); TypeScript entry mode keeps failing closed there. The remaining
-parser refusals were destructuring patterns (admitted the same day, above), regex pattern
-validation, phase imports, `for await`, identifier escapes and Annex B function-in-statement.
+parser refusals were destructuring patterns and regex pattern validation (both admitted the same
+day, above), phase imports, `for await`, identifier escapes and Annex B function-in-statement.
 
 ### 2026-09-07 — Classes as syntax
 

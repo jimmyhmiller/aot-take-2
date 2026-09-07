@@ -213,6 +213,7 @@ aot-take-2/
 │   ├── parse/               ; Simple's 2856-line Parser.java, split by concern
 │   │   ├── lexer.coil       ; JS/TS tokens, regex-vs-divide, ASI, template literals
 │   │   ├── parser.coil      ; recursive descent → SoN, straight through ScopeNode
+│   │   ├── regex.coil       ; RegExp pattern early errors: strict, web-compat and v-mode grammars
 │   │   ├── tstype.coil      ; TypeScript annotation syntax → our lattice
 │   │   └── decl.coil        ; hoisting, binding resolution, module records
 │   │
@@ -241,7 +242,7 @@ aot-take-2/
 │   ├── scope-test.coil  loop-test.coil  mem-test.coil  shape-test.coil
 │   ├── opto-test.coil  gcm-test.coil  sched-test.coil  regalloc-test.coil
 │   ├── encode-test.coil  compunit-test.coil  verify-test.coil  text-test.coil
-│   ├── lex-test.coil  parse-test.coil  tstype-test.coil  jsl-test.coil
+│   ├── lex-test.coil  parse-test.coil  regex-test.coil  tstype-test.coil  jsl-test.coil
 │   ├── test262-test.coil            ; metadata, runner policy and accounting regressions
 │   ├── harness.coil                 ; source in → linked binary out → node's answer beside it
 │   ├── execution-test.coil          ; cases that must RUN, not merely compile

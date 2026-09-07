@@ -1,5 +1,21 @@
 # Decisions
 
+## 2026-09-07 — Regex patterns are validated at parse time by a flag-selected grammar
+
+A regular-expression literal's pattern is checked by `src/parse/regex.coil` while the literal is
+parsed, with verdicts (ok, error, unknown) returned to the parser rather than raised: the parser
+owns SyntaxError reporting and the fail-closed path. The validator reads the body as code points
+under `u`/`v` and as UTF-16 code units otherwise, because Annex B's grammar counts surrogate halves
+separately, and it selects between the strict, web-compat and class-set grammars from the flags
+instead of parsing once and post-filtering. The Unicode property tables are Coil constants
+holding the exact spellings ECMA-262 admits for Unicode 17.0.0 (the version test262 revision
+419d3e0a generates from); they are data the compiler needs, so they live in source, not in a
+side-car file. A classification the tables cannot make — a non-ASCII group-name code point whose
+ID_Start/ID_Continue status decides validity — is an `unknown` verdict and a compiler error, never a
+guess in either direction. The alternative, validating at RegExp construction, would turn early
+errors of the program into runtime failures of a particular execution and would not serve the
+syntax-only test262 verdicts at all.
+
 ## 2026-09-07 — Patterns are a separate table built by parse or by cover reinterpretation
 
 Destructuring patterns are their own sum-typed records (`PatternNode`: name, Reference leaf,
