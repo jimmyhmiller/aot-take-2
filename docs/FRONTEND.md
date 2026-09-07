@@ -119,8 +119,9 @@ JavaScript does not permit it, and the reasons are specific rather than general:
 still holds. The tree exists to solve ordering and lookahead, and it is discarded the moment
 lowering finishes. The current implementation therefore uses:
 
-- compact tagged `SyntaxExpr` and `SyntaxStmt` records plus `SyntaxFun` declaration headers, with
-  child expressions/statements referenced by dense ids in parser-owned side arrays;
+- `SyntaxExpr` and `SyntaxStmt` records, each a source span plus a `defsum` node, and `SyntaxFun`
+  declaration headers, with child expressions/statements referenced by dense ids in parser-owned
+  side arrays; every walk over them is an exhaustive `match`;
 - parser-owned dense storage that is cleared before the next compilation unit; no later compiler
   pass retains or queries syntax records after graph lowering;
 - source spans, because a diagnostic without one is unactionable;
@@ -189,9 +190,14 @@ non-strict (duplicate formal parameters follow non-strict last-binding semantics
 the unshadowed, non-writable global evaluates the complete right-hand side and then has no effect.
 A lexical `let undefined` instead resolves through the ordinary Scope slot and updates normally.
 
-Function bodies currently admit sequential `let`/`const`, assignment, lexical blocks, expression
-statements, return, calls, arithmetic, conditional expressions, statement `if`/`else`, and basic
-`while` loops.
+Function bodies currently admit sequential `let`/`const`/`var`, assignment, lexical blocks,
+expression statements, return, calls, conditional expressions, `switch`, unlabelled `break`,
+statement `if`/`else`, and basic `while` loops. The complete ECMAScript operator precedence is
+parsed: every binary, unary, update, compound-assignment, logical-assignment and comma operator
+has a syntax variant naming its JSL entry point. Operators whose entry point is in the production
+index execute (`+ - * / < > <= >= === !== && || ?? ! void typeof - + ++ -- , = += -= *= /= &&=
+||= ??=`); the rest (`% ** & | ^ << >> >>> == != in instanceof ~ delete` and their compound forms)
+parse, pass early-error validation, and refuse lowering by their JSL name.
 Statement branches duplicate and merge ScopeNode directly, so reassigned bindings acquire Phis
 only when the arm values differ. Final Simple's pruned return-Scope protocol is represented by a
 function-local accumulator of control, memory, and value: bare returns and live fallthrough add
@@ -204,7 +210,7 @@ materialized Phi backedge without exposing an intermediate graph. A return in th
 to the function accumulator while the loop's false projection remains live. `break` and `continue`
 remain outside the admitted subset.
 
-Every member of the current `SyntaxExpr` and `SyntaxStmt` sums has a native execution regression:
+Every executable member of the `SyntaxNode` and `SyntaxStmtNode` sums has a native execution regression:
 numeric literals, names, grouping, `+`/`-`/`*`, named calls, conditional expressions, `let`, `const`,
 assignment, expression statements, blocks and shadowing, value/bare/implicit returns, `if` with and
 without `else`, and `while` with block and single-statement bodies. The matrix also covers forward

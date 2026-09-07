@@ -55,6 +55,29 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-07 — Operator grammar, sum-typed syntax records and NaN branch codes
+
+The parser now recognizes the full expression operator precedence and the comma operator. `>`,
+`<=`, `>=`, `++`, `--` (prefix and postfix, on names and named properties), `,`, `&&=`, `||=` and
+`??=` lower through production JSL (`compare.jsl`, `update.jsl`, the existing predicates) and have
+a native regression. `%`, `**`, `&`, `|`, `^`, `<<`, `>>`, `>>>`, `==`, `!=`, `in`, `instanceof`,
+`~` and `delete` are admitted syntax that refuses lowering by JSL entry-point name: remainder and
+exponent need float primitives the checker lacks, bitwise operators need the distinct JS32
+primitives noted below, loose equality needs string-to-number conversion, and `in`/`instanceof`/
+`delete` need generic property keys and function objects. A sloppy-mode CallExpression assignment
+target parses (it is a runtime ReferenceError, not an early error) and refuses lowering. Update
+expressions on generic property reads still hit the unproven numeric Unbox refusal recorded below.
+
+Grammar not yet admitted fails closed as a compiler refusal: arrow functions, computed members,
+optional chains, templates, spread, `async`, labels, `for`/`do`/`try`/`throw`/`with`/`class`
+statements, nested/expression functions, `this`/`new`/`super`/`import` primaries, array literals,
+regex literals, object-literal shorthand/methods/computed keys, and `let` as a sloppy identifier.
+
+The native regression for runtime NaN comparisons exposed that AArch64 float `<`/`<=` used the
+integer LT/LE condition codes, which are true for unordered operands. Both CSET and the branch now
+select MI/LS from the FLAGS producer's register class (see `docs/DECISIONS.md`). No test262
+campaign has been re-run since; the counts in `docs/TEST262.md` predate this change.
+
 ### 2026-09-06 — Assignment expressions and remaining property boundaries
 
 `=`, `+=`, `-=`, `*=` and `/=` now parse as right-associative expressions in initializers, calls,

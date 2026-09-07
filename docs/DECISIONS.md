@@ -1,5 +1,41 @@
 # Decisions
 
+## 2026-09-07 — Syntax records are sum types and operators are admitted ahead of semantics
+
+`SyntaxExpr` and `SyntaxStmt` carry a `defsum` node (`SyntaxNode`, `SyntaxStmtNode`) plus a source
+span. Every walk over the tree — lowering, strict early errors, declaration collection, break
+validation, the hidden-class prepass — is an exhaustive `match`, so a new production is a compile
+error at each site that has not decided what to do with it. The previous integer `kind` tags with
+generic `left/right/third/args` slots let a forgotten arm reach the runtime `unknown syntax`
+panic and let a variant reinterpret the shared fields by convention. Child ids remain 1-based
+indices into parser-owned side arrays; optional children are `Option`, never a sentinel id. This
+keeps `docs/FRONTEND.md`'s thin-tree rule: no per-construct structs, no visitor, no typed AST.
+
+Operator variants name their JSL entry point (`JsGt`, `JsMod`, `JsBitAnd`, …). The complete
+ECMAScript operator precedence is parsed before every operator has production JSL. Lowering asks
+`jsl-defined?` and refuses an absent definition by that name, so admitting syntax never invents a
+local semantic substitute. Exhaustive early errors this makes provable: AssignmentTargetType for
+every admitted expression kind, `++`/`--` targets, a unary operator before `**`, `??` mixed with
+`&&`/`||`, strict `delete identifier`, strict `eval`/`arguments` update and logical-assignment
+targets, and a token that can never begin an expression.
+
+A CallExpression assignment target is a SyntaxError only in strict code. Sloppy web-compatible
+code defers to a runtime ReferenceError, which test262 encodes by marking those tests `onlyStrict`;
+lowering refuses the sloppy case by name until exceptions exist. Grammar that exists in JavaScript
+but is not yet admitted (arrow `=>`, computed members, optional chains, templates, spread, `async`,
+labels, `for`/`do`/`try`/`throw`/`class`/`function` statements, `this`/`new`/`super`/`import`
+primaries, regex) must fail as a compiler refusal, never as a proven SyntaxError; the fail-closed
+token sets live beside the primary and statement-end parsers.
+
+## 2026-09-07 — AArch64 floating comparisons use unordered-false condition codes
+
+FCMP on a NaN operand sets N=0 Z=0 C=1 V=1. The signed integer codes LT (N≠V) and LE (Z=1 or
+N≠V) are therefore true for NaN, so `NaN < 0` compiled to true whenever the comparison survived to
+runtime rather than folding. Floating `<` now selects MI and `<=` selects LS; their `^1`
+negations PL and HI are true for NaN, which is exactly the false-arm behavior JavaScript requires.
+The condition code is chosen from the FLAGS producer's register class in both the CSET form and the
+conditional branch (`arm64-condition-code`). EQ/NE and unsigned ULT are unaffected.
+
 ## 2026-09-06 — Assignment expressions retain References across RHS evaluation
 
 Final Simple recursively parses assignment RHSs, retains old operands for compound updates,
