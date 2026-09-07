@@ -55,6 +55,16 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-07 — Annex B for-in initializers and the fail-closed guard on unknown tokens
+
+`for (var x = 1 in o)` parses in sloppy code (B.3.5: a plain `var` binding with an initializer in a
+for-in head); the strict pass rejects it in strict code, and patterns, lexical bindings and `of`
+heads keep their proven errors. Lowering of for-in still refuses. `syntax-error!` now fails closed
+when the token in front of the parser is one the lexer cannot classify (a raw non-ASCII identifier
+character, `@`): `var π = 1;` was a false SyntaxError before this guard and is a compiler error
+now. Non-ASCII identifiers stay outside the admitted subset until the lexer carries the
+ID_Start/ID_Continue tables.
+
 ### 2026-09-07 — Identifier escapes
 
 The lexer decodes `\uXXXX` and `\u{…}` escapes inside IdentifierNames to their StringValue,
@@ -101,8 +111,8 @@ async iteration protocol (GetIterator async, Await on each step) is unimplemente
 The campaign in `docs/TEST262.md` (4,006 files) found 20 false accepts, all in destructuring and
 all fixed: a `...rest` element followed by a trailing comma is a valid literal but never a pattern
 (tracked per literal in `rest-comma`), and for-in/of assignment-pattern heads are now visited by
-the strict pass. Remaining parser refusals: phase imports (deliberate), Annex B for-in initializers, non-ASCII
-identifiers and regex group names (`for await`, sloppy `let`, Annex B function declarations and
+the strict pass. Remaining parser refusals: phase imports (deliberate) and non-ASCII identifiers and regex group
+names (`for await`, sloppy `let`, Annex B function declarations and for-in initializers, and
 identifier escapes were admitted later the same day).
 
 ### 2026-09-07 — Regular-expression pattern early errors
@@ -229,8 +239,8 @@ that are strict reserved words) and refuse lowering by name: property enumeratio
 protocol, exception completions and object environments are absent. `debugger` lowers to nothing.
 Statement-position declarations (`if (x) let y`, `while (x) class C {}`, loop-body function
 declarations, `async function` bodies) are proven SyntaxErrors; Annex B function-in-`if`, sloppy
-`let` identifiers were admitted later the same day (as were destructuring heads, catch parameters
-and `for await`); `for (var x = 1 in o)` still fails closed. The lexer gained a two-token lookahead for `let x` versus a bare `let` identifier.
+`let` identifiers, destructuring heads, catch parameters, `for await` and `for (var x = 1 in o)`
+were all admitted later the same day. The lexer gained a two-token lookahead for `let x` versus a bare `let` identifier.
 
 ### 2026-09-07 — Operator grammar, sum-typed syntax records and NaN branch codes
 
