@@ -101,6 +101,28 @@ Evidence: `build/test262-assignment-campaign/results.tsv` and `summary.txt`. Fin
 The full sequential development gate passed 574 tests. Generic property arithmetic still has a
 representation-proof refusal. Shared assertion-harness execution and the 10% goal remain open.
 
+## Grammar-completion campaign, 2026-09-07
+
+After the parser refactor to sum-typed syntax records and the admission of the full operator,
+statement, function and class grammar, the campaign measured **2,933 / 53,582 files passing (about
+5.47%)**, up from 247. Of 102,926 variants, 5,548 passed, 2,717 produced compiler errors (parser
+refusals of still-unadmitted grammar: destructuring patterns, regex pattern validation, phase
+imports, `for await`, identifier escapes, Annex B function-in-statement), 94,608 were unsupported
+and 53 failed. The 53 failures were false accepts of invalid programs (block-level duplicate
+generator/async/class declarations, call expressions as logical-assignment and for-in/of targets,
+`await` in nested async-arrow parameters, `super.#x`, private names right of `in`, arrows as
+operands, `return` in static blocks inside functions, non-strict class heritage); each is fixed
+with a regression in `tests/parse-test.coil` after this campaign, so a rerun would not reproduce
+them. Every passing file is still a parse negative.
+
+Evidence: `build/test262-syntax-campaign/results.tsv` and `summary.txt`. Fingerprints:
+
+- Compiler: `ffe6ce4c7deb3fb89cb0b8de1eac66cb78a3ffe3`
+- Coil runtime: `09f5ef57b34d0aeadabc52c42c52eac6d100c4a7`
+
+The full sequential development gate passed 589 tests at that commit. Shared assertion-harness
+execution and the 10% goal remain open.
+
 ## String-escape campaign, 2026-09-06
 
 The string-escape campaign measured **247 / 53,582 files passing (about 0.46%)**, up from 205.

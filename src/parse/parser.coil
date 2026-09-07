@@ -296,9 +296,11 @@
    (script-index i64)
    (fun-contexts (ArrayList FunContext))
    (classes (ArrayList SyntaxClass))
-   (class-depth i64)
+   (class-depth i64)  ; open class bodies: private-name scope
+   (class-strict i64)  ; open class definitions, including name and heritage: strict code
    (private-refs (ArrayList PrivateRef))
    (new-callee bool)
+   (spread-trailing-comma bool)  ; the last argument list ended `...x ,)`
    (no-in bool)
    (regex-count i64)
    (booted bool)])
@@ -324,8 +326,10 @@
           (set! (.fun-contexts p) (al-new [FunContext] (alloc/malloc-allocator)))
           (set! (.classes p) (al-new [SyntaxClass] (alloc/malloc-allocator)))
           (set! (.class-depth p) 0)
+          (set! (.class-strict p) 0)
           (set! (.private-refs p) (al-new [PrivateRef] (alloc/malloc-allocator)))
           (set! (.new-callee p) false)
+          (set! (.spread-trailing-comma p) false)
           (set! (.no-in p) false)
           (set! (.regex-count p) 0)
           (set! (.booted p) true)
@@ -350,6 +354,7 @@
           (al-clear! [FunContext] (mut (.fun-contexts p)))
           (al-clear! [SyntaxClass] (mut (.classes p)))
           (set! (.class-depth p) 0)
+          (set! (.class-strict p) 0)
           (al-clear! [PrivateRef] (mut (.private-refs p)))
           (set! (.new-callee p) false)
           (set! (.no-in p) false)
@@ -409,6 +414,14 @@
 
 (defn parser-ctx-allows-super-call? [] (-> bool)
   (let [home (parser-ctx-home)] (.derived-constructor home)))
+
+;; `return` is legal directly inside a function or arrow body, never in a static block or Script.
+(defn parser-return-allowed? [] (-> bool)
+  (let [contexts (.fun-contexts (parser-state))]
+    (if (= (len contexts) 0)
+        false
+        (let [top (get contexts (- (len contexts) 1))]
+          (or (.arrow top) (not (or (.script-root top) (.static-block top))))))))
 
 (defn parser-current-fun [] (-> i64)
   (let [contexts (.fun-contexts (parser-state))]
@@ -536,24 +549,39 @@
                       (syntax-error! "parser: expected a binding identifier")
                       t)))))))
 
+;; Tokens this lexer cannot classify: identifier escapes, non-ASCII identifiers, decorators. A
+;; grammar failure on one of these is not evidence about the program.
+(defn token-lexically-unknown? [(t Token)] (-> bool)
+  (and (= (.kind t) TOK-PUNCT)
+       (let [x (token-text t)]
+         (or (= x "\\") (= x "@") (>= (get x 0) (cast u8 128))))))
+
+;; A required token that is absent proves a SyntaxError in JavaScript Script code once the grammar
+;; up to this point is complete; TypeScript entry mode keeps failing closed because annotations
+;; and generics are only partially admitted there.
+(defn required-token-missing! [(what (slice u8)) (t Token)] (-> i64)
+  (if (and (.script-mode (parser-state)) (not (token-lexically-unknown? t)))
+      (syntax-error! what)
+      (parse-fail what t)))
+
 (defn require-token [(text (slice u8))] (-> Token)
   (let [t (take-token)]
     (if (token-is t text)
         t
-        (do (parse-fail "parser: expected token at byte" t) t))))
+        (do (required-token-missing! "parser: unexpected token" t) t))))
 
 (defn require-ident [] (-> Token)
   (let [t (take-token)]
     (if (= (.kind t) TOK-IDENT)
         t
-        (do (parse-fail "parser: expected identifier at byte" t) t))))
+        (do (required-token-missing! "parser: expected an identifier" t) t))))
 
 ;; Property IdentifierName permits reserved words, unlike a binding Identifier.
 (defn require-property-name [] (-> Token)
   (let [t (take-token)]
     (if (or (= (.kind t) TOK-IDENT) (= (.kind t) TOK-KEYWORD))
         t
-        (do (parse-fail "parser: expected property IdentifierName at byte" t) t))))
+        (do (required-token-missing! "parser: expected a property name" t) t))))
 
 (defn syntax-expr-new [(node SyntaxNode) (lo i64) (hi i64)] (-> SyntaxExpr)
   (let [(mut x) (primitive/zeroed SyntaxExpr)]
@@ -1263,7 +1291,6 @@
           (let [x (token-text t)]
             (not (or (= x "(")
                      (= x "{")
-                     (= x "...")
                      (= x "#")
                      (= x "\\")
                      (= x "@")
@@ -1514,9 +1541,10 @@
 ;; Arguments: AssignmentExpressions and `...spread`, with an optional trailing comma.
 (defn parse-syntax-arguments [] (-> (ArrayList i64))
   (let [(mut args) (al-new [i64] (alloc/malloc-allocator))]
+    (set! (.spread-trailing-comma (parser-state)) false)
     (if (not (take-is ")"))
-        (loop (do
-                (if (token-is (peek-token) "...")
+        (loop (let [spread (token-is (peek-token) "...")]
+                (if spread
                     (let [dots (take-token)
                           value (parse-syntax-assignment)]
                       (push! [i64]
@@ -1525,10 +1553,12 @@
                                                (.start dots)
                                                (syntax-hi value))))
                     (push! [i64] (mut args) (parse-syntax-assignment)))
-                (if (parse-list-separator! ")"
-                                           "parser: expected `,` or `)` in argument list")
-                    (break 0)
-                    (continue))))
+                (let [comma (token-is (peek-token) ",")]
+                  (if (parse-list-separator! ")"
+                                             "parser: expected `,` or `)` in argument list")
+                      (do (if (and spread comma) (set! (.spread-trailing-comma (parser-state)) true) 0)
+                          (break 0))
+                      (continue)))))
         0)
     (load args)))
 
@@ -1693,10 +1723,13 @@
                                         true))
             (do
               (take-token)
-              (let [args (parse-syntax-arguments)
+                            (let [args (parse-syntax-arguments)
+                    trailing (.spread-trailing-comma (parser-state))
                     after (peek-token)]
                 (if (and (token-is after "=>") (not (.nl-before after)))
-                    (parse-syntax-arrow-from-cover! (.start t) args true)
+                    (do
+                      (if trailing (syntax-error! "parser: rest parameter must be last") 0)
+                      (parse-syntax-arrow-from-cover! (.start t) args true))
                     (let [callee
                             (syntax-add-node! (SxName "async")
                                               (.start t)
@@ -1785,6 +1818,21 @@
 ;; Refine cover-grammar items into ArrowFormalParameters: names, `name = default` and a trailing
 ;; `...rest`. Patterns fail closed; anything else, or a `yield`/`await` expression inside a
 ;; default, is a proven error. An async head reserves `await` as well.
+;; A nested arrow's parameter names, defaults and concise body are part of the enclosing head.
+(defn syntax-fun-params-mention? [(fun i64) (yield? bool) (await? bool)] (-> bool)
+  (let [f (syntax-fun-at fun) (mut found) false]
+    (al-for [name (.params f)]
+            (if (or (and yield? (= name "yield")) (and await? (= name "await"))) (set! (mut found) true) 0))
+    (match (.rest-param f)
+      (Some [r] (if (or (and yield? (= r "yield")) (and await? (= r "await"))) (set! (mut found) true) 0))
+      (None [] 0))
+    (al-for [d (.param-defaults f)]
+            (match d (Some [e] (if (syntax-expr-contains? e yield? await?) (set! (mut found) true) 0)) (None [] 0)))
+    (match (.expression-body f)
+      (Some [e] (if (syntax-expr-contains? e yield? await?) (set! (mut found) true) 0))
+      (None [] 0))
+    (load found)))
+
 (defn syntax-expr-contains? [(id i64) (yield? bool) (await? bool)] (-> bool)
   (let [(mut children) (al-new [i64] (alloc/malloc-allocator))
         (mut found)
@@ -1792,6 +1840,7 @@
             (SxYield [argument delegate] yield?)
             (SxAwait [operand] await?)
             (SxName [name] (and await? (= name "await")))
+            (SxFunction [fun] (syntax-fun-params-mention? fun yield? await?))
             (_ false))]
     (syntax-expr-children! id (mut children))
     (al-for [child (load children)]
@@ -1922,11 +1971,18 @@
 (defn parse-syntax-member-tail [(start i64) (allow-call bool)] (-> i64)
   (let [(mut base) start]
     (loop (let [t (peek-token)]
+            (if (and (syntax-arrow? (load base))
+                     (or (token-is t ".") (token-is t "?.") (token-is t "[") (token-is t "`")
+                         (and allow-call (token-is t "("))))
+                (syntax-error! "parser: an arrow function cannot be accessed or called without parentheses")
+                0)
             (if (token-is t ".")
                 (do
                   (take-token)
                   (if (token-is (peek-token) "#")
-                      (let [name (parse-syntax-private-name! (take-token))]
+                      (let [is-super (match (syntax-node (load base)) (SxSuper [] true) (_ false))
+                            name (parse-syntax-private-name! (take-token))]
+                        (if is-super (syntax-error! "parser: super cannot access a private name") 0)
                         (set! (mut base)
                               (syntax-add-node! (SxPrivateMember
                                                   :owner (load base)
@@ -2059,9 +2115,9 @@
           (SxImportCall [specifier options]
                         (syntax-error! "parser: import() cannot be used with new"))
           (_ 0))
-        (if (syntax-optional-chain? callee)
-            (syntax-error! "parser: optional chain cannot be used with new")
-            0)
+                (if (syntax-optional-chain? callee)
+            (syntax-error! "parser: optional chain cannot be used with new") 0)
+        (syntax-reject-arrow-operand! callee)
         (let [args
                 (if (take-is "(")
                     (parse-syntax-arguments)
@@ -2084,7 +2140,7 @@
 ;; so the strict pass reports it and lowering refuses it by name. Every other admitted expression
 ;; kind is proven invalid here. Parentheses are transparent for Reference targets, while a
 ;; parenthesized object literal can no longer be reinterpreted as a destructuring pattern.
-(defn syntax-check-simple-target! [(id i64) (pattern-allowed bool)] (-> i64)
+(defn syntax-check-simple-target! [(id i64) (pattern-allowed bool) (web-compat bool)] (-> i64)
   (let [target-id (syntax-ungroup-id id)
         pattern (and pattern-allowed (= target-id id))]
     (if (syntax-optional-chain? target-id)
@@ -2094,7 +2150,10 @@
           (SxMember [owner name optional] 0)
           (SxPrivateMember [owner name optional] 0)
           (SxIndex [owner key optional] 0)
-          (SxCall [callee args optional] 0)
+          ;; Sloppy `f() = 1`, `f() += 1` and `f()++` defer to a runtime ReferenceError; logical
+          ;; assignment and for-in/of heads never do.
+          (SxCall [callee args optional]
+                  (if web-compat 0 (syntax-error! "parser: call expression is not a valid assignment target")))
           (SxObject [entries]
                     (if pattern
                         (unimplemented "destructuring assignment pattern"
@@ -2118,7 +2177,7 @@
     (if (and (or (token-is t "++") (token-is t "--")) (not (.nl-before t)))
         (do
           (take-token)
-          (syntax-check-simple-target! lhs false)
+          (syntax-check-simple-target! lhs false true)
           (syntax-add-node! (SxUpdate
                               :op (token-update-op-name t)
                               :prefix false
@@ -2158,13 +2217,15 @@
               (syntax-error! "parser: await expression is not allowed in formal parameters")
               0)
           (let [operand (parse-syntax-unary)]
+            (syntax-reject-arrow-operand! operand)
             (syntax-add-node! (SxAwait operand) (.start t) (syntax-hi operand))))
         (if (token-unary-operator? t)
             (do
               (take-token)
-              (let [operand (parse-syntax-unary)
-                    hi (syntax-hi operand)]
-                (if (token-is t "delete")
+                        (let [operand (parse-syntax-unary)
+                hi (syntax-hi operand)]
+            (syntax-reject-arrow-operand! operand)
+            (if (token-is t "delete")
                     (do
                       ;; Private names cannot be deleted, parenthesized or not.
                       (match (syntax-node (syntax-ungroup-id operand))
@@ -2178,8 +2239,9 @@
             (if (or (token-is t "++") (token-is t "--"))
                 (do
                   (take-token)
-                  (let [operand (parse-syntax-unary)]
-                    (syntax-check-simple-target! operand false)
+                                (let [operand (parse-syntax-unary)]
+                (syntax-reject-arrow-operand! operand)
+                (syntax-check-simple-target! operand false true)
                     (syntax-add-node! (SxUpdate
                                         :op (token-update-op-name t)
                                         :prefix true
@@ -2188,8 +2250,30 @@
                                       (syntax-hi operand))))
                 (parse-syntax-update))))))
 
+;; An ArrowFunction is a whole AssignmentExpression: it cannot be an operand, an object of a
+;; member access, a callee, or a `new` target without parentheses.
+(defn syntax-arrow? [(id i64)] (-> bool)
+  (match (syntax-node id)
+    (SxFunction [fun]
+                (let [f (syntax-fun-at fun)] (match (.kind f) (FunArrow [] true) (_ false))))
+    (_ false)))
+
+(defn syntax-reject-arrow-operand! [(id i64)] (-> i64)
+  (if (syntax-arrow? id)
+      (syntax-error! "parser: an arrow function cannot be an operand without parentheses")
+      0))
+
 (defn syntax-binary! [(node SyntaxNode) (lhs i64) (rhs i64)] (-> i64)
-  (syntax-add-node! node (syntax-lo lhs) (syntax-hi rhs)))
+  (do
+    ;; Assignment right-hand sides, comma operands and conditional arms are AssignmentExpressions.
+    (match node
+      (SxComma [l r] 0)
+      (SxAssign [target value] 0)
+      (SxCompoundAssign [op target value] 0)
+      (SxLogicalAssign [predicate rhs-on-true target value] 0)
+      (SxConditional [condition when-true when-false] (syntax-reject-arrow-operand! condition))
+      (_ (do (syntax-reject-arrow-operand! lhs) (syntax-reject-arrow-operand! rhs))))
+    (syntax-add-node! node (syntax-lo lhs) (syntax-hi rhs))))
 
 ;; ExponentiationExpression is right-associative and its base is an UpdateExpression: a unary
 ;; operator directly before `**` is a proven SyntaxError, while a parenthesized unary is fine.
@@ -2301,6 +2385,10 @@
                                           (if (token-is t "instanceof")
                                               "JsInstanceof"
                                               "JsIn")))))]
+                    (match (syntax-node rhs)
+                      (SxPrivateName [name]
+                                     (syntax-error! "parser: a private name can only be the left operand of in"))
+                      (_ 0))
                     (set! (mut lhs)
                           (syntax-binary! (SxBinary
                                             :op op
@@ -2521,7 +2609,7 @@
         lhs
         (do
           (take-token)
-          (syntax-check-simple-target! lhs (token-is op "="))
+          (syntax-check-simple-target! lhs (token-is op "=") (not logical))
           (let [target (syntax-ungroup-id lhs)
                 rhs (parse-syntax-assignment)]
             (syntax-binary! (if logical
@@ -2600,8 +2688,8 @@
                 (syntax-stmt-add-node! (SsEmpty) (.start t) (.end t))
                 (do
                   (if (and (token-is t "return")
-                           (not (parser-in-function?)))
-                      (syntax-error! "parser: return is not allowed in Script code")
+                           (not (parser-return-allowed?)))
+                      (syntax-error! "parser: return is not allowed here")
                       0)
                   (parse-syntax-statement-inner)))))))
 
@@ -2830,7 +2918,7 @@
               (take-token)
               (match head
                 (ForInitDecl [stmt] (syntax-check-for-in-head! stmt))
-                (ForInitExpr [expr] (syntax-check-simple-target! expr true))
+                (ForInitExpr [expr] (syntax-check-simple-target! expr true false))
                 (ForNoInit [] 0))
               (let [right
                       (if of
@@ -3107,7 +3195,7 @@
     (set! (.body (mut f)) (al-new [i64] (alloc/malloc-allocator)))
     (set! (.expression-body (mut f)) (None [i64]))
     (set! (.parent (mut f)) (parser-current-fun))
-    (set! (.in-class (mut f)) (> (.class-depth (parser-state)) 0))
+    (set! (.in-class (mut f)) (> (.class-strict (parser-state)) 0))
     (set! (.hoisted (mut f)) false)
     (set! (.strict (mut f)) false)
     (set! (.lo (mut f)) lo)
@@ -3627,6 +3715,7 @@
     heritage))
 
 (defn parse-syntax-class [(keyword Token) (declaration bool)] (-> i64)
+  (set! (.class-strict (parser-state)) (+ (.class-strict (parser-state)) 1))
   (let [p (parser-state)
         lead (peek-token)
         name
@@ -3677,6 +3766,15 @@
       (al-free! [PrivateRef] (mut remaining))
       (al-free! [PrivateDecl] (mut privates))
       (set! (.class-depth p) (- depth 1))
+      (set! (.class-strict p) (- (.class-strict p) 1))
+      ;; The heritage and computed keys are strict code outside any method body.
+      (match heritage (Some [h] (syntax-check-strict-expr! h)) (None [] 0))
+      (al-for [element (load elements)]
+              (let [key (match element
+                          (CeMethod [key is-static fun] key)
+                          (CeField [key is-static init-fun] key)
+                          (CeStaticBlock [fun] (CkNamed "")))]
+                (match key (CkComputed [e] (syntax-check-strict-expr! e)) (_ 0))))
       (let [(mut c) (primitive/zeroed SyntaxClass)
             index (len (.classes p))]
         (set! (.name (mut c)) name)
@@ -4000,8 +4098,7 @@
                                            (not (and (not strict)
                                                      (syntax-labels-contain? (load functions)
                                                                              name)
-                                                     (syntax-function-decl-count stmts
-                                                                                 name))))
+                                                     (syntax-all-plain-functions? stmts name))))
                                       (syntax-error! "parser: duplicate lexical declaration")
                                       0)
                                   (set! (mut j) (+ (load j) 1))
@@ -4042,28 +4139,31 @@
                 (al-free! [i64] (mut children)))))
     0))
 
-;; Whether every declaration of `name` directly in `stmts` is a FunctionDeclaration (so a sloppy
-;; Block may hold the duplicate).
-(defn syntax-function-decl-count [(stmts (ArrayList i64)) (name (slice u8))] (-> bool)
-  (let [(mut lets) (al-new [(slice u8)] (alloc/malloc-allocator))
-        (mut clash) false]
+;; Annex B.3.2.4 tolerates duplicate FunctionDeclarations in a sloppy Block only when every
+;; declaration of the name there is a plain (non-generator, non-async) function declaration.
+(defn syntax-all-plain-functions? [(stmts (ArrayList i64)) (name (slice u8))] (-> bool)
+  (let [(mut ok) true]
     (al-for [id stmts]
             (match (syntax-stmt-node id)
+              (SsFunctionDecl [fun]
+                              (let [f (syntax-fun-at fun)]
+                                (if (and (= (.name f) name) (or (.generator f) (.async f)))
+                                    (set! (mut ok) false) 0)))
+              (SsClassDecl [cls]
+                           (let [c (get (.classes (parser-state)) cls)]
+                             (if (= (.name c) name) (set! (mut ok) false) 0)))
               (SsLet [declared init final annotation]
-                     (if (= declared name) (set! (mut clash) true) 0))
+                     (if (= declared name) (set! (mut ok) false) 0))
               (SsDeclList [decls]
                           (do
                             (al-for [d decls]
                                     (match (syntax-stmt-node d)
                                       (SsLet [declared init final annotation]
-                                             (if (= declared name)
-                                                 (set! (mut clash) true)
-                                                 0))
+                                             (if (= declared name) (set! (mut ok) false) 0))
                                       (_ 0)))
                             0))
               (_ 0)))
-    (al-free! [(slice u8)] (mut lets))
-    (not (load clash))))
+    (load ok)))
 
 ;; The CatchParameter shares a scope with the catch Block's lexical declarations; a `var` of the
 ;; same name is permitted by Annex B.

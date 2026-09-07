@@ -55,6 +55,20 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-07 — Grammar-completion campaign follow-up
+
+The campaign in `docs/TEST262.md` (2,933 files) exposed 53 false accepts, all fixed with
+regressions: Annex B's sloppy duplicate-function allowance now requires every declaration of the
+name in the Block to be a plain function; call-expression targets are web-compatible only for
+`=`, compound assignment and update expressions; `await` inside nested arrow parameters of an
+async arrow head is an error; `super.#x`, a private name right of `in`, arrows used as operands,
+callees or `new` targets, `return` in a static block nested in a function, and non-strict code in
+class heritage or computed keys are all proven errors. A required token that is missing is now a
+SyntaxError in Script code unless the offending token is lexically unknown (identifier escapes,
+non-ASCII identifiers, `@`); TypeScript entry mode keeps failing closed there. The remaining
+parser refusals are destructuring patterns, regex pattern validation, phase imports, `for await`,
+identifier escapes and Annex B function-in-statement.
+
 ### 2026-09-07 — Classes as syntax
 
 Class declarations and expressions parse: heritage, methods (static, accessor, generator, async),
