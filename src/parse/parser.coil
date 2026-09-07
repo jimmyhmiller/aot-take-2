@@ -36,15 +36,15 @@
 ;; not implemented yet. Never narrow the executable graph merely because an annotation says so.
 ;;
 ;; The admitted subset includes named function declarations, number-annotated parameters/returns,
-;; numeric, string, template, regex, array and object literals, `this`, `new`, member chains,
-;; calls, bindings, the complete operator precedence (forms without production JSL refuse at
-;; lowering by name),
+;; numeric, string, template, regex, array and object literals (with methods and accessors),
+;; `this`, `new`, `super`, member chains, calls, bindings, function expressions, arrows,
+;; generators and async functions as syntax, the complete operator precedence (forms without
+;; production JSL refuse at lowering by name),
 ;; blocks, `if`/`else`, `switch`, `while`, `do-while`, classic `for`, `break`/`continue` with
 ;; labels and labelled statements; `for-in/of`, `throw`, `try` and `with` parse and refuse
 ;; lowering by name. Grammar outside that set
 ;; fails closed as a compiler refusal, never as a proven SyntaxError; see
-;; `token-cannot-start-expression?`, `token-unsupported-continuation?` and
-;; `token-unsupported-statement?`. Parsing first produces a THIN syntax tree, then lowering
+;; `token-cannot-start-expression?` and `token-unsupported-statement?`. Parsing first produces a THIN syntax tree, then lowering
 ;; constructs SSA directly. This is the required JavaScript divergence from final Simple's one-pass
 ;; parser: declarations are hoisted, so every Fun header exists before any body is lowered. The
 ;; semantic graph remains the only typed IR; syntax nodes carry spans and grammar shape, never
@@ -86,11 +86,24 @@
 ;; IdentifierReference at parse time; CoverInitializedName survives only to be reinterpreted as a
 ;; destructuring pattern and is otherwise a SyntaxError. Methods, accessors and generators are
 ;; not admitted yet and fail closed.
+(defsum PropKey
+  (KeyNamed [(key i64)])  ; interned shape key
+  (KeyComputed [(expr i64)]))
+
 (defsum ObjectEntry
-  (PropNamed [(key i64) (value i64)])  ; interned key
-  (PropComputed [(key i64) (value i64)])
+  (PropValue [(key PropKey) (value i64)])
+  (PropMethod [(key PropKey) (fun i64)])  ; method, getter or setter: see the SyntaxFun kind
   (PropSpread [(expr i64)])
   (PropCoverInit [(name (slice u8)) (init i64)]))
+
+;; What a SyntaxFun is syntactically. Declarations hoist and name a Fun; the others are values.
+(defsum FunKind
+  (FunDeclaration)
+  (FunExpression)
+  (FunArrow)
+  (FunMethod)
+  (FunGetter)
+  (FunSetter))
 
 (defsum ArrayElement
   (ElemHole)
@@ -116,6 +129,10 @@
   (SxTemplate [(quasis (ArrayList i64)) (substitutions (ArrayList i64))])  ; quasis: SxString ids
   (SxTaggedTemplate [(tag i64) (template i64)])
   (SxRegex [(body (slice u8)) (flags (slice u8))])
+  (SxFunction [(fun i64)])  ; function expression or arrow: index into the SyntaxFun table
+  (SxYield [(argument (Option i64)) (delegate bool)])
+  (SxAwait [(operand i64)])
+  (SxSuper)  ; only as the owner of a member/index or the callee of a call
   (SxUnary [(op (slice u8)) (operand i64)])
   (SxDelete [(operand i64)])
   (SxUpdate [(op (slice u8)) (prefix bool) (target i64)])
@@ -165,7 +182,8 @@
           (catch-body (Option i64))
           (finally-body (Option i64))])
   (SsWith [(object i64) (body i64)])
-  (SsDebugger))
+  (SsDebugger)
+  (SsFunctionDecl [(fun i64)]))
 
 (defstruct SyntaxStmt [(lo i64) (hi i64) (node SyntaxStmtNode)])
 
@@ -185,16 +203,43 @@
    (kind i64)
    (labels (ArrayList (slice u8)))])
 
+;; A function header. The record is reserved when its keyword is seen so nested functions can
+;; name their parent by index (parents therefore precede children), and filled when the body
+;; closes. `strict` is settled after parsing from the directive and the enclosing function.
 (defstruct SyntaxFun
   [(name (slice u8))
+   (kind FunKind)
+   (generator bool)
+   (async bool)
    (params (ArrayList (slice u8)))
    (param-annotations (ArrayList i64))
+   (param-defaults (ArrayList (Option i64)))
+   (rest-param (Option (slice u8)))
+   (simple-params bool)
    (return-annotation i64)
    (body (ArrayList i64))
+   (expression-body (Option i64))  ; an arrow's concise body
+   (parent i64)  ; enclosing SyntaxFun index, or -1 at the top level
+   (strict bool)
+   (hoisted bool)  ; a top-level declaration (or the Script root): lowered as a closed-world Fun
    (lo i64)
    (hi i64)
    (fidx i64)
    (fun-nid i64)])
+
+;; The function being parsed. Arrows inherit `this`, `new.target` and `super` from the nearest
+;; enclosing non-arrow function, so those questions walk the stack through arrow contexts.
+(defstruct FunContext
+  [(fun i64)
+   (generator bool)
+   (async bool)
+   (arrow bool)
+   (method bool)
+   (in-params bool)
+   (script-root bool)])  ; the Script's own statement list: not a function for `return`/`new.target`
+
+(defn syntax-fun-strict [(i i64)] (-> bool)
+  (let [f (syntax-fun-at i)] (.strict f)))
 
 (defstruct ParserState
   [(exprs (ArrayList SyntaxExpr))
@@ -213,7 +258,8 @@
    (syntax-only bool)
    (strict-pending bool)
    (script-index i64)
-   (parsing-function bool)
+   (fun-contexts (ArrayList FunContext))
+   (new-callee bool)
    (no-in bool)
    (regex-count i64)
    (booted bool)])
@@ -236,6 +282,9 @@
           (set! (.pending-labels p)
                 (al-new [(slice u8)] (alloc/malloc-allocator)))
           (set! (.entry-fun-nid p) 0)
+          (set! (.fun-contexts p)
+                (al-new [FunContext] (alloc/malloc-allocator)))
+          (set! (.new-callee p) false)
           (set! (.no-in p) false)
           (set! (.regex-count p) 0)
           (set! (.booted p) true)
@@ -257,6 +306,8 @@
           (al-clear! [JumpTarget] (mut (.jump-targets p)))
           (al-clear! [(slice u8)] (mut (.pending-labels p)))
           (set! (.entry-fun-nid p) 0)
+          (al-clear! [FunContext] (mut (.fun-contexts p)))
+          (set! (.new-callee p) false)
           (set! (.no-in p) false)
           (set! (.regex-count p) 0)
           0))))
@@ -285,6 +336,126 @@
 
 (defn take-is [(text (slice u8))] (-> bool)
   (if (token-is (peek-token) text) (do (take-token) true) false))
+
+(defn parser-in-function? [] (-> bool)
+  (let [contexts (.fun-contexts (parser-state)) (mut found) false]
+    (al-for [entry contexts] (let [c entry] (if (.script-root c) 0 (set! (mut found) true))))
+    (load found)))
+
+(defn parser-current-fun [] (-> i64)
+  (let [contexts (.fun-contexts (parser-state))]
+    (if (= (len contexts) 0)
+        -1
+        (let [top (get contexts (- (len contexts) 1))] (.fun top)))))
+
+(defn parser-ctx-generator? [] (-> bool)
+  (let [contexts (.fun-contexts (parser-state))]
+    (if (= (len contexts) 0)
+        false
+        (let [top (get contexts (- (len contexts) 1))] (.generator top)))))
+
+(defn parser-ctx-async? [] (-> bool)
+  (let [contexts (.fun-contexts (parser-state))]
+    (if (= (len contexts) 0)
+        false
+        (let [top (get contexts (- (len contexts) 1))] (.async top)))))
+
+(defn parser-ctx-in-params? [] (-> bool)
+  (let [contexts (.fun-contexts (parser-state))]
+    (if (= (len contexts) 0)
+        false
+        (let [top (get contexts (- (len contexts) 1))] (.in-params top)))))
+
+;; The nearest non-arrow context decides `this`, `new.target` and `super` questions.
+(defn parser-ctx-home-method? [] (-> bool)
+  (let [contexts (.fun-contexts (parser-state))
+        (mut i) (- (len contexts) 1)
+        (mut answer) false]
+    (loop (if (< (load i) 0)
+              (break 0)
+              (let [c (get contexts (load i))]
+                (if (.arrow c)
+                    (do (set! (mut i) (- (load i) 1)) (continue))
+                    (break (do (set! (mut answer) (.method c)) 0))))))
+    (load answer)))
+
+(defn parser-ctx-allows-new-target? [] (-> bool)
+  (let [contexts (.fun-contexts (parser-state))
+        (mut found) false]
+    (al-for [entry contexts]
+            (let [c entry] (if (or (.arrow c) (.script-root c)) 0 (set! (mut found) true))))
+    (load found)))
+
+(defn parser-push-context! [(fun i64)
+                            (generator bool)
+                            (async bool)
+                            (arrow bool)
+                            (method bool)] (-> i64)
+  (let [(mut c) (primitive/zeroed FunContext)]
+    (set! (.fun (mut c)) fun)
+    (set! (.generator (mut c)) generator)
+    (set! (.async (mut c)) async)
+    (set! (.arrow (mut c)) arrow)
+    (set! (.method (mut c)) method)
+    (set! (.script-root (mut c)) false)
+    (set! (.in-params (mut c)) true)
+    (push! [FunContext] (mut (.fun-contexts (parser-state))) (load c))))
+
+;; The Script's statement list gets a context so nested functions have a parent, without being
+;; a function: `return`, `new.target` and `var` hoisting still see the Script.
+(defn parser-push-root-context! [(fun i64)] (-> i64)
+  (do
+    (parser-push-context! fun false false false false)
+    (let [count (len (.fun-contexts (parser-state)))
+          top (al-elem [FunContext] (mut (.fun-contexts (parser-state))) (- count 1))]
+      (set! (.script-root top) true)
+      (set! (.in-params top) false)
+      0)))
+
+(defn parser-set-in-params! [(value bool)] (-> i64)
+  (let [count (len (.fun-contexts (parser-state)))
+        top
+          (al-elem [FunContext]
+                   (mut (.fun-contexts (parser-state)))
+                   (- count 1))]
+    (set! (.in-params top) value)
+    0))
+
+(defn parser-pop-context! [] (-> i64)
+  (match (pop! (mut (.fun-contexts (parser-state))))
+    (None [] (broken "parser-pop-context!: no function context"))
+    (Some [c] 0)))
+
+;; BindingIdentifier: a reserved word is a proven error; `yield` and `await` are reserved inside
+;; generator and async bodies respectively. A sloppy `let` binding fails closed.
+(defn syntax-check-binding-name! [(name (slice u8))] (-> i64)
+  (if (and (= name "yield") (parser-ctx-generator?))
+      (syntax-error! "parser: yield is not a valid binding identifier in a generator")
+      (if (and (= name "await") (parser-ctx-async?))
+          (syntax-error! "parser: await is not a valid binding identifier in an async function")
+          0)))
+
+(defn require-binding-identifier [] (-> Token)
+  (let [t (take-token)]
+    (if (= (.kind t) TOK-IDENT)
+        (do (syntax-check-binding-name! (token-text t)) t)
+        (if (token-is t "let")
+            (do
+              (parse-fail "parser: sloppy `let` binding is outside the admitted subset at byte"
+                          t)
+              t)
+            (if (= (.kind t) TOK-KEYWORD)
+                (do
+                  (syntax-error! "parser: reserved word cannot be a binding identifier")
+                  t)
+                (if (or (token-is t "[") (token-is t "{"))
+                    (do
+                      (parse-fail "parser: destructuring binding patterns are outside the admitted subset at byte"
+                                  t)
+                      t)
+                    (do
+                      (syntax-error! "parser: expected a binding identifier")
+                      t)))))))
 
 (defn require-token [(text (slice u8))] (-> Token)
   (let [t (take-token)]
@@ -378,12 +549,20 @@
                 (do
                   (al-for [entry entries]
                           (match entry
-                            (PropNamed [key value]
-                                       (push! [i64] (mut out) value))
-                            (PropComputed [key value]
-                                          (do
-                                            (push! [i64] (mut out) key)
-                                            (push! [i64] (mut out) value)))
+                            (PropValue [key value]
+                                       (do
+                                         (match key
+                                           (KeyComputed [e]
+                                                        (push! [i64]
+                                                               (mut out)
+                                                               e))
+                                           (_ 0))
+                                         (push! [i64] (mut out) value)))
+                            (PropMethod [key fun]
+                                        (match key
+                                          (KeyComputed [e]
+                                                       (push! [i64] (mut out) e))
+                                          (_ 0)))
                             (PropSpread [expr] (push! [i64] (mut out) expr))
                             (PropCoverInit [name init]
                                            (push! [i64] (mut out) init))))
@@ -428,6 +607,11 @@
                           (push! [i64] (mut out) tag)
                           (push! [i64] (mut out) template)))
       (SxRegex [body flags] 0)
+      (SxFunction [fun] 0)
+      (SxYield [argument delegate]
+               (match argument (Some [a] (push! [i64] (mut out) a)) (None [] 0)))
+      (SxAwait [operand] (push! [i64] (mut out) operand))
+      (SxSuper [] 0)
       (SxUnary [op operand] (push! [i64] (mut out) operand))
       (SxDelete [operand] (push! [i64] (mut out) operand))
       (SxUpdate [op prefix target] (push! [i64] (mut out) target))
@@ -677,13 +861,16 @@
                               ;; lowering, so they declare no layout here.
                               (al-for [entry entries]
                                       (match entry
-                                        (PropNamed [key value]
-                                                   (if (= (shape-key-name key)
-                                                          "__proto__")
-                                                       0
-                                                       (set! (mut shape)
-                                                             (shape-transition (load shape)
-                                                                               (shape-key-name key)))))
+                                        (PropValue [prop-key value]
+                                                   (match prop-key
+                                                     (KeyNamed [key]
+                                                               (if (= (shape-key-name key)
+                                                                      "__proto__")
+                                                                   0
+                                                                   (set! (mut shape)
+                                                                         (shape-transition (load shape)
+                                                                                           (shape-key-name key)))))
+                                                     (_ 0)))
                                         (_ 0)))
                               (set! (mut declared) (+ (load declared) 1))))
                   ;; A named write can execute against any ordinary-object shape reachable at
@@ -803,7 +990,8 @@
                  (Some [f] (push! [i64] (mut out) f))
                  (None [] 0))))
       (SsWith [object body] (push! [i64] (mut out) body))
-      (SsDebugger [] 0))
+      (SsDebugger [] 0)
+      (SsFunctionDecl [fun] 0))
     0))
 
 ;; Expression ids directly owned by one statement, exhaustively.
@@ -841,7 +1029,8 @@
       (SsThrow [value] (push! [i64] (mut out) value))
       (SsTry [body catch-param catch-body finally-body] 0)
       (SsWith [object body] (push! [i64] (mut out) object))
-      (SsDebugger [] 0))
+      (SsDebugger [] 0)
+      (SsFunctionDecl [fun] 0))
     0))
 
 (extern strtod :cc c [(ptr i8) (ptr (ptr i8))] (-> f64))
@@ -1039,11 +1228,9 @@
       (= (.kind t) TOK-LEGACY-NUMBER)
       (= (.kind t) TOK-BIGINT)
       (token-is t "[")
-      (token-is t "*")
       (token-is t "#")))
 
-;; After a complete list element only a separator or the closer may follow. `=>` continues an
-;; arrow function this parser has not admitted, so it fails closed instead of proving an error.
+;; After a complete list element only a separator or the closer may follow.
 (defn parse-list-separator! [(close (slice u8)) (message (slice u8))] (-> bool)
   (let [t (peek-token)]
     (if (token-is t ",")
@@ -1051,100 +1238,148 @@
         (if (token-is t close)
             (do (take-token) true)
             (do
-              (if (token-unsupported-continuation? t)
-                  (parse-fail "parser: expression continuation is outside the admitted subset at byte"
-                              t)
-                  (syntax-error! message))
+              (syntax-error! message)
               true)))))
+
+;; PropertyName: IdentifierName, string, number or `[expr]`, with what the definition needs to
+;; know about its spelling afterwards.
+(defstruct ParsedKey
+  [(key PropKey)
+   (name (slice u8))
+   (ident bool)  ; spelled as an Identifier, so shorthand is possible
+   (computed bool)
+   (named-proto bool)
+   (lo i64)
+   (hi i64)])
+
+(defn parse-syntax-property-key! [] (-> ParsedKey)
+  (let [(mut k) (primitive/zeroed ParsedKey)
+        t (peek-token)]
+    (set! (.lo (mut k)) (.start t))
+    (if (token-is t "[")
+        (let [saved-no-in (.no-in (parser-state))]
+          (take-token)
+          (set! (.no-in (parser-state)) false)
+          (let [expr (parse-syntax-assignment)]
+            (set! (.no-in (parser-state)) saved-no-in)
+            (require-closing! "]"
+                              "parser: expected `]` after computed property name")
+            (set! (.key (mut k)) (KeyComputed expr))
+            (set! (.name (mut k)) "")
+            (set! (.computed (mut k)) true)))
+        (if (token-is t "#")
+            (do
+              (syntax-error! "parser: private names are not allowed in object literals")
+              0)
+            (if (not (token-property-name? t))
+                (do
+                  (syntax-error! "parser: expected a property name in object literal")
+                  0)
+                (let [key-token (take-token)
+                      name (syntax-property-key-name key-token)]
+                  (set! (.key (mut k)) (KeyNamed (shape-key-intern name)))
+                  (set! (.name (mut k)) name)
+                  (set! (.ident (mut k)) (= (.kind key-token) TOK-IDENT))
+                  (set! (.named-proto (mut k))
+                        (and (= name "__proto__")
+                             (!= (.kind key-token) TOK-NUMBER)))))))
+    (set! (.hi (mut k)) (lex-consumed-end))
+    (load k)))
+
+;; PropertyDefinition: `...spread`, `*gen(){}`, `get k(){}` / `set k(v){}` / `async k(){}` /
+;; `async *k(){}`, `k(){}`, `k: value`, shorthand `k`, or the cover form `k = init`.
+(defn parse-syntax-property-definition! [(saw-proto (mut bool))] (-> ObjectEntry)
+  (let [first (peek-token)]
+    (if (token-is first "...")
+        (do (take-token) (PropSpread (parse-syntax-assignment)))
+        (if (token-is first "*")
+            (do
+              (take-token)
+              (let [k (parse-syntax-property-key!)]
+                (parse-syntax-method! (.key k)
+                                      (.name k)
+                                      (FunMethod)
+                                      true
+                                      false
+                                      (.start first))))
+            (let [second (lex-peek-second false)
+                  prefix
+                    (and (= (.kind first) TOK-IDENT)
+                         (or (token-is first "get")
+                             (token-is first "set")
+                             (token-is first "async"))
+                         (or (token-property-name? second)
+                             (token-is second "*"))
+                         (not (and (token-is first "async") (.nl-before second))))]
+              (if prefix
+                  (do
+                    (take-token)
+                    (let [async (token-is first "async")
+                          generator (and async (take-is "*"))
+                          k (parse-syntax-property-key!)
+                          kind
+                            (if (token-is first "get")
+                                (FunGetter)
+                                (if (token-is first "set")
+                                    (FunSetter)
+                                    (FunMethod)))]
+                      (parse-syntax-method! (.key k)
+                                            (.name k)
+                                            kind
+                                            generator
+                                            async
+                                            (.start first))))
+                  (let [k (parse-syntax-property-key!)
+                        next (peek-token)]
+                    (if (token-is next "(")
+                        (parse-syntax-method! (.key k)
+                                              (.name k)
+                                              (FunMethod)
+                                              false
+                                              false
+                                              (.lo k))
+                        (if (token-is next ":")
+                            (do
+                              (take-token)
+                              (if (.named-proto k)
+                                  (if (load saw-proto)
+                                      (syntax-error! "parser: duplicate __proto__ object-literal setter")
+                                      (set! saw-proto true))
+                                  0)
+                              (PropValue (.key k) (parse-syntax-assignment)))
+                            (if (.computed k)
+                                (do
+                                  (syntax-error! "parser: computed property name requires a value")
+                                  (PropSpread 0))
+                                (if (= (.name k) "let")
+                                    (do
+                                      (parse-fail "parser: sloppy `let` property shorthand is outside the admitted subset at byte"
+                                                  first)
+                                      (PropSpread 0))
+                                    (if (not (.ident k))
+                                        (do
+                                          (syntax-error! "parser: shorthand property requires an identifier")
+                                          (PropSpread 0))
+                                        (if (token-is next "=")
+                                            (do
+                                              (take-token)
+                                              (PropCoverInit (.name k)
+                                                             (parse-syntax-assignment)))
+                                            (do
+                                              (syntax-check-binding-name! (.name k))
+                                              (PropValue (.key k)
+                                                         (syntax-add-node! (SxName (.name k))
+                                                                           (.lo k)
+                                                                           (.hi k)))))))))))))))))
 
 (defn parse-syntax-object-literal [(open Token)] (-> i64)
   (let [(mut entries) (al-new [ObjectEntry] (alloc/malloc-allocator))
         (mut saw-prototype-setter) false]
     (if (not (take-is "}"))
-        (loop (let [first (peek-token)]
-                (if (token-is first "...")
-                    (do
-                      (take-token)
-                      (push! [ObjectEntry]
-                             (mut entries)
-                             (PropSpread (parse-syntax-assignment))))
-                    (if (token-is first "[")
-                        (let [saved-no-in (.no-in (parser-state))]
-                          (take-token)
-                          (set! (.no-in (parser-state)) false)
-                          (let [key (parse-syntax-assignment)]
-                            (set! (.no-in (parser-state)) saved-no-in)
-                            (require-closing! "]"
-                                              "parser: expected `]` after computed property name")
-                            (if (take-is ":")
-                                (push! [ObjectEntry]
-                                       (mut entries)
-                                       (PropComputed key
-                                                     (parse-syntax-assignment)))
-                                (if (token-is (peek-token) "(")
-                                    (parse-fail "parser: object methods are outside the admitted subset at byte"
-                                                (peek-token))
-                                    (syntax-error! "parser: computed property name requires a value")))))
-                        (if (token-is first "#")
-                            (syntax-error! "parser: private names are not allowed in object literals")
-                            (if (token-is first "*")
-                                (parse-fail "parser: generator methods are outside the admitted subset at byte"
-                                            first)
-                                (if (token-is first "let")
-                                    (parse-fail "parser: sloppy `let` property shorthand is outside the admitted subset at byte"
-                                                first)
-                                    (if (not (token-property-name? first))
-                                        (syntax-error! "parser: expected a property name in object literal")
-                                        (let [key-token (take-token)
-                                              next (peek-token)]
-                                          ;; `get x() {}`, `set x(v) {}`, `async x() {}`: a second
-                                          ;; property name begins accessor/method grammar.
-                                          (if (and (= (.kind key-token)
-                                                      TOK-IDENT)
-                                                   (or (token-is key-token
-                                                                 "get")
-                                                       (token-is key-token
-                                                                 "set")
-                                                       (token-is key-token
-                                                                 "async"))
-                                                   (token-property-name? next))
-                                              (parse-fail "parser: accessor and method definitions are outside the admitted subset at byte"
-                                                          next)
-                                              0)
-                                          (if (token-is next "(")
-                                              (parse-fail "parser: object methods are outside the admitted subset at byte"
-                                                          next)
-                                              0)
-                                          (if (token-is next ":")
-                                              (let [key-name
-                                                      (syntax-property-key-name key-token)]
-                                                (take-token)
-                                                (if (= key-name "__proto__")
-                                                    (if (load saw-prototype-setter)
-                                                        (syntax-error! "parser: duplicate __proto__ object-literal setter")
-                                                        (set! (mut saw-prototype-setter)
-                                                              true))
-                                                    0)
-                                                (push! [ObjectEntry]
-                                                       (mut entries)
-                                                       (PropNamed (shape-key-intern key-name)
-                                                                  (parse-syntax-assignment))))
-                                              (if (!= (.kind key-token)
-                                                      TOK-IDENT)
-                                                  (syntax-error! "parser: shorthand property requires an identifier")
-                                                  (if (token-is next "=")
-                                                      (do
-                                                        (take-token)
-                                                        (push! [ObjectEntry]
-                                                               (mut entries)
-                                                               (PropCoverInit (token-text key-token)
-                                                                              (parse-syntax-assignment))))
-                                                      (push! [ObjectEntry]
-                                                             (mut entries)
-                                                             (PropNamed (shape-key-intern (token-text key-token))
-                                                                        (syntax-add-node! (SxName (token-text key-token))
-                                                                                          (.start key-token)
-                                                                                          (.end key-token))))))))))))))
+        (loop (do
+                (push! [ObjectEntry]
+                       (mut entries)
+                       (parse-syntax-property-definition! (mut saw-prototype-setter)))
                 (if (parse-list-separator! "}"
                                            "parser: expected `,` or `}` in object literal")
                     (break 0)
@@ -1259,10 +1494,7 @@
                         (do
                           (set! (mut part) (lex-template-part! brace))
                           (continue))
-                        (if (token-unsupported-continuation? brace)
-                            (break (parse-fail "parser: expression continuation is outside the admitted subset at byte"
-                                               brace))
-                            (break (syntax-error! "parser: expected `}` after template substitution"))))))
+                        (break (syntax-error! "parser: expected `}` after template substitution")))))
                 (break 0))))
     (syntax-add-node! (SxTemplate (load quasis) (load substitutions))
                       (.start open)
@@ -1307,6 +1539,238 @@
       (set! (.regex-count (parser-state)) (+ (.regex-count (parser-state)) 1))
       (syntax-add-node! (SxRegex body flags) (.start t) (.end t)))))
 
+;; IdentifierReference, or the start of an arrow function / async function that shares its first
+;; token with one. `yield`/`await` reaching this point inside their reserving contexts are errors:
+;; the expression forms are parsed at the assignment and unary levels.
+(defn parse-syntax-identifier-primary [(t Token)] (-> i64)
+  (let [next (peek-token)
+        same-line (not (.nl-before next))]
+    (if (and (token-is t "yield") (parser-ctx-generator?))
+        (syntax-error! "parser: yield expression is not allowed here")
+        (if (and (token-is t "await") (parser-ctx-async?))
+            (syntax-error! "parser: await expression is not allowed here")
+            (if (and (token-is t "async")
+                     same-line
+                     (not (.new-callee (parser-state)))
+                     (or (token-is next "function")
+                         (= (.kind next) TOK-IDENT)
+                         (token-is next "(")))
+                (parse-syntax-async-head t)
+                (if (and same-line (token-is next "=>"))
+                    (let [(mut params)
+                            (al-new [(slice u8)] (alloc/malloc-allocator))
+                          (mut defaults)
+                            (al-new [(Option i64)] (alloc/malloc-allocator))]
+                      (syntax-check-binding-name! (token-text t))
+                      (push! [(slice u8)] (mut params) (token-text t))
+                      (push! [(Option i64)] (mut defaults) (None [i64]))
+                      (parse-syntax-arrow-body! (.start t)
+                                                (load params)
+                                                (load defaults)
+                                                (None [(slice u8)])
+                                                true
+                                                false))
+                    (syntax-add-node! (SxName (token-text t))
+                                      (.start t)
+                                      (.end t))))))))
+
+;; `async function …`, `async x => …`, `async (…) => …`, or an ordinary call `async(…)`
+;; (CoverCallExpressionAndAsyncArrowHead).
+(defn parse-syntax-async-head [(t Token)] (-> i64)
+  (let [next (peek-token)]
+    (if (token-is next "function")
+        (parse-syntax-function-expression (take-token) true (.start t))
+        (if (= (.kind next) TOK-IDENT)
+            (let [param (take-token)
+                  (mut params) (al-new [(slice u8)] (alloc/malloc-allocator))
+                  (mut defaults)
+                    (al-new [(Option i64)] (alloc/malloc-allocator))]
+              (if (= (token-text param) "await")
+                  (syntax-error! "parser: await is not a valid async arrow parameter")
+                  0)
+              (syntax-check-binding-name! (token-text param))
+              (push! [(slice u8)] (mut params) (token-text param))
+              (push! [(Option i64)] (mut defaults) (None [i64]))
+              (if (not (token-is (peek-token) "=>"))
+                  (syntax-error! "parser: expected => after async arrow parameter")
+                  0)
+              (parse-syntax-arrow-body! (.start t)
+                                        (load params)
+                                        (load defaults)
+                                        (None [(slice u8)])
+                                        true
+                                        true))
+            (do
+              (take-token)
+              (let [args (parse-syntax-arguments)
+                    after (peek-token)]
+                (if (and (token-is after "=>") (not (.nl-before after)))
+                    (parse-syntax-arrow-from-cover! (.start t) args true)
+                    (let [callee
+                            (syntax-add-node! (SxName "async")
+                                              (.start t)
+                                              (.end t))]
+                      (syntax-add-node! (SxCall
+                                          :callee callee
+                                          :args args
+                                          :optional false)
+                                        (.start t)
+                                        (lex-consumed-end))))))))))
+
+;; `super.x`, `super[x]` inside a method (through arrows); `super(...)` only inside a derived
+;; class constructor, which does not exist yet. Anything else is a proven error.
+(defn parse-syntax-super [(t Token)] (-> i64)
+  (let [next (peek-token)]
+    (if (or (token-is next ".") (token-is next "["))
+        (if (parser-ctx-home-method?)
+            (syntax-add-node! (SxSuper) (.start t) (.end t))
+            (syntax-error! "parser: super property access is only allowed in a method"))
+        (if (token-is next "(")
+            (syntax-error! "parser: super call is only allowed in a derived class constructor")
+            (syntax-error! "parser: unexpected super")))))
+
+;; CoverParenthesizedExpressionAndArrowParameterList. Parentheses restore the `[+In]` grammar.
+;; The list is parsed as expressions; a following `=>` reinterprets it as ArrowFormalParameters,
+;; otherwise an empty list, a rest element or a trailing comma is a proven error and the items
+;; fold into a comma expression inside a group.
+(defn parse-syntax-parenthesized [(open Token)] (-> i64)
+  (let [saved-no-in (.no-in (parser-state))
+        (mut items) (al-new [i64] (alloc/malloc-allocator))
+        (mut arrow-only) false]
+    (set! (.no-in (parser-state)) false)
+    (if (take-is ")")
+        (set! (mut arrow-only) true)
+        (loop (if (token-is (peek-token) "...")
+                  (let [dots (take-token)
+                        name (require-binding-identifier)]
+                    (set! (mut arrow-only) true)
+                    (if (token-is (peek-token) "=")
+                        (syntax-error! "parser: rest parameter may not have a default")
+                        0)
+                    (push! [i64]
+                           (mut items)
+                           (syntax-add-node! (SxSpread (syntax-add-node! (SxName (token-text name))
+                                                                         (.start name)
+                                                                         (.end name)))
+                                             (.start dots)
+                                             (.end name)))
+                    (if (take-is ")")
+                        0
+                        (syntax-error! "parser: rest parameter must be last"))
+                    (break 0))
+                  (do
+                    (push! [i64] (mut items) (parse-syntax-assignment))
+                    (if (take-is ",")
+                        (if (take-is ")")
+                            (break (do (set! (mut arrow-only) true) 0))
+                            (continue))
+                        (break (do
+                                 (require-closing! ")"
+                                                   "parser: expected `)` after expression")
+                                 0)))))))
+    (set! (.no-in (parser-state)) saved-no-in)
+    (let [after (peek-token)]
+      (if (and (token-is after "=>") (not (.nl-before after)))
+          (parse-syntax-arrow-from-cover! (.start open) (load items) false)
+          (if (load arrow-only)
+              (syntax-error! "parser: expected an expression")
+              (let [(mut expr) (get (load items) 0)
+                    (mut i) 1]
+                (loop (if (>= (load i) (len (load items)))
+                          (break 0)
+                          (let [rhs (get (load items) (load i))]
+                            (set! (mut expr)
+                                  (syntax-binary! (SxComma (load expr) rhs)
+                                                  (load expr)
+                                                  rhs))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (syntax-add-node! (SxGroup (load expr))
+                                  (.start open)
+                                  (lex-consumed-end))))))))
+
+;; Refine cover-grammar items into ArrowFormalParameters: names, `name = default` and a trailing
+;; `...rest`. Patterns fail closed; anything else, or a `yield`/`await` expression inside a
+;; default, is a proven error. An async head reserves `await` as well.
+(defn syntax-expr-contains? [(id i64) (yield? bool) (await? bool)] (-> bool)
+  (let [(mut children) (al-new [i64] (alloc/malloc-allocator))
+        (mut found)
+          (match (syntax-node id)
+            (SxYield [argument delegate] yield?)
+            (SxAwait [operand] await?)
+            (SxName [name] (and await? (= name "await")))
+            (_ false))]
+    (syntax-expr-children! id (mut children))
+    (al-for [child (load children)]
+            (if (syntax-expr-contains? child yield? await?)
+                (set! (mut found) true)
+                0))
+    (al-free! [i64] (mut children))
+    (load found)))
+
+(defn parse-syntax-arrow-from-cover! [(lo i64)
+                                      (items (ArrayList i64))
+                                      (async bool)] (-> i64)
+  (let [(mut params) (al-new [(slice u8)] (alloc/malloc-allocator))
+        (mut defaults) (al-new [(Option i64)] (alloc/malloc-allocator))
+        (mut rest) (None [(slice u8)])
+        (mut simple) true
+        (mut i) 0]
+    (loop (if (>= (load i) (len items))
+              (break 0)
+              (let [item (get items (load i))]
+                (if (syntax-expr-contains? item
+                                           (parser-ctx-generator?)
+                                           (or async (parser-ctx-async?)))
+                    (syntax-error! "parser: yield or await is not allowed in arrow parameters")
+                    0)
+                (match (syntax-node item)
+                  (SxName [name]
+                          (do
+                            (if async
+                                (if (= name "await")
+                                    (syntax-error! "parser: await is not a valid async arrow parameter")
+                                    0)
+                                0)
+                            (push! [(slice u8)] (mut params) name)
+                            (push! [(Option i64)] (mut defaults) (None [i64]))))
+                  (SxAssign [target value]
+                            (match (syntax-node target)
+                              (SxName [name]
+                                      (do
+                                        (set! (mut simple) false)
+                                        (push! [(slice u8)] (mut params) name)
+                                        (push! [(Option i64)]
+                                               (mut defaults)
+                                               (Some value))))
+                              (_ (syntax-error! "parser: invalid arrow function parameter"))))
+                  (SxSpread [expr]
+                            (match (syntax-node expr)
+                              (SxName [name]
+                                      (if (= (load i) (- (len items) 1))
+                                          (do
+                                            (set! (mut simple) false)
+                                            (set! (mut rest) (Some name))
+                                            0)
+                                          (syntax-error! "parser: rest parameter must be last")))
+                              (_ (parse-fail "parser: destructuring rest parameters are outside the admitted subset at byte"
+                                             (peek-token)))))
+                  (SxObject [entries]
+                            (parse-fail "parser: destructuring parameters are outside the admitted subset at byte"
+                                        (peek-token)))
+                  (SxArray [elements]
+                           (parse-fail "parser: destructuring parameters are outside the admitted subset at byte"
+                                       (peek-token)))
+                  (_ (syntax-error! "parser: invalid arrow function parameter")))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (parse-syntax-arrow-body! lo
+                              (load params)
+                              (load defaults)
+                              (load rest)
+                              (load simple)
+                              async)))
+
 (defn parse-syntax-primary [] (-> i64)
   (let [t (take-token)]
     (if (= (.kind t) TOK-BIGINT)
@@ -1324,31 +1788,11 @@
                               (.start t)
                               (.end t))
             (if (= (.kind t) TOK-IDENT)
-                (do
-                  ;; `async function` and `async x =>` begin unsupported grammar; a bare `async`
-                  ;; identifier followed by a same-line identifier must not become "expected
-                  ;; semicolon".
-                  (let [next (peek-token)]
-                    (if (and (token-is t "async")
-                             (not (.nl-before next))
-                             (or (token-is next "function")
-                                 (= (.kind next) TOK-IDENT)))
-                        (parse-fail "parser: async functions are outside the admitted subset at byte"
-                                    t)
-                        0))
-                  (syntax-add-node! (SxName (token-text t)) (.start t) (.end t)))
+                (parse-syntax-identifier-primary t)
                 (if (= (.kind t) TOK-STRING)
                     (syntax-add! (syntax-string t))
                     (if (token-is t "(")
-                        ;; Parentheses restore the `[+In]` grammar inside a for-statement head.
-                        (let [saved-no-in (.no-in (parser-state))]
-                          (set! (.no-in (parser-state)) false)
-                          (let [inner (parse-syntax-expression)
-                                close (require-token ")")]
-                            (set! (.no-in (parser-state)) saved-no-in)
-                            (syntax-add-node! (SxGroup inner)
-                                              (.start t)
-                                              (.end close))))
+                        (parse-syntax-parenthesized t)
                         (if (token-is t "{")
                             (parse-syntax-object-literal t)
                             (if (token-is t "[")
@@ -1357,15 +1801,25 @@
                                     (syntax-add-node! (SxThis)
                                                       (.start t)
                                                       (.end t))
-                                    (if (token-is t "import")
-                                        (parse-syntax-import-expression t)
-                                        (if (token-is t "`")
-                                            (parse-syntax-template t false)
-                                            (if (and (= (.kind t) TOK-PUNCT)
-                                                     (or (token-is t "/")
-                                                         (token-is t "/=")))
-                                                (parse-syntax-regex t)
-                                                (parse-primary-fallback t))))))))))))))
+                                    (if (token-is t "super")
+                                        (parse-syntax-super t)
+                                        (if (token-is t "function")
+                                            (parse-syntax-function-expression t
+                                                                              false
+                                                                              (.start t))
+                                            (if (token-is t "import")
+                                                (parse-syntax-import-expression t)
+                                                (if (token-is t "`")
+                                                    (parse-syntax-template t
+                                                                           false)
+                                                    (if (and (= (.kind t)
+                                                                TOK-PUNCT)
+                                                             (or (token-is t
+                                                                           "/")
+                                                                 (token-is t
+                                                                           "/=")))
+                                                        (parse-syntax-regex t)
+                                                        (parse-primary-fallback t))))))))))))))))
 
 ;; The member/call suffix loop shared by MemberExpression (`allow-call` false, for a `new` callee),
 ;; CallExpression and OptionalExpression. A tagged template cannot follow an optional chain.
@@ -1490,7 +1944,7 @@
       (let [name (take-token)]
         (if (not (token-is name "target"))
             (syntax-error! "parser: expected new.target")
-            (if (not (.parsing-function (parser-state)))
+            (if (not (parser-ctx-allows-new-target?))
                 (syntax-error! "parser: new.target is not allowed outside a function")
                 (syntax-add-node! (SxNewTarget) (.start keyword) (.end name)))))
       (let [callee
@@ -1592,28 +2046,36 @@
   ;; Final Simple recursively parses unary minus before its multiplication loop. JavaScript
   ;; numeric conversion belongs to JSL; the parser never subtracts from zero (which loses -0).
   (let [t (peek-token)]
-    (if (token-unary-operator? t)
+    (if (and (token-is t "await") (parser-ctx-async?))
         (do
           (take-token)
-          (let [operand (parse-syntax-unary)
-                hi (syntax-hi operand)]
-            (if (token-is t "delete")
-                (syntax-add-node! (SxDelete operand) (.start t) hi)
-                (syntax-add-node! (SxUnary (token-unary-op-name t) operand)
-                                  (.start t)
-                                  hi))))
-        (if (or (token-is t "++") (token-is t "--"))
+          (if (parser-ctx-in-params?)
+              (syntax-error! "parser: await expression is not allowed in formal parameters")
+              0)
+          (let [operand (parse-syntax-unary)]
+            (syntax-add-node! (SxAwait operand) (.start t) (syntax-hi operand))))
+        (if (token-unary-operator? t)
             (do
               (take-token)
-              (let [operand (parse-syntax-unary)]
-                (syntax-check-simple-target! operand false)
-                (syntax-add-node! (SxUpdate
-                                    :op (token-update-op-name t)
-                                    :prefix true
-                                    :target (syntax-ungroup-id operand))
-                                  (.start t)
-                                  (syntax-hi operand))))
-            (parse-syntax-update)))))
+              (let [operand (parse-syntax-unary)
+                    hi (syntax-hi operand)]
+                (if (token-is t "delete")
+                    (syntax-add-node! (SxDelete operand) (.start t) hi)
+                    (syntax-add-node! (SxUnary (token-unary-op-name t) operand)
+                                      (.start t)
+                                      hi))))
+            (if (or (token-is t "++") (token-is t "--"))
+                (do
+                  (take-token)
+                  (let [operand (parse-syntax-unary)]
+                    (syntax-check-simple-target! operand false)
+                    (syntax-add-node! (SxUpdate
+                                        :op (token-update-op-name t)
+                                        :prefix true
+                                        :target (syntax-ungroup-id operand))
+                                      (.start t)
+                                      (syntax-hi operand))))
+                (parse-syntax-update))))))
 
 (defn syntax-binary! [(node SyntaxNode) (lhs i64) (rhs i64)] (-> i64)
   (syntax-add-node! node (syntax-lo lhs) (syntax-hi rhs)))
@@ -1906,7 +2368,40 @@
 ;; Reference, but arithmetic/calls cannot be turned into one by discarding their expression.
 ;; Logical assignment short-circuits: the RHS and the PutValue both live on one edge, and `||=`
 ;; evaluates its RHS on the FALSE edge of the truthiness predicate.
+;; YieldExpression: `yield`, `yield expr`, `yield* expr`. Its argument is optional and ends at a
+;; line terminator or any token that cannot begin an expression.
+(defn parse-syntax-yield [] (-> i64)
+  (let [t (take-token)]
+    (if (parser-ctx-in-params?)
+        (syntax-error! "parser: yield expression is not allowed in formal parameters")
+        0)
+    (let [next (peek-token)]
+      (if (.nl-before next)
+          (syntax-add-node! (SxYield (None [i64]) false) (.start t) (.end t))
+          (if (token-is next "*")
+              (do
+                (take-token)
+                (let [argument (parse-syntax-assignment)]
+                  (syntax-add-node! (SxYield (Some argument) true)
+                                    (.start t)
+                                    (syntax-hi argument))))
+              (if (or (token-cannot-start-expression? next)
+                      (token-is next "in")
+                      (token-is next "of"))
+                  (syntax-add-node! (SxYield (None [i64]) false)
+                                    (.start t)
+                                    (.end t))
+                  (let [argument (parse-syntax-assignment)]
+                    (syntax-add-node! (SxYield (Some argument) false)
+                                      (.start t)
+                                      (syntax-hi argument)))))))))
+
 (defn parse-syntax-assignment [] (-> i64)
+  (if (and (token-is (peek-token) "yield") (parser-ctx-generator?))
+      (parse-syntax-yield)
+      (parse-syntax-assignment-proper)))
+
+(defn parse-syntax-assignment-proper [] (-> i64)
   (let [lhs (parse-syntax-conditional)
         op (peek-token)
         compound (token-compound-operator-name op)
@@ -1959,29 +2454,18 @@
 ;; JavaScript's ASI is a parser decision. An omitted semicolon is legal only at a line terminator,
 ;; before `}`, or at EOF; accepting one between two same-line statements changes invalid source
 ;; into a different valid program.
-;; A token that continues an expression through grammar this parser has not admitted (arrow
-;; bodies, computed members, optional chains, tagged templates) is not evidence of an error.
-(defn token-unsupported-continuation? [(t Token)] (-> bool)
-  (token-is t "=>"))
-
 (defn parse-statement-end! [] (-> i64)
   (if (take-is ";")
       0
       (let [next (peek-token)]
-        (if (token-unsupported-continuation? next)
-            (parse-fail "parser: expression continuation is outside the admitted subset at byte"
-                        next)
-            (if (or (.nl-before next)
-                    (token-is next "}")
-                    (= (.kind next) TOK-EOF))
-                0
-                (syntax-error! "parser: expected semicolon or line terminator"))))))
+        (if (or (.nl-before next) (token-is next "}") (= (.kind next) TOK-EOF))
+            0
+            (syntax-error! "parser: expected semicolon or line terminator")))))
 
 ;; Statement keywords whose grammar is not admitted yet must fail before the expression path can
 ;; mistake them for a proven "expected an expression" error.
 (defn token-unsupported-statement? [(t Token)] (-> bool)
-  (and (= (.kind t) TOK-KEYWORD)
-       (or (token-is t "class") (token-is t "function"))))
+  (and (= (.kind t) TOK-KEYWORD) (token-is t "class")))
 
 ;; `break`/`continue` take an optional same-line LabelIdentifier; a line terminator ends them.
 (defn parse-jump-label [] (-> (Option (slice u8)))
@@ -2008,7 +2492,7 @@
                 (syntax-stmt-add-node! (SsEmpty) (.start t) (.end t))
                 (do
                   (if (and (token-is t "return")
-                           (not (.parsing-function (parser-state))))
+                           (not (parser-in-function?)))
                       (syntax-error! "parser: return is not allowed in Script code")
                       0)
                   (parse-syntax-statement-inner)))))))
@@ -2097,7 +2581,7 @@
         (mut declarations) (al-new [i64] (alloc/malloc-allocator))
         (mut hi) (.end keyword)]
     (if (and is-var
-             (not (.parsing-function (parser-state)))
+             (not (parser-in-function?))
              (not (.syntax-only (parser-state))))
         (unimplemented "Script var GlobalDeclarationInstantiation"
                        "docs/GAPS.md — shared global-object bindings")
@@ -2111,7 +2595,7 @@
                 (parse-fail "parser: destructuring binding patterns are outside the admitted subset at byte"
                             name-token)
                 0)
-            (let [name (require-ident)
+            (let [name (require-binding-identifier)
                   annotation (parse-optional-annotation)
                   init
                     (if (take-is "=")
@@ -2148,16 +2632,13 @@
                                (.start keyword)
                                (load hi)))))
 
-;; After a complete for-head expression only the separator can follow. A token that continues
-;; the expression through unadmitted grammar fails closed; anything else is a proven error.
+;; After a complete for-head expression only the separator can follow; anything else is a
+;; proven error.
 (defn require-closing! [(text (slice u8)) (message (slice u8))] (-> i64)
   (let [t (peek-token)]
     (if (token-is t text)
         (do (take-token) 0)
-        (if (token-unsupported-continuation? t)
-            (parse-fail "parser: expression continuation is outside the admitted subset at byte"
-                        t)
-            (syntax-error! message)))))
+        (syntax-error! message))))
 
 (defn parse-syntax-declarations [] (-> i64)
   (let [stmt (parse-syntax-declaration-list false)]
@@ -2306,7 +2787,8 @@
                     (parse-fail "parser: destructuring catch parameters are outside the admitted subset at byte"
                                 param)
                     0)
-                (set! (mut catch-param) (Some (token-text (require-ident))))
+                (set! (mut catch-param)
+                      (Some (token-text (require-binding-identifier))))
                 (require-token ")")
                 0)
               0)
@@ -2344,150 +2826,162 @@
              (not (or (lex-second-is? "(") (lex-second-is? "."))))
         (syntax-error! "parser: import declarations are only valid in a module")
         0)
-    (if (token-is first "for")
-        (parse-syntax-for)
-        (if (token-is first "try")
-            (parse-syntax-try)
-            (if (token-is first "do")
-                (let [keyword (take-token)
-                      body (parse-syntax-controlled-statement true)]
-                  (require-token "while")
-                  (require-token "(")
-                  (let [condition (parse-syntax-expression)
-                        close (require-token ")")]
-                    ;; ASI: the `;` after a do-while's `)` may be omitted even without a line terminator.
-                    (take-is ";")
-                    (syntax-stmt-add-node! (SsDoWhile body condition)
-                                           (.start keyword)
-                                           (.end close))))
-                (if (token-is first "throw")
+    (if (or (token-is first "function")
+            (and (token-is first "async")
+                 (lex-second-is? "function")
+                 (let [second (lex-peek-second false)]
+                   (not (.nl-before second)))))
+        (parse-syntax-function-declaration!)
+        (if (token-is first "for")
+            (parse-syntax-for)
+            (if (token-is first "try")
+                (parse-syntax-try)
+                (if (token-is first "do")
                     (let [keyword (take-token)
-                          next (peek-token)]
-                      (if (.nl-before next)
-                          (syntax-error! "parser: line terminator is not allowed after throw")
-                          0)
-                      (let [value (parse-syntax-expression)]
-                        (parse-statement-end!)
-                        (syntax-stmt-add-node! (SsThrow value)
+                          body (parse-syntax-controlled-statement true)]
+                      (require-token "while")
+                      (require-token "(")
+                      (let [condition (parse-syntax-expression)
+                            close (require-token ")")]
+                        ;; ASI: the `;` after a do-while's `)` may be omitted even without a line terminator.
+                        (take-is ";")
+                        (syntax-stmt-add-node! (SsDoWhile body condition)
                                                (.start keyword)
-                                               (syntax-hi value))))
-                    (if (token-is first "with")
-                        (let [keyword (take-token)]
-                          (require-token "(")
-                          (let [object (parse-syntax-expression)]
-                            (require-token ")")
-                            (let [body (parse-syntax-controlled-statement false)]
-                              (syntax-stmt-add-node! (SsWith object body)
-                                                     (.start keyword)
-                                                     (syntax-stmt-hi body)))))
-                        (if (token-is first "debugger")
+                                               (.end close))))
+                    (if (token-is first "throw")
+                        (let [keyword (take-token)
+                              next (peek-token)]
+                          (if (.nl-before next)
+                              (syntax-error! "parser: line terminator is not allowed after throw")
+                              0)
+                          (let [value (parse-syntax-expression)]
+                            (parse-statement-end!)
+                            (syntax-stmt-add-node! (SsThrow value)
+                                                   (.start keyword)
+                                                   (syntax-hi value))))
+                        (if (token-is first "with")
                             (let [keyword (take-token)]
-                              (parse-statement-end!)
-                              (syntax-stmt-add-node! (SsDebugger)
-                                                     (.start keyword)
-                                                     (.end keyword)))
-                            (if (token-is first "while")
+                              (require-token "(")
+                              (let [object (parse-syntax-expression)]
+                                (require-token ")")
+                                (let [body
+                                        (parse-syntax-controlled-statement false)]
+                                  (syntax-stmt-add-node! (SsWith object body)
+                                                         (.start keyword)
+                                                         (syntax-stmt-hi body)))))
+                            (if (token-is first "debugger")
                                 (let [keyword (take-token)]
-                                  (require-token "(")
-                                  (let [condition (parse-syntax-expression)]
-                                    (require-token ")")
-                                    (let [body
-                                            (parse-syntax-controlled-statement true)]
-                                      (syntax-stmt-add-node! (SsWhile condition
-                                                                      body)
-                                                             (.start keyword)
-                                                             (syntax-stmt-hi body)))))
-                                (if (token-is first "if")
+                                  (parse-statement-end!)
+                                  (syntax-stmt-add-node! (SsDebugger)
+                                                         (.start keyword)
+                                                         (.end keyword)))
+                                (if (token-is first "while")
                                     (let [keyword (take-token)]
                                       (require-token "(")
                                       (let [condition (parse-syntax-expression)]
                                         (require-token ")")
-                                        (let [yes
-                                                (parse-syntax-controlled-statement false)
-                                              no
-                                                (if (take-is "else")
-                                                    (Some (parse-syntax-controlled-statement false))
-                                                    (None [i64]))
-                                              last
-                                                (match no
-                                                  (Some [n] n)
-                                                  (None [] yes))]
-                                          (syntax-stmt-add-node! (SsIf
-                                                                   :condition
-                                                                     condition
-                                                                   :then-stmt
-                                                                     yes
-                                                                   :else-stmt no)
+                                        (let [body
+                                                (parse-syntax-controlled-statement true)]
+                                          (syntax-stmt-add-node! (SsWhile condition
+                                                                          body)
                                                                  (.start keyword)
-                                                                 (syntax-stmt-hi last)))))
-                                    (if (or (token-is first "let")
-                                            (token-is first "const")
-                                            (token-is first "var"))
-                                        (parse-syntax-declarations)
-                                        (if (token-is first "return")
-                                            (let [keyword (take-token)
-                                                  next (peek-token)]
-                                              ;; Return is a restricted production: a line terminator ends it before the
-                                              ;; following expression. A missing expression is the JavaScript value
-                                              ;; `undefined`; the next line remains a separate, unreachable statement.
-                                              (if (or (.nl-before next)
-                                                      (token-is next ";")
-                                                      (token-is next "}")
-                                                      (= (.kind next) TOK-EOF))
-                                                  (do
-                                                    (parse-statement-end!)
-                                                    (syntax-stmt-add-node! (SsReturn (None [i64]))
-                                                                           (.start keyword)
-                                                                           (.end keyword)))
-                                                  (let [expr
-                                                          (parse-syntax-expression)]
-                                                    (parse-statement-end!)
-                                                    (syntax-stmt-add-node! (SsReturn (Some expr))
-                                                                           (.start keyword)
-                                                                           (syntax-hi expr)))))
-                                            (if (token-is first "{")
-                                                (do
-                                                  (take-token)
-                                                  (let [(mut body)
-                                                          (al-new [i64]
-                                                                  (alloc/malloc-allocator))]
-                                                    (loop (if (token-is (peek-token)
-                                                                        "}")
-                                                              (break 0)
-                                                              (do
-                                                                (push! [i64]
-                                                                       (mut body)
-                                                                       (parse-syntax-statement))
-                                                                (continue))))
-                                                    (let [close
-                                                            (require-token "}")]
-                                                      (syntax-stmt-add-node! (SsBlock (load body))
-                                                                             (.start first)
-                                                                             (.end close)))))
-                                                (let [expr
-                                                        (parse-syntax-expression)
-                                                      parsed (syntax-at expr)]
-                                                  ;; `label: statement` shares its first token with an expression statement.
-                                                  (if (and (token-is (peek-token)
-                                                                     ":")
-                                                           (syntax-name? expr))
-                                                      (let [label
-                                                              (match (syntax-node expr)
-                                                                (SxName [name]
-                                                                        name)
-                                                                (_ ""))]
-                                                        (take-token)
-                                                        (let [body
-                                                                (parse-syntax-controlled-statement false)]
-                                                          (syntax-stmt-add-node! (SsLabeled label
-                                                                                            body)
-                                                                                 (.lo parsed)
-                                                                                 (syntax-stmt-hi body))))
+                                                                 (syntax-stmt-hi body)))))
+                                    (if (token-is first "if")
+                                        (let [keyword (take-token)]
+                                          (require-token "(")
+                                          (let [condition
+                                                  (parse-syntax-expression)]
+                                            (require-token ")")
+                                            (let [yes
+                                                    (parse-syntax-controlled-statement false)
+                                                  no
+                                                    (if (take-is "else")
+                                                        (Some (parse-syntax-controlled-statement false))
+                                                        (None [i64]))
+                                                  last
+                                                    (match no
+                                                      (Some [n] n)
+                                                      (None [] yes))]
+                                              (syntax-stmt-add-node! (SsIf
+                                                                       :condition
+                                                                         condition
+                                                                       :then-stmt
+                                                                         yes
+                                                                       :else-stmt
+                                                                         no)
+                                                                     (.start keyword)
+                                                                     (syntax-stmt-hi last)))))
+                                        (if (or (token-is first "let")
+                                                (token-is first "const")
+                                                (token-is first "var"))
+                                            (parse-syntax-declarations)
+                                            (if (token-is first "return")
+                                                (let [keyword (take-token)
+                                                      next (peek-token)]
+                                                  ;; Return is a restricted production: a line terminator ends it before the
+                                                  ;; following expression. A missing expression is the JavaScript value
+                                                  ;; `undefined`; the next line remains a separate, unreachable statement.
+                                                  (if (or (.nl-before next)
+                                                          (token-is next ";")
+                                                          (token-is next "}")
+                                                          (= (.kind next)
+                                                             TOK-EOF))
                                                       (do
                                                         (parse-statement-end!)
-                                                        (syntax-stmt-add-node! (SsExpr expr)
-                                                                               (.lo parsed)
-                                                                               (.hi parsed))))))))))))))))))
+                                                        (syntax-stmt-add-node! (SsReturn (None [i64]))
+                                                                               (.start keyword)
+                                                                               (.end keyword)))
+                                                      (let [expr
+                                                              (parse-syntax-expression)]
+                                                        (parse-statement-end!)
+                                                        (syntax-stmt-add-node! (SsReturn (Some expr))
+                                                                               (.start keyword)
+                                                                               (syntax-hi expr)))))
+                                                (if (token-is first "{")
+                                                    (do
+                                                      (take-token)
+                                                      (let [(mut body)
+                                                              (al-new [i64]
+                                                                      (alloc/malloc-allocator))]
+                                                        (loop (if (token-is (peek-token)
+                                                                            "}")
+                                                                  (break 0)
+                                                                  (do
+                                                                    (push! [i64]
+                                                                           (mut body)
+                                                                           (parse-syntax-statement))
+                                                                    (continue))))
+                                                        (let [close
+                                                                (require-token "}")]
+                                                          (syntax-stmt-add-node! (SsBlock (load body))
+                                                                                 (.start first)
+                                                                                 (.end close)))))
+                                                    (let [expr
+                                                            (parse-syntax-expression)
+                                                          parsed
+                                                            (syntax-at expr)]
+                                                      ;; `label: statement` shares its first token with an expression statement.
+                                                      (if (and (token-is (peek-token)
+                                                                         ":")
+                                                               (syntax-name? expr))
+                                                          (let [label
+                                                                  (match (syntax-node expr)
+                                                                    (SxName [name]
+                                                                            name)
+                                                                    (_ ""))]
+                                                            (syntax-check-binding-name! label)
+                                                            (take-token)
+                                                            (let [body
+                                                                    (parse-syntax-controlled-statement false)]
+                                                              (syntax-stmt-add-node! (SsLabeled label
+                                                                                                body)
+                                                                                     (.lo parsed)
+                                                                                     (syntax-stmt-hi body))))
+                                                          (do
+                                                            (parse-statement-end!)
+                                                            (syntax-stmt-add-node! (SsExpr expr)
+                                                                                   (.lo parsed)
+                                                                                   (.hi parsed)))))))))))))))))))
 
 (defn parse-syntax-statement-list [] (-> (ArrayList i64))
   (let [(mut body) (al-new [i64] (alloc/malloc-allocator))]
@@ -2496,37 +2990,310 @@
               (do (push! [i64] (mut body) (parse-syntax-statement)) (continue))))
     (load body)))
 
-(defn parse-syntax-function! [] (-> i64)
-  (let [open (require-token "function")
-        name (require-ident)
-        (mut params) (al-new [(slice u8)] (alloc/malloc-allocator))
-        (mut annotations) (al-new [i64] (alloc/malloc-allocator))]
-    (require-token "(")
-    (if (not (take-is ")"))
-        (loop (let [p (require-ident)]
-                (push! [i64] (mut annotations) (parse-optional-annotation))
-                (push! [(slice u8)] (mut params) (token-text p))
-                (if (take-is ",")
-                    (continue)
-                    (break (do (require-token ")") 0)))))
+;; Reserve a SyntaxFun before its parameters are parsed so the record index is stable for nested
+;; functions and for the `SxFunction`/`SsFunctionDecl` that will reference it.
+(defn syntax-fun-reserve! [(name (slice u8))
+                           (kind FunKind)
+                           (generator bool)
+                           (async bool)
+                           (lo i64)] (-> i64)
+  (let [(mut f) (primitive/zeroed SyntaxFun)
+        index (len (.funs (parser-state)))]
+    (set! (.name (mut f)) name)
+    (set! (.kind (mut f)) kind)
+    (set! (.generator (mut f)) generator)
+    (set! (.async (mut f)) async)
+    (set! (.params (mut f)) (al-new [(slice u8)] (alloc/malloc-allocator)))
+    (set! (.param-annotations (mut f)) (al-new [i64] (alloc/malloc-allocator)))
+    (set! (.param-defaults (mut f))
+          (al-new [(Option i64)] (alloc/malloc-allocator)))
+    (set! (.rest-param (mut f)) (None [(slice u8)]))
+    (set! (.simple-params (mut f)) true)
+    (set! (.return-annotation (mut f)) (ty-dyn TAG-ANY))
+    (set! (.body (mut f)) (al-new [i64] (alloc/malloc-allocator)))
+    (set! (.expression-body (mut f)) (None [i64]))
+    (set! (.parent (mut f)) (parser-current-fun))
+    (set! (.hoisted (mut f)) false)
+    (set! (.strict (mut f)) false)
+    (set! (.lo (mut f)) lo)
+    (push! [SyntaxFun] (mut (.funs (parser-state))) (load f))
+    index))
+
+(defn syntax-fun-ptr [(i i64)] (-> (ptr SyntaxFun))
+  (al-elem [SyntaxFun] (mut (.funs (parser-state))) i))
+
+;; FormalParameters after `(`, consuming `)`. Defaults and a rest element make the list
+;; non-simple; destructuring elements fail closed.
+(defn parse-syntax-formal-parameters! [(fp (ptr SyntaxFun))] (-> i64)
+  (do
+    (if (take-is ")")
+        0
+        (loop (if (token-is (peek-token) "...")
+                  (let [dots (take-token)
+                        name (require-binding-identifier)]
+                    (set! (.simple-params fp) false)
+                    (set! (.rest-param fp) (Some (token-text name)))
+                    (if (token-is (peek-token) "=")
+                        (syntax-error! "parser: rest parameter may not have a default")
+                        0)
+                    (if (take-is ")")
+                        0
+                        (syntax-error! "parser: rest parameter must be last"))
+                    (break 0))
+                  (let [name (require-binding-identifier)
+                        annotation (parse-optional-annotation)]
+                    (push! [(slice u8)] (mut (.params fp)) (token-text name))
+                    (push! [i64] (mut (.param-annotations fp)) annotation)
+                    (if (take-is "=")
+                        (do
+                          (set! (.simple-params fp) false)
+                          (push! [(Option i64)]
+                                 (mut (.param-defaults fp))
+                                 (Some (parse-syntax-assignment))))
+                        (push! [(Option i64)]
+                               (mut (.param-defaults fp))
+                               (None [i64])))
+                    (if (take-is ",")
+                        (if (take-is ")") (break 0) (continue))
+                        (break (do
+                                 (require-closing! ")"
+                                                   "parser: expected `,` or `)` in parameter list")
+                                 0)))))))
+    0))
+
+;; Early errors every function shares once its parameters and body are known: duplicate
+;; parameters where UniqueFormalParameters or non-simple lists forbid them (strict duplicates are
+;; the strict pass's job), a `use strict` directive over a non-simple list, accessor arity, and
+;; parameter/lexical conflicts (checked with the other declarations later).
+(defn syntax-check-function-shape! [(index i64) (own-directive bool)] (-> i64)
+  (let [f (syntax-fun-at index)
+        unique
+          (or (not (.simple-params f))
+              (match (.kind f)
+                (FunArrow [] true)
+                (FunMethod [] true)
+                (FunGetter [] true)
+                (FunSetter [] true)
+                (_ false)))]
+    (if (and own-directive (not (.simple-params f)))
+        (syntax-error! "parser: use strict directive is not allowed with a non-simple parameter list")
         0)
+    (if unique
+        (let [(mut i) 0]
+          (loop (if (>= (load i) (len (.params f)))
+                    (break 0)
+                    (let [name (get (.params f) (load i))
+                          (mut j) (+ (load i) 1)]
+                      (match (.rest-param f)
+                        (Some [r]
+                              (if (= r name)
+                                  (syntax-error! "parser: duplicate parameter name")
+                                  0))
+                        (None [] 0))
+                      (loop (if (>= (load j) (len (.params f)))
+                                (break 0)
+                                (do
+                                  (if (= name (get (.params f) (load j)))
+                                      (syntax-error! "parser: duplicate parameter name")
+                                      0)
+                                  (set! (mut j) (+ (load j) 1))
+                                  (continue))))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue)))))
+        0)
+    (match (.kind f)
+      (FunGetter []
+                 (if (or (> (len (.params f)) 0)
+                         (match (.rest-param f) (Some [r] true) (None [] false)))
+                     (syntax-error! "parser: getter must not have parameters")
+                     0))
+      (FunSetter []
+                 (if (or (!= (len (.params f)) 1)
+                         (match (.rest-param f) (Some [r] true) (None [] false)))
+                     (syntax-error! "parser: setter must have exactly one parameter")
+                     0))
+      (_ 0))))
+
+;; Parameters, optional return annotation and a braced body for every non-arrow function kind.
+;; `name` was validated in the enclosing context; parameters and body use the function's own.
+(defn parse-syntax-function-rest! [(index i64)
+                                   (kind FunKind)
+                                   (generator bool)
+                                   (async bool)] (-> i64)
+  (let [method
+          (match kind
+            (FunMethod [] true)
+            (FunGetter [] true)
+            (FunSetter [] true)
+            (_ false))]
+    (parser-push-context! index generator async false method)
+    (require-token "(")
+    (parse-syntax-formal-parameters! (syntax-fun-ptr index))
     (let [return-annotation (parse-optional-annotation)]
+      (parser-set-in-params! false)
       (require-token "{")
-      (set! (.parsing-function (parser-state)) true)
-      (let [body (parse-syntax-statement-list)]
-        (set! (.parsing-function (parser-state)) false)
-        (syntax-check-directives! body)
-        (let [close (require-token "}")
-              (mut f) (primitive/zeroed SyntaxFun)]
-          (set! (.name (mut f)) (token-text name))
-          (set! (.params (mut f)) (load params))
-          (set! (.param-annotations (mut f)) (load annotations))
-          (set! (.return-annotation (mut f)) return-annotation)
-          (set! (.body (mut f)) body)
-          (set! (.lo (mut f)) (.start open))
-          (set! (.hi (mut f)) (.end close))
-          (push! [SyntaxFun] (mut (.funs (parser-state))) (load f))
-          (len (.funs (parser-state))))))))
+      (let [body (parse-syntax-statement-list)
+            close (require-token "}")
+            own-directive (syntax-body-strict? body)
+            fp (syntax-fun-ptr index)]
+        (parser-pop-context!)
+        (if own-directive (do (set! (.strict-pending (parser-state)) true) 0) 0)
+        (set! (.return-annotation fp) return-annotation)
+        (set! (.body fp) body)
+        (set! (.hi fp) (.end close))
+        (syntax-check-function-shape! index own-directive)
+        index))))
+
+;; `function` [*] name (…) {…} as a declaration statement. The name binds in the enclosing scope.
+(defn parse-syntax-function-declaration! [] (-> i64)
+  (let [first (take-token)
+        async (token-is first "async")]
+    (if async (do (require-token "function") 0) 0)
+    (let [generator (take-is "*")
+          name (require-binding-identifier)
+          index
+            (syntax-fun-reserve! (token-text name)
+                                 (FunDeclaration)
+                                 generator
+                                 async
+                                 (.start first))]
+      (parse-syntax-function-rest! index (FunDeclaration) generator async)
+      (let [f (syntax-fun-at index)]
+        (syntax-stmt-add-node! (SsFunctionDecl index) (.start first) (.hi f))))))
+
+;; A function expression's own name is bound inside the function, so `function yield(){}` inside a
+;; generator body is legal while a generator expression named `yield` is not.
+(defn parse-syntax-function-expression-name [(generator bool) (async bool)] (-> (slice u8))
+  (let [t (take-token)
+        name (token-text t)]
+    (if (token-is t "let")
+        (parse-fail "parser: sloppy `let` function name is outside the admitted subset at byte"
+                    t)
+        (if (!= (.kind t) TOK-IDENT)
+            (syntax-error! "parser: reserved word cannot be a function name")
+            ;; The name binds inside the expression, so only its own kind reserves yield/await.
+            (if (or (and (= name "yield") generator)
+                    (and (= name "await") async))
+                (syntax-error! "parser: invalid function expression name")
+                0)))
+    name))
+
+(defn parse-syntax-function-expression [(keyword Token) (async bool) (lo i64)] (-> i64)
+  (let [generator (take-is "*")
+        name
+          (if (token-is (peek-token) "(")
+              ""
+              (parse-syntax-function-expression-name generator async))]
+    (let [index (syntax-fun-reserve! name (FunExpression) generator async lo)]
+      (parse-syntax-function-rest! index (FunExpression) generator async)
+      (let [f (syntax-fun-at index)]
+        (syntax-add-node! (SxFunction index) lo (.hi f))))))
+
+;; ArrowFunction body after its parameters are settled: `=>` then a braced FunctionBody or a
+;; ConciseBody AssignmentExpression. Arrows are never generators; `await` follows `async`.
+(defn parse-syntax-arrow-body! [(lo i64)
+                                (params (ArrayList (slice u8)))
+                                (defaults (ArrayList (Option i64)))
+                                (rest (Option (slice u8)))
+                                (simple bool)
+                                (async bool)] (-> i64)
+  (let [arrow (take-token)]
+    (if (not (token-is arrow "=>")) (syntax-error! "parser: expected =>") 0)
+    (if (.nl-before arrow)
+        (syntax-error! "parser: line terminator is not allowed before =>")
+        0)
+    (let [index (syntax-fun-reserve! "" (FunArrow) false async lo)
+          fp (syntax-fun-ptr index)]
+      (set! (.params fp) params)
+      (set! (.param-defaults fp) defaults)
+      (set! (.rest-param fp) rest)
+      (set! (.simple-params fp) simple)
+      (let [(mut i) 0]
+        (loop (if (>= (load i) (len params))
+                  (break 0)
+                  (do
+                    (push! [i64] (mut (.param-annotations fp)) (ty-dyn TAG-ANY))
+                    (set! (mut i) (+ (load i) 1))
+                    (continue)))))
+      (parser-push-context! index false async true false)
+      (parser-set-in-params! false)
+      (if (token-is (peek-token) "{")
+          (do
+            (take-token)
+            (let [body (parse-syntax-statement-list)
+                  close (require-token "}")
+                  own-directive (syntax-body-strict? body)
+                  fp2 (syntax-fun-ptr index)]
+              (parser-pop-context!)
+              (if own-directive
+                  (do (set! (.strict-pending (parser-state)) true) 0)
+                  0)
+              (set! (.body fp2) body)
+              (set! (.hi fp2) (.end close))
+              (syntax-check-function-shape! index own-directive)))
+          (let [value (parse-syntax-assignment)
+                fp2 (syntax-fun-ptr index)]
+            (parser-pop-context!)
+            (set! (.expression-body fp2) (Some value))
+            (set! (.hi fp2) (syntax-hi value))
+            (syntax-check-function-shape! index false)))
+      (let [f (syntax-fun-at index)]
+        (syntax-add-node! (SxFunction index) lo (.hi f))))))
+
+;; MethodDefinition inside an object literal: `key(…) {…}`, `get key() {…}`, `set key(v) {…}`,
+;; `*key(…)`, `async key(…)`, `async *key(…)`.
+(defn parse-syntax-method! [(key PropKey)
+                            (name (slice u8))
+                            (kind FunKind)
+                            (generator bool)
+                            (async bool)
+                            (lo i64)] (-> ObjectEntry)
+  (let [index (syntax-fun-reserve! name kind generator async lo)]
+    (parse-syntax-function-rest! index kind generator async)
+    (PropMethod key index)))
+
+;; Strictness is settled after parsing: a function is strict when its own prologue says so, when
+;; its enclosing function is, or when the Script is. Parents precede children in the table.
+(defn syntax-settle-strictness! [] (-> i64)
+  (let [p (parser-state)
+        script-strict
+          (if (.script-mode p)
+              (let [root (syntax-fun-at (.script-index p))]
+                (syntax-body-strict? (.body root)))
+              false)
+        (mut i) 0]
+    (loop (if (>= (load i) (len (.funs p)))
+              (break 0)
+              (let [fp (syntax-fun-ptr (load i))
+                    own (syntax-body-strict? (.body fp))
+                    inherited
+                      (if (< (.parent fp) 0)
+                          false
+                          (syntax-fun-strict (.parent fp)))]
+                (set! (.strict fp) (or script-strict own inherited))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))
+
+;; Whether a statement list declares a nested function anywhere, which lowering cannot yet
+;; instantiate as a binding.
+(defn syntax-contains-function-decl? [(stmts (ArrayList i64))] (-> bool)
+  (let [(mut found) false]
+    (al-for [id stmts]
+            (let [(mut children) (al-new [i64] (alloc/malloc-allocator))]
+              (match (syntax-stmt-node id)
+                (SsFunctionDecl [fun]
+                                (let [f (syntax-fun-at fun)]
+                                  (if (not (.hoisted f))
+                                      (set! (mut found) true)
+                                      0)))
+                (_ 0))
+              (syntax-stmt-children! id (mut children))
+              (if (syntax-contains-function-decl? (load children))
+                  (set! (mut found) true)
+                  0)
+              (al-free! [i64] (mut children))))
+    (load found)))
 
 (defn syntax-fun-at [(i i64)] (-> SyntaxFun)
   (get (.funs (parser-state)) i))
@@ -2649,17 +3416,22 @@
     0))
 
 (defn syntax-check-strict-functions! [] (-> i64)
-  (let [p (parser-state)
-        script-strict
-          (if (.script-mode p)
-              (let [root (syntax-fun-at (.script-index p))]
-                (syntax-body-strict? (.body root)))
-              false)]
+  (let [p (parser-state)]
     (al-for [entry (.funs p)]
             (let [fun entry]
-              (if (or script-strict (syntax-body-strict? (.body fun)))
+              (if (.strict fun)
                   (do
                     (syntax-strict-binding! (.name fun))
+                    (match (.rest-param fun)
+                      (Some [r] (syntax-strict-binding! r))
+                      (None [] 0))
+                    (match (.expression-body fun)
+                      (Some [e] (syntax-check-strict-expr! e))
+                      (None [] 0))
+                    (al-for [d (.param-defaults fun)]
+                            (match d
+                              (Some [e] (syntax-check-strict-expr! e))
+                              (None [] 0)))
                     (let [(mut i) 0]
                       (loop (if (>= (load i) (len (.params fun)))
                                 (break 0)
@@ -2729,14 +3501,44 @@
 ;; Syntax-only BoundNames collection. VarDeclaredNames crosses blocks/branches; lexical names
 ;; cross only declaration-list grouping and the shared switch CaseBlock. Function bodies live in
 ;; separate SyntaxFun records and must not be traversed as part of an enclosing declaration set.
+;; A FunctionDeclaration is var-like at the top level of a function body (TopLevelVarDeclaredNames)
+;; and lexical inside a Block or CaseBlock. Top-level Script functions are hoisted Funs, not
+;; bindings this collector reports. `top` is true only for the function body's own list.
 (defn syntax-collect-declarations! [(stmts (ArrayList i64))
                                     (lexical bool)
                                     (names (mut (ArrayList (slice u8))))] (-> i64)
+  (syntax-collect-declarations-at! stmts lexical false (mut names)))
+
+(defn syntax-function-decl-names! [(stmts (ArrayList i64))
+                                   (names (mut (ArrayList (slice u8))))] (-> i64)
+  (do
+    (al-for [id stmts]
+            (match (syntax-stmt-node id)
+              (SsFunctionDecl [fun]
+                              (let [f (syntax-fun-at fun)]
+                                (push! [(slice u8)] (mut names) (.name f))))
+              (_ 0)))
+    0))
+
+(defn syntax-collect-declarations-at! [(stmts (ArrayList i64))
+                                       (lexical bool)
+                                       (top bool)
+                                       (names (mut (ArrayList (slice u8))))] (-> i64)
   (do
     (al-for [id stmts]
             (let [(mut children) (al-new [i64] (alloc/malloc-allocator))
                   grouping
                     (match (syntax-stmt-node id)
+                      (SsFunctionDecl [fun]
+                                      (let [f (syntax-fun-at fun)]
+                                        (if (not (.hoisted f))
+                                            (if (= lexical (not top))
+                                                (push! [(slice u8)]
+                                                       (mut names)
+                                                       (.name f))
+                                                0)
+                                            0)
+                                        false))
                       (SsLet [name init final annotation]
                              (do
                                (if lexical
@@ -2755,25 +3557,33 @@
               (if (or (not lexical) grouping)
                   (do
                     (syntax-stmt-children! id (mut children))
-                    (syntax-collect-declarations! (load children)
-                                                  lexical
-                                                  (mut names)))
+                    (syntax-collect-declarations-at! (load children)
+                                                     lexical
+                                                     (and top grouping)
+                                                     (mut names)))
                   0)
               (al-free! [i64] (mut children))))
     0))
 
 ;; Early errors are checked before graph construction, including unreachable nested blocks.
 ;; This is declaration-name validation, not a second semantic environment or SSA pass.
+;; `top` marks a function body's own statement list, where function declarations are var-like.
+;; Sloppy code tolerates duplicate FunctionDeclarations in a Block (Annex B.3.2.4); everything
+;; else duplicated is an error.
 (defn syntax-check-declarations! [(stmts (ArrayList i64))
                                   (parameters (ArrayList (slice u8)))
-                                  (lexical-scope bool)] (-> i64)
+                                  (lexical-scope bool)
+                                  (top bool)
+                                  (strict bool)] (-> i64)
   (do
     (if lexical-scope
         (let [(mut names) (al-new [(slice u8)] (alloc/malloc-allocator))
               (mut vars) (al-new [(slice u8)] (alloc/malloc-allocator))
+              (mut functions) (al-new [(slice u8)] (alloc/malloc-allocator))
               (mut i) 0]
-          (syntax-collect-declarations! stmts true (mut names))
-          (syntax-collect-declarations! stmts false (mut vars))
+          (syntax-collect-declarations-at! stmts true top (mut names))
+          (syntax-collect-declarations-at! stmts false top (mut vars))
+          (if top 0 (syntax-function-decl-names! stmts (mut functions)))
           (loop (if (>= (load i) (len (load names)))
                     (break 0)
                     (let [name (get (load names) (load i))
@@ -2781,7 +3591,12 @@
                       (loop (if (>= (load j) (len (load names)))
                                 (break 0)
                                 (do
-                                  (if (= name (get (load names) (load j)))
+                                  (if (and (= name (get (load names) (load j)))
+                                           (not (and (not strict)
+                                                     (syntax-labels-contain? (load functions)
+                                                                             name)
+                                                     (syntax-function-decl-count stmts
+                                                                                 name))))
                                       (syntax-error! "parser: duplicate lexical declaration")
                                       0)
                                   (set! (mut j) (+ (load j) 1))
@@ -2814,9 +3629,36 @@
                          (syntax-check-catch-parameter! catch-param catch-body))
                   (_ 0))
                 (syntax-stmt-children! id (mut children))
-                (syntax-check-declarations! (load children) empty scope)
+                (syntax-check-declarations! (load children)
+                                            empty
+                                            scope
+                                            false
+                                            strict)
                 (al-free! [i64] (mut children)))))
     0))
+
+;; Whether every declaration of `name` directly in `stmts` is a FunctionDeclaration (so a sloppy
+;; Block may hold the duplicate).
+(defn syntax-function-decl-count [(stmts (ArrayList i64)) (name (slice u8))] (-> bool)
+  (let [(mut lets) (al-new [(slice u8)] (alloc/malloc-allocator))
+        (mut clash) false]
+    (al-for [id stmts]
+            (match (syntax-stmt-node id)
+              (SsLet [declared init final annotation]
+                     (if (= declared name) (set! (mut clash) true) 0))
+              (SsDeclList [decls]
+                          (do
+                            (al-for [d decls]
+                                    (match (syntax-stmt-node d)
+                                      (SsLet [declared init final annotation]
+                                             (if (= declared name)
+                                                 (set! (mut clash) true)
+                                                 0))
+                                      (_ 0)))
+                            0))
+              (_ 0)))
+    (al-free! [(slice u8)] (mut lets))
+    (not (load clash))))
 
 ;; The CatchParameter shares a scope with the catch Block's lexical declarations; a `var` of the
 ;; same name is permitted by Annex B.
@@ -2949,6 +3791,17 @@
 (defn syntax-restricted-global? [(name (slice u8))] (-> bool)
   (or (= name "undefined") (= name "Infinity") (= name "NaN")))
 
+;; A hoisted top-level declaration: what the closed-world Fun table and call resolution see.
+;; Nested functions, expressions, arrows and methods are values and are not lowered yet.
+(defn syntax-top-level-declaration? [(i i64)] (-> bool)
+  (let [f (syntax-fun-at i)] (.hoisted f)))
+
+;; The program loop marks the declarations it parsed at the top level as hoisted Funs.
+(defn syntax-mark-hoisted! [(stmt i64)] (-> i64)
+  (match (syntax-stmt-node stmt)
+    (SsFunctionDecl [fun] (let [fp (syntax-fun-ptr fun)] (set! (.hoisted fp) true) 0))
+    (_ 0)))
+
 (defn syntax-find-fun [(name (slice u8))] (-> i64)
   ;; Function declarations are hoisted and later declarations replace earlier declarations of the
   ;; same binding. Resolve from the end so calls and the public entry observe that JavaScript rule;
@@ -2957,7 +3810,8 @@
     (loop (if (< (load i) 0)
               (break -1)
               (let [f (syntax-fun-at (load i))]
-                (if (= (.name f) name)
+                (if (and (= (.name f) name)
+                         (syntax-top-level-declaration? (load i)))
                     (break (load i))
                     (do (set! (mut i) (- (load i) 1)) (continue))))))))
 
@@ -3040,9 +3894,14 @@
                       (lower-singleton (if (= name "Infinity")
                                            "JsInfinity"
                                            "JsNaN"))
-                      (do
-                        (panic "parser: unknown binding during lowering")
-                        (unreachable-node))))))))
+                      (if (>= (syntax-find-fun name) 0)
+                          (do
+                            (unimplemented "first-class reference to a function declaration"
+                                           "docs/GAPS.md — function values and closures")
+                            (unreachable-node))
+                          (do
+                            (panic "parser: unknown binding during lowering")
+                            (unreachable-node)))))))))
 
 (defn parser-set-current-ctrl! [(ctrl (dyn NodeOps))] (-> i64)
   (do
@@ -3280,8 +4139,16 @@
     (scope-set-mem! scope (.mem created))
     (al-for [entry entries]
             (match entry
-              (PropNamed [key value-id]
-                         (let [value (lower-syntax-expr value-id)
+              (PropValue [prop-key value-id]
+                         (let [key
+                                 (match prop-key
+                                   (KeyNamed [k] k)
+                                   (KeyComputed [e]
+                                                (do
+                                                  (unimplemented "computed property keys"
+                                                                 "docs/GAPS.md — property keys")
+                                                  0)))
+                               value (lower-syntax-expr value-id)
                                (mut args)
                                  (al-new [(dyn NodeOps)]
                                          (alloc/malloc-allocator))]
@@ -3307,9 +4174,9 @@
                              (scope-set-mem! scope (.mem defined)))
                            (al-free! [(dyn NodeOps)] (mut args))
                            0))
-              (PropComputed [key value]
-                            (unimplemented "computed property keys"
-                                           "docs/GAPS.md — property keys"))
+              (PropMethod [key fun]
+                          (unimplemented "object methods and accessors"
+                                         "docs/GAPS.md — function objects"))
               (PropSpread [expr]
                           (unimplemented "object spread"
                                          "docs/GAPS.md — property enumeration"))
@@ -3587,6 +4454,26 @@
                        (do
                          (unimplemented "regular expression objects"
                                         "docs/GAPS.md — RegExp")
+                         (unreachable-node)))
+              (SxFunction [fun]
+                          (do
+                            (unimplemented "function expressions and arrow functions (function values)"
+                                           "docs/GAPS.md — function values and closures")
+                            (unreachable-node)))
+              (SxYield [argument delegate]
+                       (do
+                         (unimplemented "generator yield"
+                                        "docs/GAPS.md — generators")
+                         (unreachable-node)))
+              (SxAwait [operand]
+                       (do
+                         (unimplemented "await"
+                                        "docs/GAPS.md — promises and async functions")
+                         (unreachable-node)))
+              (SxSuper []
+                       (do
+                         (unimplemented "super property access"
+                                        "docs/GAPS.md — methods and home objects")
                          (unreachable-node)))
               (SxUnary [op operand]
                        (do
@@ -4166,7 +5053,13 @@
     (SsWith [object body]
             (unimplemented "with object environment" "docs/GAPS.md — with"))
     ;; `debugger` has no observable semantics outside a debugger and lowers to nothing.
-    (SsDebugger [] 0)))
+    (SsDebugger [] 0)
+    ;; A hoisted top-level declaration is already a Fun; nothing executes at its statement.
+    (SsFunctionDecl [fun]
+                    (if (syntax-top-level-declaration? fun)
+                        0
+                        (unimplemented "nested function declarations (closures)"
+                                       "docs/GAPS.md — function values and closures")))))
 
 (defn lower-syntax-statements [(stmts (ArrayList i64))] (-> i64)
   (let [(mut i) 0
@@ -4240,43 +5133,42 @@
     (set! (.syntax-only (parser-state)) syntax-only)
     (set! (.strict-pending (parser-state)) false)
     (set! (.script-index (parser-state)) -1)
-    (set! (.parsing-function (parser-state)) false)
     (lex-init! src)
     (set! (.typed-diagnostics (lexer-state)) syntax-only)
     ;; Syntax pass: collect every declaration before graph construction. This is the hoisting
     ;; boundary; no semantic node is built while the cover grammar is still ambiguous.
-    (let [(mut script-body) (al-new [i64] (alloc/malloc-allocator))]
+    (let [(mut script-body) (al-new [i64] (alloc/malloc-allocator))
+          root-index (if script-mode
+                         (syntax-fun-reserve! "$aot$.script" (FunDeclaration) false false 0)
+                         -1)]
+      (if script-mode
+          (do
+            (set! (.script-index (parser-state)) root-index)
+            (parser-push-root-context! root-index))
+          0)
       (loop (let [t (peek-token)]
               (if (= (.kind t) TOK-EOF)
                   (break 0)
                   (do
-                    (if (or (not script-mode) (token-is t "function"))
-                        (do
-                          (parse-syntax-function!)
-                          ;; A declaration terminates a Script directive prologue. Preserve that
-                          ;; boundary with its real empty execution step in the syntax sequence.
-                          (if script-mode
-                              (push! [i64]
-                                     (mut script-body)
-                                     (syntax-stmt-add-node! (SsEmpty)
-                                                            (.start t)
-                                                            (.end t)))
-                              0))
-                        (push! [i64] (mut script-body) (parse-syntax-statement)))
+                    ;; Function-entry mode admits only top-level function declarations; a Script
+                    ;; is a statement list whose function declarations are hoisted Funs.
+                    (if (not script-mode)
+                        (if (or (token-is t "function") (token-is t "async"))
+                            (syntax-mark-hoisted! (parse-syntax-function-declaration!))
+                            (parse-fail "parser: expected a function declaration at byte"
+                                        t))
+                        (let [stmt (parse-syntax-statement)]
+                          (syntax-mark-hoisted! stmt)
+                          (push! [i64] (mut script-body) stmt)))
                     (continue)))))
       (if script-mode
-          (let [(mut root) (primitive/zeroed SyntaxFun)]
+          (let [root (syntax-fun-ptr root-index)]
+            (parser-pop-context!)
             (syntax-check-directives! (load script-body))
-            (set! (.name (mut root)) "$aot$.script")
-            (set! (.params (mut root))
-                  (al-new [(slice u8)] (alloc/malloc-allocator)))
-            (set! (.param-annotations (mut root))
-                  (al-new [i64] (alloc/malloc-allocator)))
-            (set! (.return-annotation (mut root)) (ty-dyn TAG-UNDEFINED))
-            (set! (.body (mut root)) (load script-body))
-            (set! (.hi (mut root)) (len src))
-            (set! (.script-index (parser-state)) (len (.funs (parser-state))))
-            (push! [SyntaxFun] (mut (.funs (parser-state))) (load root))
+            (set! (.return-annotation root) (ty-dyn TAG-UNDEFINED))
+            (set! (.body root) (load script-body))
+            (set! (.hi root) (len src))
+            (set! (.hoisted root) true)
             ;; These standard global properties are non-configurable. GlobalDeclarationInstantiation
             ;; rejects a top-level lexical binding over them; block/function locals may shadow them.
             ;; Typed SyntaxError/TypeError delivery is still part of the missing exception host.
@@ -4287,23 +5179,31 @@
                 (panic "parser: Script lexical declaration conflicts with a restricted global property")
                 0)
             (let [(mut i) 0]
-              (loop (if (>= (load i) (.script-index (parser-state)))
+              (loop (if (>= (load i) (len (.funs (parser-state))))
                         (break 0)
                         (let [f (syntax-fun-at (load i))]
-                          (if (and (not syntax-only)
-                                   (syntax-restricted-global? (.name f)))
-                              (panic "parser: Script function cannot replace a non-writable global property")
-                              0)
-                          (if (syntax-script-binding? (.name f))
-                              (syntax-error! "parser: Script lexical declaration conflicts with a function declaration")
+                          (if (and (!= (load i) root-index) (syntax-top-level-declaration? (load i)))
+                              (do
+                                (if (and (not syntax-only)
+                                         (syntax-restricted-global? (.name f)))
+                                    (panic "parser: Script function cannot replace a non-writable global property")
+                                    0)
+                                (if (syntax-script-binding? (.name f))
+                                    (syntax-error! "parser: Script lexical declaration conflicts with a function declaration")
+                                    0))
                               0)
                           (set! (mut i) (+ (load i) 1))
                           (continue))))))
           0))
+    (syntax-settle-strictness!)
     (syntax-check-cover-initializers!)
     (al-for [f (.funs (parser-state))]
             (let [fun f]
-              (syntax-check-declarations! (.body fun) (.params fun) true)
+              (syntax-check-declarations! (.body fun)
+                                          (.params fun)
+                                          true
+                                          true
+                                          (.strict fun))
               (let [(mut labels) (al-new [(slice u8)] (alloc/malloc-allocator))
                     (mut loop-labels)
                       (al-new [(slice u8)] (alloc/malloc-allocator))]
@@ -4337,141 +5237,164 @@
     (let [start (start-make (ty-int-bot))
           stop (stop-make)
           (mut fi) 0]
-      ;; Header pass: install all Fun/Parm nodes before lowering any call-bearing body.
+      ;; Header pass: install all Fun/Parm nodes before lowering any call-bearing body. Only
+      ;; hoisted top-level declarations are Funs; function values are refused at their use.
       (loop (if (>= (load fi) (len (.funs (parser-state))))
                 (break 0)
-                (let [fp
-                        (al-elem [SyntaxFun]
-                                 (mut (.funs (parser-state)))
-                                 (load fi))
-                      argc (len (.params fp))
-                      (mut members) (al-new [i64] (alloc/malloc-allocator))]
-                  ;; JavaScript calling convention: return and arguments are dynamic values.
-                  ;; `number` is evidence to discharge later, never a raw representation claim.
-                  (push! [i64] (mut members) (ty-dyn TAG-ANY))
-                  (let [(mut i) 0]
-                    (loop (if (>= (load i) argc)
-                              (break 0)
-                              (do
-                                (push! [i64] (mut members) (ty-dyn TAG-ANY))
-                                (set! (mut i) (+ (load i) 1))
-                                (continue)))))
-                  (let [fun
-                          (fun-make start
-                                    (ty-tuple (al-slice (load members)))
-                                    (if (= (load fi) (syntax-find-fun "main"))
-                                        (parser-internal-main-name)
-                                        (.name fp)))
-                        (mut i) 0]
-                    ;; JSL declarations reserved the low closed-world identities. Every source
-                    ;; declaration receives a distinct identity from the same compilation-local
-                    ;; allocator; syntax-table position is not a symbol identity.
-                    (set! (.fidx fp) (next-inline-fidx!))
-                    (set! (.fun-nid fp) (n-nid fun))
-                    ;; Slot 1 is the exact Call memory input, as in final Simple. The unknown-caller
-                    ;; seed is Start's bulk memory; closed-world internal functions drop it with
-                    ;; the matching Fun path before optimization.
-                    (let [mem-parm
-                            (parm-make-slot fun
-                                            CALL-MEM
-                                            (ty-mem 1 TY-BOT)
-                                            "$mem")]
-                      (parm-set-unknown-input! mem-parm
-                                               (proj-make start 1 "start.mem"))
-                      (n-keep! mem-parm))
-                    (loop (if (>= (load i) argc)
-                              (break 0)
-                              (do
-                                ;; Headers precede bodies, so hold parameter Phis alive until every
-                                ;; body and call edge has been installed.
-                                (n-keep! (parm-make fun
-                                                    (load i)
-                                                    (ty-dyn TAG-ANY)
-                                                    (get (.params fp) (load i))))
-                                (set! (mut i) (+ (load i) 1))
-                                (continue)))))
-                  (set! (mut fi) (+ (load fi) 1))
-                  (continue))))
+                (if (not (syntax-top-level-declaration? (load fi)))
+                    (do (set! (mut fi) (+ (load fi) 1)) (continue))
+                    (let [fp
+                            (al-elem [SyntaxFun]
+                                     (mut (.funs (parser-state)))
+                                     (load fi))
+                          argc (len (.params fp))
+                          (mut members) (al-new [i64] (alloc/malloc-allocator))]
+                      (if (or (not (.simple-params fp))
+                              (.generator fp)
+                              (.async fp))
+                          (unimplemented "default, rest, generator and async functions"
+                                         "docs/GAPS.md — function environments")
+                          0)
+                      ;; JavaScript calling convention: return and arguments are dynamic values.
+                      ;; `number` is evidence to discharge later, never a raw representation claim.
+                      (push! [i64] (mut members) (ty-dyn TAG-ANY))
+                      (let [(mut i) 0]
+                        (loop (if (>= (load i) argc)
+                                  (break 0)
+                                  (do
+                                    (push! [i64] (mut members) (ty-dyn TAG-ANY))
+                                    (set! (mut i) (+ (load i) 1))
+                                    (continue)))))
+                      (let [fun
+                              (fun-make start
+                                        (ty-tuple (al-slice (load members)))
+                                        (if (= (load fi)
+                                               (syntax-find-fun "main"))
+                                            (parser-internal-main-name)
+                                            (.name fp)))
+                            (mut i) 0]
+                        ;; JSL declarations reserved the low closed-world identities. Every source
+                        ;; declaration receives a distinct identity from the same compilation-local
+                        ;; allocator; syntax-table position is not a symbol identity.
+                        (set! (.fidx fp) (next-inline-fidx!))
+                        (set! (.fun-nid fp) (n-nid fun))
+                        ;; Slot 1 is the exact Call memory input, as in final Simple. The unknown-caller
+                        ;; seed is Start's bulk memory; closed-world internal functions drop it with
+                        ;; the matching Fun path before optimization.
+                        (let [mem-parm
+                                (parm-make-slot fun
+                                                CALL-MEM
+                                                (ty-mem 1 TY-BOT)
+                                                "$mem")]
+                          (parm-set-unknown-input! mem-parm
+                                                   (proj-make start
+                                                              1
+                                                              "start.mem"))
+                          (n-keep! mem-parm))
+                        (loop (if (>= (load i) argc)
+                                  (break 0)
+                                  (do
+                                    ;; Headers precede bodies, so hold parameter Phis alive until every
+                                    ;; body and call edge has been installed.
+                                    (n-keep! (parm-make fun
+                                                        (load i)
+                                                        (ty-dyn TAG-ANY)
+                                                        (get (.params fp)
+                                                             (load i))))
+                                    (set! (mut i) (+ (load i) 1))
+                                    (continue)))))
+                      (set! (mut fi) (+ (load fi) 1))
+                      (continue)))))
       ;; Body pass: ScopeNode is the sole SSA environment. Statements update its ordinary graph
       ;; edges; no post-parse name-resolution or SSA construction pass exists.
       (set! (mut fi) 0)
       (loop (if (>= (load fi) (len (.funs (parser-state))))
                 (break 0)
-                (let [f (syntax-fun-at (load fi))
-                      fun (parser-node (.fun-nid f))
-                      body-start (arena-node-count)
-                      scope (scope-make)]
-                  (set! (.current-fun (parser-state)) (load fi))
-                  (set! (.current-ctrl (parser-state)) (n-nid fun))
-                  (set! (.current-scope (parser-state)) (n-nid scope))
-                  (n-add-def! scope (Some fun))
-                  (match (fun-mem-parm fun)
-                    (Some [m] (n-add-def! scope (Some m)))
-                    (None [] (panic "parser: function memory Parm is missing")))
-                  (scope-push! scope)
-                  (parser-reset-returns!)
-                  (let [(mut i) 0]
-                    (loop (if (>= (load i) (len (.params f)))
-                              (break 0)
-                              (let [name (get (.params f) (load i))
-                                    (mut later) (+ (load i) 1)
-                                    (mut shadowed) false]
-                                ;; A non-strict JavaScript simple parameter list may repeat a
-                                ;; name. Every positional Parm still exists for the ABI, but only
-                                ;; the last occurrence introduces the body binding.
-                                (loop (if (>= (load later) (len (.params f)))
-                                          (break 0)
-                                          (if (= (get (.params f) (load later))
-                                                 name)
-                                              (break (do
-                                                       (set! (mut shadowed)
-                                                             true)
-                                                       0))
-                                              (do
-                                                (set! (mut later)
-                                                      (+ (load later) 1))
-                                                (continue)))))
-                                (if (not (load shadowed))
-                                    (scope-define! scope
-                                                   name
-                                                   (ty-dyn TAG-ANY)
-                                                   false
-                                                   (match (fun-parm fun
-                                                                    (load i))
-                                                     (Some [p] p)
-                                                     (None []
-                                                           (unreachable-node))))
-                                    0)
-                                (set! (mut i) (+ (load i) 1))
-                                (continue)))))
-                  (lower-instantiate-vars! (.body f))
-                  (lower-instantiate-lexicals! (.body f))
-                  (let [terminated (lower-syntax-statements (.body f))]
-                    ;; JavaScript functions return undefined when control reaches the closing brace.
-                    (if (= terminated 0)
-                        (parser-record-return! (dyn-undefined-make))
-                        0)
-                    (let [ret (parser-build-return! fun)]
-                      (fun-set-ret! fun ret)
-                      ;; Header hoisting interleaves unrelated Fun/Parm nids before this body.
-                      ;; Preserve Simple's per-function construction estimate by measuring only
-                      ;; this lowering window; live-size remains the independent second cap.
-                      (fun-set-approx-size! fun
-                                            (- (arena-node-count) body-start))
-                      (stop-add-return! stop ret)))
-                  ;; Branches normally merge back into `scope`; loops deliberately replace it
-                  ;; with their false-edge exit Scope. Publish and discard the actual final
-                  ;; environment, then discard an obsolete loop-entry environment separately.
-                  (let [final-scope
-                          (parser-node (.current-scope (parser-state)))]
-                    (scope-pop! final-scope)
-                    (n-kill! final-scope)
-                    (if (n-same? final-scope scope) 0 (n-kill! scope)))
-                  (match (fun-mem-parm fun)
-                    (Some [m] (n-unkeep! m))
-                    (None [] 0))
-                  (set! (mut fi) (+ (load fi) 1))
-                  (continue))))
+                (if (not (syntax-top-level-declaration? (load fi)))
+                    (do (set! (mut fi) (+ (load fi) 1)) (continue))
+                    (let [f (syntax-fun-at (load fi))
+                          fun (parser-node (.fun-nid f))
+                          body-start (arena-node-count)
+                          scope (scope-make)]
+                      (if (syntax-contains-function-decl? (.body f))
+                          (unimplemented "nested function declarations (closures)"
+                                         "docs/GAPS.md — function values and closures")
+                          0)
+                      (set! (.current-fun (parser-state)) (load fi))
+                      (set! (.current-ctrl (parser-state)) (n-nid fun))
+                      (set! (.current-scope (parser-state)) (n-nid scope))
+                      (n-add-def! scope (Some fun))
+                      (match (fun-mem-parm fun)
+                        (Some [m] (n-add-def! scope (Some m)))
+                        (None []
+                              (panic "parser: function memory Parm is missing")))
+                      (scope-push! scope)
+                      (parser-reset-returns!)
+                      (let [(mut i) 0]
+                        (loop (if (>= (load i) (len (.params f)))
+                                  (break 0)
+                                  (let [name (get (.params f) (load i))
+                                        (mut later) (+ (load i) 1)
+                                        (mut shadowed) false]
+                                    ;; A non-strict JavaScript simple parameter list may repeat a
+                                    ;; name. Every positional Parm still exists for the ABI, but only
+                                    ;; the last occurrence introduces the body binding.
+                                    (loop (if (>= (load later)
+                                                  (len (.params f)))
+                                              (break 0)
+                                              (if (= (get (.params f)
+                                                          (load later))
+                                                     name)
+                                                  (break (do
+                                                           (set! (mut shadowed)
+                                                                 true)
+                                                           0))
+                                                  (do
+                                                    (set! (mut later)
+                                                          (+ (load later) 1))
+                                                    (continue)))))
+                                    (if (not (load shadowed))
+                                        (scope-define! scope
+                                                       name
+                                                       (ty-dyn TAG-ANY)
+                                                       false
+                                                       (match (fun-parm fun
+                                                                        (load i))
+                                                         (Some [p] p)
+                                                         (None []
+                                                               (unreachable-node))))
+                                        0)
+                                    (set! (mut i) (+ (load i) 1))
+                                    (continue)))))
+                      (lower-instantiate-vars! (.body f))
+                      (lower-instantiate-lexicals! (.body f))
+                      (let [terminated (lower-syntax-statements (.body f))]
+                        ;; JavaScript functions return undefined when control reaches the closing brace.
+                        (if (= terminated 0)
+                            (parser-record-return! (dyn-undefined-make))
+                            0)
+                        (let [ret (parser-build-return! fun)]
+                          (fun-set-ret! fun ret)
+                          ;; Header hoisting interleaves unrelated Fun/Parm nids before this body.
+                          ;; Preserve Simple's per-function construction estimate by measuring only
+                          ;; this lowering window; live-size remains the independent second cap.
+                          (fun-set-approx-size! fun
+                                                (- (arena-node-count)
+                                                   body-start))
+                          (stop-add-return! stop ret)))
+                      ;; Branches normally merge back into `scope`; loops deliberately replace it
+                      ;; with their false-edge exit Scope. Publish and discard the actual final
+                      ;; environment, then discard an obsolete loop-entry environment separately.
+                      (let [final-scope
+                              (parser-node (.current-scope (parser-state)))]
+                        (scope-pop! final-scope)
+                        (n-kill! final-scope)
+                        (if (n-same? final-scope scope) 0 (n-kill! scope)))
+                      (match (fun-mem-parm fun)
+                        (Some [m] (n-unkeep! m))
+                        (None [] 0))
+                      (set! (mut fi) (+ (load fi) 1))
+                      (continue)))))
       (parser-install-entry-wrapper! start stop)
       stop)))
 
@@ -4489,22 +5412,24 @@
   (let [(mut fi) 0]
     (loop (if (>= (load fi) (len (.funs (parser-state))))
               (break 0)
-              (let [f (syntax-fun-at (load fi))]
-                ;; Every source function, including source-level `main`, is closed-world. The
-                ;; compiler-owned wrapper alone retains the external Start hook.
-                (fun-drop-unknown-callers! (parser-node (.fun-nid f)))
-                (let [fun (parser-node (.fun-nid f))
-                      (mut i) 0]
-                  (loop (if (>= (load i) (len (.params f)))
-                            (break 0)
-                            (do
-                              (match (fun-parm fun (load i))
-                                (Some [p] (n-unkeep! p))
-                                (None [] 0))
-                              (set! (mut i) (+ (load i) 1))
-                              (continue)))))
-                (set! (mut fi) (+ (load fi) 1))
-                (continue))))
+              (if (not (syntax-top-level-declaration? (load fi)))
+                  (do (set! (mut fi) (+ (load fi) 1)) (continue))
+                  (let [f (syntax-fun-at (load fi))]
+                    ;; Every source function, including source-level `main`, is closed-world. The
+                    ;; compiler-owned wrapper alone retains the external Start hook.
+                    (fun-drop-unknown-callers! (parser-node (.fun-nid f)))
+                    (let [fun (parser-node (.fun-nid f))
+                          (mut i) 0]
+                      (loop (if (>= (load i) (len (.params f)))
+                                (break 0)
+                                (do
+                                  (match (fun-parm fun (load i))
+                                    (Some [p] (n-unkeep! p))
+                                    (None [] 0))
+                                  (set! (mut i) (+ (load i) 1))
+                                  (continue)))))
+                    (set! (mut fi) (+ (load fi) 1))
+                    (continue)))))
     (jsl-close-world!)
     0))
 
@@ -4540,24 +5465,26 @@
         (mut retained) 0]
     (loop (if (>= (load fi) (len (.funs (parser-state))))
               (break (load retained))
-              (let [syntax (syntax-fun-at (load fi))
-                    fun (parser-node (.fun-nid syntax))]
-                (match (fun-ret fun)
-                  (Some [ret]
-                        (if (and (and (not (n-dead? fun))
-                                      (not (fun-folding? fun)))
-                                 (not (ty-high? (n-ty fun))))
-                            (do
-                              (stop-add-return! stop ret)
-                              (set! (mut retained) (+ (load retained) 1))
-                              (n-unkill! ret))
-                            ;; Match the JSL lifetime protocol: an inlined or unreachable source
-                            ;; Return has no compilation-unit owner and must detach from its former
-                            ;; caller control as soon as the temporary Opto keep is released.
-                            (n-unkill! ret)))
-                  (None [] 0))
-                (set! (mut fi) (+ (load fi) 1))
-                (continue))))))
+              (if (not (syntax-top-level-declaration? (load fi)))
+                  (do (set! (mut fi) (+ (load fi) 1)) (continue))
+                  (let [syntax (syntax-fun-at (load fi))
+                        fun (parser-node (.fun-nid syntax))]
+                    (match (fun-ret fun)
+                      (Some [ret]
+                            (if (and (and (not (n-dead? fun))
+                                          (not (fun-folding? fun)))
+                                     (not (ty-high? (n-ty fun))))
+                                (do
+                                  (stop-add-return! stop ret)
+                                  (set! (mut retained) (+ (load retained) 1))
+                                  (n-unkill! ret))
+                                ;; Match the JSL lifetime protocol: an inlined or unreachable source
+                                ;; Return has no compilation-unit owner and must detach from its former
+                                ;; caller control as soon as the temporary Opto keep is released.
+                                (n-unkill! ret)))
+                      (None [] 0))
+                    (set! (mut fi) (+ (load fi) 1))
+                    (continue)))))))
 
 ;; Install final Simple's post-Opto code-generation entry hooks. Optimisation uses concrete
 ;; Call->Fun edges to discover and inline callees; machine code cannot retain those
@@ -4571,12 +5498,14 @@
     (loop (if (>= (load fi) (len (.funs (parser-state))))
               (break (+ (load prepared)
                         (fun-prepare-codegen! (parser-entry-fun) start)))
-              (let [syntax (syntax-fun-at (load fi))
-                    fun (parser-node (.fun-nid syntax))]
-                (set! (mut prepared)
-                      (+ (load prepared) (fun-prepare-codegen! fun start)))
-                (set! (mut fi) (+ (load fi) 1))
-                (continue))))))
+              (if (not (syntax-top-level-declaration? (load fi)))
+                  (do (set! (mut fi) (+ (load fi) 1)) (continue))
+                  (let [syntax (syntax-fun-at (load fi))
+                        fun (parser-node (.fun-nid syntax))]
+                    (set! (mut prepared)
+                          (+ (load prepared) (fun-prepare-codegen! fun start)))
+                    (set! (mut fi) (+ (load fi) 1))
+                    (continue)))))))
 
 (defn parse-statement [] (-> (dyn NodeOps))
   (do

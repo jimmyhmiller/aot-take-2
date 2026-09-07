@@ -55,6 +55,28 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-07 — Functions everywhere as syntax
+
+Nested function declarations, function expressions, arrow functions (through the parenthesized
+and `async(...)` cover grammars), object methods, getters, setters, generators and async functions
+now parse with their contexts: `yield` and `await` are expressions only inside generator and async
+bodies and reserved as binding names there, `new.target` needs an enclosing non-arrow function,
+`super.x` needs a home method, `super()` a derived constructor (none exist yet). Proven early
+errors: duplicate parameters with non-simple lists, arrows and methods; a `use strict` directive
+over a non-simple parameter list; accessor arity; rest-parameter position and defaults; invalid
+arrow parameters and a line terminator before `=>`; `yield`/`await` in formal parameters and in
+arrow parameters; reserved function names; block-level function declarations conflicting with
+`let`/`var` (with Annex B's sloppy duplicate-function allowance); and parameter/lexical conflicts.
+Destructuring parameters, sloppy `let` names, Annex B function-in-`if` and labelled functions fail
+closed.
+
+The Script statement list is parsed under a root context so nested functions have a parent; only
+declarations the program loop saw at the top level are hoisted closed-world Funs. Every other
+function is a value the lowering refuses by name: nested declarations, expressions, arrows,
+methods, `yield`, `await`, `super`, and first-class references to hoisted declarations. Default,
+rest, generator and async top-level declarations refuse at the Fun header. Closures and function
+objects are the next semantic subsystem.
+
 ### 2026-09-07 — Primary expressions, member chains, templates and regex tokens
 
 `this`, `new` (with and without arguments, nested), `new.target`, computed members, calls through

@@ -1,5 +1,20 @@
 # Decisions
 
+## 2026-09-07 — Function records are reserved before their bodies and only top-level ones are Funs
+
+Final Simple parses a function by pushing its scope and body inline; a nested function is a
+`FunNode` created as its body parses. JavaScript needs the enclosing function known before the
+body (contexts for `yield`/`await`/`super`/`new.target`, strictness inheritance, and declaration
+scoping), so a `SyntaxFun` record is reserved when the `function` keyword, method key or arrow
+head is seen and filled when the body closes. Parents therefore precede children in the table and
+strictness settles in one forward pass after parsing.
+
+The closed-world Fun table lowers only declarations the program loop met at the top level (marked
+`hoisted`), plus the Script root, which has its own non-function context so `return` and
+`new.target` stay Script errors while block-level function declarations get a parent. Everything
+else is a function value; until closures and function objects exist those refuse by name at
+lowering, and the syntax passes still prove their early errors.
+
 ## 2026-09-07 — Regex and template tokens are parser-driven; unvalidated regex fails closed
 
 Final Simple's lexer has no context-dependent tokens. JavaScript's `/` is division or a regex
