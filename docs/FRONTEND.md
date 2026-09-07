@@ -137,7 +137,8 @@ about *syntax*.
 
 ```
 source text
-   │  lexer                      line terminators feed ASI; regex bodies rescanned from `/`
+   │  lexer                      line terminators feed ASI; regex bodies rescanned from `/`;
+   │                             identifier escapes decode to StringValue, spelling stays for syntax
    │  regex                      pattern early errors under the u / web-compat / v grammars
    ▼
 tokens

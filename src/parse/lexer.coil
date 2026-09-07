@@ -29,6 +29,8 @@
 (module aot.parse.lexer)
 (import "coil.primitive" :as primitive)
 (import "coil.slice" :use *)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
 (import "aot.util.panic" :use *)
 
 (const TOK-EOF 0)
@@ -48,7 +50,9 @@
 (const TOK-KEYWORD 7)
 
 (const TOK-PRIVATE 8)
+
 (const TOK-LEGACY-NUMBER 9)
+
 (const TOK-BIGINT 10)
 
 (defstruct Token
@@ -57,7 +61,10 @@
    (end i64)
    (line i64)
    (col i64)
-   (nl-before bool)])  ; ASI needs this; the lexer records, the parser decides
+   (nl-before bool)  ; ASI needs this; the lexer records, the parser decides
+   (escaped bool)  ; an IdentifierName written with `\u` escapes; its StringValue is in the pool
+   (decoded-lo i64)
+   (decoded-hi i64)])
 
 (defstruct LexerState
   [(src (slice u8))
@@ -67,7 +74,9 @@
    (consumed-end i64)
    (peeked bool)
    (typed-diagnostics bool)
-   (peek-token Token)])
+   (peek-token Token)
+   (decoded (ArrayList u8))  ; StringValues of escaped IdentifierNames
+   (decoded-ready bool)])
 
 (defn lexer-state [] (-> (ptr LexerState))
   (primitive/alloc-static LexerState))
@@ -91,6 +100,12 @@
     (set! (.consumed-end s) 0)
     (set! (.peeked s) false)
     (set! (.typed-diagnostics s) false)
+    (if (.decoded-ready s)
+        (al-clear! [u8] (mut (.decoded s)))
+        (do
+          (set! (.decoded s) (al-new [u8] (alloc/malloc-allocator)))
+          (set! (.decoded-ready s) true)
+          0))
     0))
 
 (defn lex-source [] (-> (slice u8))
@@ -101,23 +116,61 @@
 (defn lex-consumed-end [] (-> i64)
   (.consumed-end (lexer-state)))
 
+;; The StringValue of a token: the source spelling, or the decoded IdentifierName when it was
+;; written with escapes. Names, property keys and early errors compare this.
 (defn token-text [(t Token)] (-> (slice u8))
-  (subslice [u8] (lex-source) (.start t) (.end t)))
+  (if (.escaped t)
+      (subslice [u8] (al-slice [u8] (.decoded (lexer-state))) (.decoded-lo t) (.decoded-hi t))
+      (subslice [u8] (lex-source) (.start t) (.end t))))
 
+;; Whether a token is the given keyword, punctuator or contextual word as written. An escaped
+;; IdentifierName is never a keyword: `\u0061sync function` does not start an async function.
 (defn token-is [(t Token) (text (slice u8))] (-> bool)
-  (= (token-text t) text))
+  (and (not (.escaped t)) (= (subslice [u8] (lex-source) (.start t) (.end t)) text)))
+
+;; An escaped IdentifierName whose StringValue is a ReservedWord cannot be an Identifier; `let`
+;; is contextual and stays a valid sloppy name.
+(defn token-escaped-reserved? [(t Token)] (-> bool)
+  (and (.escaped t) (lex-reserved-word? t) (!= (token-text t) "let")))
 
 (defn lex-reserved-word? [(t Token)] (-> bool)
   (let [word (token-text t)]
-    (or (= word "break") (= word "case") (= word "catch") (= word "class")
-        (= word "const") (= word "continue") (= word "debugger") (= word "default")
-        (= word "delete") (= word "do") (= word "else") (= word "enum")
-        (= word "export") (= word "extends") (= word "false") (= word "finally")
-        (= word "for") (= word "function") (= word "if") (= word "import")
-        (= word "in") (= word "instanceof") (= word "new") (= word "null")
-        (= word "return") (= word "super") (= word "switch") (= word "this")
-        (= word "throw") (= word "true") (= word "try") (= word "typeof")
-        (= word "var") (= word "void") (= word "while") (= word "with")
+    (or (= word "break")
+        (= word "case")
+        (= word "catch")
+        (= word "class")
+        (= word "const")
+        (= word "continue")
+        (= word "debugger")
+        (= word "default")
+        (= word "delete")
+        (= word "do")
+        (= word "else")
+        (= word "enum")
+        (= word "export")
+        (= word "extends")
+        (= word "false")
+        (= word "finally")
+        (= word "for")
+        (= word "function")
+        (= word "if")
+        (= word "import")
+        (= word "in")
+        (= word "instanceof")
+        (= word "new")
+        (= word "null")
+        (= word "return")
+        (= word "super")
+        (= word "switch")
+        (= word "this")
+        (= word "throw")
+        (= word "true")
+        (= word "try")
+        (= word "typeof")
+        (= word "var")
+        (= word "void")
+        (= word "while")
+        (= word "with")
         ;; `let` is retained as a declaration token. Its contextual sloppy identifier grammar
         ;; remains outside the admitted slice; await/yield are not unconditionally reserved.
         (= word "let"))))
@@ -150,8 +203,10 @@
   (and (< (.pos (lexer-state)) (len (lex-source))) (= (lex-at (.pos (lexer-state))) c)))
 
 (defn lex-digit-value [(c u8)] (-> i64)
-  (if (lex-digit? c) (- (cast i64 c) 48)
-      (if (and (>= c (cast u8 97)) (<= c (cast u8 102))) (- (cast i64 c) 87)
+  (if (lex-digit? c)
+      (- (cast i64 c) 48)
+      (if (and (>= c (cast u8 97)) (<= c (cast u8 102)))
+          (- (cast i64 c) 87)
           (if (and (>= c (cast u8 65)) (<= c (cast u8 70))) (- (cast i64 c) 55) -1))))
 
 (defn lex-radix-digit? [(c u8) (radix i64)] (-> bool)
@@ -160,16 +215,22 @@
 ;; `previous` accounts for an already consumed first digit. A separator requires digits on BOTH
 ;; sides, including after a prefix, decimal point or exponent sign. EOF is not a digit.
 (defn lex-number-digits! [(radix i64) (separators bool) (previous bool)] (-> i64)
-  (let [s (lexer-state) size (len (lex-source)) (mut count) (if previous 1 0)]
-    (loop (if (>= (.pos s) size) (break 0)
+  (let [s (lexer-state)
+        size (len (lex-source))
+        (mut count) (if previous 1 0)]
+    (loop (if (>= (.pos s) size)
+              (break 0)
               (let [c (lex-at (.pos s))]
                 (if (lex-radix-digit? c radix)
                     (do (lex-advance!) (set! (mut count) (+ (load count) 1)) (continue))
                     (if (= c (cast u8 95))
                         (do
-                          (if (and separators (> (load count) 0) (< (+ (.pos s) 1) size)
+                          (if (and separators
+                                   (> (load count) 0)
+                                   (< (+ (.pos s) 1) size)
                                    (lex-radix-digit? (lex-at (+ (.pos s) 1)) radix))
-                              0 (lex-syntax-error! "lexer: numeric separator must separate digits"))
+                              0
+                              (lex-syntax-error! "lexer: numeric separator must separate digits"))
                           (lex-advance!)
                           ;; Consume the required following digit, so consecutive underscores fail.
                           (lex-advance!)
@@ -179,17 +240,27 @@
     (load count)))
 
 (defn lex-scan-number! [(start i64) (first u8)] (-> i64)
-  (let [s (lexer-state) size (len (lex-source))
-        (mut radix) 10 (mut kind) TOK-NUMBER (mut integer) true (mut leading-zero) false]
+  (let [s (lexer-state)
+        size (len (lex-source))
+        (mut radix) 10
+        (mut kind) TOK-NUMBER
+        (mut integer) true
+        (mut leading-zero) false]
     (if (and (= first (cast u8 48)) (< (.pos s) size))
         (let [c (lex-at (.pos s))]
-          (set! (mut radix) (if (or (= c (cast u8 120)) (= c (cast u8 88))) 16
-                               (if (or (= c (cast u8 98)) (= c (cast u8 66))) 2
-                                   (if (or (= c (cast u8 111)) (= c (cast u8 79))) 8 10))))) 0)
+          (set! (mut radix)
+                (if (or (= c (cast u8 120)) (= c (cast u8 88)))
+                    16
+                    (if (or (= c (cast u8 98)) (= c (cast u8 66)))
+                        2
+                        (if (or (= c (cast u8 111)) (= c (cast u8 79))) 8 10)))))
+        0)
     (if (!= (load radix) 10)
-        (do (lex-advance!)
-            (if (= (lex-number-digits! (load radix) true false) 0)
-                (lex-syntax-error! "lexer: radix prefix requires a digit") 0))
+        (do
+          (lex-advance!)
+          (if (= (lex-number-digits! (load radix) true false) 0)
+              (lex-syntax-error! "lexer: radix prefix requires a digit")
+              0))
         (do
           (if (= first (cast u8 46))
               (do (set! (mut integer) false) (lex-number-digits! 10 true false) 0)
@@ -200,36 +271,53 @@
                       (set! (mut kind) TOK-LEGACY-NUMBER)
                       ;; A leading-zero spelling containing 8/9 is Annex-B decimal, not octal.
                       (let [(mut i) start]
-                        (loop (if (>= (load i) (.pos s)) (break 0)
+                        (loop (if (>= (load i) (.pos s))
+                                  (break 0)
                                   (do
                                     (if (>= (lex-at (load i)) (cast u8 56))
-                                        (set! (mut kind) TOK-NUMBER) 0)
-                                    (set! (mut i) (+ (load i) 1)) (continue)))))) 0)))
-          (if (and (!= (load kind) TOK-LEGACY-NUMBER) (!= first (cast u8 46))
+                                        (set! (mut kind) TOK-NUMBER)
+                                        0)
+                                    (set! (mut i) (+ (load i) 1))
+                                    (continue))))))
+                    0)))
+          (if (and (!= (load kind) TOK-LEGACY-NUMBER)
+                   (!= first (cast u8 46))
                    (lex-current-is? (cast u8 46)))
-              (do (lex-advance!) (set! (mut integer) false) (lex-number-digits! 10 true false) 0) 0)
+              (do (lex-advance!) (set! (mut integer) false) (lex-number-digits! 10 true false) 0)
+              0)
           (if (and (!= (load kind) TOK-LEGACY-NUMBER)
                    (or (lex-current-is? (cast u8 101)) (lex-current-is? (cast u8 69))))
               (do
-                (lex-advance!) (set! (mut integer) false)
+                (lex-advance!)
+                (set! (mut integer) false)
                 (if (or (lex-current-is? (cast u8 43)) (lex-current-is? (cast u8 45)))
-                    (do (lex-advance!) 0) 0)
+                    (do (lex-advance!) 0)
+                    0)
                 (if (= (lex-number-digits! 10 true false) 0)
-                    (lex-syntax-error! "lexer: exponent requires a digit") 0)) 0)))
+                    (lex-syntax-error! "lexer: exponent requires a digit")
+                    0))
+              0)))
     (if (lex-current-is? (cast u8 110))
         (do
           (if (or (not (load integer)) (load leading-zero))
-              (lex-syntax-error! "lexer: invalid decimal BigInt literal") 0)
-          (lex-advance!) (set! (mut kind) TOK-BIGINT)) 0)
+              (lex-syntax-error! "lexer: invalid decimal BigInt literal")
+              0)
+          (lex-advance!)
+          (set! (mut kind) TOK-BIGINT))
+        0)
     (if (< (.pos s) size)
         (let [c (lex-at (.pos s))]
           (if (or (lex-alpha? c) (lex-digit? c) (= c (cast u8 92)))
-              (lex-syntax-error! "lexer: identifier or digit immediately follows numeric literal") 0)
+              (lex-syntax-error! "lexer: identifier or digit immediately follows numeric literal")
+              0)
           ;; Unicode identifier classification is not implemented. Whitespace/line terminators
           ;; are already recognized exactly; refuse other non-ASCII boundaries without guessing.
-          (if (and (>= c (cast u8 128)) (= (lex-space-width (.pos s)) 0)
+          (if (and (>= c (cast u8 128))
+                   (= (lex-space-width (.pos s)) 0)
                    (= (lex-line-width (.pos s)) 0))
-              (unimplemented "Unicode numeric literal boundary" "src/parse/lexer.coil") 0)) 0)
+              (unimplemented "Unicode numeric literal boundary" "src/parse/lexer.coil")
+              0))
+        0)
     (load kind)))
 
 ;; ECMAScript LineTerminator is LF, CR, LS or PS. Keep byte spans while recognizing the
@@ -268,17 +356,22 @@
         (if (and (< (+ i 1) size) (= c (cast u8 194)) (= (lex-at (+ i 1)) (cast u8 160)))
             2
             (if (and (< (+ i 2) size)
-                     (or (and (= c (cast u8 225)) (= (lex-at (+ i 1)) (cast u8 154))
+                     (or (and (= c (cast u8 225))
+                              (= (lex-at (+ i 1)) (cast u8 154))
                               (= (lex-at (+ i 2)) (cast u8 128)))
-                         (and (= c (cast u8 226)) (= (lex-at (+ i 1)) (cast u8 128))
+                         (and (= c (cast u8 226))
+                              (= (lex-at (+ i 1)) (cast u8 128))
                               (or (and (>= (lex-at (+ i 2)) (cast u8 128))
                                        (<= (lex-at (+ i 2)) (cast u8 138)))
                                   (= (lex-at (+ i 2)) (cast u8 175))))
-                         (and (= c (cast u8 226)) (= (lex-at (+ i 1)) (cast u8 129))
+                         (and (= c (cast u8 226))
+                              (= (lex-at (+ i 1)) (cast u8 129))
                               (= (lex-at (+ i 2)) (cast u8 159)))
-                         (and (= c (cast u8 227)) (= (lex-at (+ i 1)) (cast u8 128))
+                         (and (= c (cast u8 227))
+                              (= (lex-at (+ i 1)) (cast u8 128))
                               (= (lex-at (+ i 2)) (cast u8 128)))
-                         (and (= c (cast u8 239)) (= (lex-at (+ i 1)) (cast u8 187))
+                         (and (= c (cast u8 239))
+                              (= (lex-at (+ i 1)) (cast u8 187))
                               (= (lex-at (+ i 2)) (cast u8 191)))))
                 3
                 0)))))
@@ -292,8 +385,10 @@
                     space (lex-space-width (.pos s))
                     line-width (lex-line-width (.pos s))]
                 (if (> space 0)
-                    (do (set! (.pos s) (+ (.pos s) space))
-                        (set! (.col s) (+ (.col s) 1)) (continue))
+                    (do
+                      (set! (.pos s) (+ (.pos s) space))
+                      (set! (.col s) (+ (.col s) 1))
+                      (continue))
                     (if (> line-width 0)
                         (do (set! (mut nl) true) (lex-skip-line! line-width) (continue))
                         ;; Line comments are unambiguous even though a bare slash is parser-led.
@@ -314,18 +409,17 @@
                                 (do
                                   (lex-advance!)
                                   (lex-advance!)
-                                  (loop
-                                    (if (>= (.pos s) (len (.src s)))
-                                        (break (panic "lexer: unterminated block comment"))
-                                        (if (and (= (lex-at (.pos s)) (cast u8 42))
-                                                 (< (+ (.pos s) 1) (len (.src s)))
-                                                 (= (lex-at (+ (.pos s) 1)) (cast u8 47)))
-                                            (break (do (lex-advance!) (lex-advance!) 0))
-                                            (let [width (lex-line-width (.pos s))]
-                                              (if (> width 0)
-                                                  (do (set! (mut nl) true) (lex-skip-line! width))
-                                                  (do (lex-advance!) 0))
-                                              (continue)))))
+                                  (loop (if (>= (.pos s) (len (.src s)))
+                                            (break (panic "lexer: unterminated block comment"))
+                                            (if (and (= (lex-at (.pos s)) (cast u8 42))
+                                                     (< (+ (.pos s) 1) (len (.src s)))
+                                                     (= (lex-at (+ (.pos s) 1)) (cast u8 47)))
+                                                (break (do (lex-advance!) (lex-advance!) 0))
+                                                (let [width (lex-line-width (.pos s))]
+                                                  (if (> width 0)
+                                                      (do (set! (mut nl) true) (lex-skip-line! width))
+                                                      (do (lex-advance!) 0))
+                                                  (continue)))))
                                   (continue))
                                 (break 0))))))))
     (load nl)))
@@ -339,21 +433,138 @@
         4
         (if (and (<= (+ start 3) size)
                  (let [p (subslice [u8] src start (+ start 3))]
-                   (or (= p "===") (= p "!==") (= p ">>>") (= p "**=")
-                       (= p "<<=") (= p ">>=") (= p "&&=") (= p "||=")
-                       (= p "??=") (= p "..."))))
+                   (or (= p "===")
+                       (= p "!==")
+                       (= p ">>>")
+                       (= p "**=")
+                       (= p "<<=")
+                       (= p ">>=")
+                       (= p "&&=")
+                       (= p "||=")
+                       (= p "??=")
+                       (= p "..."))))
             3
             (if (and (<= (+ start 2) size)
                      (let [p (subslice [u8] src start (+ start 2))]
-                       (or (= p "==") (= p "!=") (= p "<=") (= p ">=")
-                           (= p "++") (= p "--") (= p "**") (= p "<<") (= p ">>")
-                           (= p "&&") (= p "||") (= p "??") (= p "=>")
-                           (= p "+=") (= p "-=") (= p "*=") (= p "/=") (= p "%=")
-                           (= p "&=") (= p "|=") (= p "^=")
+                       (or (= p "==")
+                           (= p "!=")
+                           (= p "<=")
+                           (= p ">=")
+                           (= p "++")
+                           (= p "--")
+                           (= p "**")
+                           (= p "<<")
+                           (= p ">>")
+                           (= p "&&")
+                           (= p "||")
+                           (= p "??")
+                           (= p "=>")
+                           (= p "+=")
+                           (= p "-=")
+                           (= p "*=")
+                           (= p "/=")
+                           (= p "%=")
+                           (= p "&=")
+                           (= p "|=")
+                           (= p "^=")
                            (and (= p "?.")
                                 (not (and (< (+ start 2) size) (lex-digit? (lex-at (+ start 2)))))))))
                 2
                 1)))))
+
+;; IdentifierName, with `\u` escapes decoded to their StringValue. ASCII code points are classified
+;; exactly (letters, `$`, `_`, digits after the first); ZWNJ/ZWJ continue a name; any other
+;; non-ASCII code point needs the ID_Start/ID_Continue tables this compiler does not carry yet and
+;; fails closed. A `\` not followed by `u` and an escape that is not an identifier character are
+;; proven errors: nothing else in the grammar admits a backslash here.
+(defn lex-scan-identifier! [(start i64) (first u8) (line i64) (col i64) (nl bool)] (-> Token)
+  (let [s (lexer-state)
+        pool-lo (len (.decoded s))
+        (mut escaped) false
+        (mut c) first
+        (mut at-start) true]
+    (loop (do
+            (if (= (load c) (cast u8 92))
+                (let [cp (lex-identifier-escape!)]
+                  (set! (mut escaped) true)
+                  (if (< cp 128)
+                      (if (or (lex-alpha? (cast u8 cp)) (and (not (load at-start)) (lex-digit? (cast u8 cp))))
+                          (push! [u8] (mut (.decoded s)) (cast u8 cp))
+                          (lex-syntax-error! "lexer: escape sequence is not an identifier character"))
+                      (if (or (= cp 8204) (= cp 8205))
+                          (if (load at-start)
+                              (lex-syntax-error! "lexer: escape sequence is not an identifier character")
+                              (do
+                                (push! [u8] (mut (.decoded s)) (cast u8 226))
+                                (push! [u8] (mut (.decoded s)) (cast u8 128))
+                                (push! [u8] (mut (.decoded s)) (cast u8 (+ 140 (- cp 8204))))))
+                          (if (and (>= cp 55296) (<= cp 57343))
+                              (lex-syntax-error! "lexer: escape sequence is not an identifier character")
+                              (unimplemented "Unicode identifier classification (ID_Start/ID_Continue)"
+                                             "src/parse/lexer.coil")))))
+                (push! [u8] (mut (.decoded s)) (load c)))
+            (set! (mut at-start) false)
+            (if (and (< (.pos s) (len (.src s)))
+                     (let [x (lex-at (.pos s))] (or (lex-alpha? x) (lex-digit? x) (= x (cast u8 92)))))
+                (do (set! (mut c) (lex-advance!)) (continue))
+                (break 0))))
+    (if (load escaped)
+        (let [(mut t) (token-new TOK-IDENT start (.pos s) line col nl)]
+          (set! (.escaped (mut t)) true)
+          (set! (.decoded-lo (mut t)) pool-lo)
+          (set! (.decoded-hi (mut t)) (len (.decoded s)))
+          (load t))
+        (let [t (token-new TOK-IDENT start (.pos s) line col nl)]
+          ;; The pool bytes for an unescaped name are not referenced; drop them.
+          (loop (if (> (len (.decoded s)) pool-lo)
+                    (do (pop! [u8] (mut (.decoded s))) (continue))
+                    (break 0)))
+          (if (lex-reserved-word? t)
+              (token-new TOK-KEYWORD start (.pos s) line col nl)
+              t)))))
+
+;; `\uXXXX` or `\u{X…}` after a consumed `\` in an IdentifierName; the code point, or an error.
+(defn lex-identifier-escape! [] (-> i64)
+  (let [s (lexer-state)
+        size (len (.src s))]
+    (if (not (and (< (.pos s) size) (= (lex-at (.pos s)) (cast u8 117))))
+        (do (lex-syntax-error! "lexer: invalid identifier escape") 0)
+        (do
+          (lex-advance!)
+          (if (and (< (.pos s) size) (= (lex-at (.pos s)) (cast u8 123)))
+              (let [(mut value) 0
+                    (mut digits) 0]
+                (lex-advance!)
+                (loop (if (and (< (.pos s) size)
+                               (>= (lex-digit-value (lex-at (.pos s))) 0)
+                               (!= (lex-digit-value (lex-at (.pos s))) 99))
+                          (do
+                            (if (<= (load value) 1114111)
+                                (set! (mut value) (+ (* (load value) 16) (lex-digit-value (lex-at (.pos s)))))
+                                0)
+                            (set! (mut digits) (+ (load digits) 1))
+                            (lex-advance!)
+                            (continue))
+                          (break 0)))
+                (if (or (= (load digits) 0) (not (lex-current-is? (cast u8 125))) (> (load value) 1114111))
+                    (do (lex-syntax-error! "lexer: invalid identifier escape") 0)
+                    (do (lex-advance!) (load value))))
+              (let [(mut value) 0
+                    (mut k) 0]
+                (loop (if (>= (load k) 4)
+                          (break 0)
+                          (if (and (< (.pos s) size)
+                                   (>= (lex-digit-value (lex-at (.pos s))) 0)
+                                   (!= (lex-digit-value (lex-at (.pos s))) 99))
+                              (do
+                                (set! (mut value) (+ (* (load value) 16) (lex-digit-value (lex-at (.pos s)))))
+                                (lex-advance!)
+                                (set! (mut k) (+ (load k) 1))
+                                (continue))
+                              (break 0))))
+                (if (< (load k) 4)
+                    (do (lex-syntax-error! "lexer: invalid identifier escape") 0)
+                    (load value))))))))
 
 (defn lex-scan! [(regex-ok bool)] (-> Token)
   (let [s (lexer-state)
@@ -364,18 +575,11 @@
     (if (>= start (len (.src s)))
         (token-new TOK-EOF start start line col nl)
         (let [c (lex-advance!)]
-          (if (lex-alpha? c)
-              (do
-                (loop (if (and (< (.pos s) (len (.src s)))
-                               (let [x (lex-at (.pos s))] (or (lex-alpha? x) (lex-digit? x))))
-                          (do (lex-advance!) (continue))
-                          (break 0)))
-                (let [t (token-new TOK-IDENT start (.pos s) line col nl)]
-                  (if (lex-reserved-word? t)
-                      (token-new TOK-KEYWORD start (.pos s) line col nl)
-                      t)))
+          (if (or (lex-alpha? c) (= c (cast u8 92)))
+              (lex-scan-identifier! start c line col nl)
               (if (or (lex-digit? c)
-                      (and (= c (cast u8 46)) (< (.pos s) (len (.src s)))
+                      (and (= c (cast u8 46))
+                           (< (.pos s) (len (.src s)))
                            (lex-digit? (lex-at (.pos s)))))
                   (let [kind (lex-scan-number! start c)]
                     (token-new kind start (.pos s) line col nl))
@@ -383,15 +587,19 @@
                       (let [quote c]
                         (loop (if (>= (.pos s) (len (.src s)))
                                   (break (lex-syntax-error! "lexer: unterminated string literal"))
-                                  (let [x (lex-at (.pos s)) width (lex-line-width (.pos s))]
-                                    (if (= x quote) (do (lex-advance!) (break 0))
+                                  (let [x (lex-at (.pos s))
+                                        width (lex-line-width (.pos s))]
+                                    (if (= x quote)
+                                        (do (lex-advance!) (break 0))
                                         (if (= x (cast u8 92))
                                             (do
                                               (lex-advance!)
                                               (if (>= (.pos s) (len (.src s)))
-                                                  (lex-syntax-error! "lexer: unterminated string escape") 0)
+                                                  (lex-syntax-error! "lexer: unterminated string escape")
+                                                  0)
                                               (let [escaped-line (lex-line-width (.pos s))]
-                                                (if (> escaped-line 0) (lex-skip-line! escaped-line)
+                                                (if (> escaped-line 0)
+                                                    (lex-skip-line! escaped-line)
                                                     (do (lex-advance!) 0)))
                                               (continue))
                                             (if (> width 0)
@@ -414,9 +622,10 @@
 ;; The next token. `regex-ok` is the parser telling the lexer which reading of `/` to take.
 (defn lex-next! [(regex-ok bool)] (-> Token)
   (let [s (lexer-state)
-        token (if (.peeked s)
-                  (do (set! (.peeked s) false) (.peek-token s))
-                  (lex-scan! regex-ok))]
+        token
+          (if (.peeked s)
+              (do (set! (.peeked s) false) (.peek-token s))
+              (lex-scan! regex-ok))]
     (set! (.consumed-end s) (.end token))
     token))
 
@@ -434,7 +643,9 @@
 (defn lex-peek-second [(regex-ok bool)] (-> Token)
   (let [s (lexer-state)]
     (lex-peek regex-ok)
-    (let [pos (.pos s) line (.line s) col (.col s)
+    (let [pos (.pos s)
+          line (.line s)
+          col (.col s)
           second (lex-scan! regex-ok)]
       (set! (.pos s) pos)
       (set! (.line s) line)
@@ -447,7 +658,9 @@
 ;; IdentifierPart characters; escaped or non-ASCII flags fail closed. The pattern grammar itself is
 ;; validated by the parser's regex pass, not here.
 (defn lex-regex! [(slash Token)] (-> Token)
-  (let [s (lexer-state) size (len (.src s)) (mut in-class) false]
+  (let [s (lexer-state)
+        size (len (.src s))
+        (mut in-class) false]
     (set! (.pos s) (+ (.start slash) 1))
     (set! (.line s) (.line slash))
     (set! (.col s) (+ (.col slash) 1))
@@ -461,13 +674,15 @@
                         (do
                           (lex-advance!)
                           (if (or (>= (.pos s) size) (> (lex-line-width (.pos s)) 0))
-                              (lex-syntax-error! "lexer: unterminated regular expression escape") 0)
+                              (lex-syntax-error! "lexer: unterminated regular expression escape")
+                              0)
                           (lex-advance!)
                           (continue))
                         (if (and (= c (cast u8 47)) (not (load in-class)))
                             (break (do (lex-advance!) 0))
                             (do
-                              (if (= c (cast u8 91)) (set! (mut in-class) true)
+                              (if (= c (cast u8 91))
+                                  (set! (mut in-class) true)
                                   (if (= c (cast u8 93)) (set! (mut in-class) false) 0))
                               (lex-advance!)
                               (continue))))))))
@@ -477,7 +692,8 @@
               (break 0)))
     (if (and (< (.pos s) size)
              (or (= (lex-at (.pos s)) (cast u8 92)) (>= (lex-at (.pos s)) (cast u8 128))))
-        (panic "lexer: escaped or non-ASCII regular expression flags are outside the admitted subset") 0)
+        (panic "lexer: escaped or non-ASCII regular expression flags are outside the admitted subset")
+        0)
     (let [t (token-new TOK-REGEX (.start slash) (.pos s) (.line slash) (.col slash) (.nl-before slash))]
       (set! (.consumed-end s) (.end t))
       t)))
@@ -486,26 +702,30 @@
 ;; at `` ` `` (a tail) or `${` (a head or middle). Line terminators are ordinary template
 ;; characters that count source lines; `\` consumes the next character or LineTerminatorSequence.
 (defn lex-template-part! [(open Token)] (-> Token)
-  (let [s (lexer-state) size (len (.src s))]
+  (let [s (lexer-state)
+        size (len (.src s))]
     (set! (.pos s) (+ (.start open) 1))
     (set! (.line s) (.line open))
     (set! (.col s) (+ (.col open) 1))
     (set! (.peeked s) false)
     (loop (if (>= (.pos s) size)
               (break (lex-syntax-error! "lexer: unterminated template literal"))
-              (let [c (lex-at (.pos s)) width (lex-line-width (.pos s))]
+              (let [c (lex-at (.pos s))
+                    width (lex-line-width (.pos s))]
                 (if (> width 0)
                     (do (lex-skip-line! width) (continue))
                     (if (= c (cast u8 96))
                         (break (do (lex-advance!) 0))
-                        (if (and (= c (cast u8 36)) (< (+ (.pos s) 1) size)
+                        (if (and (= c (cast u8 36))
+                                 (< (+ (.pos s) 1) size)
                                  (= (lex-at (+ (.pos s) 1)) (cast u8 123)))
                             (break (do (lex-advance!) (lex-advance!) 0))
                             (if (= c (cast u8 92))
                                 (do
                                   (lex-advance!)
                                   (if (>= (.pos s) size)
-                                      (lex-syntax-error! "lexer: unterminated template literal") 0)
+                                      (lex-syntax-error! "lexer: unterminated template literal")
+                                      0)
                                   (let [escaped (lex-line-width (.pos s))]
                                     (if (> escaped 0) (lex-skip-line! escaped) (do (lex-advance!) 0)))
                                   (continue))

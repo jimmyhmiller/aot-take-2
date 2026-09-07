@@ -55,6 +55,20 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-07 — Identifier escapes
+
+The lexer decodes `\uXXXX` and `\u{…}` escapes inside IdentifierNames to their StringValue,
+kept in a per-source pool the token references. ASCII code points are classified exactly (letters,
+`$`, `_`, digits after the first); ZWNJ/ZWJ continue a name; a `\` not followed by `u`, a malformed
+or out-of-range escape, a non-identifier ASCII code point (`\u0023!`, `\u007B\u007D;`) and a
+surrogate are proven errors. Any other non-ASCII code point needs the ID_Start/ID_Continue tables
+the compiler does not carry yet and fails closed (`Unicode identifier classification`), as do raw
+non-ASCII identifier characters. An escaped IdentifierName is never a keyword or contextual word
+(`\u0061sync function`, `st\u0061tic m() {}`, `l\u0065t x` are errors) but is still the name for
+StringValue rules: escaped `await`/`yield` in their reserving contexts, escaped reserved words in
+Identifier positions (`v\u0061r x`, `({v\u0061r})`), and strict-mode `let`/`eval`/`arguments`.
+Property names and member access accept escaped reserved words (`x.\u0069f`).
+
 ### 2026-09-07 — Sloppy `let` identifiers and Annex B function declarations
 
 `let` is an ordinary identifier outside strict code: bindings (`var let`, `function let() {}`,
@@ -87,9 +101,9 @@ async iteration protocol (GetIterator async, Await on each step) is unimplemente
 The campaign in `docs/TEST262.md` (4,006 files) found 20 false accepts, all in destructuring and
 all fixed: a `...rest` element followed by a trailing comma is a valid literal but never a pattern
 (tracked per literal in `rest-comma`), and for-in/of assignment-pattern heads are now visited by
-the strict pass. Remaining parser refusals: phase imports (deliberate), identifier escapes (the unadmitted
-primaries), Annex B for-in initializers, non-ASCII regex group names (`for await`, sloppy `let`
-and Annex B function declarations were admitted later the same day).
+the strict pass. Remaining parser refusals: phase imports (deliberate), Annex B for-in initializers, non-ASCII
+identifiers and regex group names (`for await`, sloppy `let`, Annex B function declarations and
+identifier escapes were admitted later the same day).
 
 ### 2026-09-07 — Regular-expression pattern early errors
 

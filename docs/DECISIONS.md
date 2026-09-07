@@ -1,5 +1,19 @@
 # Decisions
 
+## 2026-09-07 — Tokens have a spelling and a StringValue, and the grammar reads only the spelling
+
+An IdentifierName written with `\u` escapes is one token whose `token-text` is its decoded
+StringValue and whose `token-is` — the predicate every keyword, punctuator and contextual-word
+check uses — compares the raw source spelling and is false for any escaped token. This is the
+specification's split: `async`, `of`, `get`, `static`, `let` and the reserved words are syntax and
+must be spelled literally, while early errors about `await`, `yield`, `eval`, `arguments` and
+strict-mode reserved names are stated on StringValue and see through escapes. Decoding in the
+lexer with two predicates keeps the parser's several hundred `token-is` checks correct by
+construction; the alternative — decoding in the parser at each identifier position — would need
+every contextual-keyword site to remember which comparison it is making. Escaped reserved words
+stay `TOK-IDENT` (they are legal property names) and the parser rejects them where an Identifier is
+required.
+
 ## 2026-09-07 — Regex patterns are validated at parse time by a flag-selected grammar
 
 A regular-expression literal's pattern is checked by `src/parse/regex.coil` while the literal is
