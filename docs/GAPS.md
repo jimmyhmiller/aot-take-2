@@ -55,6 +55,15 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-07 — Patterns campaign follow-up
+
+The campaign in `docs/TEST262.md` (4,006 files) found 20 false accepts, all in destructuring and
+all fixed: a `...rest` element followed by a trailing comma is a valid literal but never a pattern
+(tracked per literal in `rest-comma`), and for-in/of assignment-pattern heads are now visited by
+the strict pass. Remaining parser refusals: phase imports (deliberate), `for await`, the unadmitted
+primaries, Annex B function-in-statement and for-in initializers, sloppy `let` identifiers,
+non-ASCII regex group names.
+
 ### 2026-09-07 — Regular-expression pattern early errors
 
 `src/parse/regex.coil` validates every RegularExpressionLiteral body at parse time under the

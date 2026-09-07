@@ -101,6 +101,22 @@ Evidence: `build/test262-assignment-campaign/results.tsv` and `summary.txt`. Fin
 The full sequential development gate passed 574 tests. Generic property arithmetic still has a
 representation-proof refusal. Shared assertion-harness execution and the 10% goal remain open.
 
+## Patterns campaign, 2026-09-07
+
+With destructuring patterns and regular-expression pattern validation admitted as syntax, the
+campaign in `build/test262-patterns-campaign/` measured **4,006 / 53,582 files passing (about
+7.47%)**, up from 2,933. Of 102,926 variants, 7,623 passed, 819 produced compiler errors, 94,464
+were unsupported and 20 failed. Fingerprints: compiler blob
+`9a7321b108b85af0eceab29ffb0951e4ffaaeedb`, runtime `09f5ef57b34d0aeadabc52c42c52eac6d100c4a7`.
+
+The 20 failures were false accepts in destructuring, all fixed with regressions the same day: a
+rest element followed by a trailing comma (`[...x,] = y`, `({...x,} = y)`, also in for-in/of heads
+and arrow parameters), and strict-mode `eval`/`arguments`/`yield` leaves in for-in/of assignment
+pattern heads, which the strict pass had not visited. Remaining compiler errors by refusal: phase
+imports 400 (deliberate), `for await` 178, unadmitted primaries 125, Annex B function-in-statement
+59, non-ASCII regex group names 16, sloppy `let` 11, Annex B for-in initializers 6, and a handful
+of lexer/parser fail-closed paths.
+
 ## Grammar-completion campaign, 2026-09-07
 
 After the parser refactor to sum-typed syntax records and the admission of the full operator,
