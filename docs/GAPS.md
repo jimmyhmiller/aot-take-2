@@ -55,6 +55,24 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-07 — Destructuring patterns as syntax
+
+Binding and assignment patterns parse everywhere the grammar admits them: `let`/`const`/`var`
+declarations (with the initializer requirement, also inside `for (;;)` heads), formal and rest
+parameters of every function form, catch parameters, `for (… in/of …)` heads (declarations and
+bare patterns), arrow parameters through the parenthesized cover, and `=` assignment where an
+unparenthesized object or array literal is the target. Patterns live in their own table
+(`SyntaxPattern`: name, Reference leaf, object, array, each with an optional default); a literal
+reinterpreted as a pattern is marked consumed so `{a = 1}` survives only inside one. Proven early
+errors: rest element not last or with a default, object rest that is not a plain name (binding) or
+simple target (assignment), method or call or optional-chain leaves, a parenthesized pattern or
+parenthesized name where a binding is required, duplicate bound names across a parameter list or
+lexical scope, catch-parameter/lexical conflicts, `yield`/`await` inside destructured parameters,
+strict `eval`/`arguments` leaves, and destructuring declarations without initializers. Not yet
+lowered — every form refuses by name (`destructuring declarations`, `destructuring parameters`,
+`destructuring assignment`, `destructuring for-in/of heads`); the runtime needs iterator
+destructuring (`IteratorRestArray`, `ObjectRest`) and per-leaf PutValue/InitializeBinding first.
+
 ### 2026-09-07 — Grammar-completion campaign follow-up
 
 The campaign in `docs/TEST262.md` (2,933 files) exposed 53 false accepts, all fixed with
@@ -66,8 +84,8 @@ callees or `new` targets, `return` in a static block nested in a function, and n
 class heritage or computed keys are all proven errors. A required token that is missing is now a
 SyntaxError in Script code unless the offending token is lexically unknown (identifier escapes,
 non-ASCII identifiers, `@`); TypeScript entry mode keeps failing closed there. The remaining
-parser refusals are destructuring patterns, regex pattern validation, phase imports, `for await`,
-identifier escapes and Annex B function-in-statement.
+parser refusals were destructuring patterns (admitted the same day, above), regex pattern
+validation, phase imports, `for await`, identifier escapes and Annex B function-in-statement.
 
 ### 2026-09-07 — Classes as syntax
 
@@ -96,8 +114,8 @@ over a non-simple parameter list; accessor arity; rest-parameter position and de
 arrow parameters and a line terminator before `=>`; `yield`/`await` in formal parameters and in
 arrow parameters; reserved function names; block-level function declarations conflicting with
 `let`/`var` (with Annex B's sloppy duplicate-function allowance); and parameter/lexical conflicts.
-Destructuring parameters, sloppy `let` names, Annex B function-in-`if` and labelled functions fail
-closed.
+Sloppy `let` names, Annex B function-in-`if` and labelled functions fail closed (destructuring
+parameters were admitted later the same day).
 
 The Script statement list is parsed under a root context so nested functions have a parent; only
 declarations the program loop saw at the top level are hoisted closed-world Funs. Every other
@@ -143,8 +161,8 @@ that are strict reserved words) and refuse lowering by name: property enumeratio
 protocol, exception completions and object environments are absent. `debugger` lowers to nothing.
 Statement-position declarations (`if (x) let y`, `while (x) class C {}`, loop-body function
 declarations, `async function` bodies) are proven SyntaxErrors; Annex B function-in-`if`, sloppy
-`let` identifiers, destructuring heads/catch parameters, `for await` and `for (var x = 1 in o)`
-fail closed. The lexer gained a two-token lookahead for `let x` versus a bare `let` identifier.
+`let` identifiers, `for await` and `for (var x = 1 in o)` fail closed (destructuring heads and
+catch parameters were admitted later the same day). The lexer gained a two-token lookahead for `let x` versus a bare `let` identifier.
 
 ### 2026-09-07 — Operator grammar, sum-typed syntax records and NaN branch codes
 

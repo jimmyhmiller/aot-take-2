@@ -1,5 +1,20 @@
 # Decisions
 
+## 2026-09-07 — Patterns are a separate table built by parse or by cover reinterpretation
+
+Destructuring patterns are their own sum-typed records (`PatternNode`: name, Reference leaf,
+object, array) in a `patterns` table beside the expression table, never a flag on object or array
+literal nodes. Where the grammar knows it is reading a BindingPattern (declarations, parameters,
+catch) the parser builds the pattern directly and can reject `[`/`{` in an identifier position as
+a proven error. Where JavaScript's cover grammar applies — `=` targets, arrow parameter lists and
+for-in/of heads — the literal is parsed as an expression and converted afterwards; the literal
+stays in the expression table but is marked consumed so the shorthand-initializer check skips it.
+A parenthesized name inside an assignment pattern is kept as a Reference leaf, not a name, so the
+same pattern reused as arrow parameters (`({a: (b)} = c) => 0`) still fails. The alternative — a
+`pattern` flag on literals with leaves validated at lowering — would let a syntax fact escape the
+syntax pass, and every pass that enumerates bound names (declaration conflicts, strict bindings,
+`yield`/`await` in parameters) would have to understand literal shapes instead of one walker.
+
 ## 2026-09-07 — Private names resolve when their class closes
 
 A `.#name` reference may precede the field or method that declares it, and may sit inside nested

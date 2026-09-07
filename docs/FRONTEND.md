@@ -199,7 +199,8 @@ has a syntax variant naming its JSL entry point. Operators whose entry point is 
 index execute (`+ - * / < > <= >= === !== && || ?? ! void typeof - + ++ -- , = += -= *= /= &&=
 ||= ??=`); the rest (`% ** & | ^ << >> >>> == != in instanceof ~ delete` and their compound forms)
 parse, pass early-error validation, and refuse lowering by their JSL name. Primary and member
-grammar is complete except destructuring patterns: `this`, `new`, `new.target`, `super`, computed
+grammar is complete, destructuring patterns included (binding and assignment forms parse and
+validate; lowering refuses them by name): `this`, `new`, `new.target`, `super`, computed
 members, general callees, spread, optional chains, array literals, `import()`, templates, regex
 literals, function expressions, arrows, methods and accessors, generators, async functions and
 classes parse, and the forms without runtime support refuse by name at lowering.

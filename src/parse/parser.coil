@@ -124,6 +124,22 @@
 
 (defstruct PrivateDecl [(name (slice u8)) (static bool) (getter bool) (setter bool)])
 
+;; Destructuring patterns. A binding pattern's leaves are names; an assignment pattern's leaves
+;; may also be Reference expressions. Every element may carry a default initializer.
+(defsum PatElem
+  (PatHole)
+  (PatItem [(pattern i64)]))
+
+(defstruct PatProp [(key PropKey) (pattern i64)])
+
+(defsum PatternNode
+  (PatName [(name (slice u8))])
+  (PatTarget [(expr i64)])  ; assignment pattern leaf: member, index or private member
+  (PatObject [(props (ArrayList PatProp)) (rest (Option i64))])
+  (PatArray [(elements (ArrayList PatElem)) (rest (Option i64))]))
+
+(defstruct SyntaxPattern [(node PatternNode) (default (Option i64)) (lo i64) (hi i64)])
+
 ;; What a SyntaxFun is syntactically. Declarations hoist and name a Fun; the others are values.
 (defsum FunKind
   (FunDeclaration)
@@ -162,6 +178,7 @@
   (SxAwait [(operand i64)])
   (SxSuper)  ; only as the owner of a member/index or the callee of a call
   (SxClass [(cls i64)])  ; class expression: index into the SyntaxClass table
+  (SxDestructuringAssign [(pattern i64) (value i64)])
   (SxPrivateMember [(owner i64) (name (slice u8)) (optional bool)])
   (SxPrivateName [(name (slice u8))])  ; only as the left operand of `in`
   (SxUnary [(op (slice u8)) (operand i64)])
@@ -187,11 +204,14 @@
 (defsum ForInit
   (ForNoInit)
   (ForInitDecl [(stmt i64)])
-  (ForInitExpr [(expr i64)]))
+  (ForInitExpr [(expr i64)])
+  (ForInitPattern [(pattern i64)]))  ; an assignment pattern as a for-in/of head
 
 (defsum SyntaxStmtNode
   (SsLet [(name (slice u8)) (init (Option i64)) (final bool) (annotation i64)])
   (SsVar [(name (slice u8)) (init (Option i64)) (annotation i64)])
+  (SsLetPattern [(pattern i64) (init (Option i64)) (final bool)])
+  (SsVarPattern [(pattern i64) (init (Option i64))])
   (SsDeclList [(decls (ArrayList i64))])
   (SsReturn [(value (Option i64))])
   (SsExpr [(expr i64)])
@@ -209,9 +229,9 @@
   (SsLabeled [(label (slice u8)) (body i64)])
   (SsThrow [(value i64)])
   (SsTry [(body i64)
-          (catch-param (Option (slice u8)))
+          (catch-param (Option i64))
           (catch-body (Option i64))
-          (finally-body (Option i64))])
+          (finally-body (Option i64))])  ; catch-param: a pattern
   (SsWith [(object i64) (body i64)])
   (SsDebugger)
   (SsFunctionDecl [(fun i64)])
@@ -246,7 +266,9 @@
    (params (ArrayList (slice u8)))
    (param-annotations (ArrayList i64))
    (param-defaults (ArrayList (Option i64)))
+   (param-patterns (ArrayList (Option i64)))  ; a destructured parameter; its `params` name is ""
    (rest-param (Option (slice u8)))
+   (rest-pattern (Option i64))
    (simple-params bool)
    (return-annotation i64)
    (body (ArrayList i64))
@@ -296,6 +318,8 @@
    (script-index i64)
    (fun-contexts (ArrayList FunContext))
    (classes (ArrayList SyntaxClass))
+   (patterns (ArrayList SyntaxPattern))
+   (cover-consumed (ArrayList i64))  ; literals reinterpreted as patterns
    (class-depth i64)  ; open class bodies: private-name scope
    (class-strict i64)  ; open class definitions, including name and heritage: strict code
    (private-refs (ArrayList PrivateRef))
@@ -325,6 +349,8 @@
           (set! (.entry-fun-nid p) 0)
           (set! (.fun-contexts p) (al-new [FunContext] (alloc/malloc-allocator)))
           (set! (.classes p) (al-new [SyntaxClass] (alloc/malloc-allocator)))
+          (set! (.patterns p) (al-new [SyntaxPattern] (alloc/malloc-allocator)))
+          (set! (.cover-consumed p) (al-new [i64] (alloc/malloc-allocator)))
           (set! (.class-depth p) 0)
           (set! (.class-strict p) 0)
           (set! (.private-refs p) (al-new [PrivateRef] (alloc/malloc-allocator)))
@@ -353,6 +379,8 @@
           (set! (.entry-fun-nid p) 0)
           (al-clear! [FunContext] (mut (.fun-contexts p)))
           (al-clear! [SyntaxClass] (mut (.classes p)))
+          (al-clear! [SyntaxPattern] (mut (.patterns p)))
+          (al-clear! [i64] (mut (.cover-consumed p)))
           (set! (.class-depth p) 0)
           (set! (.class-strict p) 0)
           (al-clear! [PrivateRef] (mut (.private-refs p)))
@@ -540,14 +568,12 @@
                 (do
                   (syntax-error! "parser: reserved word cannot be a binding identifier")
                   t)
-                (if (or (token-is t "[") (token-is t "{"))
-                    (do
-                      (parse-fail "parser: destructuring binding patterns are outside the admitted subset at byte"
-                                  t)
-                      t)
-                    (do
-                      (syntax-error! "parser: expected a binding identifier")
-                      t)))))))
+                ;; Every position that admits a BindingPattern parses it before asking for an
+                ;; identifier, so a pattern here (an object rest element, a function name) is a
+                ;; proven error.
+                (do
+                  (syntax-error! "parser: expected a binding identifier")
+                  t))))))
 
 ;; Tokens this lexer cannot classify: identifier escapes, non-ASCII identifiers, decorators. A
 ;; grammar failure on one of these is not evidence about the program.
@@ -643,6 +669,104 @@
     (SxTaggedTemplate [tag template] (syntax-optional-chain? tag))
     (_ false)))
 
+;; ---------------------------------------------------------------------------
+;; Destructuring patterns
+(defn syntax-pattern-add! [(node PatternNode) (default (Option i64)) (lo i64) (hi i64)] (-> i64)
+  (let [(mut x) (primitive/zeroed SyntaxPattern)]
+    (set! (.node (mut x)) node)
+    (set! (.default (mut x)) default)
+    (set! (.lo (mut x)) lo)
+    (set! (.hi (mut x)) hi)
+    (push! [SyntaxPattern] (mut (.patterns (parser-state))) (load x))
+    (len (.patterns (parser-state)))))
+
+(defn syntax-pattern-at [(id i64)] (-> SyntaxPattern)
+  (get (.patterns (parser-state)) (- id 1)))
+
+(defn syntax-pattern-node [(id i64)] (-> PatternNode)
+  (let [x (syntax-pattern-at id)] (.node x)))
+
+(defn syntax-pattern-default [(id i64)] (-> (Option i64))
+  (let [x (syntax-pattern-at id)] (.default x)))
+
+;; The names a pattern binds, in source order.
+(defn syntax-pattern-names! [(id i64) (out (mut (ArrayList (slice u8))))] (-> i64)
+  (do
+    (match (syntax-pattern-node id)
+      (PatName [name] (push! [(slice u8)] (mut out) name))
+      (PatTarget [expr] 0)
+      (PatObject [props rest]
+                 (do
+                   (al-for [prop props] (let [pp prop] (syntax-pattern-names! (.pattern pp) (mut out))))
+                   (match rest (Some [r] (syntax-pattern-names! r (mut out))) (None [] 0))))
+      (PatArray [elements rest]
+                (do
+                  (al-for [element elements]
+                          (match element (PatItem [pat] (syntax-pattern-names! pat (mut out))) (PatHole [] 0)))
+                  (match rest (Some [r] (syntax-pattern-names! r (mut out))) (None [] 0)))))
+    0))
+
+;; The expressions a pattern owns: defaults, computed keys and Reference leaves.
+(defn syntax-pattern-exprs! [(id i64) (out (mut (ArrayList i64)))] (-> i64)
+  (do
+    (match (syntax-pattern-default id) (Some [d] (push! [i64] (mut out) d)) (None [] 0))
+    (match (syntax-pattern-node id)
+      (PatName [name] 0)
+      (PatTarget [expr] (push! [i64] (mut out) expr))
+      (PatObject [props rest]
+                 (do
+                   (al-for [prop props]
+                           (let [pp prop]
+                             (match (.key pp) (KeyComputed [e] (push! [i64] (mut out) e)) (_ 0))
+                             (syntax-pattern-exprs! (.pattern pp) (mut out))))
+                   (match rest (Some [r] (syntax-pattern-exprs! r (mut out))) (None [] 0))))
+      (PatArray [elements rest]
+                (do
+                  (al-for [element elements]
+                          (match element (PatItem [pat] (syntax-pattern-exprs! pat (mut out))) (PatHole [] 0)))
+                  (match rest (Some [r] (syntax-pattern-exprs! r (mut out))) (None [] 0)))))
+    0))
+
+;; Every name a function binds through its parameters: plain names, destructured names and the
+;; rest element.
+(defn syntax-fun-bound-names [(f SyntaxFun)] (-> (ArrayList (slice u8)))
+  (let [(mut names) (al-new [(slice u8)] (alloc/malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) (len (.params f)))
+              (break 0)
+              (do
+                (match (get (.param-patterns f) (load i))
+                  (Some [pat] (syntax-pattern-names! pat (mut names)))
+                  (None [] (push! [(slice u8)] (mut names) (get (.params f) (load i)))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (match (.rest-param f) (Some [r] (push! [(slice u8)] (mut names) r)) (None [] 0))
+    (match (.rest-pattern f) (Some [r] (syntax-pattern-names! r (mut names))) (None [] 0))
+    (load names)))
+
+;; An assignment pattern reused as a binding pattern: every leaf must be a binding name.
+(defn syntax-pattern-require-binding! [(id i64)] (-> i64)
+  (do
+    (match (syntax-pattern-node id)
+      (PatName [name] (syntax-check-binding-name! name))
+      (PatTarget [expr] (syntax-error! "parser: invalid binding pattern"))
+      (PatObject [props rest]
+                 (do
+                   (al-for [prop props] (let [pp prop] (syntax-pattern-require-binding! (.pattern pp))))
+                   (match rest (Some [r] (syntax-pattern-require-binding! r)) (None [] 0))))
+      (PatArray [elements rest]
+                (do
+                  (al-for [element elements]
+                          (match element (PatItem [pat] (syntax-pattern-require-binding! pat)) (PatHole [] 0)))
+                  (match rest (Some [r] (syntax-pattern-require-binding! r)) (None [] 0)))))
+    0))
+
+;; Whether any parameter of `f` is a destructuring pattern.
+(defn syntax-fun-has-patterns? [(f SyntaxFun)] (-> bool)
+  (let [(mut found) (match (.rest-pattern f) (Some [r] true) (None [] false))]
+    (al-for [p (.param-patterns f)] (match p (Some [pat] (set! (mut found) true)) (None [] 0)))
+    (load found)))
+
 ;; The one place that knows every variant's children. Generic walks (strict checks, and later any
 ;; syntax query that does not care about shape) iterate this list instead of repeating the match.
 (defn syntax-expr-children! [(id i64) (out (mut (ArrayList i64)))] (-> i64)
@@ -721,6 +845,8 @@
       (SxAwait [operand] (push! [i64] (mut out) operand))
       (SxSuper [] 0)
       (SxClass [cls] (syntax-class-exprs! cls (mut out)))
+      (SxDestructuringAssign [pattern value]
+                             (do (syntax-pattern-exprs! pattern (mut out)) (push! [i64] (mut out) value)))
       (SxPrivateMember [owner name optional] (push! [i64] (mut out) owner))
       (SxPrivateName [name] 0)
       (SxUnary [op operand] (push! [i64] (mut out) operand))
@@ -1060,6 +1186,8 @@
     (match (syntax-stmt-node id)
       (SsLet [name init final annotation] 0)
       (SsVar [name init annotation] 0)
+      (SsLetPattern [pattern init final] 0)
+      (SsVarPattern [pattern init] 0)
       (SsDeclList [decls] (do (al-for [d decls] (push! [i64] (mut out) d)) 0))
       (SsReturn [value] 0)
       (SsExpr [expr] 0)
@@ -1128,6 +1256,14 @@
              (match init (Some [e] (push! [i64] (mut out) e)) (None [] 0)))
       (SsVar [name init annotation]
              (match init (Some [e] (push! [i64] (mut out) e)) (None [] 0)))
+      (SsLetPattern [pattern init final]
+                    (do
+                      (syntax-pattern-exprs! pattern (mut out))
+                      (match init (Some [e] (push! [i64] (mut out) e)) (None [] 0))))
+      (SsVarPattern [pattern init]
+                    (do
+                      (syntax-pattern-exprs! pattern (mut out))
+                      (match init (Some [e] (push! [i64] (mut out) e)) (None [] 0))))
       (SsDeclList [decls] 0)
       (SsReturn [value]
                 (match value (Some [e] (push! [i64] (mut out) e)) (None [] 0)))
@@ -1144,16 +1280,23 @@
       (SsDoWhile [body condition] (push! [i64] (mut out) condition))
       (SsFor [init test update body]
              (do
-               (match init (ForInitExpr [e] (push! [i64] (mut out) e)) (_ 0))
+               (match init
+                 (ForInitExpr [e] (push! [i64] (mut out) e))
+                 (ForInitPattern [pat] (syntax-pattern-exprs! pat (mut out)))
+                 (_ 0))
                (match test (Some [e] (push! [i64] (mut out) e)) (None [] 0))
                (match update (Some [e] (push! [i64] (mut out) e)) (None [] 0))))
       (SsForIn [head of right body]
                (do
-                 (match head (ForInitExpr [e] (push! [i64] (mut out) e)) (_ 0))
+                 (match head
+                   (ForInitExpr [e] (push! [i64] (mut out) e))
+                   (ForInitPattern [pat] (syntax-pattern-exprs! pat (mut out)))
+                   (_ 0))
                  (push! [i64] (mut out) right)))
       (SsLabeled [label body] 0)
       (SsThrow [value] (push! [i64] (mut out) value))
-      (SsTry [body catch-param catch-body finally-body] 0)
+      (SsTry [body catch-param catch-body finally-body]
+             (match catch-param (Some [pat] (syntax-pattern-exprs! pat (mut out))) (None [] 0)))
       (SsWith [object body] (push! [i64] (mut out) object))
       (SsDebugger [] 0)
       (SsFunctionDecl [fun] 0)
@@ -1556,8 +1699,9 @@
                 (let [comma (token-is (peek-token) ",")]
                   (if (parse-list-separator! ")"
                                              "parser: expected `,` or `)` in argument list")
-                      (do (if (and spread comma) (set! (.spread-trailing-comma (parser-state)) true) 0)
-                          (break 0))
+                      (do
+                        (if (and spread comma) (set! (.spread-trailing-comma (parser-state)) true) 0)
+                        (break 0))
                       (continue)))))
         0)
     (load args)))
@@ -1684,14 +1828,18 @@
                     (parse-syntax-async-head t)
                     (if (and same-line (token-is next "=>"))
                         (let [(mut params) (al-new [(slice u8)] (alloc/malloc-allocator))
-                              (mut defaults) (al-new [(Option i64)] (alloc/malloc-allocator))]
+                              (mut defaults) (al-new [(Option i64)] (alloc/malloc-allocator))
+                              (mut patterns) (al-new [(Option i64)] (alloc/malloc-allocator))]
                           (syntax-check-binding-name! (token-text t))
                           (push! [(slice u8)] (mut params) (token-text t))
                           (push! [(Option i64)] (mut defaults) (None [i64]))
+                          (push! [(Option i64)] (mut patterns) (None [i64]))
                           (parse-syntax-arrow-body! (.start t)
                                                     (load params)
                                                     (load defaults)
+                                                    (load patterns)
                                                     (None [(slice u8)])
+                                                    (None [i64])
                                                     true
                                                     false))
                         (syntax-add-node! (SxName (token-text t)) (.start t) (.end t)))))))))
@@ -1705,25 +1853,29 @@
         (if (= (.kind next) TOK-IDENT)
             (let [param (take-token)
                   (mut params) (al-new [(slice u8)] (alloc/malloc-allocator))
-                  (mut defaults) (al-new [(Option i64)] (alloc/malloc-allocator))]
+                  (mut defaults) (al-new [(Option i64)] (alloc/malloc-allocator))
+                  (mut patterns) (al-new [(Option i64)] (alloc/malloc-allocator))]
               (if (= (token-text param) "await")
                   (syntax-error! "parser: await is not a valid async arrow parameter")
                   0)
               (syntax-check-binding-name! (token-text param))
               (push! [(slice u8)] (mut params) (token-text param))
               (push! [(Option i64)] (mut defaults) (None [i64]))
+              (push! [(Option i64)] (mut patterns) (None [i64]))
               (if (not (token-is (peek-token) "=>"))
                   (syntax-error! "parser: expected => after async arrow parameter")
                   0)
               (parse-syntax-arrow-body! (.start t)
                                         (load params)
                                         (load defaults)
+                                        (load patterns)
                                         (None [(slice u8)])
+                                        (None [i64])
                                         true
                                         true))
             (do
               (take-token)
-                            (let [args (parse-syntax-arguments)
+              (let [args (parse-syntax-arguments)
                     trailing (.spread-trailing-comma (parser-state))
                     after (peek-token)]
                 (if (and (token-is after "=>") (not (.nl-before after)))
@@ -1768,18 +1920,18 @@
         (set! (mut arrow-only) true)
         (loop (if (token-is (peek-token) "...")
                   (let [dots (take-token)
-                        name (require-binding-identifier)]
+                        target
+                          (if (or (token-is (peek-token) "[") (token-is (peek-token) "{"))
+                              (parse-syntax-primary)
+                              (let [name (require-binding-identifier)]
+                                (syntax-add-node! (SxName (token-text name)) (.start name) (.end name))))]
                     (set! (mut arrow-only) true)
                     (if (token-is (peek-token) "=")
                         (syntax-error! "parser: rest parameter may not have a default")
                         0)
                     (push! [i64]
                            (mut items)
-                           (syntax-add-node! (SxSpread (syntax-add-node! (SxName (token-text name))
-                                                                         (.start name)
-                                                                         (.end name)))
-                                             (.start dots)
-                                             (.end name)))
+                           (syntax-add-node! (SxSpread target) (.start dots) (syntax-hi target)))
                     (if (take-is ")")
                         0
                         (syntax-error! "parser: rest parameter must be last"))
@@ -1820,7 +1972,8 @@
 ;; default, is a proven error. An async head reserves `await` as well.
 ;; A nested arrow's parameter names, defaults and concise body are part of the enclosing head.
 (defn syntax-fun-params-mention? [(fun i64) (yield? bool) (await? bool)] (-> bool)
-  (let [f (syntax-fun-at fun) (mut found) false]
+  (let [f (syntax-fun-at fun)
+        (mut found) false]
     (al-for [name (.params f)]
             (if (or (and yield? (= name "yield")) (and await? (= name "await"))) (set! (mut found) true) 0))
     (match (.rest-param f)
@@ -1828,6 +1981,22 @@
       (None [] 0))
     (al-for [d (.param-defaults f)]
             (match d (Some [e] (if (syntax-expr-contains? e yield? await?) (set! (mut found) true) 0)) (None [] 0)))
+    ;; Destructured parameters: their bound names and the expressions they own.
+    (let [(mut names) (al-new [(slice u8)] (alloc/malloc-allocator))
+          (mut exprs) (al-new [i64] (alloc/malloc-allocator))]
+      (al-for [p (.param-patterns f)]
+              (match p
+                (Some [pat] (do (syntax-pattern-names! pat (mut names)) (syntax-pattern-exprs! pat (mut exprs))))
+                (None [] 0)))
+      (match (.rest-pattern f)
+        (Some [pat] (do (syntax-pattern-names! pat (mut names)) (syntax-pattern-exprs! pat (mut exprs))))
+        (None [] 0))
+      (al-for [name (load names)]
+              (if (or (and yield? (= name "yield")) (and await? (= name "await"))) (set! (mut found) true) 0))
+      (al-for [e (load exprs)]
+              (if (syntax-expr-contains? e yield? await?) (set! (mut found) true) 0))
+      (al-free! [(slice u8)] (mut names))
+      (al-free! [i64] (mut exprs)))
     (match (.expression-body f)
       (Some [e] (if (syntax-expr-contains? e yield? await?) (set! (mut found) true) 0))
       (None [] 0))
@@ -1855,7 +2024,9 @@
                                       (async bool)] (-> i64)
   (let [(mut params) (al-new [(slice u8)] (alloc/malloc-allocator))
         (mut defaults) (al-new [(Option i64)] (alloc/malloc-allocator))
+        (mut patterns) (al-new [(Option i64)] (alloc/malloc-allocator))
         (mut rest) (None [(slice u8)])
+        (mut rest-pattern) (None [i64])
         (mut simple) true
         (mut i) 0]
     (loop (if (>= (load i) (len items))
@@ -1875,43 +2046,293 @@
                                     0)
                                 0)
                             (push! [(slice u8)] (mut params) name)
-                            (push! [(Option i64)] (mut defaults) (None [i64]))))
+                            (push! [(Option i64)] (mut defaults) (None [i64]))
+                            (push! [(Option i64)] (mut patterns) (None [i64]))))
                   (SxAssign [target value]
                             (match (syntax-node target)
                               (SxName [name]
                                       (do
                                         (set! (mut simple) false)
                                         (push! [(slice u8)] (mut params) name)
-                                        (push! [(Option i64)]
-                                               (mut defaults)
-                                               (Some value))))
+                                        (push! [(Option i64)] (mut defaults) (Some value))
+                                        (push! [(Option i64)] (mut patterns) (None [i64]))))
+                              (SxObject [entries]
+                                        (do
+                                          (set! (mut simple) false)
+                                          (push! [(slice u8)] (mut params) "")
+                                          (push! [(Option i64)] (mut defaults) (Some value))
+                                          (push! [(Option i64)]
+                                                 (mut patterns)
+                                                 (Some (syntax-cover-to-pattern! target true)))))
+                              (SxArray [elements]
+                                       (do
+                                         (set! (mut simple) false)
+                                         (push! [(slice u8)] (mut params) "")
+                                         (push! [(Option i64)] (mut defaults) (Some value))
+                                         (push! [(Option i64)]
+                                                (mut patterns)
+                                                (Some (syntax-cover-to-pattern! target true)))))
                               (_ (syntax-error! "parser: invalid arrow function parameter"))))
                   (SxSpread [expr]
-                            (match (syntax-node expr)
-                              (SxName [name]
-                                      (if (= (load i) (- (len items) 1))
-                                          (do
-                                            (set! (mut simple) false)
-                                            (set! (mut rest) (Some name))
-                                            0)
-                                          (syntax-error! "parser: rest parameter must be last")))
-                              (_ (parse-fail "parser: destructuring rest parameters are outside the admitted subset at byte"
-                                             (peek-token)))))
+                            (do
+                              (if (!= (load i) (- (len items) 1))
+                                  (syntax-error! "parser: rest parameter must be last")
+                                  0)
+                              (set! (mut simple) false)
+                              (match (syntax-node expr)
+                                (SxName [name] (do (set! (mut rest) (Some name)) 0))
+                                (SxObject [entries]
+                                          (do (set! (mut rest-pattern) (Some (syntax-cover-to-pattern! expr true))) 0))
+                                (SxArray [elements]
+                                         (do (set! (mut rest-pattern) (Some (syntax-cover-to-pattern! expr true))) 0))
+                                (SxAssign [target value]
+                                          (syntax-error! "parser: rest parameter may not have a default"))
+                                (_ (syntax-error! "parser: invalid arrow function parameter")))))
+                  ;; `([a] = b) => …` parsed as a destructuring assignment; its pattern must be
+                  ;; a binding pattern.
+                  (SxDestructuringAssign [pattern value]
+                                         (do
+                                           (set! (mut simple) false)
+                                           (syntax-pattern-require-binding! pattern)
+                                           (push! [(slice u8)] (mut params) "")
+                                           (push! [(Option i64)] (mut defaults) (Some value))
+                                           (push! [(Option i64)] (mut patterns) (Some pattern))))
                   (SxObject [entries]
-                            (parse-fail "parser: destructuring parameters are outside the admitted subset at byte"
-                                        (peek-token)))
+                            (do
+                              (set! (mut simple) false)
+                              (push! [(slice u8)] (mut params) "")
+                              (push! [(Option i64)] (mut defaults) (None [i64]))
+                              (push! [(Option i64)] (mut patterns) (Some (syntax-cover-to-pattern! item true)))))
                   (SxArray [elements]
-                           (parse-fail "parser: destructuring parameters are outside the admitted subset at byte"
-                                       (peek-token)))
+                           (do
+                             (set! (mut simple) false)
+                             (push! [(slice u8)] (mut params) "")
+                             (push! [(Option i64)] (mut defaults) (None [i64]))
+                             (push! [(Option i64)] (mut patterns) (Some (syntax-cover-to-pattern! item true)))))
                   (_ (syntax-error! "parser: invalid arrow function parameter")))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
     (parse-syntax-arrow-body! lo
                               (load params)
                               (load defaults)
+                              (load patterns)
                               (load rest)
+                              (load rest-pattern)
                               (load simple)
                               async)))
+
+;; BindingPattern: `[ elements ]` or `{ properties }` in a declaration, parameter or catch clause.
+;; Elements are names or nested patterns with an optional `= default`; a rest element takes no
+;; default and must be last; an object rest element is a plain name.
+(defn parse-syntax-binding-element! [] (-> i64)
+  (let [t (peek-token)
+        target
+          (if (or (token-is t "[") (token-is t "{"))
+              (parse-syntax-binding-pattern!)
+              (let [name (require-binding-identifier)]
+                (syntax-pattern-add! (PatName (token-text name)) (None [i64]) (.start name) (.end name))))]
+    (if (take-is "=")
+        (let [value (parse-syntax-assignment)
+              x (syntax-pattern-at target)]
+          (syntax-pattern-add! (.node x) (Some value) (.lo x) (syntax-hi value)))
+        target)))
+
+(defn parse-syntax-binding-pattern! [] (-> i64)
+  (let [open (take-token)]
+    (if (token-is open "[")
+        (let [(mut elements) (al-new [PatElem] (alloc/malloc-allocator))
+              (mut rest) (None [i64])]
+          (loop (let [t (peek-token)]
+                  (if (token-is t "]")
+                      (break (do (take-token) 0))
+                      (if (token-is t ",")
+                          (do (take-token) (push! [PatElem] (mut elements) (PatHole)) (continue))
+                          (if (token-is t "...")
+                              (do
+                                (take-token)
+                                (let [target
+                                        (if (or (token-is (peek-token) "[") (token-is (peek-token) "{"))
+                                            (parse-syntax-binding-pattern!)
+                                            (let [name (require-binding-identifier)]
+                                              (syntax-pattern-add! (PatName (token-text name))
+                                                                   (None [i64])
+                                                                   (.start name)
+                                                                   (.end name))))]
+                                  (if (token-is (peek-token) "=")
+                                      (syntax-error! "parser: rest element may not have a default")
+                                      0)
+                                  (set! (mut rest) (Some target))
+                                  (if (take-is "]") 0 (syntax-error! "parser: rest element must be last"))
+                                  (break 0)))
+                              (do
+                                (push! [PatElem] (mut elements) (PatItem (parse-syntax-binding-element!)))
+                                (if (parse-list-separator! "]" "parser: expected `,` or `]` in array pattern")
+                                    (break 0)
+                                    (continue))))))))
+          (syntax-pattern-add! (PatArray (load elements) (load rest)) (None [i64]) (.start open) (lex-consumed-end)))
+        (let [(mut props) (al-new [PatProp] (alloc/malloc-allocator))
+              (mut rest) (None [i64])]
+          (loop (let [t (peek-token)]
+                  (if (token-is t "}")
+                      (break (do (take-token) 0))
+                      (if (token-is t "...")
+                          (do
+                            (take-token)
+                            (let [name (require-binding-identifier)]
+                              (set! (mut rest)
+                                    (Some (syntax-pattern-add! (PatName (token-text name))
+                                                               (None [i64])
+                                                               (.start name)
+                                                               (.end name)))))
+                            (if (take-is "}") 0 (syntax-error! "parser: rest element must be last"))
+                            (break 0))
+                          (let [k (parse-syntax-property-key!)
+                                (mut prop) (primitive/zeroed PatProp)]
+                            (set! (.key (mut prop)) (.key k))
+                            (if (take-is ":")
+                                (set! (.pattern (mut prop)) (parse-syntax-binding-element!))
+                                (do
+                                  (if (not (.ident k))
+                                      (syntax-error! "parser: shorthand binding property requires an identifier")
+                                      0)
+                                  (syntax-check-binding-name! (.name k))
+                                  (set! (.pattern (mut prop))
+                                        (let [target
+                                                (syntax-pattern-add! (PatName (.name k)) (None [i64]) (.lo k) (.hi k))]
+                                          (if (take-is "=")
+                                              (let [value (parse-syntax-assignment)]
+                                                (syntax-pattern-add! (PatName (.name k))
+                                                                     (Some value)
+                                                                     (.lo k)
+                                                                     (syntax-hi value)))
+                                              target)))))
+                            (push! [PatProp] (mut props) (load prop))
+                            (if (parse-list-separator! "}" "parser: expected `,` or `}` in object pattern")
+                                (break 0)
+                                (continue)))))))
+          (syntax-pattern-add! (PatObject (load props) (load rest)) (None [i64]) (.start open) (lex-consumed-end))))))
+
+;; Reinterpret an object or array literal parsed by the cover grammar as a pattern. `binding`
+;; patterns accept only names at the leaves; assignment patterns also accept Reference
+;; expressions. Parentheses around a pattern, methods, call expressions, defaults on rest elements
+;; and non-final rest elements are proven errors.
+(defn syntax-mark-cover-consumed! [(expr i64)] (-> i64)
+  (push! [i64] (mut (.cover-consumed (parser-state))) expr))
+
+(defn syntax-cover-consumed? [(expr i64)] (-> bool)
+  (let [(mut found) false]
+    (al-for [id (.cover-consumed (parser-state))] (if (= id expr) (set! (mut found) true) 0))
+    (load found)))
+
+(defn syntax-cover-leaf! [(expr i64) (binding bool)] (-> i64)
+  (let [x (syntax-at expr)]
+    (match (.node x)
+      (SxName [name]
+              (do
+                (if binding (syntax-check-binding-name! name) 0)
+                (syntax-pattern-add! (PatName name) (None [i64]) (.lo x) (.hi x))))
+      (SxMember [owner name optional]
+                (if (or binding (syntax-optional-chain? expr))
+                    (syntax-error! "parser: invalid destructuring target")
+                    (syntax-pattern-add! (PatTarget expr) (None [i64]) (.lo x) (.hi x))))
+      (SxPrivateMember [owner name optional]
+                       (if (or binding (syntax-optional-chain? expr))
+                           (syntax-error! "parser: invalid destructuring target")
+                           (syntax-pattern-add! (PatTarget expr) (None [i64]) (.lo x) (.hi x))))
+      (SxIndex [owner key optional]
+               (if (or binding (syntax-optional-chain? expr))
+                   (syntax-error! "parser: invalid destructuring target")
+                   (syntax-pattern-add! (PatTarget expr) (None [i64]) (.lo x) (.hi x))))
+      (_ (syntax-error! "parser: invalid destructuring target")))))
+
+(defn syntax-cover-to-element! [(expr i64) (binding bool)] (-> i64)
+  (let [x (syntax-at expr)]
+    (match (.node x)
+      (SxAssign [target value]
+                (let [element (syntax-cover-to-element! target binding)
+                      e (syntax-pattern-at element)]
+                  (match (.default e)
+                    (Some [d] (syntax-error! "parser: invalid destructuring target"))
+                    (None [] 0))
+                  (syntax-pattern-add! (.node e) (Some value) (.lo e) (.hi x))))
+      (SxObject [entries] (syntax-cover-to-pattern! expr binding))
+      (SxArray [elements] (syntax-cover-to-pattern! expr binding))
+      (SxGroup [inner]
+               (if binding
+                   (syntax-error! "parser: invalid binding pattern")
+                   (let [target (syntax-ungroup-id expr)]
+                     (match (syntax-node target)
+                       (SxObject [entries] (syntax-error! "parser: a parenthesized pattern is not a valid target"))
+                       (SxArray [elements] (syntax-error! "parser: a parenthesized pattern is not a valid target"))
+                       ;; `(a)` is a Reference, not a binding: keep the parentheses so a later
+                       ;; reinterpretation as a binding pattern rejects it.
+                       (SxName [name] (syntax-pattern-add! (PatTarget expr) (None [i64]) (.lo x) (.hi x)))
+                       (_ (syntax-cover-leaf! target binding))))))
+      (_ (syntax-cover-leaf! expr binding)))))
+
+(defn syntax-cover-to-pattern! [(expr i64) (binding bool)] (-> i64)
+  (let [x (syntax-at expr)]
+    (syntax-mark-cover-consumed! expr)
+    (match (.node x)
+      (SxObject [entries]
+                (let [(mut props) (al-new [PatProp] (alloc/malloc-allocator))
+                      (mut rest) (None [i64])
+                      (mut i) 0]
+                  (al-for [entry entries]
+                          (do
+                            (match (load rest)
+                              (Some [r] (syntax-error! "parser: rest element must be last"))
+                              (None [] 0))
+                            (match entry
+                              (PropValue [key value]
+                                         (let [(mut prop) (primitive/zeroed PatProp)]
+                                           (set! (.key (mut prop)) key)
+                                           (set! (.pattern (mut prop)) (syntax-cover-to-element! value binding))
+                                           (push! [PatProp] (mut props) (load prop))))
+                              (PropCoverInit [name init]
+                                             (let [(mut prop) (primitive/zeroed PatProp)]
+                                               (if binding (syntax-check-binding-name! name) 0)
+                                               (set! (.key (mut prop)) (KeyNamed (shape-key-intern name)))
+                                               (set! (.pattern (mut prop))
+                                                     (syntax-pattern-add! (PatName name)
+                                                                          (Some init)
+                                                                          (.lo x)
+                                                                          (syntax-hi init)))
+                                               (push! [PatProp] (mut props) (load prop))))
+                              (PropSpread [e]
+                                          (do
+                                            (match (syntax-node e)
+                                              (SxObject [inner]
+                                                        (syntax-error! "parser: object rest element must be a simple target"))
+                                              (SxArray [inner]
+                                                       (syntax-error! "parser: object rest element must be a simple target"))
+                                              (SxAssign [target value]
+                                                        (syntax-error! "parser: rest element may not have a default"))
+                                              (_ 0))
+                                            (set! (mut rest) (Some (syntax-cover-to-element! e binding)))))
+                              (PropMethod [key fun] (syntax-error! "parser: invalid destructuring target")))
+                            (set! (mut i) (+ (load i) 1))))
+                  (syntax-pattern-add! (PatObject (load props) (load rest)) (None [i64]) (.lo x) (.hi x))))
+      (SxArray [elements]
+               (let [(mut items) (al-new [PatElem] (alloc/malloc-allocator))
+                     (mut rest) (None [i64])]
+                 (al-for [element elements]
+                         (do
+                           (match (load rest)
+                             (Some [r] (syntax-error! "parser: rest element must be last"))
+                             (None [] 0))
+                           (match element
+                             (ElemHole [] (push! [PatElem] (mut items) (PatHole)))
+                             (ElemExpr [e] (push! [PatElem] (mut items) (PatItem (syntax-cover-to-element! e binding))))
+                             (ElemSpread [e]
+                                         (do
+                                           (match (syntax-node e)
+                                             (SxAssign [target value]
+                                                       (syntax-error! "parser: rest element may not have a default"))
+                                             (_ 0))
+                                           (set! (mut rest) (Some (syntax-cover-to-element! e binding))))))))
+                 (syntax-pattern-add! (PatArray (load items) (load rest)) (None [i64]) (.lo x) (.hi x))))
+      (_ (do (broken "syntax-cover-to-pattern!: not an object or array literal") 0)))))
 
 (defn parse-syntax-primary [] (-> i64)
   (let [t (take-token)]
@@ -1972,7 +2393,10 @@
   (let [(mut base) start]
     (loop (let [t (peek-token)]
             (if (and (syntax-arrow? (load base))
-                     (or (token-is t ".") (token-is t "?.") (token-is t "[") (token-is t "`")
+                     (or (token-is t ".")
+                         (token-is t "?.")
+                         (token-is t "[")
+                         (token-is t "`")
                          (and allow-call (token-is t "("))))
                 (syntax-error! "parser: an arrow function cannot be accessed or called without parentheses")
                 0)
@@ -2115,8 +2539,9 @@
           (SxImportCall [specifier options]
                         (syntax-error! "parser: import() cannot be used with new"))
           (_ 0))
-                (if (syntax-optional-chain? callee)
-            (syntax-error! "parser: optional chain cannot be used with new") 0)
+        (if (syntax-optional-chain? callee)
+            (syntax-error! "parser: optional chain cannot be used with new")
+            0)
         (syntax-reject-arrow-operand! callee)
         (let [args
                 (if (take-is "(")
@@ -2154,16 +2579,8 @@
           ;; assignment and for-in/of heads never do.
           (SxCall [callee args optional]
                   (if web-compat 0 (syntax-error! "parser: call expression is not a valid assignment target")))
-          (SxObject [entries]
-                    (if pattern
-                        (unimplemented "destructuring assignment pattern"
-                                       "docs/GAPS.md — destructuring")
-                        (syntax-error! "parser: invalid assignment target")))
-          (SxArray [elements]
-                   (if pattern
-                       (unimplemented "destructuring assignment pattern"
-                                      "docs/GAPS.md — destructuring")
-                       (syntax-error! "parser: invalid assignment target")))
+          (SxObject [entries] (syntax-error! "parser: invalid assignment target"))
+          (SxArray [elements] (syntax-error! "parser: invalid assignment target"))
           (_ (syntax-error! "parser: invalid assignment target"))))))
 
 (defn token-update-op-name [(t Token)] (-> (slice u8))
@@ -2222,10 +2639,10 @@
         (if (token-unary-operator? t)
             (do
               (take-token)
-                        (let [operand (parse-syntax-unary)
-                hi (syntax-hi operand)]
-            (syntax-reject-arrow-operand! operand)
-            (if (token-is t "delete")
+              (let [operand (parse-syntax-unary)
+                    hi (syntax-hi operand)]
+                (syntax-reject-arrow-operand! operand)
+                (if (token-is t "delete")
                     (do
                       ;; Private names cannot be deleted, parenthesized or not.
                       (match (syntax-node (syntax-ungroup-id operand))
@@ -2239,9 +2656,9 @@
             (if (or (token-is t "++") (token-is t "--"))
                 (do
                   (take-token)
-                                (let [operand (parse-syntax-unary)]
-                (syntax-reject-arrow-operand! operand)
-                (syntax-check-simple-target! operand false true)
+                  (let [operand (parse-syntax-unary)]
+                    (syntax-reject-arrow-operand! operand)
+                    (syntax-check-simple-target! operand false true)
                     (syntax-add-node! (SxUpdate
                                         :op (token-update-op-name t)
                                         :prefix true
@@ -2600,6 +3017,13 @@
       (parse-syntax-yield)
       (parse-syntax-assignment-proper)))
 
+;; An unparenthesized object or array literal on the left of `=` is a destructuring pattern.
+(defn syntax-pattern-literal? [(id i64)] (-> bool)
+  (match (syntax-node id)
+    (SxObject [entries] true)
+    (SxArray [elements] true)
+    (_ false)))
+
 (defn parse-syntax-assignment-proper [] (-> i64)
   (let [lhs (parse-syntax-conditional)
         op (peek-token)
@@ -2609,26 +3033,32 @@
         lhs
         (do
           (take-token)
-          (syntax-check-simple-target! lhs (token-is op "=") (not logical))
-          (let [target (syntax-ungroup-id lhs)
-                rhs (parse-syntax-assignment)]
-            (syntax-binary! (if logical
-                                (SxLogicalAssign
-                                  :predicate
-                                    (if (token-is op "??=")
-                                        "JsNullish"
-                                        "JsTruthy")
-                                  :rhs-on-true (not (token-is op "||="))
-                                  :target target
-                                  :value rhs)
-                                (if (token-is op "=")
-                                    (SxAssign target rhs)
-                                    (SxCompoundAssign
-                                      :op compound
-                                      :target target
-                                      :value rhs)))
-                            lhs
-                            rhs))))))
+          (if (and (token-is op "=") (syntax-pattern-literal? lhs))
+              ;; Destructuring assignment: the literal becomes an assignment pattern.
+              (let [pattern (syntax-cover-to-pattern! lhs false)
+                    rhs (parse-syntax-assignment)]
+                (syntax-add-node! (SxDestructuringAssign pattern rhs) (syntax-lo lhs) (syntax-hi rhs)))
+              (do
+                (syntax-check-simple-target! lhs (token-is op "=") (not logical))
+                (let [target (syntax-ungroup-id lhs)
+                      rhs (parse-syntax-assignment)]
+                  (syntax-binary! (if logical
+                                      (SxLogicalAssign
+                                        :predicate
+                                          (if (token-is op "??=")
+                                              "JsNullish"
+                                              "JsTruthy")
+                                        :rhs-on-true (not (token-is op "||="))
+                                        :target target
+                                        :value rhs)
+                                      (if (token-is op "=")
+                                          (SxAssign target rhs)
+                                          (SxCompoundAssign
+                                            :op compound
+                                            :target target
+                                            :value rhs)))
+                                  lhs
+                                  rhs))))))))
 
 ;; Expression: comma-separated AssignmentExpressions, left to right, valued by the last.
 (defn parse-syntax-expression [] (-> i64)
@@ -2788,40 +3218,58 @@
                 (syntax-error! "parser: `let` is not a valid lexically bound name")
                 0)
             (if (or (token-is name-token "[") (token-is name-token "{"))
-                (parse-fail "parser: destructuring binding patterns are outside the admitted subset at byte"
-                            name-token)
-                0)
-            (let [name (require-binding-identifier)
-                  annotation (parse-optional-annotation)
-                  init
-                    (if (take-is "=")
-                        (Some (parse-syntax-assignment))
-                        (do
-                          (if (and (token-is keyword "const") (not for-head))
-                              (syntax-error! "parser: const declaration requires an initializer")
-                              0)
-                          (None [i64])))
-                  end (lex-consumed-end)
-                  start
-                    (if (= (len (load declarations)) 0)
-                        (.start keyword)
-                        (.start name))
-                  node
-                    (if is-var
-                        (SsVar
-                          :name (token-text name)
-                          :init init
-                          :annotation annotation)
-                        (SsLet
-                          :name (token-text name)
-                          :init init
-                          :final (token-is keyword "const")
-                          :annotation annotation))]
-              (push! [i64]
-                     (mut declarations)
-                     (syntax-stmt-add-node! node start end))
-              (set! (mut hi) end)
-              (if (take-is ",") (continue) (break 0)))))
+                (let [pattern (parse-syntax-binding-pattern!)
+                      init
+                        (if (take-is "=")
+                            (Some (parse-syntax-assignment))
+                            (do
+                              (if (not for-head)
+                                  (syntax-error! "parser: a destructuring declaration requires an initializer")
+                                  0)
+                              (None [i64])))
+                      end (lex-consumed-end)
+                      start (if (= (len (load declarations)) 0) (.start keyword) (.start name-token))
+                      node
+                        (if is-var
+                            (SsVarPattern pattern init)
+                            (SsLetPattern
+                              :pattern pattern
+                              :init init
+                              :final (token-is keyword "const")))]
+                  (push! [i64] (mut declarations) (syntax-stmt-add-node! node start end))
+                  (set! (mut hi) end)
+                  (if (take-is ",") (continue) (break 0)))
+                (let [name (require-binding-identifier)
+                      annotation (parse-optional-annotation)
+                      init
+                        (if (take-is "=")
+                            (Some (parse-syntax-assignment))
+                            (do
+                              (if (and (token-is keyword "const") (not for-head))
+                                  (syntax-error! "parser: const declaration requires an initializer")
+                                  0)
+                              (None [i64])))
+                      end (lex-consumed-end)
+                      start
+                        (if (= (len (load declarations)) 0)
+                            (.start keyword)
+                            (.start name))
+                      node
+                        (if is-var
+                            (SsVar
+                              :name (token-text name)
+                              :init init
+                              :annotation annotation)
+                            (SsLet
+                              :name (token-text name)
+                              :init init
+                              :final (token-is keyword "const")
+                              :annotation annotation))]
+                  (push! [i64]
+                         (mut declarations)
+                         (syntax-stmt-add-node! node start end))
+                  (set! (mut hi) end)
+                  (if (take-is ",") (continue) (break 0))))))
     (if (= (len (load declarations)) 1)
         (get (load declarations) 0)
         (syntax-stmt-add-node! (SsDeclList (load declarations))
@@ -2844,6 +3292,7 @@
 (defn syntax-stmt-lexical? [(id i64)] (-> bool)
   (match (syntax-stmt-node id)
     (SsLet [name init final annotation] true)
+    (SsLetPattern [pattern init final] true)
     (SsDeclList [decls]
                 (if (= (len decls) 0)
                     false
@@ -2865,6 +3314,14 @@
              (Some [e]
                    (syntax-error! "parser: for-in/of lexical binding cannot have an initializer"))
              (None [] 0)))
+    (SsLetPattern [pattern init final]
+                  (match init
+                    (Some [e] (syntax-error! "parser: for-in/of binding pattern cannot have an initializer"))
+                    (None [] 0)))
+    (SsVarPattern [pattern init]
+                  (match init
+                    (Some [e] (syntax-error! "parser: for-in/of binding pattern cannot have an initializer"))
+                    (None [] 0)))
     (SsDeclList [decls]
                 (syntax-error! "parser: for-in/of head declares exactly one binding"))
     (_ (broken "syntax-check-for-in-head!: head is not a declaration"))))
@@ -2875,6 +3332,14 @@
            (if (and final (match init (Some [e] false) (None [] true)))
                (syntax-error! "parser: const declaration requires an initializer")
                0))
+    (SsLetPattern [pattern init final]
+                  (match init
+                    (Some [e] 0)
+                    (None [] (syntax-error! "parser: a destructuring declaration requires an initializer"))))
+    (SsVarPattern [pattern init]
+                  (match init
+                    (Some [e] 0)
+                    (None [] (syntax-error! "parser: a destructuring declaration requires an initializer"))))
     (SsDeclList [decls]
                 (do (al-for [d decls] (syntax-check-const-initializers! d)) 0))
     (_ 0)))
@@ -2916,16 +3381,18 @@
                  (match head (ForNoInit [] false) (_ true)))
             (do
               (take-token)
-              (match head
-                (ForInitDecl [stmt] (syntax-check-for-in-head! stmt))
-                (ForInitExpr [expr] (syntax-check-simple-target! expr true false))
-                (ForNoInit [] 0))
-              (let [right
-                      (if of
-                          (parse-syntax-assignment)
-                          (parse-syntax-expression))]
-                (require-closing! ")"
-                                  "parser: expected `)` after for-in/of head")
+              (let [head-pattern
+                      (match head
+                        (ForInitExpr [expr]
+                                     (match (syntax-node expr)
+                                       (SxObject [entries] (Some (syntax-cover-to-pattern! expr false)))
+                                       (SxArray [elements] (Some (syntax-cover-to-pattern! expr false)))
+                                       (_ (do (syntax-check-simple-target! expr true false) (None [i64])))))
+                        (ForInitDecl [stmt] (do (syntax-check-for-in-head! stmt) (None [i64])))
+                        (_ (None [i64])))
+                    head (match head-pattern (Some [pat] (ForInitPattern pat)) (None [] head))
+                    right (if of (parse-syntax-assignment) (parse-syntax-expression))]
+                (require-closing! ")" "parser: expected `)` after for-in/of head")
                 (let [body (parse-syntax-controlled-statement true)]
                   (syntax-stmt-add-node! (SsForIn
                                            :head head
@@ -2963,7 +3430,7 @@
                                            (syntax-stmt-hi body)))))))))))
 
 ;; try Block Catch? Finally?; at least one of Catch/Finally. CatchParameter is a BindingIdentifier
-;; here; destructuring catch parameters fail closed.
+;; or a BindingPattern, recorded as a pattern either way.
 (defn parse-syntax-block-required [(what (slice u8))] (-> i64)
   (if (token-is (peek-token) "{")
       (parse-syntax-statement)
@@ -2972,19 +3439,21 @@
 (defn parse-syntax-try [] (-> i64)
   (let [keyword (require-token "try")
         body (parse-syntax-block-required "parser: expected a block after try")
-        (mut catch-param) (None [(slice u8)])
+        (mut catch-param) (None [i64])
         (mut catch-body) (None [i64])
         (mut finally-body) (None [i64])]
     (if (take-is "catch")
         (do
           (if (take-is "(")
               (let [param (peek-token)]
-                (if (or (token-is param "[") (token-is param "{"))
-                    (parse-fail "parser: destructuring catch parameters are outside the admitted subset at byte"
-                                param)
-                    0)
                 (set! (mut catch-param)
-                      (Some (token-text (require-binding-identifier))))
+                      (Some (if (or (token-is param "[") (token-is param "{"))
+                                (parse-syntax-binding-pattern!)
+                                (let [name (require-binding-identifier)]
+                                  (syntax-pattern-add! (PatName (token-text name))
+                                                       (None [i64])
+                                                       (.start name)
+                                                       (.end name))))))
                 (require-token ")")
                 0)
               0)
@@ -3189,7 +3658,9 @@
     (set! (.param-annotations (mut f)) (al-new [i64] (alloc/malloc-allocator)))
     (set! (.param-defaults (mut f))
           (al-new [(Option i64)] (alloc/malloc-allocator)))
+    (set! (.param-patterns (mut f)) (al-new [(Option i64)] (alloc/malloc-allocator)))
     (set! (.rest-param (mut f)) (None [(slice u8)]))
+    (set! (.rest-pattern (mut f)) (None [i64]))
     (set! (.simple-params (mut f)) true)
     (set! (.return-annotation (mut f)) (ty-dyn TAG-ANY))
     (set! (.body (mut f)) (al-new [i64] (alloc/malloc-allocator)))
@@ -3205,17 +3676,19 @@
 (defn syntax-fun-ptr [(i i64)] (-> (ptr SyntaxFun))
   (al-elem [SyntaxFun] (mut (.funs (parser-state))) i))
 
-;; FormalParameters after `(`, consuming `)`. Defaults and a rest element make the list
-;; non-simple; destructuring elements fail closed.
+;; FormalParameters after `(`, consuming `)`. Defaults, a rest element and destructuring
+;; patterns make the list non-simple; a destructured parameter keeps "" in `params`.
 (defn parse-syntax-formal-parameters! [(fp (ptr SyntaxFun))] (-> i64)
   (do
     (if (take-is ")")
         0
         (loop (if (token-is (peek-token) "...")
-                  (let [dots (take-token)
-                        name (require-binding-identifier)]
+                  (let [dots (take-token)]
                     (set! (.simple-params fp) false)
-                    (set! (.rest-param fp) (Some (token-text name)))
+                    (if (or (token-is (peek-token) "[") (token-is (peek-token) "{"))
+                        (set! (.rest-pattern fp) (Some (parse-syntax-binding-pattern!)))
+                        (let [name (require-binding-identifier)]
+                          (set! (.rest-param fp) (Some (token-text name)))))
                     (if (token-is (peek-token) "=")
                         (syntax-error! "parser: rest parameter may not have a default")
                         0)
@@ -3223,9 +3696,13 @@
                         0
                         (syntax-error! "parser: rest parameter must be last"))
                     (break 0))
-                  (let [name (require-binding-identifier)
+                  (let [pattern-param (or (token-is (peek-token) "[") (token-is (peek-token) "{"))
+                        pattern (if pattern-param (Some (parse-syntax-binding-pattern!)) (None [i64]))
+                        name-text (if pattern-param "" (token-text (require-binding-identifier)))
                         annotation (parse-optional-annotation)]
-                    (push! [(slice u8)] (mut (.params fp)) (token-text name))
+                    (if pattern-param (set! (.simple-params fp) false) 0)
+                    (push! [(slice u8)] (mut (.params fp)) name-text)
+                    (push! [(Option i64)] (mut (.param-patterns fp)) pattern)
                     (push! [i64] (mut (.param-annotations fp)) annotation)
                     (if (take-is "=")
                         (do
@@ -3262,27 +3739,23 @@
         (syntax-error! "parser: use strict directive is not allowed with a non-simple parameter list")
         0)
     (if unique
-        (let [(mut i) 0]
-          (loop (if (>= (load i) (len (.params f)))
+        (let [(mut bound) (syntax-fun-bound-names f)
+              (mut i) 0]
+          (loop (if (>= (load i) (len (load bound)))
                     (break 0)
-                    (let [name (get (.params f) (load i))
+                    (let [name (get (load bound) (load i))
                           (mut j) (+ (load i) 1)]
-                      (match (.rest-param f)
-                        (Some [r]
-                              (if (= r name)
-                                  (syntax-error! "parser: duplicate parameter name")
-                                  0))
-                        (None [] 0))
-                      (loop (if (>= (load j) (len (.params f)))
+                      (loop (if (>= (load j) (len (load bound)))
                                 (break 0)
                                 (do
-                                  (if (= name (get (.params f) (load j)))
+                                  (if (= name (get (load bound) (load j)))
                                       (syntax-error! "parser: duplicate parameter name")
                                       0)
                                   (set! (mut j) (+ (load j) 1))
                                   (continue))))
                       (set! (mut i) (+ (load i) 1))
-                      (continue)))))
+                      (continue))))
+          (al-free! [(slice u8)] (mut bound)))
         0)
     (match (.kind f)
       (FunGetter []
@@ -3379,7 +3852,9 @@
 (defn parse-syntax-arrow-body! [(lo i64)
                                 (params (ArrayList (slice u8)))
                                 (defaults (ArrayList (Option i64)))
+                                (patterns (ArrayList (Option i64)))
                                 (rest (Option (slice u8)))
+                                (rest-pattern (Option i64))
                                 (simple bool)
                                 (async bool)] (-> i64)
   (let [arrow (take-token)]
@@ -3391,7 +3866,9 @@
           fp (syntax-fun-ptr index)]
       (set! (.params fp) params)
       (set! (.param-defaults fp) defaults)
+      (set! (.param-patterns fp) patterns)
       (set! (.rest-param fp) rest)
+      (set! (.rest-pattern fp) rest-pattern)
       (set! (.simple-params fp) simple)
       (let [(mut i) 0]
         (loop (if (>= (load i) (len params))
@@ -3770,10 +4247,11 @@
       ;; The heritage and computed keys are strict code outside any method body.
       (match heritage (Some [h] (syntax-check-strict-expr! h)) (None [] 0))
       (al-for [element (load elements)]
-              (let [key (match element
-                          (CeMethod [key is-static fun] key)
-                          (CeField [key is-static init-fun] key)
-                          (CeStaticBlock [fun] (CkNamed "")))]
+              (let [key
+                      (match element
+                        (CeMethod [key is-static fun] key)
+                        (CeField [key is-static init-fun] key)
+                        (CeStaticBlock [fun] (CkNamed "")))]
                 (match key (CkComputed [e] (syntax-check-strict-expr! e)) (_ 0))))
       (let [(mut c) (primitive/zeroed SyntaxClass)
             index (len (.classes p))]
@@ -3848,6 +4326,7 @@
         (mut children) (al-new [i64] (alloc/malloc-allocator))]
     (match (.node x)
       (SxAssign [target value] (syntax-check-strict-target! target))
+      (SxDestructuringAssign [pattern value] (syntax-strict-pattern-names! pattern))
       (SxCompoundAssign [op target value] (syntax-check-strict-target! target))
       (SxLogicalAssign [predicate rhs-on-true target value]
                        (syntax-check-strict-target! target))
@@ -3877,6 +4356,22 @@
     (al-free! [i64] (mut children))
     0))
 
+(defn syntax-strict-pattern-names! [(pattern i64)] (-> i64)
+  (do
+    (match (syntax-pattern-node pattern)
+      (PatName [name] (syntax-strict-binding! name))
+      (PatTarget [expr] (syntax-check-strict-target! (syntax-ungroup-id expr)))
+      (PatObject [props rest]
+                 (do
+                   (al-for [prop props] (let [pp prop] (syntax-strict-pattern-names! (.pattern pp))))
+                   (match rest (Some [r] (syntax-strict-pattern-names! r)) (None [] 0))))
+      (PatArray [elements rest]
+                (do
+                  (al-for [element elements]
+                          (match element (PatItem [pat] (syntax-strict-pattern-names! pat)) (PatHole [] 0)))
+                  (match rest (Some [r] (syntax-strict-pattern-names! r)) (None [] 0)))))
+    0))
+
 (defn syntax-check-strict-statements! [(stmts (ArrayList i64))] (-> i64)
   (do
     (al-for [id stmts]
@@ -3886,6 +4381,8 @@
                 (SsLet [name init final annotation]
                        (syntax-strict-binding! name))
                 (SsVar [name init annotation] (syntax-strict-binding! name))
+                (SsLetPattern [pattern init final] (syntax-strict-pattern-names! pattern))
+                (SsVarPattern [pattern init] (syntax-strict-pattern-names! pattern))
                 (SsWith [object body]
                         (syntax-error! "parser: with statement is not allowed in strict code"))
                 (SsLabeled [label body]
@@ -3893,9 +4390,7 @@
                                (syntax-error! "parser: reserved identifier in strict code")
                                0))
                 (SsTry [body catch-param catch-body finally-body]
-                       (match catch-param
-                         (Some [name] (syntax-strict-binding! name))
-                         (None [] 0)))
+                       (match catch-param (Some [pat] (syntax-strict-pattern-names! pat)) (None [] 0)))
                 (_ 0))
               (syntax-stmt-exprs! id (mut exprs))
               (al-for [e (load exprs)] (syntax-check-strict-expr! e))
@@ -3917,9 +4412,9 @@
                       (FunDeclaration [] (syntax-strict-binding! (.name fun)))
                       (FunExpression [] (syntax-strict-binding! (.name fun)))
                       (_ 0))
-                    (match (.rest-param fun)
-                      (Some [r] (syntax-strict-binding! r))
-                      (None [] 0))
+                    (let [(mut bound) (syntax-fun-bound-names fun)]
+                      (al-for [name (load bound)] (syntax-strict-binding! name))
+                      (al-free! [(slice u8)] (mut bound)))
                     (match (.expression-body fun)
                       (Some [e] (syntax-check-strict-expr! e))
                       (None [] 0))
@@ -3927,45 +4422,50 @@
                             (match d
                               (Some [e] (syntax-check-strict-expr! e))
                               (None [] 0)))
-                    (let [(mut i) 0]
-                      (loop (if (>= (load i) (len (.params fun)))
+                    (let [(mut bound) (syntax-fun-bound-names fun)
+                          (mut i) 0]
+                      (loop (if (>= (load i) (len (load bound)))
                                 (break 0)
-                                (let [name (get (.params fun) (load i))
+                                (let [name (get (load bound) (load i))
                                       (mut j) (+ (load i) 1)]
-                                  (syntax-strict-binding! name)
-                                  (loop (if (>= (load j) (len (.params fun)))
+                                  (loop (if (>= (load j) (len (load bound)))
                                             (break 0)
                                             (do
-                                              (if (= name
-                                                     (get (.params fun)
-                                                          (load j)))
+                                              (if (= name (get (load bound) (load j)))
                                                   (syntax-error! "parser: duplicate strict-mode parameter")
                                                   0)
                                               (set! (mut j) (+ (load j) 1))
                                               (continue))))
                                   (set! (mut i) (+ (load i) 1))
-                                  (continue)))))
+                                  (continue))))
+                      (al-free! [(slice u8)] (mut bound)))
                     (syntax-check-strict-statements! (.body fun)))
                   0)))
     0))
 
 ;; `{a = 1}` is only valid when the object literal is reinterpreted as an assignment pattern.
-;; Destructuring assignment refuses before this walk runs, so any surviving CoverInitializedName
-;; is a proven SyntaxError.
+;; Reinterpreted literals are marked consumed, so any surviving CoverInitializedName is a proven
+;; SyntaxError.
 (defn syntax-check-cover-initializers! [] (-> i64)
   (do
-    (al-for [x (.exprs (parser-state))]
-            (let [expr x]
-              (match (.node expr)
-                (SxObject [entries]
-                          (do
-                            (al-for [entry entries]
-                                    (match entry
-                                      (PropCoverInit [name init]
-                                                     (syntax-error! "parser: invalid shorthand property initializer"))
-                                      (_ 0)))
-                            0))
-                (_ 0))))
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (len (.exprs (parser-state))))
+                (break 0)
+                (let [expr (get (.exprs (parser-state)) (load i))]
+                  (match (.node expr)
+                    (SxObject [entries]
+                              (if (syntax-cover-consumed? (+ (load i) 1))
+                                  0
+                                  (do
+                                    (al-for [entry entries]
+                                            (match entry
+                                              (PropCoverInit [name init]
+                                                             (syntax-error! "parser: invalid shorthand property initializer"))
+                                              (_ 0)))
+                                    0)))
+                    (_ 0))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
     0))
 
 (defn parser-source-entry-index [] (-> i64)
@@ -3980,6 +4480,12 @@
               (let [found
                       (match (syntax-stmt-node (get stmts (load i)))
                         (SsLet [declared init final annotation] (= declared name))
+                        (SsLetPattern [pattern init final]
+                                      (let [(mut names) (al-new [(slice u8)] (alloc/malloc-allocator))]
+                                        (syntax-pattern-names! pattern (mut names))
+                                        (let [hit (syntax-labels-contain? (load names) name)]
+                                          (al-free! [(slice u8)] (mut names))
+                                          hit)))
                         (SsDeclList [decls] (syntax-direct-lexical? decls name))
                         (SsClassDecl [cls]
                                      (let [c (get (.classes (parser-state)) cls)] (= (.name c) name)))
@@ -4054,6 +4560,10 @@
                                    0
                                    (push! [(slice u8)] (mut names) name))
                                false))
+                      (SsLetPattern [pattern init final]
+                                    (do (if lexical (syntax-pattern-names! pattern (mut names)) 0) false))
+                      (SsVarPattern [pattern init]
+                                    (do (if lexical 0 (syntax-pattern-names! pattern (mut names))) false))
                       (SsDeclList [decls] true)
                       (SsCase [selector body] true)
                       (_ false))]
@@ -4148,18 +4658,21 @@
               (SsFunctionDecl [fun]
                               (let [f (syntax-fun-at fun)]
                                 (if (and (= (.name f) name) (or (.generator f) (.async f)))
-                                    (set! (mut ok) false) 0)))
+                                    (set! (mut ok) false)
+                                    0)))
               (SsClassDecl [cls]
                            (let [c (get (.classes (parser-state)) cls)]
                              (if (= (.name c) name) (set! (mut ok) false) 0)))
               (SsLet [declared init final annotation]
                      (if (= declared name) (set! (mut ok) false) 0))
+              (SsLetPattern [pattern init final] (set! (mut ok) false))
               (SsDeclList [decls]
                           (do
                             (al-for [d decls]
                                     (match (syntax-stmt-node d)
                                       (SsLet [declared init final annotation]
                                              (if (= declared name) (set! (mut ok) false) 0))
+                                      (SsLetPattern [pattern init final] (set! (mut ok) false))
                                       (_ 0)))
                             0))
               (_ 0)))
@@ -4167,29 +4680,44 @@
 
 ;; The CatchParameter shares a scope with the catch Block's lexical declarations; a `var` of the
 ;; same name is permitted by Annex B.
-(defn syntax-check-catch-parameter! [(param (Option (slice u8)))
+(defn syntax-check-catch-parameter! [(param (Option i64))
                                      (catch-body (Option i64))] (-> i64)
   (match param
     (None [] 0)
-    (Some [name]
-          (match catch-body
-            (None [] 0)
-            (Some [block]
-                  (match (syntax-stmt-node block)
-                    (SsBlock [body]
-                             (let [(mut names)
-                                     (al-new [(slice u8)]
-                                             (alloc/malloc-allocator))]
-                               (syntax-collect-declarations! body
-                                                             true
-                                                             (mut names))
-                               (al-for [declared (load names)]
-                                       (if (= declared name)
-                                           (syntax-error! "parser: catch parameter conflicts with a lexical declaration")
-                                           0))
-                               (al-free! [(slice u8)] (mut names))
-                               0))
-                    (_ 0)))))))
+    (Some [pattern]
+          (let [(mut bound) (al-new [(slice u8)] (alloc/malloc-allocator))]
+            (syntax-pattern-names! pattern (mut bound))
+            ;; A destructuring catch parameter cannot repeat a name.
+            (let [(mut i) 0]
+              (loop (if (>= (load i) (len (load bound)))
+                        (break 0)
+                        (let [name (get (load bound) (load i))
+                              (mut j) (+ (load i) 1)]
+                          (loop (if (>= (load j) (len (load bound)))
+                                    (break 0)
+                                    (do
+                                      (if (= name (get (load bound) (load j)))
+                                          (syntax-error! "parser: duplicate catch parameter name")
+                                          0)
+                                      (set! (mut j) (+ (load j) 1))
+                                      (continue))))
+                          (set! (mut i) (+ (load i) 1))
+                          (continue)))))
+            (match catch-body
+              (None [] 0)
+              (Some [block]
+                    (match (syntax-stmt-node block)
+                      (SsBlock [body]
+                               (let [(mut names) (al-new [(slice u8)] (alloc/malloc-allocator))]
+                                 (syntax-collect-declarations! body true (mut names))
+                                 (al-for [declared (load names)]
+                                         (al-for [name (load bound)]
+                                                 (if (= declared name)
+                                                     (syntax-error! "parser: catch parameter conflicts with a lexical declaration")
+                                                     0)))
+                                 (al-free! [(slice u8)] (mut names))
+                                 0))
+                      (_ 0))))))))
 
 (defn syntax-iteration-stmt? [(id i64)] (-> bool)
   (match (syntax-stmt-node id)
@@ -4982,6 +5510,10 @@
                        (do
                          (unimplemented "class definitions" "docs/GAPS.md — classes")
                          (unreachable-node)))
+              (SxDestructuringAssign [pattern value]
+                                     (do
+                                       (unimplemented "destructuring assignment" "docs/GAPS.md — destructuring")
+                                       (unreachable-node)))
               (SxPrivateMember [owner name optional]
                                (do
                                  (unimplemented "private class members" "docs/GAPS.md — classes")
@@ -5212,6 +5744,8 @@
                                      name
                                      (ty-dyn TAG-ANY)
                                      final))
+              (SsLetPattern [pattern init final]
+                            (unimplemented "destructuring declarations" "docs/GAPS.md — destructuring"))
               (SsDeclList [decls] (lower-instantiate-lexicals! decls))
               (SsCase [selector body] (lower-instantiate-lexicals! body))
               (_ 0)))
@@ -5480,7 +6014,9 @@
                    (do
                      (lower-instantiate-lexical-stmt! stmt)
                      (lower-syntax-statement stmt)))
-      (ForInitExpr [e] (do (lower-syntax-expr e) 0)))
+      (ForInitExpr [e] (do (lower-syntax-expr e) 0))
+      (ForInitPattern [pattern]
+                      (unimplemented "destructuring for-in/of heads" "docs/GAPS.md — destructuring")))
     (let [terminated (lower-test-loop test update body)]
       (scope-pop! (parser-node (.current-scope (parser-state))))
       terminated)))
@@ -5531,6 +6067,10 @@
                                     value)
                      0))
              (None [] 0)))
+    (SsLetPattern [pattern init final]
+                  (unimplemented "destructuring declarations" "docs/GAPS.md — destructuring"))
+    (SsVarPattern [pattern init]
+                  (unimplemented "destructuring declarations" "docs/GAPS.md — destructuring"))
     (SsDeclList [decls] (lower-syntax-statements decls))
     (SsReturn [value]
               (parser-record-return! (match value
@@ -5713,7 +6253,7 @@
     (al-for [f (.funs (parser-state))]
             (let [fun f]
               (syntax-check-declarations! (.body fun)
-                                          (.params fun)
+                                          (syntax-fun-bound-names fun)
                                           true
                                           true
                                           (.strict fun))
@@ -5831,6 +6371,9 @@
                       (if (syntax-contains-function-decl? (.body f))
                           (unimplemented "nested function declarations (closures)"
                                          "docs/GAPS.md — function values and closures")
+                          0)
+                      (if (syntax-fun-has-patterns? f)
+                          (unimplemented "destructuring parameters" "docs/GAPS.md — destructuring")
                           0)
                       (set! (.current-fun (parser-state)) (load fi))
                       (set! (.current-ctrl (parser-state)) (n-nid fun))
