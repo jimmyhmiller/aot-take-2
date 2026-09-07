@@ -1,5 +1,14 @@
 # Decisions
 
+## 2026-09-07 — Private names resolve when their class closes
+
+A `.#name` reference may precede the field or method that declares it, and may sit inside nested
+functions or classes. The parser records every private reference with its class nesting depth;
+when a class body closes, references at its depth either match one of its declarations or are
+handed to the enclosing class one level up, and a reference that reaches the outermost class
+unresolved is a proven SyntaxError. This keeps AllPrivateIdentifiersValid a syntax fact without a
+second scope structure: the class table only knows names, never bindings.
+
 ## 2026-09-07 — Function records are reserved before their bodies and only top-level ones are Funs
 
 Final Simple parses a function by pushing its scope and body inline; a nested function is a

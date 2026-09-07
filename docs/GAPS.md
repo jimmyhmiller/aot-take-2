@@ -55,6 +55,21 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-07 — Classes as syntax
+
+Class declarations and expressions parse: heritage, methods (static, accessor, generator, async),
+fields with initializers, private names, and static blocks. Class code is strict; field
+initializers and static blocks are method-like contexts. Proven early errors: duplicate or special
+constructors; static `prototype` methods/fields and `constructor` fields; duplicate private names
+outside a getter/setter pair; `#constructor`; whitespace inside `#name`; references to undeclared
+private names (resolved when the declaring class closes, through nested classes and functions);
+`#name` anywhere but the left operand of `in`; `delete` of a private member; `super()` outside a
+derived constructor and its nested arrows; `arguments` in field initializers and static blocks;
+`await` and `return` in static blocks; field ASI; class names that are strict-reserved; class
+declarations conflicting with other lexical names; and an arrow function as heritage. Unicode
+escapes in element names fail closed at the lexer. Classes, private members and brand checks
+refuse lowering by name; class heritage and computed keys are outside the strict expression walk.
+
 ### 2026-09-07 — Functions everywhere as syntax
 
 Nested function declarations, function expressions, arrow functions (through the parenthesized
