@@ -55,6 +55,25 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-07 — Iteration statements, labels and the remaining statement grammar
+
+`do-while`, classic `for` (expression, `var` and `let`/`const` heads, optional test/update),
+`continue`, labelled statements and labelled `break`/`continue` lower through final Simple's loop
+and `jumpTo` protocol: one Loop with lazy Phis, a pruned Scope copy per jump, the first
+`continue`'s copy becoming the continue Scope and the loop bottom merging into it before the
+update and the backedge. A `do-while` exit and a labelled block exit start dead and receive their
+paths by merge, as the switch exit already did. A `for` head `let` is one binding, not a
+per-iteration environment; that is unobservable until closures exist and must change with them.
+
+`for-in`, `for-of`, `throw`, `try/catch/finally` and `with` parse with their early errors
+(head declarations, catch-parameter conflicts, `throw` line terminators, strict `with`, labels
+that are strict reserved words) and refuse lowering by name: property enumeration, the iterator
+protocol, exception completions and object environments are absent. `debugger` lowers to nothing.
+Statement-position declarations (`if (x) let y`, `while (x) class C {}`, loop-body function
+declarations, `async function` bodies) are proven SyntaxErrors; Annex B function-in-`if`, sloppy
+`let` identifiers, destructuring heads/catch parameters, `for await` and `for (var x = 1 in o)`
+fail closed. The lexer gained a two-token lookahead for `let x` versus a bare `let` identifier.
+
 ### 2026-09-07 — Operator grammar, sum-typed syntax records and NaN branch codes
 
 The parser now recognizes the full expression operator precedence and the comma operator. `>`,

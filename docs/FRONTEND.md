@@ -191,8 +191,9 @@ the unshadowed, non-writable global evaluates the complete right-hand side and t
 A lexical `let undefined` instead resolves through the ordinary Scope slot and updates normally.
 
 Function bodies currently admit sequential `let`/`const`/`var`, assignment, lexical blocks,
-expression statements, return, calls, conditional expressions, `switch`, unlabelled `break`,
-statement `if`/`else`, and basic `while` loops. The complete ECMAScript operator precedence is
+expression statements, return, calls, conditional expressions, `switch`, `break` and `continue`
+with or without labels, labelled statements, statement `if`/`else`, `while`, `do-while`, classic
+`for`, and `debugger`. `for-in`/`for-of`, `throw`, `try` and `with` parse and refuse lowering. The complete ECMAScript operator precedence is
 parsed: every binary, unary, update, compound-assignment, logical-assignment and comma operator
 has a syntax variant naming its JSL entry point. Operators whose entry point is in the production
 index execute (`+ - * / < > <= >= === !== && || ?? ! void typeof - + ++ -- , = += -= *= /= &&=
@@ -204,11 +205,11 @@ function-local accumulator of control, memory, and value: bare returns and live 
 boxed `undefined`, early exits kill only their own path, and one final Region/MemPhi/value Phi owns
 all exits. Statements after an unconditional return remain valid parsed syntax but are not lowered
 back onto live control. ScopeNode is the sole lowering environment, so shadowing and reassignment
-construct SSA during parsing. `while` follows final Simple's atomic loop protocol: an open Loop and
+construct SSA during parsing. Every loop follows final Simple's atomic loop protocol: an open Loop and
 lazy binding Phis are built first, then `scope-end-loop!` installs the control backedge and every
 materialized Phi backedge without exposing an intermediate graph. A return in the body contributes
 to the function accumulator while the loop's false projection remains live. `break` and `continue`
-remain outside the admitted subset.
+follow Simple's `jumpTo`: a pruned Scope copy merges into the target's exit or continue Scope.
 
 Every executable member of the `SyntaxNode` and `SyntaxStmtNode` sums has a native execution regression:
 numeric literals, names, grouping, `+`/`-`/`*`, named calls, conditional expressions, `let`, `const`,

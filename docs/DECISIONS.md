@@ -1,5 +1,22 @@
 # Decisions
 
+## 2026-09-07 — Loops, continue and labels follow Simple's jumpTo with dead-start exits
+
+Final Simple's `parseLooping` builds the Loop, duplicates the head Scope with lazy Phis, parses the
+predicate, creates the break Scope on the false projection, parses the body, merges the loop bottom
+into the continue Scope (`_continueScope = jumpTo(_continueScope)`), then parses the deferred `for`
+update and closes the loop atomically. `jumpTo` duplicates the current Scope, kills control, pops
+lexical levels to the target depth, and either becomes the continue Scope (first continue) or
+merges into the target. We keep that order exactly; the syntax tree lets the update be lowered in
+place instead of re-scanned.
+
+JavaScript adds `do-while`, labelled targets and labelled blocks. A `do-while` exit and a labelled
+block exit have no predicate edge to be born on, so they start with XCtrl control and receive
+breaks (and the do-while false edge) by ordinary Scope merges, the same construction the switch
+exit already uses; Region peepholes drop the dead path. Jump targets form one stack: an unlabelled
+`break` takes the nearest loop or switch, an unlabelled `continue` the nearest loop, a labelled jump
+the target carrying that label, and labels accumulate onto the loop or switch they name.
+
 ## 2026-09-07 — Syntax records are sum types and operators are admitted ahead of semantics
 
 `SyntaxExpr` and `SyntaxStmt` carry a `defsum` node (`SyntaxNode`, `SyntaxStmtNode`) plus a source
