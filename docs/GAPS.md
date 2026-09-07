@@ -55,6 +55,23 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-07 — Sloppy `let` identifiers and Annex B function declarations
+
+`let` is an ordinary identifier outside strict code: bindings (`var let`, `function let() {}`,
+parameters, catch), references (`let;`, `let.x`, `(let[0])`, `{let}`), labels and for heads
+(`for (let in o)`, `for (let;;)`) parse, and the strict pass rejects every one of them in strict
+code as a reserved word. Proven errors: `let [` never starts a Statement or an ExpressionStatement
+(`let[0];`, `if (x) let\n[a] = 0;`), a same-line `let x` / `let {` in a statement position, `let`
+as a lexically bound name (`let let`, `const let`, `let [let]`, for-in/of lexical heads), and the
+for-of lookahead exclusions `for (let of …)` and `for (async of …)` (`for await (async of …)` is
+admitted). Annex B.3.3 `if (x) function f() {}` parses in sloppy code as a synthetic Block holding
+the declaration, recorded in `annexb-blocks` so the strict pass rejects it in strict code;
+labelled function declarations (`a: b: function f() {}`) parse as labelled items in sloppy code.
+Proven errors: generator/async declarations in either position, function declarations as
+loop/`with` bodies, labelled functions as `if`/loop/`with` bodies (IsLabelledFunction), and both
+forms in strict code. B.3.2's web-compat var hoisting of block functions is not modelled; the
+lowering of nested function declarations still refuses.
+
 ### 2026-09-07 — `for await` as syntax
 
 `for await (… of …)` parses inside async functions, async arrows, async methods and async
@@ -70,9 +87,9 @@ async iteration protocol (GetIterator async, Await on each step) is unimplemente
 The campaign in `docs/TEST262.md` (4,006 files) found 20 false accepts, all in destructuring and
 all fixed: a `...rest` element followed by a trailing comma is a valid literal but never a pattern
 (tracked per literal in `rest-comma`), and for-in/of assignment-pattern heads are now visited by
-the strict pass. Remaining parser refusals: phase imports (deliberate), the unadmitted primaries, Annex B
-function-in-statement and for-in initializers, sloppy `let` identifiers, non-ASCII regex group
-names (`for await` was admitted later the same day).
+the strict pass. Remaining parser refusals: phase imports (deliberate), identifier escapes (the unadmitted
+primaries), Annex B for-in initializers, non-ASCII regex group names (`for await`, sloppy `let`
+and Annex B function declarations were admitted later the same day).
 
 ### 2026-09-07 — Regular-expression pattern early errors
 
@@ -151,8 +168,8 @@ over a non-simple parameter list; accessor arity; rest-parameter position and de
 arrow parameters and a line terminator before `=>`; `yield`/`await` in formal parameters and in
 arrow parameters; reserved function names; block-level function declarations conflicting with
 `let`/`var` (with Annex B's sloppy duplicate-function allowance); and parameter/lexical conflicts.
-Sloppy `let` names, Annex B function-in-`if` and labelled functions fail closed (destructuring
-parameters were admitted later the same day).
+Sloppy `let` names, Annex B function-in-`if` and labelled functions were admitted later the same
+day, as were destructuring parameters.
 
 The Script statement list is parsed under a root context so nested functions have a parent; only
 declarations the program loop saw at the top level are hoisted closed-world Funs. Every other
@@ -198,8 +215,8 @@ that are strict reserved words) and refuse lowering by name: property enumeratio
 protocol, exception completions and object environments are absent. `debugger` lowers to nothing.
 Statement-position declarations (`if (x) let y`, `while (x) class C {}`, loop-body function
 declarations, `async function` bodies) are proven SyntaxErrors; Annex B function-in-`if`, sloppy
-`let` identifiers and `for (var x = 1 in o)` fail closed (destructuring heads, catch parameters
-and `for await` were admitted later the same day). The lexer gained a two-token lookahead for `let x` versus a bare `let` identifier.
+`let` identifiers were admitted later the same day (as were destructuring heads, catch parameters
+and `for await`); `for (var x = 1 in o)` still fails closed. The lexer gained a two-token lookahead for `let x` versus a bare `let` identifier.
 
 ### 2026-09-07 — Operator grammar, sum-typed syntax records and NaN branch codes
 
