@@ -198,7 +198,10 @@ parsed: every binary, unary, update, compound-assignment, logical-assignment and
 has a syntax variant naming its JSL entry point. Operators whose entry point is in the production
 index execute (`+ - * / < > <= >= === !== && || ?? ! void typeof - + ++ -- , = += -= *= /= &&=
 ||= ??=`); the rest (`% ** & | ^ << >> >>> == != in instanceof ~ delete` and their compound forms)
-parse, pass early-error validation, and refuse lowering by their JSL name.
+parse, pass early-error validation, and refuse lowering by their JSL name. Primary and member
+grammar is complete except functions, classes and `super`: `this`, `new`, `new.target`, computed
+members, general callees, spread, optional chains, array literals, `import()`, templates and regex
+literals parse, and the forms without runtime support refuse by name at lowering.
 Statement branches duplicate and merge ScopeNode directly, so reassigned bindings acquire Phis
 only when the arm values differ. Final Simple's pruned return-Scope protocol is represented by a
 function-local accumulator of control, memory, and value: bare returns and live fallthrough add

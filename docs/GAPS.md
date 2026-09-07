@@ -55,6 +55,27 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-07 — Primary expressions, member chains, templates and regex tokens
+
+`this`, `new` (with and without arguments, nested), `new.target`, computed members, calls through
+any callee, spread arguments, optional chains, array literals with holes and spread, `import()`,
+template literals (untagged and tagged) and regular-expression literals now parse. Object literals
+admit shorthand (desugared to a named property with an IdentifierReference), computed keys,
+spread, string and integral numeric keys; methods, accessors, generators, non-integral and
+escaped keys fail closed. Proven early errors: `this`/`new.target`/`import()`/optional-chain
+assignment targets, `new.target` outside a function, `import.meta` and import/export declarations
+in a Script, `import()` arity and spread, `new import()`, tagged templates and `new` on optional
+chains, CoverInitializedName outside a pattern, private names in object literals, duplicate
+`__proto__` across string and identifier spellings, template NotEscapeSequences, and regex flag
+syntax. Phase imports (`import.source`/`import.defer`) and `super` fail closed.
+
+Lowering executes a substitution-free template as its cooked string and object shorthand as the
+named property it desugars to. `this`, `new`, `new.target`, computed access and assignment,
+non-name callees, spread, array literals, optional chains, `import()`, template substitutions
+(ToString), tagged templates, object spread and computed keys refuse by name. The regex pattern
+grammar is not validated: a syntax-only verdict fails closed whenever a regex literal survives
+every other check, so no pattern early error can be missed silently or falsely reported.
+
 ### 2026-09-07 — Iteration statements, labels and the remaining statement grammar
 
 `do-while`, classic `for` (expression, `var` and `let`/`const` heads, optional test/update),

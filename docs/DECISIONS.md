@@ -1,5 +1,18 @@
 # Decisions
 
+## 2026-09-07 — Regex and template tokens are parser-driven; unvalidated regex fails closed
+
+Final Simple's lexer has no context-dependent tokens. JavaScript's `/` is division or a regex
+literal depending on parse state, and a template resumes after each `}` that closes a substitution.
+Both are therefore rescanned by the parser: it meets a `/`, `/=` or `` ` `` punctuator in primary
+position (or a `}` after a substitution) and asks the lexer to rescan from that token's start as
+a regex body or template part. Peeking never changes the consumed-end boundary, so spans stay exact.
+
+The regex pattern grammar is not implemented yet. A regex literal is tokenized and its flags are
+checked, but once the whole program has been parsed a syntax-only run that saw any regex literal
+fails closed as a compiler refusal. Other early errors in the same program are still reported first,
+so `/re/ = 1` proves its target error while `/(?/` is neither accepted nor falsely rejected.
+
 ## 2026-09-07 — Loops, continue and labels follow Simple's jumpTo with dead-start exits
 
 Final Simple's `parseLooping` builds the Loop, duplicates the head Scope with lazy Phis, parses the

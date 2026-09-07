@@ -36,8 +36,9 @@
 ;; not implemented yet. Never narrow the executable graph merely because an annotation says so.
 ;;
 ;; The admitted subset includes named function declarations, number-annotated parameters/returns,
-;; numeric and string literals, object literals with named properties, calls, bindings, the
-;; complete operator precedence (operators without production JSL refuse at lowering by name),
+;; numeric, string, template, regex, array and object literals, `this`, `new`, member chains,
+;; calls, bindings, the complete operator precedence (forms without production JSL refuse at
+;; lowering by name),
 ;; blocks, `if`/`else`, `switch`, `while`, `do-while`, classic `for`, `break`/`continue` with
 ;; labels and labelled statements; `for-in/of`, `throw`, `try` and `with` parse and refuse
 ;; lowering by name. Grammar outside that set
@@ -59,7 +60,7 @@
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use [subslice slice-data])
-(import "coil.str" :use [sb-new sb-push-byte! sb-str sb-free!])
+(import "coil.str" :use [sb-new sb-push-byte! sb-push-i64! sb-str sb-free!])
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
 (import "aot.node.constant" :use *)
@@ -81,15 +82,40 @@
 ;; not yet decided what to do with it. Records carry source spans and grammar shape only. Child
 ;; references are 1-based ids into the parser-owned side arrays; an absent optional child is
 ;; `None`, never a sentinel id. Operator variants name their JSL entry point directly.
+;; One PropertyDefinition. Shorthand `{a}` is desugared to a named property valued by an
+;; IdentifierReference at parse time; CoverInitializedName survives only to be reinterpreted as a
+;; destructuring pattern and is otherwise a SyntaxError. Methods, accessors and generators are
+;; not admitted yet and fail closed.
+(defsum ObjectEntry
+  (PropNamed [(key i64) (value i64)])  ; interned key
+  (PropComputed [(key i64) (value i64)])
+  (PropSpread [(expr i64)])
+  (PropCoverInit [(name (slice u8)) (init i64)]))
+
+(defsum ArrayElement
+  (ElemHole)
+  (ElemExpr [(expr i64)])
+  (ElemSpread [(expr i64)]))
+
 (defsum SyntaxNode
   (SxNumber [(value i64) (value-float f64) (rep i64)])
   (SxString [(raw (slice u8)) (units (ArrayList i64)) (legacy-escape bool)])
   (SxName [(name (slice u8))])
   (SxSingleton [(name (slice u8))])  ; JsTrue, JsFalse, JsNull
   (SxGroup [(inner i64)])
-  (SxObject [(entries (ArrayList i64))])  ; alternating interned key, value id
-  (SxMember [(owner i64) (name (slice u8))])
-  (SxCall [(callee (slice u8)) (args (ArrayList i64))])
+  (SxObject [(entries (ArrayList ObjectEntry))])
+  (SxArray [(elements (ArrayList ArrayElement))])
+  (SxMember [(owner i64) (name (slice u8)) (optional bool)])  ; optional: this link is `?.`
+  (SxIndex [(owner i64) (key i64) (optional bool)])
+  (SxCall [(callee i64) (args (ArrayList i64)) (optional bool)])
+  (SxNew [(callee i64) (args (ArrayList i64))])
+  (SxNewTarget)
+  (SxThis)
+  (SxSpread [(expr i64)])  ; only as an argument or array element
+  (SxImportCall [(specifier i64) (options (Option i64))])
+  (SxTemplate [(quasis (ArrayList i64)) (substitutions (ArrayList i64))])  ; quasis: SxString ids
+  (SxTaggedTemplate [(tag i64) (template i64)])
+  (SxRegex [(body (slice u8)) (flags (slice u8))])
   (SxUnary [(op (slice u8)) (operand i64)])
   (SxDelete [(operand i64)])
   (SxUpdate [(op (slice u8)) (prefix bool) (target i64)])
@@ -189,6 +215,7 @@
    (script-index i64)
    (parsing-function bool)
    (no-in bool)
+   (regex-count i64)
    (booted bool)])
 
 (defn parser-state [] (-> (ptr ParserState))
@@ -204,10 +231,13 @@
           (set! (.return-ctrls p) (al-new [i64] (alloc/malloc-allocator)))
           (set! (.return-mems p) (al-new [i64] (alloc/malloc-allocator)))
           (set! (.return-values p) (al-new [i64] (alloc/malloc-allocator)))
-          (set! (.jump-targets p) (al-new [JumpTarget] (alloc/malloc-allocator)))
-          (set! (.pending-labels p) (al-new [(slice u8)] (alloc/malloc-allocator)))
+          (set! (.jump-targets p)
+                (al-new [JumpTarget] (alloc/malloc-allocator)))
+          (set! (.pending-labels p)
+                (al-new [(slice u8)] (alloc/malloc-allocator)))
           (set! (.entry-fun-nid p) 0)
           (set! (.no-in p) false)
+          (set! (.regex-count p) 0)
           (set! (.booted p) true)
           0)
         (do
@@ -228,6 +258,7 @@
           (al-clear! [(slice u8)] (mut (.pending-labels p)))
           (set! (.entry-fun-nid p) 0)
           (set! (.no-in p) false)
+          (set! (.regex-count p) 0)
           0))))
 
 (defn parse-fail [(what (slice u8)) (t Token)] (-> i64)
@@ -310,7 +341,28 @@
   (match (syntax-node id) (SxName [name] true) (_ false)))
 
 (defn syntax-member? [(id i64)] (-> bool)
-  (match (syntax-node id) (SxMember [owner name] true) (_ false)))
+  (match (syntax-node id) (SxMember [owner name optional] true) (_ false)))
+
+;; Whether an OptionalExpression owns this member/call spine. Parentheses end the chain, so
+;; `(a?.b).c` is an ordinary Reference while `a?.b.c` is not.
+;; The innermost expression a member/call spine hangs from: `a.b(c)[d]` roots at `a`.
+(defn syntax-spine-root [(id i64)] (-> i64)
+  (match (syntax-node id)
+    (SxMember [owner name optional] (syntax-spine-root owner))
+    (SxIndex [owner key optional] (syntax-spine-root owner))
+    (SxCall [callee args optional] (syntax-spine-root callee))
+    (SxTaggedTemplate [tag template] (syntax-spine-root tag))
+    (_ id)))
+
+(defn syntax-optional-chain? [(id i64)] (-> bool)
+  (match (syntax-node id)
+    (SxMember [owner name optional]
+              (or optional (syntax-optional-chain? owner)))
+    (SxIndex [owner key optional] (or optional (syntax-optional-chain? owner)))
+    (SxCall [callee args optional]
+            (or optional (syntax-optional-chain? callee)))
+    (SxTaggedTemplate [tag template] (syntax-optional-chain? tag))
+    (_ false)))
 
 ;; The one place that knows every variant's children. Generic walks (strict checks, and later any
 ;; syntax query that does not care about shape) iterate this list instead of repeating the match.
@@ -323,16 +375,59 @@
       (SxSingleton [name] 0)
       (SxGroup [inner] (push! [i64] (mut out) inner))
       (SxObject [entries]
-                (let [(mut i) 1]
-                  (loop (if (>= (load i) (len entries))
-                            (break 0)
-                            (do
-                              (push! [i64] (mut out) (get entries (load i)))
-                              (set! (mut i) (+ (load i) 2))
-                              (continue))))))
-      (SxMember [owner name] (push! [i64] (mut out) owner))
-      (SxCall [callee args]
-              (do (al-for [arg args] (push! [i64] (mut out) arg)) 0))
+                (do
+                  (al-for [entry entries]
+                          (match entry
+                            (PropNamed [key value]
+                                       (push! [i64] (mut out) value))
+                            (PropComputed [key value]
+                                          (do
+                                            (push! [i64] (mut out) key)
+                                            (push! [i64] (mut out) value)))
+                            (PropSpread [expr] (push! [i64] (mut out) expr))
+                            (PropCoverInit [name init]
+                                           (push! [i64] (mut out) init))))
+                  0))
+      (SxArray [elements]
+               (do
+                 (al-for [element elements]
+                         (match element
+                           (ElemHole [] 0)
+                           (ElemExpr [expr] (push! [i64] (mut out) expr))
+                           (ElemSpread [expr] (push! [i64] (mut out) expr))))
+                 0))
+      (SxMember [owner name optional] (push! [i64] (mut out) owner))
+      (SxIndex [owner key optional]
+               (do (push! [i64] (mut out) owner) (push! [i64] (mut out) key)))
+      (SxCall [callee args optional]
+              (do
+                (push! [i64] (mut out) callee)
+                (al-for [arg args] (push! [i64] (mut out) arg))
+                0))
+      (SxNew [callee args]
+             (do
+               (push! [i64] (mut out) callee)
+               (al-for [arg args] (push! [i64] (mut out) arg))
+               0))
+      (SxNewTarget [] 0)
+      (SxThis [] 0)
+      (SxSpread [expr] (push! [i64] (mut out) expr))
+      (SxImportCall [specifier options]
+                    (do
+                      (push! [i64] (mut out) specifier)
+                      (match options
+                        (Some [o] (push! [i64] (mut out) o))
+                        (None [] 0))))
+      (SxTemplate [quasis substitutions]
+                  (do
+                    (al-for [q quasis] (push! [i64] (mut out) q))
+                    (al-for [e substitutions] (push! [i64] (mut out) e))
+                    0))
+      (SxTaggedTemplate [tag template]
+                        (do
+                          (push! [i64] (mut out) tag)
+                          (push! [i64] (mut out) template)))
+      (SxRegex [body flags] 0)
       (SxUnary [op operand] (push! [i64] (mut out) operand))
       (SxDelete [operand] (push! [i64] (mut out) operand))
       (SxUpdate [op prefix target] (push! [i64] (mut out) target))
@@ -461,11 +556,15 @@
           (push! [i64] (mut units) (+ 0xdc00 (& supplement 0x3ff)))))
     0))
 
-(defn syntax-string [(t Token)] (-> SyntaxExpr)
-  (let [text (subslice [u8] (token-text t) 1 (- (- (.end t) (.start t)) 1))
-        (mut units) (al-new [i64] (alloc/malloc-allocator))
-        (mut legacy) false
-        (mut i) 0]
+;; Decode a string or template body into UTF-16 code units. `abs-start` is the source offset of
+;; `text` so line continuations can be measured in place. Template bodies (TV) additionally
+;; normalize CR and CRLF to LF and treat every legacy escape as a NotEscapeSequence error.
+(defn syntax-decode-string-body! [(text (slice u8))
+                                  (abs-start i64)
+                                  (template bool)
+                                  (units (mut (ArrayList i64)))
+                                  (legacy (mut bool))] (-> i64)
+  (let [(mut i) 0]
     (loop (if (>= (load i) (len text))
               (break 0)
               (do
@@ -475,32 +574,81 @@
                       (if (>= (load i) (len text))
                           (syntax-error! "parser: truncated string escape")
                           0)
-                      (let [width (lex-line-width (+ (+ (.start t) 1) (load i)))]
+                      (let [width (lex-line-width (+ abs-start (load i)))]
                         (if (> width 0)
                             (set! (mut i) (+ (load i) width))
                             (if (< (get text (load i)) (cast u8 128))
-                                (syntax-string-escape! (mut units)
-                                                       (mut legacy)
-                                                       text
-                                                       (mut i))
+                                (do
+                                  (syntax-string-escape! (mut units)
+                                                         (mut legacy)
+                                                         text
+                                                         (mut i))
+                                  (if (and template (load legacy))
+                                      (syntax-error! "parser: octal escape sequence is not allowed in a template")
+                                      0))
                                 ;; Non-ASCII NonEscapeCharacter: the raw-run decoder below consumes
                                 ;; its entire scalar, not merely the first UTF-8 byte.
                                 0))))
                     0)
                 (let [start (load i)]
                   (loop (if (and (< (load i) (len text))
-                                 (!= (get text (load i)) (cast u8 92)))
+                                 (!= (get text (load i)) (cast u8 92))
+                                 (not (and template
+                                           (= (get text (load i)) (cast u8 13)))))
                             (do (set! (mut i) (+ (load i) 1)) (continue))
                             (break 0)))
                   (jsl-string-append-utf8! (subslice [u8] text start (load i))
-                                           (mut units)))
+                                           (mut units))
+                  (if (and template
+                           (< (load i) (len text))
+                           (= (get text (load i)) (cast u8 13)))
+                      (do
+                        (push! [i64] (mut units) 10)
+                        (set! (mut i) (+ (load i) 1))
+                        (if (and (< (load i) (len text))
+                                 (= (get text (load i)) (cast u8 10)))
+                            (set! (mut i) (+ (load i) 1))
+                            0))
+                      0))
                 (continue))))
+    0))
+
+(defn syntax-string [(t Token)] (-> SyntaxExpr)
+  (let [text (subslice [u8] (token-text t) 1 (- (- (.end t) (.start t)) 1))
+        (mut units) (al-new [i64] (alloc/malloc-allocator))
+        (mut legacy) false]
+    (syntax-decode-string-body! text
+                                (+ (.start t) 1)
+                                false
+                                (mut units)
+                                (mut legacy))
     (syntax-expr-new (SxString
                        :raw text
                        :units (load units)
                        :legacy-escape (load legacy))
                      (.start t)
                      (.end t))))
+
+;; One template quasi. A tagged template keeps only raw text: its cooked value may be undefined
+;; and this compiler does not evaluate tagged templates yet.
+(defn syntax-template-quasi [(part Token) (tagged bool)] (-> i64)
+  (let [inner-end (- (.end part) (if (lex-template-continues? part) 2 1))
+        text (subslice [u8] (lex-source) (+ (.start part) 1) inner-end)
+        (mut units) (al-new [i64] (alloc/malloc-allocator))
+        (mut legacy) false]
+    (if tagged
+        0
+        (syntax-decode-string-body! text
+                                    (+ (.start part) 1)
+                                    true
+                                    (mut units)
+                                    (mut legacy)))
+    (syntax-add-node! (SxString
+                        :raw text
+                        :units (load units)
+                        :legacy-escape false)
+                      (.start part)
+                      (.end part))))
 
 ;; Declare the closed-world hidden-class transition universe before lowering reusable JSL graphs.
 ;; Key interning alone is insufficient: representation-level own-property dispatch enumerates
@@ -509,7 +657,7 @@
 ;; without moving any JavaScript semantic decision out of JSL.
 (defn syntax-write-key! [(target i64) (write-keys (mut (ArrayList i64)))] (-> i64)
   (match (syntax-node target)
-    (SxMember [owner name]
+    (SxMember [owner name optional]
               (push! [i64] (mut write-keys) (shape-key-intern name)))
     (_ 0)))
 
@@ -522,23 +670,21 @@
               (let [x (get (.exprs (parser-state)) (load i))]
                 (match (.node x)
                   (SxObject [entries]
-                            (let [(mut shape) SHAPE-EMPTY
-                                  (mut entry) 0]
-                              (loop (if (>= (load entry) (len entries))
-                                        (break 0)
-                                        (do
-                                          ;; The object-initializer `__proto__` setter mutates the stable
-                                          ;; prototype slot; it does not define a data property or create a
-                                          ;; hidden-class transition.
-                                          (let [key (get entries (load entry))]
-                                            (if (= (shape-key-name key)
-                                                   "__proto__")
-                                                0
-                                                (set! (mut shape)
-                                                      (shape-transition (load shape)
-                                                                        (shape-key-name key)))))
-                                          (set! (mut entry) (+ (load entry) 2))
-                                          (continue))))
+                            (let [(mut shape) SHAPE-EMPTY]
+                              ;; The object-initializer `__proto__` setter mutates the stable
+                              ;; prototype slot; it does not define a data property or create a
+                              ;; hidden-class transition. Computed and spread entries refuse
+                              ;; lowering, so they declare no layout here.
+                              (al-for [entry entries]
+                                      (match entry
+                                        (PropNamed [key value]
+                                                   (if (= (shape-key-name key)
+                                                          "__proto__")
+                                                       0
+                                                       (set! (mut shape)
+                                                             (shape-transition (load shape)
+                                                                               (shape-key-name key)))))
+                                        (_ 0)))
                               (set! (mut declared) (+ (load declared) 1))))
                   ;; A named write can execute against any ordinary-object shape reachable at
                   ;; that site, including a shape produced by an earlier loop iteration. Collect
@@ -635,19 +781,27 @@
       (SsDoWhile [body condition] (push! [i64] (mut out) body))
       (SsFor [init test update body]
              (do
-               (match init (ForInitDecl [stmt] (push! [i64] (mut out) stmt)) (_ 0))
+               (match init
+                 (ForInitDecl [stmt] (push! [i64] (mut out) stmt))
+                 (_ 0))
                (push! [i64] (mut out) body)))
       (SsForIn [head of right body]
                (do
-                 (match head (ForInitDecl [stmt] (push! [i64] (mut out) stmt)) (_ 0))
+                 (match head
+                   (ForInitDecl [stmt] (push! [i64] (mut out) stmt))
+                   (_ 0))
                  (push! [i64] (mut out) body)))
       (SsLabeled [label body] (push! [i64] (mut out) body))
       (SsThrow [value] 0)
       (SsTry [body catch-param catch-body finally-body]
              (do
                (push! [i64] (mut out) body)
-               (match catch-body (Some [c] (push! [i64] (mut out) c)) (None [] 0))
-               (match finally-body (Some [f] (push! [i64] (mut out) f)) (None [] 0))))
+               (match catch-body
+                 (Some [c] (push! [i64] (mut out) c))
+                 (None [] 0))
+               (match finally-body
+                 (Some [f] (push! [i64] (mut out) f))
+                 (None [] 0))))
       (SsWith [object body] (push! [i64] (mut out) body))
       (SsDebugger [] 0))
     0))
@@ -820,11 +974,7 @@
       (if (= (.kind t) TOK-PUNCT)
           (let [x (token-text t)]
             (not (or (= x "(")
-                     (= x "[")
                      (= x "{")
-                     (= x "/")
-                     (= x "/=")
-                     (= x "`")
                      (= x "...")
                      (= x "#")
                      (= x "\\")
@@ -832,12 +982,9 @@
                      (>= (get x 0) (cast u8 128)))))
           (if (= (.kind t) TOK-KEYWORD)
               (let [x (token-text t)]
-                (not (or (= x "this")
-                         (= x "new")
-                         (= x "function")
+                (not (or (= x "function")
                          (= x "class")
                          (= x "super")
-                         (= x "import")
                          (= x "let"))))
               false))))
 
@@ -848,28 +995,317 @@
         (parse-fail "parser: primary is outside the admitted subset at byte" t)
         0)))
 
+;; PropertyName as an interned shape key. IdentifierNames, plain ASCII string literals and
+;; integral numeric literals canonicalize to the same key as the identifier spelling; escaped,
+;; non-ASCII and non-integral spellings fail closed.
+(defn syntax-property-key-name [(t Token)] (-> (slice u8))
+  (if (or (= (.kind t) TOK-IDENT) (= (.kind t) TOK-KEYWORD))
+      (token-text t)
+      (if (= (.kind t) TOK-STRING)
+          (let [inner
+                  (subslice [u8] (token-text t) 1 (- (- (.end t) (.start t)) 1))]
+            (for c
+              (iter inner)
+              (if (or (= c (cast u8 92)) (>= c (cast u8 128)))
+                  (parse-fail "parser: escaped or non-ASCII string property keys are outside the admitted subset at byte"
+                              t)
+                  0))
+            inner)
+          (if (or (= (.kind t) TOK-NUMBER) (= (.kind t) TOK-LEGACY-NUMBER))
+              (let [x (syntax-number t)]
+                (match (.node x)
+                  (SxNumber [value value-float rep]
+                            (if (= rep REP-INT)
+                                (let [(mut text)
+                                        (sb-new (alloc/malloc-allocator))]
+                                  ;; The key outlives the parse; the builder is deliberately retained.
+                                  (sb-push-i64! (mut text) value)
+                                  (sb-str (load text)))
+                                (do
+                                  (parse-fail "parser: non-integral numeric property keys are outside the admitted subset at byte"
+                                              t)
+                                  "")))
+                  (_ "")))
+              (do
+                (parse-fail "parser: property key is outside the admitted subset at byte"
+                            t)
+                "")))))
+
+(defn token-property-name? [(t Token)] (-> bool)
+  (or (= (.kind t) TOK-IDENT)
+      (= (.kind t) TOK-KEYWORD)
+      (= (.kind t) TOK-STRING)
+      (= (.kind t) TOK-NUMBER)
+      (= (.kind t) TOK-LEGACY-NUMBER)
+      (= (.kind t) TOK-BIGINT)
+      (token-is t "[")
+      (token-is t "*")
+      (token-is t "#")))
+
+;; After a complete list element only a separator or the closer may follow. `=>` continues an
+;; arrow function this parser has not admitted, so it fails closed instead of proving an error.
+(defn parse-list-separator! [(close (slice u8)) (message (slice u8))] (-> bool)
+  (let [t (peek-token)]
+    (if (token-is t ",")
+        (do (take-token) (take-is close))
+        (if (token-is t close)
+            (do (take-token) true)
+            (do
+              (if (token-unsupported-continuation? t)
+                  (parse-fail "parser: expression continuation is outside the admitted subset at byte"
+                              t)
+                  (syntax-error! message))
+              true)))))
+
 (defn parse-syntax-object-literal [(open Token)] (-> i64)
-  (let [(mut entries) (al-new [i64] (alloc/malloc-allocator))
+  (let [(mut entries) (al-new [ObjectEntry] (alloc/malloc-allocator))
         (mut saw-prototype-setter) false]
     (if (not (take-is "}"))
-        (loop (let [key-token (require-property-name)
-                    key-name (token-text key-token)
-                    key (shape-key-intern key-name)]
-                (if (= key-name "__proto__")
-                    (if (load saw-prototype-setter)
-                        (syntax-error! "parser: duplicate __proto__ object-literal setter")
-                        (set! (mut saw-prototype-setter) true))
-                    0)
-                (require-token ":")
-                (push! [i64] (mut entries) key)
-                (push! [i64] (mut entries) (parse-syntax-assignment))
-                (if (take-is ",")
-                    (if (take-is "}") (break 0) (continue))
-                    (break (do (require-token "}") 0)))))
+        (loop (let [first (peek-token)]
+                (if (token-is first "...")
+                    (do
+                      (take-token)
+                      (push! [ObjectEntry]
+                             (mut entries)
+                             (PropSpread (parse-syntax-assignment))))
+                    (if (token-is first "[")
+                        (let [saved-no-in (.no-in (parser-state))]
+                          (take-token)
+                          (set! (.no-in (parser-state)) false)
+                          (let [key (parse-syntax-assignment)]
+                            (set! (.no-in (parser-state)) saved-no-in)
+                            (require-closing! "]"
+                                              "parser: expected `]` after computed property name")
+                            (if (take-is ":")
+                                (push! [ObjectEntry]
+                                       (mut entries)
+                                       (PropComputed key
+                                                     (parse-syntax-assignment)))
+                                (if (token-is (peek-token) "(")
+                                    (parse-fail "parser: object methods are outside the admitted subset at byte"
+                                                (peek-token))
+                                    (syntax-error! "parser: computed property name requires a value")))))
+                        (if (token-is first "#")
+                            (syntax-error! "parser: private names are not allowed in object literals")
+                            (if (token-is first "*")
+                                (parse-fail "parser: generator methods are outside the admitted subset at byte"
+                                            first)
+                                (if (token-is first "let")
+                                    (parse-fail "parser: sloppy `let` property shorthand is outside the admitted subset at byte"
+                                                first)
+                                    (if (not (token-property-name? first))
+                                        (syntax-error! "parser: expected a property name in object literal")
+                                        (let [key-token (take-token)
+                                              next (peek-token)]
+                                          ;; `get x() {}`, `set x(v) {}`, `async x() {}`: a second
+                                          ;; property name begins accessor/method grammar.
+                                          (if (and (= (.kind key-token)
+                                                      TOK-IDENT)
+                                                   (or (token-is key-token
+                                                                 "get")
+                                                       (token-is key-token
+                                                                 "set")
+                                                       (token-is key-token
+                                                                 "async"))
+                                                   (token-property-name? next))
+                                              (parse-fail "parser: accessor and method definitions are outside the admitted subset at byte"
+                                                          next)
+                                              0)
+                                          (if (token-is next "(")
+                                              (parse-fail "parser: object methods are outside the admitted subset at byte"
+                                                          next)
+                                              0)
+                                          (if (token-is next ":")
+                                              (let [key-name
+                                                      (syntax-property-key-name key-token)]
+                                                (take-token)
+                                                (if (= key-name "__proto__")
+                                                    (if (load saw-prototype-setter)
+                                                        (syntax-error! "parser: duplicate __proto__ object-literal setter")
+                                                        (set! (mut saw-prototype-setter)
+                                                              true))
+                                                    0)
+                                                (push! [ObjectEntry]
+                                                       (mut entries)
+                                                       (PropNamed (shape-key-intern key-name)
+                                                                  (parse-syntax-assignment))))
+                                              (if (!= (.kind key-token)
+                                                      TOK-IDENT)
+                                                  (syntax-error! "parser: shorthand property requires an identifier")
+                                                  (if (token-is next "=")
+                                                      (do
+                                                        (take-token)
+                                                        (push! [ObjectEntry]
+                                                               (mut entries)
+                                                               (PropCoverInit (token-text key-token)
+                                                                              (parse-syntax-assignment))))
+                                                      (push! [ObjectEntry]
+                                                             (mut entries)
+                                                             (PropNamed (shape-key-intern (token-text key-token))
+                                                                        (syntax-add-node! (SxName (token-text key-token))
+                                                                                          (.start key-token)
+                                                                                          (.end key-token))))))))))))))
+                (if (parse-list-separator! "}"
+                                           "parser: expected `,` or `}` in object literal")
+                    (break 0)
+                    (continue))))
         0)
     (syntax-add-node! (SxObject (load entries))
                       (.start open)
                       (lex-consumed-end))))
+
+(defn parse-syntax-array-literal [(open Token)] (-> i64)
+  (let [(mut elements) (al-new [ArrayElement] (alloc/malloc-allocator))]
+    (if (not (take-is "]"))
+        (loop (let [first (peek-token)]
+                (if (token-is first ",")
+                    (do
+                      (take-token)
+                      (push! [ArrayElement] (mut elements) (ElemHole))
+                      (if (take-is "]") (break 0) (continue)))
+                    (do
+                      (if (token-is first "...")
+                          (do
+                            (take-token)
+                            (push! [ArrayElement]
+                                   (mut elements)
+                                   (ElemSpread (parse-syntax-assignment))))
+                          (push! [ArrayElement]
+                                 (mut elements)
+                                 (ElemExpr (parse-syntax-assignment))))
+                      (if (parse-list-separator! "]"
+                                                 "parser: expected `,` or `]` in array literal")
+                          (break 0)
+                          (continue))))))
+        0)
+    (syntax-add-node! (SxArray (load elements))
+                      (.start open)
+                      (lex-consumed-end))))
+
+;; Arguments: AssignmentExpressions and `...spread`, with an optional trailing comma.
+(defn parse-syntax-arguments [] (-> (ArrayList i64))
+  (let [(mut args) (al-new [i64] (alloc/malloc-allocator))]
+    (if (not (take-is ")"))
+        (loop (do
+                (if (token-is (peek-token) "...")
+                    (let [dots (take-token)
+                          value (parse-syntax-assignment)]
+                      (push! [i64]
+                             (mut args)
+                             (syntax-add-node! (SxSpread value)
+                                               (.start dots)
+                                               (syntax-hi value))))
+                    (push! [i64] (mut args) (parse-syntax-assignment)))
+                (if (parse-list-separator! ")"
+                                           "parser: expected `,` or `)` in argument list")
+                    (break 0)
+                    (continue))))
+        0)
+    (load args)))
+
+;; `import(specifier)` / `import(specifier, options)` and the module-only `import.meta`, which is a
+;; proven error in a Script. Phase imports (`import.source`, `import.defer`) are proposals this
+;; parser fails closed on; any other `import.x` matches no production.
+(defn parse-syntax-import-expression [(keyword Token)] (-> i64)
+  (if (take-is ".")
+      (let [name (take-token)]
+        (if (token-is name "meta")
+            (syntax-error! "parser: import.meta is only valid in a module")
+            (if (or (token-is name "source") (token-is name "defer"))
+                (parse-fail "parser: phase imports are outside the admitted subset at byte"
+                            name)
+                (syntax-error! "parser: unexpected token after import"))))
+      (if (take-is "(")
+          (do
+            (if (token-is (peek-token) ")")
+                (syntax-error! "parser: import() requires a specifier")
+                0)
+            (if (token-is (peek-token) "...")
+                (syntax-error! "parser: import() does not accept spread arguments")
+                0)
+            (let [specifier (parse-syntax-assignment)
+                  options
+                    (if (and (take-is ",") (not (token-is (peek-token) ")")))
+                        (do
+                          (if (token-is (peek-token) "...")
+                              (syntax-error! "parser: import() does not accept spread arguments")
+                              0)
+                          (let [o (parse-syntax-assignment)]
+                            (take-is ",")
+                            (Some o)))
+                        (None [i64]))]
+              (require-closing! ")"
+                                "parser: import() accepts at most two arguments")
+              (syntax-add-node! (SxImportCall specifier options)
+                                (.start keyword)
+                                (lex-consumed-end))))
+          (syntax-error! "parser: import declarations are only valid in a module"))))
+
+(defn parse-syntax-template [(open Token) (tagged bool)] (-> i64)
+  (let [(mut quasis) (al-new [i64] (alloc/malloc-allocator))
+        (mut substitutions) (al-new [i64] (alloc/malloc-allocator))
+        (mut part) (lex-template-part! open)]
+    (loop (do
+            (push! [i64]
+                   (mut quasis)
+                   (syntax-template-quasi (load part) tagged))
+            (if (lex-template-continues? (load part))
+                (let [saved-no-in (.no-in (parser-state))]
+                  (set! (.no-in (parser-state)) false)
+                  (push! [i64] (mut substitutions) (parse-syntax-expression))
+                  (set! (.no-in (parser-state)) saved-no-in)
+                  (let [brace (peek-token)]
+                    (if (token-is brace "}")
+                        (do
+                          (set! (mut part) (lex-template-part! brace))
+                          (continue))
+                        (if (token-unsupported-continuation? brace)
+                            (break (parse-fail "parser: expression continuation is outside the admitted subset at byte"
+                                               brace))
+                            (break (syntax-error! "parser: expected `}` after template substitution"))))))
+                (break 0))))
+    (syntax-add-node! (SxTemplate (load quasis) (load substitutions))
+                      (.start open)
+                      (lex-consumed-end))))
+
+;; RegularExpressionFlags: each of d g i m s u v y at most once, and not both u and v.
+(defn syntax-check-regex-flags! [(flags (slice u8))] (-> i64)
+  (let [(mut seen) (al-new [u8] (alloc/malloc-allocator))]
+    (for c
+      (iter flags)
+      (do
+        (if (not (or (= c (cast u8 100))
+                     (= c (cast u8 103))
+                     (= c (cast u8 105))
+                     (= c (cast u8 109))
+                     (= c (cast u8 115))
+                     (= c (cast u8 117))
+                     (= c (cast u8 118))
+                     (= c (cast u8 121))))
+            (syntax-error! "parser: invalid regular expression flag")
+            0)
+        (al-for [earlier (load seen)]
+                (if (or (= earlier c)
+                        (and (= earlier (cast u8 117)) (= c (cast u8 118)))
+                        (and (= earlier (cast u8 118)) (= c (cast u8 117))))
+                    (syntax-error! "parser: duplicate or conflicting regular expression flag")
+                    0))
+        (push! [u8] (mut seen) c)))
+    (al-free! [u8] (mut seen))
+    0))
+
+(defn parse-syntax-regex [(slash Token)] (-> i64)
+  (let [t (lex-regex! slash)
+        text (token-text t)
+        (mut close) (- (len text) 1)]
+    (loop (if (= (get text (load close)) (cast u8 47))
+              (break 0)
+              (do (set! (mut close) (- (load close) 1)) (continue))))
+    (let [body (subslice [u8] text 1 (load close))
+          flags (subslice [u8] text (+ (load close) 1) (len text))]
+      (syntax-check-regex-flags! flags)
+      (set! (.regex-count (parser-state)) (+ (.regex-count (parser-state)) 1))
+      (syntax-add-node! (SxRegex body flags) (.start t) (.end t)))))
 
 (defn parse-syntax-primary [] (-> i64)
   (let [t (take-token)]
@@ -895,8 +1331,10 @@
                   (let [next (peek-token)]
                     (if (and (token-is t "async")
                              (not (.nl-before next))
-                             (or (token-is next "function") (= (.kind next) TOK-IDENT)))
-                        (parse-fail "parser: async functions are outside the admitted subset at byte" t)
+                             (or (token-is next "function")
+                                 (= (.kind next) TOK-IDENT)))
+                        (parse-fail "parser: async functions are outside the admitted subset at byte"
+                                    t)
                         0))
                   (syntax-add-node! (SxName (token-text t)) (.start t) (.end t)))
                 (if (= (.kind t) TOK-STRING)
@@ -908,63 +1346,207 @@
                           (let [inner (parse-syntax-expression)
                                 close (require-token ")")]
                             (set! (.no-in (parser-state)) saved-no-in)
-                            (syntax-add-node! (SxGroup inner) (.start t) (.end close))))
+                            (syntax-add-node! (SxGroup inner)
+                                              (.start t)
+                                              (.end close))))
                         (if (token-is t "{")
                             (parse-syntax-object-literal t)
-                            (parse-primary-fallback t)))))))))
+                            (if (token-is t "[")
+                                (parse-syntax-array-literal t)
+                                (if (token-is t "this")
+                                    (syntax-add-node! (SxThis)
+                                                      (.start t)
+                                                      (.end t))
+                                    (if (token-is t "import")
+                                        (parse-syntax-import-expression t)
+                                        (if (token-is t "`")
+                                            (parse-syntax-template t false)
+                                            (if (and (= (.kind t) TOK-PUNCT)
+                                                     (or (token-is t "/")
+                                                         (token-is t "/=")))
+                                                (parse-syntax-regex t)
+                                                (parse-primary-fallback t))))))))))))))
 
-;; LeftHandSideExpression: calls and named members. Computed members, `new`, optional chains,
-;; tagged templates and non-name callees are not admitted yet and fail before lowering.
-(defn parse-syntax-lhs [] (-> i64)
-  (let [(mut base) (parse-syntax-primary)]
-    (loop (if (take-is "(")
-              (let [(mut args) (al-new [i64] (alloc/malloc-allocator))]
-                (if (not (take-is ")"))
-                    (loop (do
-                            (push! [i64] (mut args) (parse-syntax-assignment))
-                            (if (take-is ",")
-                                (continue)
-                                (break (do (require-token ")") 0)))))
-                    0)
-                (let [callee (syntax-at (syntax-ungroup-id (load base)))]
-                  (match (.node callee)
-                    (SxName [name]
-                            (set! (mut base)
-                                  (syntax-add-node! (SxCall name (load args))
-                                                    (.lo callee)
-                                                    (lex-consumed-end))))
-                    (_ (parse-fail "parser: only named calls are admitted at byte"
-                                   (peek-token))))
-                  (continue)))
-              (if (take-is ".")
-                  (let [member (require-property-name)
-                        owner (syntax-at (load base))]
+;; The member/call suffix loop shared by MemberExpression (`allow-call` false, for a `new` callee),
+;; CallExpression and OptionalExpression. A tagged template cannot follow an optional chain.
+(defn parse-syntax-member-tail [(start i64) (allow-call bool)] (-> i64)
+  (let [(mut base) start]
+    (loop (let [t (peek-token)]
+            (if (token-is t ".")
+                (do
+                  (take-token)
+                  (if (token-is (peek-token) "#")
+                      (parse-fail "parser: private names are outside the admitted subset at byte"
+                                  (peek-token))
+                      0)
+                  (let [member (require-property-name)]
                     (set! (mut base)
-                          (syntax-add-node! (SxMember (load base)
-                                                      (token-text member))
-                                            (.lo owner)
+                          (syntax-add-node! (SxMember
+                                              :owner (load base)
+                                              :name (token-text member)
+                                              :optional false)
+                                            (syntax-lo (load base))
                                             (.end member)))
-                    (continue))
-                  (break 0))))
+                    (continue)))
+                (if (token-is t "?.")
+                    (do
+                      (take-token)
+                      (let [next (peek-token)]
+                        (if (token-is next "(")
+                            (do
+                              (take-token)
+                              (let [args (parse-syntax-arguments)]
+                                (set! (mut base)
+                                      (syntax-add-node! (SxCall
+                                                          :callee (load base)
+                                                          :args args
+                                                          :optional true)
+                                                        (syntax-lo (load base))
+                                                        (lex-consumed-end)))))
+                            (if (token-is next "[")
+                                (let [saved-no-in (.no-in (parser-state))]
+                                  (take-token)
+                                  (set! (.no-in (parser-state)) false)
+                                  (let [key (parse-syntax-expression)]
+                                    (set! (.no-in (parser-state)) saved-no-in)
+                                    (require-closing! "]"
+                                                      "parser: expected `]` after computed member")
+                                    (set! (mut base)
+                                          (syntax-add-node! (SxIndex
+                                                              :owner (load base)
+                                                              :key key
+                                                              :optional true)
+                                                            (syntax-lo (load base))
+                                                            (lex-consumed-end)))))
+                                (if (token-is next "`")
+                                    (syntax-error! "parser: tagged template is not allowed in an optional chain")
+                                    (if (token-is next "#")
+                                        (parse-fail "parser: private names are outside the admitted subset at byte"
+                                                    next)
+                                        (if (or (= (.kind next) TOK-IDENT)
+                                                (= (.kind next) TOK-KEYWORD))
+                                            (let [member (take-token)]
+                                              (set! (mut base)
+                                                    (syntax-add-node! (SxMember
+                                                                        :owner
+                                                                          (load base)
+                                                                        :name
+                                                                          (token-text member)
+                                                                        :optional
+                                                                          true)
+                                                                      (syntax-lo (load base))
+                                                                      (.end member))))
+                                            (syntax-error! "parser: expected a property, index or call after ?.")))))))
+                      (continue))
+                    (if (token-is t "[")
+                        (let [saved-no-in (.no-in (parser-state))]
+                          (take-token)
+                          (set! (.no-in (parser-state)) false)
+                          (let [key (parse-syntax-expression)]
+                            (set! (.no-in (parser-state)) saved-no-in)
+                            (require-closing! "]"
+                                              "parser: expected `]` after computed member")
+                            (set! (mut base)
+                                  (syntax-add-node! (SxIndex
+                                                      :owner (load base)
+                                                      :key key
+                                                      :optional false)
+                                                    (syntax-lo (load base))
+                                                    (lex-consumed-end)))
+                            (continue)))
+                        (if (and allow-call (token-is t "("))
+                            (do
+                              (take-token)
+                              (let [args (parse-syntax-arguments)]
+                                (set! (mut base)
+                                      (syntax-add-node! (SxCall
+                                                          :callee (load base)
+                                                          :args args
+                                                          :optional false)
+                                                        (syntax-lo (load base))
+                                                        (lex-consumed-end)))
+                                (continue)))
+                            (if (token-is t "`")
+                                (do
+                                  (if (syntax-optional-chain? (load base))
+                                      (syntax-error! "parser: tagged template is not allowed in an optional chain")
+                                      0)
+                                  (take-token)
+                                  (let [template (parse-syntax-template t true)]
+                                    (set! (mut base)
+                                          (syntax-add-node! (SxTaggedTemplate (load base)
+                                                                              template)
+                                                            (syntax-lo (load base))
+                                                            (lex-consumed-end)))
+                                    (continue)))
+                                (break 0))))))))
     (load base)))
+
+;; `new MemberExpression Arguments?`, `new new X()()`, and the meta property `new.target`, which
+;; is a proven error outside a function body. An `import()` or optional chain cannot be a `new`
+;; callee.
+(defn parse-syntax-new [(keyword Token)] (-> i64)
+  (if (take-is ".")
+      (let [name (take-token)]
+        (if (not (token-is name "target"))
+            (syntax-error! "parser: expected new.target")
+            (if (not (.parsing-function (parser-state)))
+                (syntax-error! "parser: new.target is not allowed outside a function")
+                (syntax-add-node! (SxNewTarget) (.start keyword) (.end name)))))
+      (let [callee
+              (if (token-is (peek-token) "new")
+                  (parse-syntax-new (take-token))
+                  (parse-syntax-member-tail (parse-syntax-primary) false))]
+        (match (syntax-node (syntax-spine-root callee))
+          (SxImportCall [specifier options]
+                        (syntax-error! "parser: import() cannot be used with new"))
+          (_ 0))
+        (if (syntax-optional-chain? callee)
+            (syntax-error! "parser: optional chain cannot be used with new")
+            0)
+        (let [args
+                (if (take-is "(")
+                    (parse-syntax-arguments)
+                    (al-new [i64] (alloc/malloc-allocator)))]
+          (syntax-add-node! (SxNew callee args)
+                            (.start keyword)
+                            (lex-consumed-end))))))
+
+;; LeftHandSideExpression: NewExpression or CallExpression, with the shared suffix loop.
+(defn parse-syntax-lhs [] (-> i64)
+  (let [first (peek-token)
+        base
+          (if (token-is first "new")
+              (parse-syntax-new (take-token))
+              (parse-syntax-primary))]
+    (parse-syntax-member-tail base true)))
 
 ;; AssignmentTargetType. A name or property Reference is simple. A CallExpression is invalid, but
 ;; only strict code proves it early: sloppy web-compatible code defers to a runtime ReferenceError,
 ;; so the strict pass reports it and lowering refuses it by name. Every other admitted expression
 ;; kind is proven invalid here. Parentheses are transparent for Reference targets, while a
 ;; parenthesized object literal can no longer be reinterpreted as a destructuring pattern.
-(defn syntax-check-simple-target! [(id i64) (op Token)] (-> i64)
-  (let [target-id (syntax-ungroup-id id)]
-    (match (syntax-node target-id)
-      (SxName [name] 0)
-      (SxMember [owner name] 0)
-      (SxCall [callee args] 0)
-      (SxObject [entries]
-                (if (and (= target-id id) (token-is op "="))
-                    (unimplemented "destructuring assignment pattern"
-                                   "docs/GAPS.md — destructuring")
-                    (syntax-error! "parser: invalid assignment target")))
-      (_ (syntax-error! "parser: invalid assignment target")))))
+(defn syntax-check-simple-target! [(id i64) (pattern-allowed bool)] (-> i64)
+  (let [target-id (syntax-ungroup-id id)
+        pattern (and pattern-allowed (= target-id id))]
+    (if (syntax-optional-chain? target-id)
+        (syntax-error! "parser: optional chain is not a valid assignment target")
+        (match (syntax-node target-id)
+          (SxName [name] 0)
+          (SxMember [owner name optional] 0)
+          (SxIndex [owner key optional] 0)
+          (SxCall [callee args optional] 0)
+          (SxObject [entries]
+                    (if pattern
+                        (unimplemented "destructuring assignment pattern"
+                                       "docs/GAPS.md — destructuring")
+                        (syntax-error! "parser: invalid assignment target")))
+          (SxArray [elements]
+                   (if pattern
+                       (unimplemented "destructuring assignment pattern"
+                                      "docs/GAPS.md — destructuring")
+                       (syntax-error! "parser: invalid assignment target")))
+          (_ (syntax-error! "parser: invalid assignment target"))))))
 
 (defn token-update-op-name [(t Token)] (-> (slice u8))
   (if (token-is t "++") "JsIncrement" "JsDecrement"))
@@ -977,7 +1559,7 @@
     (if (and (or (token-is t "++") (token-is t "--")) (not (.nl-before t)))
         (do
           (take-token)
-          (syntax-check-simple-target! lhs t)
+          (syntax-check-simple-target! lhs false)
           (syntax-add-node! (SxUpdate
                               :op (token-update-op-name t)
                               :prefix false
@@ -1024,7 +1606,7 @@
             (do
               (take-token)
               (let [operand (parse-syntax-unary)]
-                (syntax-check-simple-target! operand t)
+                (syntax-check-simple-target! operand false)
                 (syntax-add-node! (SxUpdate
                                     :op (token-update-op-name t)
                                     :prefix true
@@ -1333,7 +1915,7 @@
         lhs
         (do
           (take-token)
-          (syntax-check-simple-target! lhs op)
+          (syntax-check-simple-target! lhs (token-is op "="))
           (let [target (syntax-ungroup-id lhs)
                 rhs (parse-syntax-assignment)]
             (syntax-binary! (if logical
@@ -1380,15 +1962,18 @@
 ;; A token that continues an expression through grammar this parser has not admitted (arrow
 ;; bodies, computed members, optional chains, tagged templates) is not evidence of an error.
 (defn token-unsupported-continuation? [(t Token)] (-> bool)
-  (or (token-is t "=>") (token-is t "[") (token-is t "?.") (token-is t "`")))
+  (token-is t "=>"))
 
 (defn parse-statement-end! [] (-> i64)
   (if (take-is ";")
       0
       (let [next (peek-token)]
         (if (token-unsupported-continuation? next)
-            (parse-fail "parser: expression continuation is outside the admitted subset at byte" next)
-            (if (or (.nl-before next) (token-is next "}") (= (.kind next) TOK-EOF))
+            (parse-fail "parser: expression continuation is outside the admitted subset at byte"
+                        next)
+            (if (or (.nl-before next)
+                    (token-is next "}")
+                    (= (.kind next) TOK-EOF))
                 0
                 (syntax-error! "parser: expected semicolon or line terminator"))))))
 
@@ -1396,7 +1981,7 @@
 ;; mistake them for a proven "expected an expression" error.
 (defn token-unsupported-statement? [(t Token)] (-> bool)
   (and (= (.kind t) TOK-KEYWORD)
-       (or (token-is t "class") (token-is t "function") (token-is t "import") (token-is t "export"))))
+       (or (token-is t "class") (token-is t "function"))))
 
 ;; `break`/`continue` take an optional same-line LabelIdentifier; a line terminator ends them.
 (defn parse-jump-label [] (-> (Option (slice u8)))
@@ -1414,7 +1999,9 @@
               (take-token)
               (let [label (parse-jump-label)]
                 (parse-statement-end!)
-                (syntax-stmt-add-node! (if (token-is t "break") (SsBreak label) (SsContinue label))
+                (syntax-stmt-add-node! (if (token-is t "break")
+                                           (SsBreak label)
+                                           (SsContinue label))
                                        (.start t)
                                        (lex-consumed-end))))
             (if (take-is ";")
@@ -1487,13 +2074,17 @@
               (take-token)
               (let [next (peek-token)]
                 (if (and (not (.nl-before next))
-                         (or (= (.kind next) TOK-IDENT) (token-is next "[") (token-is next "{")))
+                         (or (= (.kind next) TOK-IDENT)
+                             (token-is next "[")
+                             (token-is next "{")))
                     (syntax-error! "parser: lexical declaration is not allowed in a statement position")
-                    (parse-fail "parser: sloppy `let` identifier is outside the admitted subset at byte" t))))
+                    (parse-fail "parser: sloppy `let` identifier is outside the admitted subset at byte"
+                                t))))
             (if (token-is t "function")
                 (if loop-body
                     (syntax-error! "parser: function declaration is not allowed in a loop body")
-                    (parse-fail "parser: Annex B function-in-statement is outside the admitted subset at byte" t))
+                    (parse-fail "parser: Annex B function-in-statement is outside the admitted subset at byte"
+                                t))
                 (if (and (token-is t "async") (lex-second-is? "function"))
                     (syntax-error! "parser: async function declaration is not allowed in a statement position")
                     (parse-syntax-statement)))))))
@@ -1564,7 +2155,8 @@
     (if (token-is t text)
         (do (take-token) 0)
         (if (token-unsupported-continuation? t)
-            (parse-fail "parser: expression continuation is outside the admitted subset at byte" t)
+            (parse-fail "parser: expression continuation is outside the admitted subset at byte"
+                        t)
             (syntax-error! message)))))
 
 (defn parse-syntax-declarations [] (-> i64)
@@ -1575,7 +2167,10 @@
 (defn syntax-stmt-lexical? [(id i64)] (-> bool)
   (match (syntax-stmt-node id)
     (SsLet [name init final annotation] true)
-    (SsDeclList [decls] (if (= (len decls) 0) false (syntax-stmt-lexical? (get decls 0))))
+    (SsDeclList [decls]
+                (if (= (len decls) 0)
+                    false
+                    (syntax-stmt-lexical? (get decls 0))))
     (_ false)))
 
 ;; A for-in/of head declaration binds exactly one name without an initializer. Annex B admits
@@ -1590,9 +2185,11 @@
              (None [] 0)))
     (SsLet [name init final annotation]
            (match init
-             (Some [e] (syntax-error! "parser: for-in/of lexical binding cannot have an initializer"))
+             (Some [e]
+                   (syntax-error! "parser: for-in/of lexical binding cannot have an initializer"))
              (None [] 0)))
-    (SsDeclList [decls] (syntax-error! "parser: for-in/of head declares exactly one binding"))
+    (SsDeclList [decls]
+                (syntax-error! "parser: for-in/of head declares exactly one binding"))
     (_ (broken "syntax-check-for-in-head!: head is not a declaration"))))
 
 (defn syntax-check-const-initializers! [(stmt i64)] (-> i64)
@@ -1601,7 +2198,8 @@
            (if (and final (match init (Some [e] false) (None [] true)))
                (syntax-error! "parser: const declaration requires an initializer")
                0))
-    (SsDeclList [decls] (do (al-for [d decls] (syntax-check-const-initializers! d)) 0))
+    (SsDeclList [decls]
+                (do (al-for [d decls] (syntax-check-const-initializers! d)) 0))
     (_ 0)))
 
 ;; for ( init ; test ; update ) body, for ( head in object ) body, for ( head of iterable ) body.
@@ -1609,7 +2207,8 @@
 (defn parse-syntax-for [] (-> i64)
   (let [keyword (require-token "for")]
     (if (token-is (peek-token) "await")
-        (parse-fail "parser: for-await-of is outside the admitted subset at byte" (peek-token))
+        (parse-fail "parser: for-await-of is outside the admitted subset at byte"
+                    (peek-token))
         0)
     (require-token "(")
     (let [first (peek-token)
@@ -1622,8 +2221,10 @@
                   (if (or (token-is first "var")
                           (token-is first "const")
                           (and (token-is first "let")
-                                  (or (lex-second-kind? TOK-IDENT) (lex-second-is? "let")
-                                      (lex-second-is? "[") (lex-second-is? "{"))))
+                               (or (lex-second-kind? TOK-IDENT)
+                                   (lex-second-is? "let")
+                                   (lex-second-is? "[")
+                                   (lex-second-is? "{"))))
                       (ForInitDecl (parse-syntax-declaration-list true))
                       (if (token-is first "let")
                           (do
@@ -1640,10 +2241,14 @@
               (take-token)
               (match head
                 (ForInitDecl [stmt] (syntax-check-for-in-head! stmt))
-                (ForInitExpr [expr] (syntax-check-simple-target! expr after))
+                (ForInitExpr [expr] (syntax-check-simple-target! expr true))
                 (ForNoInit [] 0))
-              (let [right (if of (parse-syntax-assignment) (parse-syntax-expression))]
-                (require-closing! ")" "parser: expected `)` after for-in/of head")
+              (let [right
+                      (if of
+                          (parse-syntax-assignment)
+                          (parse-syntax-expression))]
+                (require-closing! ")"
+                                  "parser: expected `)` after for-in/of head")
                 (let [body (parse-syntax-controlled-statement true)]
                   (syntax-stmt-add-node! (SsForIn
                                            :head head
@@ -1657,11 +2262,20 @@
               (match head
                 (ForInitDecl [stmt] (syntax-check-const-initializers! stmt))
                 (_ 0))
-              (require-closing! ";" "parser: expected `;` in for statement head")
-              (let [test (if (token-is (peek-token) ";") (None [i64]) (Some (parse-syntax-expression)))]
-                (require-closing! ";" "parser: expected `;` in for statement head")
-                (let [update (if (token-is (peek-token) ")") (None [i64]) (Some (parse-syntax-expression)))]
-                  (require-closing! ")" "parser: expected `)` after for statement head")
+              (require-closing! ";"
+                                "parser: expected `;` in for statement head")
+              (let [test
+                      (if (token-is (peek-token) ";")
+                          (None [i64])
+                          (Some (parse-syntax-expression)))]
+                (require-closing! ";"
+                                  "parser: expected `;` in for statement head")
+                (let [update
+                        (if (token-is (peek-token) ")")
+                            (None [i64])
+                            (Some (parse-syntax-expression)))]
+                  (require-closing! ")"
+                                    "parser: expected `)` after for statement head")
                   (let [body (parse-syntax-controlled-statement true)]
                     (syntax-stmt-add-node! (SsFor
                                              :init head
@@ -1689,16 +2303,19 @@
           (if (take-is "(")
               (let [param (peek-token)]
                 (if (or (token-is param "[") (token-is param "{"))
-                    (parse-fail "parser: destructuring catch parameters are outside the admitted subset at byte" param)
+                    (parse-fail "parser: destructuring catch parameters are outside the admitted subset at byte"
+                                param)
                     0)
                 (set! (mut catch-param) (Some (token-text (require-ident))))
                 (require-token ")")
                 0)
               0)
-          (set! (mut catch-body) (Some (parse-syntax-block-required "parser: expected a block after catch"))))
+          (set! (mut catch-body)
+                (Some (parse-syntax-block-required "parser: expected a block after catch"))))
         0)
     (if (take-is "finally")
-        (set! (mut finally-body) (Some (parse-syntax-block-required "parser: expected a block after finally")))
+        (set! (mut finally-body)
+              (Some (parse-syntax-block-required "parser: expected a block after finally")))
         0)
     (if (and (match (load catch-body) (None [] true) (_ false))
              (match (load finally-body) (None [] true) (_ false)))
@@ -1715,7 +2332,17 @@
 (defn parse-syntax-statement-inner [] (-> i64)
   (let [first (peek-token)]
     (if (token-unsupported-statement? first)
-        (parse-fail "parser: statement is outside the admitted subset at byte" first)
+        (parse-fail "parser: statement is outside the admitted subset at byte"
+                    first)
+        0)
+    ;; Import and export declarations exist only in the Module goal. `import(` and `import.` begin
+    ;; expressions and take the ordinary expression-statement path below.
+    (if (token-is first "export")
+        (syntax-error! "parser: export declarations are only valid in a module")
+        0)
+    (if (and (token-is first "import")
+             (not (or (lex-second-is? "(") (lex-second-is? "."))))
+        (syntax-error! "parser: import declarations are only valid in a module")
         0)
     (if (token-is first "for")
         (parse-syntax-for)
@@ -1730,7 +2357,9 @@
                         close (require-token ")")]
                     ;; ASI: the `;` after a do-while's `)` may be omitted even without a line terminator.
                     (take-is ";")
-                    (syntax-stmt-add-node! (SsDoWhile body condition) (.start keyword) (.end close))))
+                    (syntax-stmt-add-node! (SsDoWhile body condition)
+                                           (.start keyword)
+                                           (.end close))))
                 (if (token-is first "throw")
                     (let [keyword (take-token)
                           next (peek-token)]
@@ -1739,25 +2368,33 @@
                           0)
                       (let [value (parse-syntax-expression)]
                         (parse-statement-end!)
-                        (syntax-stmt-add-node! (SsThrow value) (.start keyword) (syntax-hi value))))
+                        (syntax-stmt-add-node! (SsThrow value)
+                                               (.start keyword)
+                                               (syntax-hi value))))
                     (if (token-is first "with")
                         (let [keyword (take-token)]
                           (require-token "(")
                           (let [object (parse-syntax-expression)]
                             (require-token ")")
                             (let [body (parse-syntax-controlled-statement false)]
-                              (syntax-stmt-add-node! (SsWith object body) (.start keyword) (syntax-stmt-hi body)))))
+                              (syntax-stmt-add-node! (SsWith object body)
+                                                     (.start keyword)
+                                                     (syntax-stmt-hi body)))))
                         (if (token-is first "debugger")
                             (let [keyword (take-token)]
                               (parse-statement-end!)
-                              (syntax-stmt-add-node! (SsDebugger) (.start keyword) (.end keyword)))
+                              (syntax-stmt-add-node! (SsDebugger)
+                                                     (.start keyword)
+                                                     (.end keyword)))
                             (if (token-is first "while")
                                 (let [keyword (take-token)]
                                   (require-token "(")
                                   (let [condition (parse-syntax-expression)]
                                     (require-token ")")
-                                    (let [body (parse-syntax-controlled-statement true)]
-                                      (syntax-stmt-add-node! (SsWhile condition body)
+                                    (let [body
+                                            (parse-syntax-controlled-statement true)]
+                                      (syntax-stmt-add-node! (SsWhile condition
+                                                                      body)
                                                              (.start keyword)
                                                              (syntax-stmt-hi body)))))
                                 (if (token-is first "if")
@@ -1765,15 +2402,21 @@
                                       (require-token "(")
                                       (let [condition (parse-syntax-expression)]
                                         (require-token ")")
-                                        (let [yes (parse-syntax-controlled-statement false)
+                                        (let [yes
+                                                (parse-syntax-controlled-statement false)
                                               no
                                                 (if (take-is "else")
                                                     (Some (parse-syntax-controlled-statement false))
                                                     (None [i64]))
-                                              last (match no (Some [n] n) (None [] yes))]
+                                              last
+                                                (match no
+                                                  (Some [n] n)
+                                                  (None [] yes))]
                                           (syntax-stmt-add-node! (SsIf
-                                                                   :condition condition
-                                                                   :then-stmt yes
+                                                                   :condition
+                                                                     condition
+                                                                   :then-stmt
+                                                                     yes
                                                                    :else-stmt no)
                                                                  (.start keyword)
                                                                  (syntax-stmt-hi last)))))
@@ -1796,7 +2439,8 @@
                                                     (syntax-stmt-add-node! (SsReturn (None [i64]))
                                                                            (.start keyword)
                                                                            (.end keyword)))
-                                                  (let [expr (parse-syntax-expression)]
+                                                  (let [expr
+                                                          (parse-syntax-expression)]
                                                     (parse-statement-end!)
                                                     (syntax-stmt-add-node! (SsReturn (Some expr))
                                                                            (.start keyword)
@@ -1804,26 +2448,39 @@
                                             (if (token-is first "{")
                                                 (do
                                                   (take-token)
-                                                  (let [(mut body) (al-new [i64] (alloc/malloc-allocator))]
-                                                    (loop (if (token-is (peek-token) "}")
+                                                  (let [(mut body)
+                                                          (al-new [i64]
+                                                                  (alloc/malloc-allocator))]
+                                                    (loop (if (token-is (peek-token)
+                                                                        "}")
                                                               (break 0)
                                                               (do
                                                                 (push! [i64]
                                                                        (mut body)
                                                                        (parse-syntax-statement))
                                                                 (continue))))
-                                                    (let [close (require-token "}")]
+                                                    (let [close
+                                                            (require-token "}")]
                                                       (syntax-stmt-add-node! (SsBlock (load body))
                                                                              (.start first)
                                                                              (.end close)))))
-                                                (let [expr (parse-syntax-expression)
+                                                (let [expr
+                                                        (parse-syntax-expression)
                                                       parsed (syntax-at expr)]
                                                   ;; `label: statement` shares its first token with an expression statement.
-                                                  (if (and (token-is (peek-token) ":") (syntax-name? expr))
-                                                      (let [label (match (syntax-node expr) (SxName [name] name) (_ ""))]
+                                                  (if (and (token-is (peek-token)
+                                                                     ":")
+                                                           (syntax-name? expr))
+                                                      (let [label
+                                                              (match (syntax-node expr)
+                                                                (SxName [name]
+                                                                        name)
+                                                                (_ ""))]
                                                         (take-token)
-                                                        (let [body (parse-syntax-controlled-statement false)]
-                                                          (syntax-stmt-add-node! (SsLabeled label body)
+                                                        (let [body
+                                                                (parse-syntax-controlled-statement false)]
+                                                          (syntax-stmt-add-node! (SsLabeled label
+                                                                                            body)
                                                                                  (.lo parsed)
                                                                                  (syntax-stmt-hi body))))
                                                       (do
@@ -1923,7 +2580,7 @@
 (defn syntax-check-strict-target! [(target i64)] (-> i64)
   (match (syntax-node target)
     (SxName [name] (syntax-strict-binding! name))
-    (SxCall [callee args]
+    (SxCall [callee args optional]
             (syntax-error! "parser: call expression is not a valid assignment target in strict code"))
     (_ 0)))
 
@@ -1944,10 +2601,6 @@
                     0))
       (SxName [name]
               (if (syntax-strict-reserved? name)
-                  (syntax-error! "parser: reserved identifier in strict code")
-                  0))
-      (SxCall [callee args]
-              (if (syntax-strict-reserved? callee)
                   (syntax-error! "parser: reserved identifier in strict code")
                   0))
       (SxDelete [operand]
@@ -1983,7 +2636,9 @@
                                (syntax-error! "parser: reserved identifier in strict code")
                                0))
                 (SsTry [body catch-param catch-body finally-body]
-                       (match catch-param (Some [name] (syntax-strict-binding! name)) (None [] 0)))
+                       (match catch-param
+                         (Some [name] (syntax-strict-binding! name))
+                         (None [] 0)))
                 (_ 0))
               (syntax-stmt-exprs! id (mut exprs))
               (al-for [e (load exprs)] (syntax-check-strict-expr! e))
@@ -2025,6 +2680,25 @@
                                   (continue)))))
                     (syntax-check-strict-statements! (.body fun)))
                   0)))
+    0))
+
+;; `{a = 1}` is only valid when the object literal is reinterpreted as an assignment pattern.
+;; Destructuring assignment refuses before this walk runs, so any surviving CoverInitializedName
+;; is a proven SyntaxError.
+(defn syntax-check-cover-initializers! [] (-> i64)
+  (do
+    (al-for [x (.exprs (parser-state))]
+            (let [expr x]
+              (match (.node expr)
+                (SxObject [entries]
+                          (do
+                            (al-for [entry entries]
+                                    (match entry
+                                      (PropCoverInit [name init]
+                                                     (syntax-error! "parser: invalid shorthand property initializer"))
+                                      (_ 0)))
+                            0))
+                (_ 0))))
     0))
 
 (defn parser-source-entry-index [] (-> i64)
@@ -2146,7 +2820,8 @@
 
 ;; The CatchParameter shares a scope with the catch Block's lexical declarations; a `var` of the
 ;; same name is permitted by Annex B.
-(defn syntax-check-catch-parameter! [(param (Option (slice u8))) (catch-body (Option i64))] (-> i64)
+(defn syntax-check-catch-parameter! [(param (Option (slice u8)))
+                                     (catch-body (Option i64))] (-> i64)
   (match param
     (None [] 0)
     (Some [name]
@@ -2155,8 +2830,12 @@
             (Some [block]
                   (match (syntax-stmt-node block)
                     (SsBlock [body]
-                             (let [(mut names) (al-new [(slice u8)] (alloc/malloc-allocator))]
-                               (syntax-collect-declarations! body true (mut names))
+                             (let [(mut names)
+                                     (al-new [(slice u8)]
+                                             (alloc/malloc-allocator))]
+                               (syntax-collect-declarations! body
+                                                             true
+                                                             (mut names))
                                (al-for [declared (load names)]
                                        (if (= declared name)
                                            (syntax-error! "parser: catch parameter conflicts with a lexical declaration")
@@ -2191,7 +2870,8 @@
                                 (unknown (slice u8))] (-> i64)
   (match label
     (None [] (if (= depth 0) (syntax-error! unlabelled) 0))
-    (Some [name] (if (syntax-labels-contain? labels name) 0 (syntax-error! unknown)))))
+    (Some [name]
+          (if (syntax-labels-contain? labels name) 0 (syntax-error! unknown)))))
 
 ;; Early errors for break/continue/labels. `labels` is the enclosing label set, `loop-labels`
 ;; the subset naming an iteration statement; `breakable` and `loops` count enclosing targets for
@@ -2207,12 +2887,18 @@
                   handled
                     (match (syntax-stmt-node id)
                       (SsLabeled [label body]
-                                 (let [iteration (syntax-labeled-iteration? body)]
-                                   (if (syntax-labels-contain? (load labels) label)
+                                 (let [iteration
+                                         (syntax-labeled-iteration? body)]
+                                   (if (syntax-labels-contain? (load labels)
+                                                               label)
                                        (syntax-error! "parser: duplicate label")
                                        0)
                                    (push! [(slice u8)] (mut labels) label)
-                                   (if iteration (push! [(slice u8)] (mut loop-labels) label) 0)
+                                   (if iteration
+                                       (push! [(slice u8)]
+                                              (mut loop-labels)
+                                              label)
+                                       0)
                                    (push! [i64] (mut children) body)
                                    (syntax-check-jumps! (load children)
                                                         (mut labels)
@@ -2220,7 +2906,9 @@
                                                         breakable
                                                         loops)
                                    (pop! (mut labels))
-                                   (if iteration (do (pop! (mut loop-labels)) 0) 0)
+                                   (if iteration
+                                       (do (pop! (mut loop-labels)) 0)
+                                       0)
                                    true))
                       (SsBreak [label]
                                (do
@@ -2240,7 +2928,10 @@
                                     true))
                       (_ false))
                   loop (syntax-iteration-stmt? id)
-                  switch (match (syntax-stmt-node id) (SsSwitch [discriminant cases] true) (_ false))]
+                  switch
+                    (match (syntax-stmt-node id)
+                      (SsSwitch [discriminant cases] true)
+                      (_ false))]
               (if handled
                   0
                   (do
@@ -2248,7 +2939,9 @@
                     (syntax-check-jumps! (load children)
                                          (mut labels)
                                          (mut loop-labels)
-                                         (if (or loop switch) (+ breakable 1) breakable)
+                                         (if (or loop switch)
+                                             (+ breakable 1)
+                                             breakable)
                                          (if loop (+ loops 1) loops))))
               (al-free! [i64] (mut children))))
     0))
@@ -2422,7 +3115,10 @@
 (defn lower-ref-prepare! [(target i64)] (-> SyntaxRef)
   (let [(mut ref) (primitive/zeroed SyntaxRef)]
     (match (syntax-node target)
-      (SxMember [owner name]
+      (SxIndex [owner key optional]
+               (unimplemented "computed property assignment"
+                              "docs/GAPS.md — property keys"))
+      (SxMember [owner name optional]
                 (let [base (lower-syntax-expr owner)
                       key (con-int (shape-key-intern name))]
                   (n-keep! base)
@@ -2437,7 +3133,7 @@
                       (>= (scope-find (parser-node (.current-scope (parser-state)))
                                       name)
                           0))))
-      (SxCall [callee args]
+      (SxCall [callee args optional]
               (unimplemented "call expression assignment target (sloppy runtime ReferenceError)"
                              "docs/GAPS.md — exceptions"))
       (_ (broken "lower-ref-prepare!: target survived syntax validation")))
@@ -2571,7 +3267,7 @@
     (scope-set-mem! scope (.mem result))
     (.value result)))
 
-(defn lower-object-literal [(entries (ArrayList i64))] (-> (dyn NodeOps))
+(defn lower-object-literal [(entries (ArrayList ObjectEntry))] (-> (dyn NodeOps))
   (let [scope (parser-node (.current-scope (parser-state)))
         (mut no-args) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))
         created
@@ -2579,37 +3275,46 @@
                                   (load no-args)
                                   (parser-node (.current-ctrl (parser-state)))
                                   (scope-mem scope))
-        (mut object-nid) (n-nid (.value created))
-        (mut i) 0]
+        (mut object-nid) (n-nid (.value created))]
     (parser-set-current-ctrl! (.ctrl created))
     (scope-set-mem! scope (.mem created))
-    (loop (if (>= (load i) (len entries))
-              (break 0)
-              (let [key (get entries (load i))
-                    value (lower-syntax-expr (get entries (+ (load i) 1)))
-                    (mut args) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))]
-                (push! [(dyn NodeOps)]
-                       (mut args)
-                       (match (arena-node (load object-nid))
-                         (Some [n] n)
-                         (None [] (unreachable-node))))
-                (if (= (shape-key-name key) "__proto__")
-                    0
-                    (push! [(dyn NodeOps)] (mut args) (con-int key)))
-                (push! [(dyn NodeOps)] (mut args) value)
-                (let [defined
-                        (jsl-lower-macro-values (if (= (shape-key-name key)
-                                                       "__proto__")
-                                                    "JsSetObjectLiteralPrototype"
-                                                    "JsCreateDataPropertyNamed")
-                                                (load args)
-                                                (parser-node (.current-ctrl (parser-state)))
-                                                (scope-mem scope))]
-                  (set! (mut object-nid) (n-nid (.value defined)))
-                  (parser-set-current-ctrl! (.ctrl defined))
-                  (scope-set-mem! scope (.mem defined)))
-                (set! (mut i) (+ (load i) 2))
-                (continue))))
+    (al-for [entry entries]
+            (match entry
+              (PropNamed [key value-id]
+                         (let [value (lower-syntax-expr value-id)
+                               (mut args)
+                                 (al-new [(dyn NodeOps)]
+                                         (alloc/malloc-allocator))]
+                           (push! [(dyn NodeOps)]
+                                  (mut args)
+                                  (match (arena-node (load object-nid))
+                                    (Some [n] n)
+                                    (None [] (unreachable-node))))
+                           (if (= (shape-key-name key) "__proto__")
+                               0
+                               (push! [(dyn NodeOps)] (mut args) (con-int key)))
+                           (push! [(dyn NodeOps)] (mut args) value)
+                           (let [defined
+                                   (jsl-lower-macro-values (if (= (shape-key-name key)
+                                                                  "__proto__")
+                                                               "JsSetObjectLiteralPrototype"
+                                                               "JsCreateDataPropertyNamed")
+                                                           (load args)
+                                                           (parser-node (.current-ctrl (parser-state)))
+                                                           (scope-mem scope))]
+                             (set! (mut object-nid) (n-nid (.value defined)))
+                             (parser-set-current-ctrl! (.ctrl defined))
+                             (scope-set-mem! scope (.mem defined)))
+                           (al-free! [(dyn NodeOps)] (mut args))
+                           0))
+              (PropComputed [key value]
+                            (unimplemented "computed property keys"
+                                           "docs/GAPS.md — property keys"))
+              (PropSpread [expr]
+                          (unimplemented "object spread"
+                                         "docs/GAPS.md — property enumeration"))
+              (PropCoverInit [name init]
+                             (broken "lower-object-literal: CoverInitializedName survived validation"))))
     (let [(mut finish-args) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))]
       (push! [(dyn NodeOps)]
              (mut finish-args)
@@ -2798,7 +3503,8 @@
                                          (con-int value)
                                          (con-flt value-float))))
               (SxString [raw units legacy]
-                        (let [scope (parser-node (.current-scope (parser-state)))
+                        (let [scope
+                                (parser-node (.current-scope (parser-state)))
                               lowered
                                 (jsl-lower-string-units units
                                                         (parser-node (.current-ctrl (parser-state)))
@@ -2810,8 +3516,78 @@
               (SxSingleton [name] (lower-singleton name))
               (SxGroup [inner] (lower-syntax-expr inner))
               (SxObject [entries] (lower-object-literal entries))
-              (SxMember [owner name] (lower-member-read owner name))
-              (SxCall [callee args] (lower-named-call callee args))
+              (SxArray [elements]
+                       (do
+                         (unimplemented "array literals"
+                                        "docs/GAPS.md — array allocation")
+                         (unreachable-node)))
+              (SxMember [owner name optional]
+                        (if optional
+                            (do
+                              (unimplemented "optional chaining"
+                                             "docs/GAPS.md — nullish short-circuit chains")
+                              (unreachable-node))
+                            (lower-member-read owner name)))
+              (SxIndex [owner key optional]
+                       (do
+                         (unimplemented "computed property access"
+                                        "docs/GAPS.md — property keys")
+                         (unreachable-node)))
+              (SxCall [callee args optional]
+                      (if optional
+                          (do
+                            (unimplemented "optional chaining"
+                                           "docs/GAPS.md — nullish short-circuit chains")
+                            (unreachable-node))
+                          (match (syntax-node (syntax-ungroup-id callee))
+                            (SxName [name] (lower-named-call name args))
+                            (_ (do
+                                 (unimplemented "calls through callable values"
+                                                "docs/GAPS.md — function values and closures")
+                                 (unreachable-node))))))
+              (SxNew [callee args]
+                     (do
+                       (unimplemented "constructor calls"
+                                      "docs/GAPS.md — function objects")
+                       (unreachable-node)))
+              (SxNewTarget []
+                           (do
+                             (unimplemented "new.target"
+                                            "docs/GAPS.md — function objects")
+                             (unreachable-node)))
+              (SxThis []
+                      (do
+                        (unimplemented "this binding"
+                                       "docs/GAPS.md — receivers and the global object")
+                        (unreachable-node)))
+              (SxSpread [expr]
+                        (do
+                          (unimplemented "spread arguments"
+                                         "docs/GAPS.md — iteration protocol")
+                          (unreachable-node)))
+              (SxImportCall [specifier options]
+                            (do
+                              (unimplemented "dynamic import()"
+                                             "docs/GAPS.md — modules")
+                              (unreachable-node)))
+              ;; A substitution-free template is exactly its cooked string.
+              (SxTemplate [quasis substitutions]
+                          (if (= (len substitutions) 0)
+                              (lower-syntax-expr (get quasis 0))
+                              (do
+                                (unimplemented "template substitutions (ToString)"
+                                               "docs/GAPS.md — string conversion")
+                                (unreachable-node))))
+              (SxTaggedTemplate [tag template]
+                                (do
+                                  (unimplemented "tagged templates"
+                                                 "docs/GAPS.md — function values")
+                                  (unreachable-node)))
+              (SxRegex [body flags]
+                       (do
+                         (unimplemented "regular expression objects"
+                                        "docs/GAPS.md — RegExp")
+                         (unreachable-node)))
               (SxUnary [op operand]
                        (do
                          (lower-require-jsl! op)
@@ -2899,7 +3675,10 @@
 
 (defn parser-pop-jump! [] (-> JumpTarget)
   (match (pop! (mut (.jump-targets (parser-state))))
-    (None [] (do (broken "parser-pop-jump!: no target") (primitive/zeroed JumpTarget)))
+    (None []
+          (do
+            (broken "parser-pop-jump!: no target")
+            (primitive/zeroed JumpTarget)))
     (Some [target]
           (let [saved target
                 (mut labels) (.labels saved)]
@@ -2911,11 +3690,14 @@
   (let [p (parser-state)
         (mut i) (- (len (.jump-targets p)) 1)]
     (loop (if (< (load i) 0)
-              (break (do (broken "parser-find-jump: no target after syntax validation") -1))
+              (break (do
+                       (broken "parser-find-jump: no target after syntax validation")
+                       -1))
               (let [target (get (.jump-targets p) (load i))
                     matches
                       (match label
-                        (Some [name] (syntax-labels-contain? (.labels target) name))
+                        (Some [name]
+                              (syntax-labels-contain? (.labels target) name))
                         (None []
                               (if continue?
                                   (= (.kind target) JUMP-LOOP)
@@ -2939,7 +3721,11 @@
       (if continue?
           (do
             (match (.continue-scope meta)
-              (None [] (do (n-keep! outgoing) (set! (.continue-scope meta) (Some (n-nid outgoing))) 0))
+              (None []
+                    (do
+                      (n-keep! outgoing)
+                      (set! (.continue-scope meta) (Some (n-nid outgoing)))
+                      0))
               (Some [cs] (do (scope-merge! (parser-node cs) outgoing) 0)))
             (set! (.continue-count meta) (+ (.continue-count meta) 1)))
           (do
@@ -2989,8 +3775,10 @@
                                  (None [(dyn NodeOps)])
                                  (Some fun))
                     (let [region (region-make)
-                          memphi (memphi-make region ALIAS-BULK TY-BOT "$return.mem")
-                          valuephi (phi-make region (ty-dyn TAG-ANY) "$return.value")
+                          memphi
+                            (memphi-make region ALIAS-BULK TY-BOT "$return.mem")
+                          valuephi
+                            (phi-make region (ty-dyn TAG-ANY) "$return.value")
                           (mut i) 0]
                       (loop (if (>= (load i) count)
                                 (break 0)
@@ -3107,7 +3895,8 @@
                                 (lower-js-truthy (lower-js-binary value
                                                                   selector
                                                                   "JsStrictEqual"))
-                              selected (parser-node (.current-scope (parser-state)))
+                              selected
+                                (parser-node (.current-scope (parser-state)))
                               iff (if-make (scope-ctrl selected) predicate)
                               arms (if-arms! iff)
                               unmatched (scope-dup selected false)]
@@ -3151,7 +3940,11 @@
         0)
     (let [target (parser-pop-jump!)]
       (parser-use-scope! exit)
-      (if (or (< (load default-index) 0) (!= (load fallthrough) 0) (> (.count target) 0)) 0 1))))
+      (if (or (< (load default-index) 0)
+              (!= (load fallthrough) 0)
+              (> (.count target) 0))
+          0
+          1))))
 
 (defn lower-block [(body (ArrayList i64))] (-> i64)
   (let [scope (parser-node (.current-scope (parser-state)))]
@@ -3225,7 +4018,9 @@
             0)
         ;; This is one atomic protocol: backedge control first, then all materialized Phi
         ;; backedges, before any peephole can run.
-        (scope-end-loop! entry (parser-node (.current-scope (parser-state))) exit-scope)
+        (scope-end-loop! entry
+                         (parser-node (.current-scope (parser-state)))
+                         exit-scope)
         (parser-pop-jump!)
         (n-unkeep! entry)
         (parser-use-scope! exit-scope)
@@ -3240,7 +4035,8 @@
 ;; after the loop is unreachable unless a break reached the exit.
 (defn lower-do-while [(body i64) (condition-id i64)] (-> i64)
   (let [entry (lower-loop-head!)
-        exit-scope (scope-dup (parser-node (.current-scope (parser-state))) false)]
+        exit-scope
+          (scope-dup (parser-node (.current-scope (parser-state))) false)]
     (scope-set-ctrl! exit-scope (xctrl-make))
     (parser-push-jump! exit-scope JUMP-LOOP)
     (let [terminated (lower-syntax-statement body)
@@ -3255,7 +4051,9 @@
             (scope-merge! exit-scope false-scope)
             (scope-set-ctrl! condition-scope (arms-true arms))
             (scope-end-loop! entry condition-scope exit-scope))
-          (scope-end-loop! entry (parser-node (.current-scope (parser-state))) exit-scope))
+          (scope-end-loop! entry
+                           (parser-node (.current-scope (parser-state)))
+                           exit-scope))
       (let [target (parser-pop-jump!)]
         (n-unkeep! entry)
         (parser-use-scope! exit-scope)
@@ -3272,7 +4070,10 @@
 ;; runs the shared looping protocol and pops that scope. A head `let` is one binding here, not a
 ;; per-iteration copy: without closures the per-iteration environment is unobservable, and this
 ;; must change when captured environments arrive.
-(defn lower-for [(init ForInit) (test (Option i64)) (update (Option i64)) (body i64)] (-> i64)
+(defn lower-for [(init ForInit)
+                 (test (Option i64))
+                 (update (Option i64))
+                 (body i64)] (-> i64)
   (do
     (scope-push! (parser-node (.current-scope (parser-state))))
     (match init
@@ -3305,7 +4106,9 @@
           (parser-push-jump! exit JUMP-BLOCK)
           (let [terminated (lower-syntax-statement body)
                 target (parser-pop-jump!)
-                merged (scope-merge! (parser-node (.current-scope (parser-state))) exit)]
+                merged
+                  (scope-merge! (parser-node (.current-scope (parser-state)))
+                                exit)]
             (parser-use-scope! merged)
             (if (and (!= terminated 0) (= (.count target) 0)) 1 0))))))
 
@@ -3351,13 +4154,17 @@
     (SsDoWhile [body condition] (lower-do-while body condition))
     (SsFor [init test update body] (lower-for init test update body))
     (SsForIn [head of right body]
-             (unimplemented (if of "for-of iteration protocol" "for-in property enumeration")
+             (unimplemented (if of
+                                "for-of iteration protocol"
+                                "for-in property enumeration")
                             "docs/GAPS.md — iteration statements"))
     (SsLabeled [label body] (lower-labeled label body))
-    (SsThrow [value] (unimplemented "throw completion" "docs/GAPS.md — exceptions"))
+    (SsThrow [value]
+             (unimplemented "throw completion" "docs/GAPS.md — exceptions"))
     (SsTry [body catch-param catch-body finally-body]
            (unimplemented "try/catch/finally" "docs/GAPS.md — exceptions"))
-    (SsWith [object body] (unimplemented "with object environment" "docs/GAPS.md — with"))
+    (SsWith [object body]
+            (unimplemented "with object environment" "docs/GAPS.md — with"))
     ;; `debugger` has no observable semantics outside a debugger and lowers to nothing.
     (SsDebugger [] 0)))
 
@@ -3493,13 +4300,25 @@
                           (set! (mut i) (+ (load i) 1))
                           (continue))))))
           0))
+    (syntax-check-cover-initializers!)
     (al-for [f (.funs (parser-state))]
             (let [fun f]
               (syntax-check-declarations! (.body fun) (.params fun) true)
               (let [(mut labels) (al-new [(slice u8)] (alloc/malloc-allocator))
-                    (mut loop-labels) (al-new [(slice u8)] (alloc/malloc-allocator))]
-                (syntax-check-jumps! (.body fun) (mut labels) (mut loop-labels) 0 0))))
+                    (mut loop-labels)
+                      (al-new [(slice u8)] (alloc/malloc-allocator))]
+                (syntax-check-jumps! (.body fun)
+                                     (mut labels)
+                                     (mut loop-labels)
+                                     0
+                                     0))))
     (syntax-check-strict-functions!)
+    ;; Regular-expression literals are tokenized and flag-checked, but the pattern grammar is not
+    ;; validated yet. A syntax-only verdict must therefore fail closed once every other early error
+    ;; has had its chance to be reported.
+    (if (and syntax-only (> (.regex-count (parser-state)) 0))
+        (panic "parser: regular expression pattern validation is unimplemented")
+        0)
     ;; The admitted syntax is validated above. Runtime strict binding/receiver/arguments semantics
     ;; remain unimplemented; a syntax-only result must never implicitly enable sloppy execution.
     (if (and (.strict-pending (parser-state)) (not syntax-only))
@@ -3643,7 +4462,8 @@
                   ;; Branches normally merge back into `scope`; loops deliberately replace it
                   ;; with their false-edge exit Scope. Publish and discard the actual final
                   ;; environment, then discard an obsolete loop-entry environment separately.
-                  (let [final-scope (parser-node (.current-scope (parser-state)))]
+                  (let [final-scope
+                          (parser-node (.current-scope (parser-state)))]
                     (scope-pop! final-scope)
                     (n-kill! final-scope)
                     (if (n-same? final-scope scope) 0 (n-kill! scope)))
