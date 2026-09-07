@@ -55,14 +55,24 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-07 — `for await` as syntax
+
+`for await (… of …)` parses inside async functions, async arrows, async methods and async
+generators; `SsForIn` carries an `awaited` flag. Proven errors: `for await` outside an async
+context (including nested plain functions and non-async arrows), `for await` with an `in` clause or
+a `;` head, initializers on `of` heads (`var x = 1 of`, lexical and pattern bindings), and the
+usual for-in/of head rules. Lowering refuses `for-await-of asynchronous iteration` by name; the
+async iteration protocol (GetIterator async, Await on each step) is unimplemented. Annex B's
+`for (var x = 1 in o)` still fails closed.
+
 ### 2026-09-07 — Patterns campaign follow-up
 
 The campaign in `docs/TEST262.md` (4,006 files) found 20 false accepts, all in destructuring and
 all fixed: a `...rest` element followed by a trailing comma is a valid literal but never a pattern
 (tracked per literal in `rest-comma`), and for-in/of assignment-pattern heads are now visited by
-the strict pass. Remaining parser refusals: phase imports (deliberate), `for await`, the unadmitted
-primaries, Annex B function-in-statement and for-in initializers, sloppy `let` identifiers,
-non-ASCII regex group names.
+the strict pass. Remaining parser refusals: phase imports (deliberate), the unadmitted primaries, Annex B
+function-in-statement and for-in initializers, sloppy `let` identifiers, non-ASCII regex group
+names (`for await` was admitted later the same day).
 
 ### 2026-09-07 — Regular-expression pattern early errors
 
@@ -188,8 +198,8 @@ that are strict reserved words) and refuse lowering by name: property enumeratio
 protocol, exception completions and object environments are absent. `debugger` lowers to nothing.
 Statement-position declarations (`if (x) let y`, `while (x) class C {}`, loop-body function
 declarations, `async function` bodies) are proven SyntaxErrors; Annex B function-in-`if`, sloppy
-`let` identifiers, `for await` and `for (var x = 1 in o)` fail closed (destructuring heads and
-catch parameters were admitted later the same day). The lexer gained a two-token lookahead for `let x` versus a bare `let` identifier.
+`let` identifiers and `for (var x = 1 in o)` fail closed (destructuring heads, catch parameters
+and `for await` were admitted later the same day). The lexer gained a two-token lookahead for `let x` versus a bare `let` identifier.
 
 ### 2026-09-07 — Operator grammar, sum-typed syntax records and NaN branch codes
 
