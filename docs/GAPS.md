@@ -143,10 +143,10 @@ enumeration of shapes. The static shape table travels in the `__aot_shapes` sect
 extends it. Remaining: the dynamic axis does not carry a struct, so a value that crosses a Box
 loses its shape and every access through it pays the runtime call; a guarded small-set fast path
 (a few shape compares before the call) is not built; the runtime transition lookup is linear over
-all shapes; property keys are interned only at compile time, so `o[k]` with a runtime key
-(`JsGetKeyed`/`JsSetKeyed`) refuses at run time — the key names are already in the blob, so
-runtime interning is the next step, followed by arrays; deletion, accessors, attributes and
-dictionary mode do not exist. `tests/bloat-test.coil` holds node-count ceilings that fail on any
+all shapes; `o[k]` interns its key at run time against the blob's key table (`aot_rt_intern_key`, minting
+runtime ids for new names; linear search) and takes the named path — a constant string key is
+not yet folded to its compile-time id, and arrays do not exist (an integer key is an ordinary
+property); deletion, accessors, attributes, symbols as keys and dictionary mode do not exist. `tests/bloat-test.coil` holds node-count ceilings that fail on any
 regression of this class; `iter-peeps!` and `iter-run!` panic with a trace of recent rewrites or
 inlined sites instead of spinning; `property-expand-all!` panics if the shape universe grows.
 

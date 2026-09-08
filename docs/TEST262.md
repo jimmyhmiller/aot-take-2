@@ -258,7 +258,10 @@ coil build src/main.coil -o build/aot-test262-compiler
 coil run tools/test262.coil -- run /Users/jimmyhmiller/Documents/Code/open-source/test262 ./build/aot-test262-compiler build/release/aot-runtime.o build/test262-next-campaign
 ```
 
-The runner refuses an existing output directory. It checks suite revision/cleanliness before
+The runner reads `jsl/compiler/index` and its units from the working tree at run time and links
+`build/release/aot-runtime.o`: do not edit `jsl/` or run `coil build` while a campaign runs (the
+2026-09-08b campaign compiled against a half-edited unit and refused nearly every case), or run
+the campaign from a separate worktree. The runner refuses an existing output directory. It checks suite revision/cleanliness before
 execution and again before publishing results. It returns one when any test has not passed;
 this is the expected baseline exit status. Generated reports and diagnostics stay under `build/`.
 

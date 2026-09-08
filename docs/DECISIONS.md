@@ -31,6 +31,12 @@ receiver (`JsCalledAsFunction`); `NewTarget` proper waits for the closures/class
 consequence of the slot ABI: a zero-argument call is indistinguishable from an `undefined`
 argument (`String()` is "undefined", `Number()` is NaN).
 
+Computed access `o[k]` is ToPropertyKey then the named access: a string key is interned at run
+time against the same key table the shape blob carries (`aot_rt_intern_key`, a new name minting a
+runtime id past the static ones), every other primitive goes through ToString first. The runtime
+shape tree already transitions on any key id, so `o[k] = v` with a never-seen name is just a
+runtime transition. Symbols and objects as keys refuse by name.
+
 A Load or Store that reads its slice through a MemMerge depends on that slot node directly
 (`n-add-dep!`): the merge's own type does not move when one slot's does, and SCCP once left a
 store at the optimistic TOP it computed while the slot was still TOP, to fall from it in the

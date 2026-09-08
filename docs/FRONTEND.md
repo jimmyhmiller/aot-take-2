@@ -209,7 +209,7 @@ index execute in sloppy and strict code alike (`+ - * / < > <= >= === !== && || 
 parse, pass early-error validation, and refuse lowering by their JSL name. Primary and member
 grammar is complete, destructuring patterns included (binding and assignment forms parse and
 validate; lowering refuses them by name): `this`, `new`, computed members and general callees
-execute (a computed member access and an undeclared global compile and refuse at run time);
+execute (an undeclared global compiles and refuses at run time);
 `new.target`, `super`, spread, optional chains, array literals, `import()`, templates, regex
 literals, function expressions, arrows, methods and accessors, generators, async functions and
 classes parse, and the forms without runtime support refuse by name at lowering.
