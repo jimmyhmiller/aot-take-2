@@ -204,7 +204,7 @@ with or without labels, labelled statements, statement `if`/`else`, `while`, `do
 `for-in`/`for-of` and `with` parse and refuse lowering. The complete ECMAScript operator precedence is
 parsed: every binary, unary, update, compound-assignment, logical-assignment and comma operator
 has a syntax variant naming its JSL entry point. Operators whose entry point is in the production
-index execute (`+ - * / < > <= >= === !== && || ?? ! void typeof instanceof - + ++ -- , = += -=
+index execute in sloppy and strict code alike (`+ - * / < > <= >= === !== && || ?? ! void typeof instanceof - + ++ -- , = += -=
 *= /= &&= ||= ??=`); the rest (`% ** & | ^ << >> >>> == != in ~ delete` and their compound forms)
 parse, pass early-error validation, and refuse lowering by their JSL name. Primary and member
 grammar is complete, destructuring patterns included (binding and assignment forms parse and

@@ -80,6 +80,13 @@ in selection, `ALIAS-FIRST-PROPERTY` follows the function aliases, and `ra-build
 undefined live range. A boxed live range with a fixed definition and a conflicting fixed use also
 no longer loops in the managed-root splitters: those apply only to ranges a safepoint restricted.
 
+### 2026-09-08 — Strict code
+
+Strict code compiles and runs (docs/DECISIONS.md, strict code runs). Still missing under strict
+mode specifically: `arguments` (unmapped or otherwise), the `TypeError` object for a write to a
+non-writable global (a runtime trap today), and ReferenceError for an assignment to an undeclared
+name (a runtime refusal in both modes).
+
 ### 2026-09-08 — Standard globals
 
 `Object`, `String`, `Number`, `Boolean`, `Error`, `TypeError`, `RangeError`, `SyntaxError`,
