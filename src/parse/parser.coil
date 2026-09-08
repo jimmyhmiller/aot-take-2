@@ -70,6 +70,7 @@
 (import "aot.node.dynamic" :use *)
 (import "aot.node.memory" :use *)
 (import "aot.node.property" :use *)
+(import "aot.node.compare" :use *)
 (import "aot.rt.abi" :use *)
 (import "aot.node.gc" :use *)
 (import "aot.node.jsops" :use *)
@@ -252,6 +253,12 @@
 
 (const JUMP-BLOCK 3)
 
+;; A try statement's catch clause: the target of every throw and unwinding call inside its body.
+(const JUMP-CATCH 4)
+
+;; The synthetic Scope variable that carries a thrown value to its catch clause.
+(const EXCEPTION-VAR "$aot$.exception")
+
 (defstruct JumpTarget
   [(scope i64)
    (count i64)
@@ -287,7 +294,8 @@
    (hi i64)
    (fidx i64)
    (fun-nid i64)
-   (script i64)])  ; the realm Script this function belongs to (its position in `scripts`)
+   (script i64)  ; the realm Script this function belongs to (its position in `scripts`)
+   (may-throw bool)])  ; can a call to this function leave an exception pending? (closed-world fixpoint)
 
 ;; A var-like global: a top-level `var` or function declaration of some Script of the realm. The
 ;; realm's global object carries one property per binding from the start.
@@ -5611,6 +5619,168 @@
 ;; orders them; then a FUNCTION guard either loads the code word and calls through the shared
 ;; ABI or hands the value to the runtime's abrupt-completion entry (a TypeError once exceptions
 ;; exist). Both arms merge as an ordinary Scope diamond.
+;; ---------------------------------------------------------------------------
+;; Exceptions: a pending word and ordinary control flow (docs/DECISIONS.md, exceptions)
+
+;; The innermost catch target, or -1 when a throw leaves the function.
+(defn parser-find-catch [] (-> i64)
+  (let [p (parser-state)
+        (mut i) (- (len (.jump-targets p)) 1)
+        (mut found) -1]
+    (loop (if (or (< (load i) 0) (>= (load found) 0))
+              (break 0)
+              (let [target (get (.jump-targets p) (load i))]
+                (if (= (.kind target) JUMP-CATCH) (set! (mut found) (load i)) (set! (mut i) (- (load i) 1)))
+                (continue))))
+    (load found)))
+
+;; Carry `value` to the catch target `index`: bind the synthetic exception variable, then take the
+;; same Scope-merging jump a `break` takes to a labeled block.
+(defn lower-jump-to-catch! [(index i64) (value (dyn NodeOps))] (-> i64)
+  (let [p (parser-state)
+        scope (parser-node (.current-scope p))
+        target (get (.jump-targets p) index)
+        exit (parser-node (.scope target))
+        outgoing (scope-dup scope false)
+        depth (len (.levels (scope-node exit)))]
+    (scope-update! outgoing EXCEPTION-VAR value)
+    (parser-set-current-ctrl! (xctrl-make))
+    (loop (if (<= (len (.levels (scope-node outgoing))) depth)
+              (break 0)
+              (do (scope-pop! outgoing) (continue))))
+    (scope-merge! exit outgoing)
+    (let [meta (al-elem [JumpTarget] (mut (.jump-targets p)) index)]
+      (set! (.count meta) (+ (.count meta) 1)))
+    0))
+
+;; Store into one of the pending-exception fields of the runtime heap record.
+(defn lower-pending-store! [(offset i64) (alias i64) (value (dyn NodeOps))] (-> i64)
+  (let [p (parser-state)
+        scope (parser-node (.current-scope p))
+        mem (scope-mem scope)
+        stored (store-make (parser-node (.current-ctrl p)) mem (heapstate-make) (con-int offset) value alias (ty-dyn TAG-ANY))
+        merged (memmerge-make)]
+    (memmerge-set-alias! merged ALIAS-BULK (mem-effective mem ALIAS-BULK))
+    (if (= (n-op mem) OP-MEMMERGE)
+        (let [(mut a) 2]
+          (loop (if (>= (load a) (n-nins mem))
+                    (break 0)
+                    (do
+                      (match (n-in mem (load a))
+                        (Some [slice] (if (= (load a) alias) 0 (memmerge-set-alias! merged (load a) slice)))
+                        (None [] 0))
+                      (set! (mut a) (+ (load a) 1))
+                      (continue)))))
+        0)
+    (memmerge-set-alias! merged alias stored)
+    (scope-set-mem! scope merged)
+    0))
+
+(defn lower-pending-load [(offset i64) (alias i64) (declared i64)] (-> (dyn NodeOps))
+  (let [p (parser-state)
+        scope (parser-node (.current-scope p))]
+    (load-make (parser-node (.current-ctrl p)) (scope-mem scope) (heapstate-make) (con-int offset) alias declared)))
+
+;; `throw v`: inside a try, a jump to its catch; otherwise set the pending word and leave the
+;; function with undefined.
+(defn lower-throw [(value-id i64)] (-> i64)
+  (let [value (lower-syntax-expr value-id)
+        index (parser-find-catch)]
+    (n-keep! value)
+    (if (>= index 0)
+        (lower-jump-to-catch! index value)
+        (do
+          (lower-pending-store! RT-HEAP-OFFSET-EXCEPTION-VALUE ALIAS-EXCEPTION-VALUE value)
+          (lower-pending-store! RT-HEAP-OFFSET-EXCEPTION-FLAG ALIAS-EXCEPTION-FLAG (con-int 1))
+          (parser-record-return! (dyn-undefined-make))))
+    (n-unkeep! value)
+    1))
+
+;; After a source call: if the callee left an exception pending, take it to the enclosing catch
+;; (clearing the flag) or propagate by returning. An ordinary Scope diamond; the taken arm ends
+;; dead, so the merge keeps only the normal continuation.
+(defn lower-pending-check! [] (-> i64)
+  (let [p (parser-state)
+        flag (lower-pending-load RT-HEAP-OFFSET-EXCEPTION-FLAG ALIAS-EXCEPTION-FLAG (ty-int-bot))
+        iff (if-make (parser-node (.current-ctrl p)) (ne-make flag (con-int 0)))
+        arms (if-arms! iff)
+        normal (parser-node (.current-scope p))
+        unwinding (scope-dup normal false)]
+    (set! (.current-scope p) (n-nid unwinding))
+    (scope-set-ctrl! unwinding (arms-true arms))
+    (set! (.current-ctrl p) (n-nid (arms-true arms)))
+    (let [index (parser-find-catch)]
+      (if (>= index 0)
+          (let [thrown (lower-pending-load RT-HEAP-OFFSET-EXCEPTION-VALUE ALIAS-EXCEPTION-VALUE (ty-dyn TAG-ANY))]
+            (n-keep! thrown)
+            (lower-pending-store! RT-HEAP-OFFSET-EXCEPTION-FLAG ALIAS-EXCEPTION-FLAG (con-int 0))
+            (lower-jump-to-catch! index thrown)
+            (n-unkeep! thrown))
+          (parser-record-return! (dyn-undefined-make))))
+    (let [taken (parser-node (.current-scope p))]
+      (scope-set-ctrl! normal (arms-false arms))
+      (let [merged (scope-merge! normal taken)]
+        (set! (.current-scope p) (n-nid merged))
+        (set! (.current-ctrl p) (n-nid (scope-ctrl merged)))
+        0))))
+
+;; `try { body } catch (e) { handler } finally { tail }`. The catch target is a Scope with the
+;; synthetic exception variable; every throw and unwinding call in the body merges into it. The
+;; handler binds `e` from that variable in its own level. `finally` runs after the normal merge;
+;; an abrupt completion crossing it refuses by name.
+(defn lower-try [(body i64) (catch-param (Option i64)) (catch-body (Option i64)) (finally-body (Option i64))] (-> i64)
+  (let [p (parser-state)
+        scope (parser-node (.current-scope p))
+        returns-before (len (.return-values p))]
+    (scope-push! scope)
+    (scope-define! scope EXCEPTION-VAR (ty-dyn TAG-ANY) false (dyn-undefined-make))
+    (let [exit (scope-dup scope false)]
+      (scope-set-ctrl! exit (xctrl-make))
+      (parser-push-jump! exit JUMP-CATCH)
+      (let [terminated (lower-syntax-statement body)
+            target (parser-pop-jump!)
+            after-body (parser-node (.current-scope p))]
+        (match catch-body
+          (None []
+                ;; No catch: rethrow is the only exit of the target. Only a body that throws nothing
+                ;; and calls nothing is expressible today.
+                (if (> (.count target) 0)
+                    (unimplemented "try/finally without catch (rethrow through finally)" "docs/GAPS.md — exceptions")
+                    0))
+          (Some [handler]
+                (do
+                  ;; The handler runs in the merged throw Scope with `e` bound in a fresh level.
+                  (parser-use-scope! exit)
+                  (scope-push! exit)
+                  (match catch-param
+                    (Some [pattern]
+                          (match (syntax-pattern-node pattern)
+                            (PatName [name]
+                                     (scope-define! (parser-node (.current-scope p))
+                                                    name
+                                                    (ty-dyn TAG-ANY)
+                                                    false
+                                                    (match (scope-lookup (parser-node (.current-scope p)) EXCEPTION-VAR)
+                                                      (Some [v] v)
+                                                      (None [] (unreachable-node)))))
+                            (_ (unimplemented "destructuring catch parameter" "docs/GAPS.md — destructuring"))))
+                    (None [] 0))
+                  (lower-syntax-statement handler)
+                  (scope-pop! (parser-node (.current-scope p)))
+                  (let [merged (scope-merge! after-body (parser-node (.current-scope p)))]
+                    (parser-use-scope! merged)))))
+        (scope-pop! (parser-node (.current-scope p)))
+        (match finally-body
+          (Some [tail]
+                (do
+                  (if (> (len (.return-values p)) returns-before)
+                      (unimplemented "abrupt completion (return or uncaught throw) through finally"
+                                     "docs/GAPS.md — exceptions")
+                      0)
+                  (lower-syntax-statement tail)))
+          (None [] 0))
+        (if (and (!= terminated 0) (= (.count target) 0)) 1 0)))))
+
 ;; A call through a value with `this` = undefined: a plain `f(...)`.
 (defn lower-value-call [(callee (dyn NodeOps)) (args (ArrayList i64))] (-> (dyn NodeOps))
   (lower-value-call-with-receiver callee (dyn-undefined-make) args))
@@ -5654,6 +5824,7 @@
           (n-keep! value)
           (parser-set-current-ctrl! (cproj-make end RETURN-CTRL "value-call.ctrl"))
           (scope-set-mem! scope (proj-make end RETURN-MEM "value-call.mem"))
+          (lower-pending-check!)
           (let [called-scope (parser-node (.current-scope (parser-state)))]
             (set! (.current-scope (parser-state)) (n-nid false-scope))
             (parser-set-current-ctrl! (guard-false g))
@@ -5809,7 +5980,11 @@
               (parser-set-current-ctrl! ctrl))
             (scope-set-mem! (parser-node (.current-scope (parser-state)))
                             (proj-make end RETURN-MEM "call.mem"))
-            (proj-make end RETURN-VALUE "call.value"))))))
+            (let [value (proj-make end RETURN-VALUE "call.value")]
+              (if (syntax-fun-may-throw? target-idx)
+                  (do (n-keep! value) (lower-pending-check!) (n-unkeep! value) 0)
+                  0)
+              value))))))
 
 ;; Final Simple parseAsgn recursively parses the RHS, updates the lexical Scope and returns the
 ;; assigned value. opAssign keeps the old value across RHS parsing, then computes and updates.
@@ -6583,10 +6758,9 @@
                                     "for-in property enumeration"))
                             "docs/GAPS.md — iteration statements"))
     (SsLabeled [label body] (lower-labeled label body))
-    (SsThrow [value]
-             (unimplemented "throw completion" "docs/GAPS.md — exceptions"))
+    (SsThrow [value] (lower-throw value))
     (SsTry [body catch-param catch-body finally-body]
-           (unimplemented "try/catch/finally" "docs/GAPS.md — exceptions"))
+           (lower-try body catch-param catch-body finally-body))
     (SsWith [object body]
             (unimplemented "with object environment" "docs/GAPS.md — with"))
     ;; `debugger` has no observable semantics outside a debugger and lowers to nothing.
@@ -6660,6 +6834,26 @@
                       (set! (mut ctrl-nid) (n-nid (cproj-make end RETURN-CTRL "entry.ctrl")))
                       (set! (mut mem-nid) (n-nid (proj-make end RETURN-MEM "entry.mem")))
                       (set! (mut value-nid) (n-nid (proj-make end RETURN-VALUE "entry.value"))))))
+          ;; A throw that no Script caught is pending here; report it through the runtime, which
+          ;; exits. The arms merge so the wrapper keeps one Return.
+          (if (.script-mode p)
+              (let [ctrl (parser-node (load ctrl-nid))
+                    mem (parser-node (load mem-nid))
+                    flag (load-make ctrl mem (heapstate-make) (con-int RT-HEAP-OFFSET-EXCEPTION-FLAG) ALIAS-EXCEPTION-FLAG (ty-int-bot))
+                    iff (if-make ctrl (ne-make flag (con-int 0)))
+                    arms (if-arms! iff)
+                    thrown (load-make (arms-true arms) mem (heapstate-make) (con-int RT-HEAP-OFFSET-EXCEPTION-VALUE) ALIAS-EXCEPTION-VALUE (ty-dyn TAG-ANY))
+                    report (jsop-make (arms-true arms) mem JS-UNCAUGHT)
+                    region (region-make)
+                    memphi (memphi-make region 1 TY-BOT "entry.uncaught.mem")]
+                (jsop-add-arg! report thrown)
+                (region-add-path! region (arms-true arms))
+                (memphi-add-state! memphi (proj-make report 1 "entry.uncaught.mem"))
+                (region-add-path! region (arms-false arms))
+                (memphi-add-state! memphi mem)
+                (set! (mut ctrl-nid) (n-nid region))
+                (set! (mut mem-nid) (n-nid memphi)))
+              0)
           (let [ret (return-make (parser-node (load ctrl-nid))
                                  (Some (parser-node (load mem-nid)))
                                  (parser-node (load value-nid))
@@ -6780,6 +6974,7 @@
                   (set! (mut si) (+ (load si) 1))
                   (continue)))))
     (if script-mode (syntax-collect-globals!) 0)
+    (syntax-compute-may-throw!)
     (syntax-settle-strictness!)
     (syntax-check-cover-initializers!)
     (al-for [f (.funs (parser-state))]
@@ -6803,6 +6998,107 @@
         (unimplemented "strict-mode runtime semantics"
                        "docs/GAPS.md — frontend")
         0)))
+
+;; ---------------------------------------------------------------------------
+;; Which functions can leave an exception pending
+;;
+;; A call site checks the pending word only when its callee may throw. That is a closed-world
+;; fixpoint over the syntax: a function throws directly when a `throw`, or a call whose target the
+;; syntax cannot name (a value, a member, a constructor, a reassigned global), sits outside every
+;; try-with-catch in its body; it throws indirectly when a directly named callee may throw. The
+;; approximation is conservative: shadowing a hoisted name with a local binding still counts as a
+;; call to the hoisted function.
+
+(defn syntax-fun-may-throw? [(i i64)] (-> bool)
+  (let [f (syntax-fun-at i)] (.may-throw f)))
+
+;; Walk one function's statements once, recording direct throws and named call edges.
+;; `protected` is true inside a try body that has a catch clause.
+(defn syntax-throw-walk-expr! [(id i64) (protected bool) (direct (mut bool)) (edges (mut (ArrayList i64)))] (-> i64)
+  (do
+    (match (syntax-node id)
+      (SxCall [callee args optional]
+              (if protected
+                  0
+                  (match (syntax-node (syntax-ungroup-id callee))
+                    (SxName [name]
+                            (let [idx (syntax-find-fun name)
+                                  g (syntax-global-index name)]
+                              (if (or (< idx 0) (and (>= g 0) (.assigned (syntax-global-ptr g))))
+                                  (set! direct true)
+                                  (push! [i64] (mut edges) idx))))
+                    (_ (set! direct true)))))
+      (SxNew [callee args] (if protected 0 (set! direct true)))
+      (_ 0))
+    (let [(mut kids) (al-new [i64] (alloc/malloc-allocator))]
+      (syntax-expr-children! id (mut kids))
+      (al-for [k (load kids)] (syntax-throw-walk-expr! k protected (mut direct) (mut edges)))
+      (al-free! [i64] (mut kids))
+      0)))
+
+(defn syntax-throw-walk-stmt! [(id i64) (protected bool) (direct (mut bool)) (edges (mut (ArrayList i64)))] (-> i64)
+  (match (syntax-stmt-node id)
+    (SsThrow [value]
+             (do
+               (if protected 0 (set! direct true))
+               (syntax-throw-walk-expr! value protected (mut direct) (mut edges))))
+    (SsTry [body catch-param catch-body finally-body]
+           (do
+             (syntax-throw-walk-stmt! body (or protected (match catch-body (Some [_] true) (None [] false))) (mut direct) (mut edges))
+             (match catch-body (Some [h] (syntax-throw-walk-stmt! h protected (mut direct) (mut edges))) (None [] 0))
+             (match finally-body (Some [t] (syntax-throw-walk-stmt! t protected (mut direct) (mut edges))) (None [] 0))))
+    (_
+     (let [(mut kids) (al-new [i64] (alloc/malloc-allocator))
+           (mut exprs) (al-new [i64] (alloc/malloc-allocator))]
+       (syntax-stmt-exprs! id (mut exprs))
+       (al-for [e (load exprs)] (syntax-throw-walk-expr! e protected (mut direct) (mut edges)))
+       (syntax-stmt-children! id (mut kids))
+       (al-for [k (load kids)] (syntax-throw-walk-stmt! k protected (mut direct) (mut edges)))
+       (al-free! [i64] (mut exprs))
+       (al-free! [i64] (mut kids))
+       0))))
+
+(defn syntax-compute-may-throw! [] (-> i64)
+  (let [p (parser-state)
+        count (len (.funs p))
+        (mut edge-from) (al-new [i64] (alloc/malloc-allocator))
+        (mut edge-to) (al-new [i64] (alloc/malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) count)
+              (break 0)
+              (let [f (syntax-fun-ptr (load i))
+                    (mut direct) false
+                    (mut edges) (al-new [i64] (alloc/malloc-allocator))]
+                (al-for [id (.body f)] (syntax-throw-walk-stmt! id false (mut direct) (mut edges)))
+                (match (.expression-body f)
+                  (Some [e] (syntax-throw-walk-expr! e false (mut direct) (mut edges)))
+                  (None [] 0))
+                (set! (.may-throw f) (load direct))
+                (al-for [t (load edges)]
+                        (do (push! [i64] (mut edge-from) (load i)) (push! [i64] (mut edge-to) t)))
+                (al-free! [i64] (mut edges))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    ;; Propagate along call edges to a fixpoint.
+    (let [(mut changed) true]
+      (loop (if (not (load changed))
+                (break 0)
+                (do
+                  (set! (mut changed) false)
+                  (let [(mut e) 0]
+                    (loop (if (>= (load e) (len (load edge-from)))
+                              (break 0)
+                              (let [from (syntax-fun-ptr (get (load edge-from) (load e)))
+                                    to (get (load edge-to) (load e))]
+                                (if (and (not (.may-throw from)) (syntax-fun-may-throw? to))
+                                    (do (set! (.may-throw from) true) (set! (mut changed) true))
+                                    0)
+                                (set! (mut e) (+ (load e) 1))
+                                (continue)))))
+                  (continue)))))
+    (al-free! [i64] (mut edge-from))
+    (al-free! [i64] (mut edge-to))
+    0))
 
 ;; ---------------------------------------------------------------------------
 ;; The realm's var-like globals

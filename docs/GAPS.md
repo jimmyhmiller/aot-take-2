@@ -80,6 +80,19 @@ in selection, `ALIAS-FIRST-PROPERTY` follows the function aliases, and `ra-build
 undefined live range. A boxed live range with a fixed definition and a conflicting fixed use also
 no longer loops in the managed-root splitters: those apply only to ranges a safepoint restricted.
 
+### 2026-09-08 — Exceptions
+
+`throw` and `try`/`catch` execute (docs/DECISIONS.md, exceptions): a throw inside a try is a jump
+to its catch carrying the value in a synthetic Scope variable; a throw leaving a function sets the
+pending flag and value in the runtime heap record and returns undefined; every source call site
+checks the flag afterwards and either jumps to its enclosing catch (clearing the flag) or
+propagates by returning; the entry wrapper reports a pending exception after the last Script
+through `aot_rt_uncaught` with status 3. `finally` runs on normal completions; an abrupt
+completion crossing a `finally` (a return, or a throw with no catch) refuses by name, as does a
+destructuring catch parameter. Runtime refusals (non-callable calls, the unimplemented
+conversions) are still hard errors rather than TypeError completions, and the uncaught report
+prints the boxed word: naming the error constructor waits for `new` and prototypes.
+
 ### 2026-09-08 — Receivers, function objects and total coercions
 
 `this` is the receiver slot of the enclosing non-strict function mapped by `JsSloppyThis`

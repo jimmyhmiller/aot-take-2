@@ -200,7 +200,8 @@ A lexical `let undefined` instead resolves through the ordinary Scope slot and u
 Function bodies currently admit sequential `let`/`const`/`var`, assignment, lexical blocks,
 expression statements, return, calls, conditional expressions, `switch`, `break` and `continue`
 with or without labels, labelled statements, statement `if`/`else`, `while`, `do-while`, classic
-`for`, and `debugger`. `for-in`/`for-of`, `throw`, `try` and `with` parse and refuse lowering. The complete ECMAScript operator precedence is
+`for`, `debugger`, `throw` and `try`/`catch`/`finally` (normal completions through `finally`).
+`for-in`/`for-of` and `with` parse and refuse lowering. The complete ECMAScript operator precedence is
 parsed: every binary, unary, update, compound-assignment, logical-assignment and comma operator
 has a syntax variant naming its JSL entry point. Operators whose entry point is in the production
 index execute (`+ - * / < > <= >= === !== && || ?? ! void typeof - + ++ -- , = += -= *= /= &&=

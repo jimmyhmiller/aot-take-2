@@ -279,7 +279,9 @@ stale pointer; `AOT_RT_GC_STATS` reports collection counts and barrier activity 
 the heap record through the reserved heap-state register: `HeapState` selects to a read of that
 register, and the record's field offsets come from `aot.rt.abi`, folded from the struct itself.
 The realm's global object root is one such field, published and read as ordinary memory on its
-own alias class; the collector forwards it, and no write barrier covers host memory.
+own alias class; the collector forwards it, and no write barrier covers host memory. The pending
+exception is two more: a flag and the thrown boxed word, forwarded as a root while the flag is set
+and checked by `AOT_RT_GC_VERIFY`.
 
 Work outside this nine-stage backend slice remains: compilation-unit/serialized-IR sections,
 explicit loop-backedge safepoint placement, and cross-platform linked execution coverage. The
