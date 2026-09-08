@@ -137,8 +137,16 @@ Instantiation, so `inner === inner` and `inner.prototype` identity are wrong the
 declarations are instantiated once by GlobalDeclarationInstantiation and are correct); this is
 the closures slice's job.
 
-Unresolvable names: a read or write of a name no Script declares refuses at run time with the
-undeclared-global message; the correct semantics (global object property lookup, ReferenceError
+Harness status (2026-09-08): `assert.js` + `sta.js` + a test compile and run as one realm; a
+passing test exits 0 and `assert.throws` works. The first refusal on a failing assertion and on
+most real tests is a standard global (`Object`, `String`, …), named in the runtime message
+(`reference to the undeclared global \`Object\``): the builtin library is the next slice, then
+ToString of numbers in concatenation for the harness's messages.
+
+Unresolvable names: a global declared by a later Script is a refusal only in the top-level code
+of an earlier Script; a function body reads the slot when called, which yields undefined instead
+of a ReferenceError if the call comes before that Script's instantiation. A read or write of a
+name no Script declares refuses at run time with the undeclared-global message; the correct semantics (global object property lookup, ReferenceError
 on a missing read, implicit global on a sloppy write) wait for global-object bindings as
 properties. `typeof` of such a name is "undefined". Standard globals (`syntax-standard-global?`)
 refuse at run time even under `typeof`.

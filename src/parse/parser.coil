@@ -1125,21 +1125,15 @@
                       (.start part)
                       (.end part))))
 
-;; Declare the closed-world hidden-class transition universe before lowering reusable JSL graphs.
-;; Key interning alone is insufficient: representation-level own-property dispatch enumerates
-;; shapes, and source object literals create their ordered transition paths only during body
-;; lowering. Walking the already complete syntax table here makes those layouts available to JSL
-;; without moving any JavaScript semantic decision out of JSL.
-(defn syntax-write-key! [(target i64) (write-keys (mut (ArrayList i64)))] (-> i64)
-  (match (syntax-node target)
-    (SxMember [owner name optional]
-              (push! [i64] (mut write-keys) (shape-key-intern name)))
-    (_ 0)))
-
+;; Declare the shapes the source spells out — object literals and the realm's global object —
+;; before lowering, so a literal's layout is one canonical transition path however many places
+;; build it. Nothing else is declared: a named write to an owner the compiler cannot see is a
+;; runtime transition (`aot.rt.shapes`), never a compile-time one. The closure this pass once
+;; took over every written key multiplied the shape universe by every permutation of those keys
+;; (docs/DECISIONS.md, generic property access) and could not even close it.
 (defn syntax-declare-object-shapes! [] (-> i64)
   (let [(mut i) 0
-        (mut declared) 0
-        (mut write-keys) (al-new [i64] (alloc/malloc-allocator))]
+        (mut declared) 0]
     (loop (if (>= (load i) (len (.exprs (parser-state))))
               (break 0)
               (let [x (get (.exprs (parser-state)) (load i))]
@@ -1164,25 +1158,11 @@
                                                      (_ 0)))
                                         (_ 0)))
                               (set! (mut declared) (+ (load declared) 1))))
-                  ;; A named write can execute against any ordinary-object shape reachable at
-                  ;; that site, including a shape produced by an earlier loop iteration. Collect
-                  ;; every source-visible write key from each Reference-updating form.
-                  (SxAssign [target value]
-                            (syntax-write-key! target (mut write-keys)))
-                  (SxCompoundAssign [op target value]
-                                    (syntax-write-key! target (mut write-keys)))
-                  (SxLogicalAssign [predicate rhs-on-true target value]
-                                   (syntax-write-key! target (mut write-keys)))
-                  (SxUpdate [op prefix target]
-                            (syntax-write-key! target (mut write-keys)))
                   (_ 0))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
-    ;; The realm's global object is built by adding every var-like global in table order. A
-    ;; lexically resolved global is a field access over that one hidden class, never a generic
-    ;; named write, so global names do not enter the write-key closure below: doing so would
-    ;; multiply the shape universe by every permutation of the globals and every generic
-    ;; dispatch with it.
+    ;; The realm's global object is built by adding every var-like global in table order; a
+    ;; lexically resolved global is a field access over that one hidden class.
     (if (> (len (.globals (parser-state))) 0)
         (let [(mut shape) SHAPE-EMPTY]
           (al-for [g (.globals (parser-state))]
@@ -1191,35 +1171,6 @@
           (set! (mut declared) (+ (load declared) 1))
           0)
         0)
-    ;; Close the finite transition graph over every write key before JSL emits its runtime shape
-    ;; dispatch.
-    (let [(mut changed) true]
-      (loop (if (not (load changed))
-                (break 0)
-                (let [before (shape-count)
-                      (mut shape) SHAPE-EMPTY]
-                  (set! (mut changed) false)
-                  (loop (if (>= (load shape) before)
-                            (break 0)
-                            (if (= (load shape) SHAPE-STRING)
-                                (do
-                                  (set! (mut shape) (+ (load shape) 1))
-                                  (continue))
-                                (let [(mut key-index) 0]
-                                  (loop (if (>= (load key-index)
-                                                (len (load write-keys)))
-                                            (break 0)
-                                            (do
-                                              (shape-transition (load shape)
-                                                                (shape-key-name (get (load write-keys)
-                                                                                     (load key-index))))
-                                              (set! (mut key-index)
-                                                    (+ (load key-index) 1))
-                                              (continue))))
-                                  (set! (mut shape) (+ (load shape) 1))
-                                  (continue)))))
-                  (if (> (shape-count) before) (set! (mut changed) true) 0)
-                  (continue)))))
     (load declared)))
 
 (defn syntax-stmt-new [(node SyntaxStmtNode) (lo i64) (hi i64)] (-> SyntaxStmt)
@@ -5247,7 +5198,8 @@
                               ;; Nothing in the Script or any enclosing function declares the
                               ;; name: it is a Reference into the global object, resolved at
                               ;; runtime as a property read or a ReferenceError.
-                              (lower-jsl-nullary "JsUnresolvedGlobalRead"))))))))))
+                              (lower-jsl-unary-value "JsUnresolvedGlobalRead"
+                                                     (con-int (shape-key-intern name))))))))))))
 
 (defn parser-set-current-ctrl! [(ctrl (dyn NodeOps))] (-> i64)
   (do
@@ -5401,7 +5353,18 @@
                 ;; name would create one at run time and refuses until that is implemented.
                 (if (>= (syntax-global-index (.name ref)) 0)
                     (lower-global-store! (.name ref) value)
-                    (do (lower-jsl-unary-value "JsUnresolvedGlobalWrite" value) 0)))))))
+                    (let [scope (parser-node (.current-scope (parser-state)))
+                          (mut wargs) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))]
+                      (push! [(dyn NodeOps)] (mut wargs) (con-int (shape-key-intern (.name ref))))
+                      (push! [(dyn NodeOps)] (mut wargs) value)
+                      (let [w (jsl-lower-macro-values "JsUnresolvedGlobalWrite"
+                                                      (load wargs)
+                                                      (parser-node (.current-ctrl (parser-state)))
+                                                      (scope-mem scope))]
+                        (al-free! [(dyn NodeOps)] (mut wargs))
+                        (parser-set-current-ctrl! (.ctrl w))
+                        (scope-set-mem! scope (.mem w))
+                        0))))))))
 
 (defn lower-ref-release! [(ref SyntaxRef)] (-> i64)
   (if (.member ref)
@@ -7441,8 +7404,14 @@
   (let [g (syntax-global-index name)
         p (parser-state)]
     (if (< g 0) (panic "lower-global-load: name is not a realm global") 0)
+    ;; Top-level code of an earlier Script reading a global a later Script declares runs before
+    ;; that declaration is instantiated: a ReferenceError, unimplemented. A function body resolves
+    ;; the name when it is called, which is after every Script's instantiation in the common case
+    ;; (the harness's functions naming the test's globals); a call made too early reads the slot's
+    ;; initial undefined instead of the ReferenceError (docs/GAPS.md).
     (let [b (get (.globals p) g)]
-      (if (> (.script b) (parser-current-script))
+      (if (and (> (.script b) (parser-current-script))
+               (syntax-script-root? (.current-fun p)))
         (unimplemented "reference to a global declared only by a later Script (ReferenceError before its instantiation)"
                        "docs/GAPS.md — shared global-object bindings")
         0))

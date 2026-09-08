@@ -85,7 +85,8 @@ separate sources in plan order (`aot compile-script HARNESS... TEST OUT.o`). Con
 (the runtime shape tree), `throw` and `try`/`catch` execute; undeclared globals and computed
 member access compile and refuse at run time; the upstream assertion harness still needs the
 conversions the remaining runtime refusals name (ToString for its messages, key interning for
-`o[k]`, arrays) and the standard globals. Module plans and async
+`o[k]`, arrays) and the standard globals; on 2026-09-08 the harness plus a trivial test compiled,
+linked and ran (exit 0), and a failing assertion refused at `String(value)` by name. Module plans and async
 execution receive explicit unsupported results and remain in the denominator. Typed JavaScript abrupt-completion
 reporting at runtime and realm host bindings remain unimplemented. Do not convert a nonzero native exit into
 an expected exception by parsing its diagnostics.

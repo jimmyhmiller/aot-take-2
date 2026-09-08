@@ -44,8 +44,20 @@ Two backend defects surfaced by the first raw object pointer live across a mid-b
   a copy of a copy stays after its input. A range allowed exactly one register that fails while a
   neighbour BORN in that register (an allocation or call result in X0) still holds it is resolved
   the neighbour's way — split after its definition — because copies of the failing range cannot
-  free the register and each round would re-make one. `AOT_RA_TRACE=1` narrates failed rounds:
-  the failing range, its members and uses, its neighbours, the block schedule, the policy taken.
+  free the register and each round would re-make one. A new before-use copy bypasses an older
+  copy only when that copy was made for the same use (final Simple's `insertBefore`); an
+  after-definition copy moving a fixed-register value (the link-register Parm) out of its register
+  is a value in its own right and stays in the chain — bypassing it undid it every round. A copy
+  anchored to a use that is itself an anchored copy travels with it: groups close over anchors.
+  `AOT_RA_TRACE=1` narrates failed rounds: the failing range, its members and uses, its
+  neighbours, the block schedule, the policy taken.
+
+With these the upstream test262 assertion harness (`assert.js`, `sta.js`) compiles, links and
+runs as a realm in about a second; a passing test exits 0, `assert.throws` catches its
+`Test262Error`, and a failing assertion reaches `String(value)` in the harness's formatter — the
+first standard global — which is the next slice. The parser's old closed-world "write-key shape
+closure" (every written key applied to every shape) is gone with the enumerated dispatch it fed;
+on `assert.js` it never terminated.
 
 Also decided here: `new F(args)` creates an ordinary object whose [[Prototype]] is F's
 `prototype` property, calls F with it as receiver and yields F's result if that is an object;
@@ -111,10 +123,11 @@ receiver the compiler can see folds to a single Load at the site and only the ch
 Measured on `let o = {a: 1}; return o.a + o.a`: 178 nodes after optimization became 37, the sum a
 constant. `tests/bloat-test.coil` holds the ceilings.
 
-Two neighbours were fixed with it. Global names never enter the shape universe's write-key
+Two neighbours were fixed with it. Global names never entered the shape universe's write-key
 closure: a lexically resolved global is a field access over the realm's one hidden class, and
 adding the names had multiplied the universe by every permutation of the globals (47,000 nodes
-for a ten-line realm, a 105-second fixpoint). And a memory slice now carries Simple's `_one`:
+for a ten-line realm, a 105-second fixpoint); the closure itself is gone since generic property
+access became a runtime operation (the entry above). And a memory slice now carries Simple's `_one`:
 an allocation's private memory and the stores continuing it for that same object are private and
 track just the stored value; a store to any other object may not use a private slice as its
 prior (BOT) and a load through any other object reads only its declared type from it. Without the
