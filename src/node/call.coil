@@ -174,7 +174,8 @@
 ;; Body ownership lives in `aot.node.copy`, which imports this module. Register its cleaned-body
 ;; cardinality query at boot instead of creating a cyclic import. Candidate selection must not fall
 ;; back to the construction span: optimizer-created growth can make that historical number stale.
-(defstruct FunBodySizeExt [(f (fnptr c [(ref (dyn NodeOps))] i64)) (installed bool)])
+(defstruct FunBodySizeExt
+  [(f (fnptr c [(ref (dyn NodeOps))] i64)) (installed bool)])
 
 (defn fun-body-size-ext [] (-> (ptr FunBodySizeExt))
   (primitive/alloc-static FunBodySizeExt))
@@ -185,9 +186,27 @@
     (set! (.installed (fun-body-size-ext)) true)
     0))
 
+;; The inlining epoch: bumped after every inline that fires. A body's live size is walked at most
+;; once per epoch per Fun — every deferred candidate asks again each round, and the walk is the
+;; body's size; asking per candidate made the inline decision a third of a whole compile. A size
+;; measured earlier in the epoch can only be stale upward (peepholes shrink bodies), which delays
+;; an inline to the next epoch and never admits one wrongly.
+(defn fun-size-epoch [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defn fun-size-epoch-bump! [] (-> i64)
+  (do (set! (fun-size-epoch) (+ (load (fun-size-epoch)) 1)) 0))
+
 (defn fun-live-body-size [(fun (dyn NodeOps))] (-> i64)
   (if (.installed (fun-body-size-ext))
-      (primitive/call-ptr (.f (fun-body-size-ext)) fun)
+      (let [p (primitive/cast (ptr FunNode) (hdr fun))
+            epoch (+ (load (fun-size-epoch)) 1)]
+        (if (= (.live-size-epoch p) epoch)
+            (.live-size p)
+            (let [size (primitive/call-ptr (.f (fun-body-size-ext)) fun)]
+              (set! (.live-size p) size)
+              (set! (.live-size-epoch p) epoch)
+              size)))
       (do
         (panic "fun-live-body-size: body-selection extension was not installed at boot")
         0)))
@@ -198,7 +217,9 @@
 (defn clone-inline-ext [] (-> (ptr CloneInlineExt))
   (primitive/alloc-static CloneInlineExt))
 
-(defn set-clone-inline-ext! [(f (fnptr c [(ref (dyn NodeOps)) (ref (dyn NodeOps))] i64))] (-> i64)
+(defn set-clone-inline-ext! [(f (fnptr c
+                                       [(ref (dyn NodeOps)) (ref (dyn NodeOps))]
+                                       i64))] (-> i64)
   (do
     (set! (.f (clone-inline-ext)) f)
     (set! (.installed (clone-inline-ext)) true)
@@ -235,6 +256,10 @@
    (folding bool)  ; set while this Fun is being trivially inlined away
    (escapes bool)  ; its pointer was materialized as a value: the address must stay defined
    (approx-size i64)  ; approximate body size, the inlining heuristic
+   (live-size i64)  ; the last measured live body size (see `fun-live-body-size`)
+   (live-size-epoch i64)  ; the inlining epoch that measurement belongs to; 0 = never
+   (self-recursive bool)  ; the last answer of `fun-self-recursive?`
+   (self-recursive-epoch i64)  ; and the epoch it belongs to; 0 = never
    (ret-nid i64)])  ; the Return, by nid — a back-pointer that survives edge surgery
 
 (defn fun-sig [(f (dyn NodeOps))] (-> i64)
@@ -314,7 +339,8 @@
        (and (not (n-dead? f))
             (and (not (fun-folding? f))
                  (match (fun-ret f)
-                   (Some [ret] (and (!= (n-ty ret) TY-INVALID) (not (n-dead? ret))))
+                   (Some [ret]
+                         (and (!= (n-ty ret) TY-INVALID) (not (n-dead? ret))))
                    (None [] false))))))
 
 ;; Replace optimization-only caller edges with a runtime entry and architectural RPC parameter.
@@ -335,7 +361,9 @@
                             (match (n-out fun (load i))
                               (Some [u]
                                     (if (= (n-op u) OP-PARM)
-                                        (n-insert-def! u 1 (None [(dyn NodeOps)]))
+                                        (n-insert-def! u
+                                                       1
+                                                       (None [(dyn NodeOps)]))
                                         0))
                               (None [] 0))
                             (set! (mut i) (+ (load i) 1))
@@ -345,12 +373,14 @@
           (Some [rpc]
                 (match (fun-ret fun)
                   (Some [ret] (n-set-def! ret RETURN-RPC (Some rpc)))
-                  (None [] (panic "fun-prepare-codegen!: live Fun has no Return"))))
+                  (None []
+                        (panic "fun-prepare-codegen!: live Fun has no Return"))))
           (None []
                 (let [rpc (parm-make-slot fun 0 (ty-int-bot) "$rpc")]
                   (match (fun-ret fun)
                     (Some [ret] (n-set-def! ret RETURN-RPC (Some rpc)))
-                    (None [] (panic "fun-prepare-codegen!: live Fun has no Return"))))))
+                    (None []
+                          (panic "fun-prepare-codegen!: live Fun has no Return"))))))
         1)))
 
 ;; Cannot build the Return and the Fun at once; one has to come first. So the link is a second step,
@@ -428,15 +458,21 @@
                     ;; value and must not be inspected as one; proceed directly to Fun collapse.
                     (if (= rt TY-INVALID)
                         (fun--maybe-collapse f)
-                        (if (and (ty-tuple? rt) (> (ty-tuple-len rt) RETURN-VALUE))
+                        (if (and (ty-tuple? rt)
+                                 (> (ty-tuple-len rt) RETURN-VALUE))
                             (let [actual (ty-tuple-at rt RETURN-VALUE)
                                   declared (ty-sig-ret (fun-sig f))]
                               (if (= actual TY-INVALID)
                                   (panic-i "fun-idealize: return tuple contains TY_INVALID; fun nid"
                                            (n-nid f))
                                   0)
-                              (if (and (!= actual declared) (ty-isa? actual declared))
-                                  (do (fun-set-sig! f (fun--sig-with-ret (fun-sig f) actual)) (Some f))
+                              (if (and (!= actual declared)
+                                       (ty-isa? actual declared))
+                                  (do
+                                    (fun-set-sig! f
+                                                  (fun--sig-with-ret (fun-sig f)
+                                                                     actual))
+                                    (Some f))
                                   (fun--maybe-collapse f)))
                             (fun--maybe-collapse f)))))
             (None [] (fun--maybe-collapse f))))))
@@ -475,7 +511,8 @@
 (defn fun--maybe-collapse [(f (dyn NodeOps))] (-> (Option (dyn NodeOps)))
   (if (fun-unknown-callers? f)
       (None [(dyn NodeOps)])
-      (if (and (and (fun-folding? f) (= (n-nins f) 2)) (not (region-has-phi? f)))
+      (if (and (and (fun-folding? f) (= (n-nins f) 2))
+               (not (region-has-phi? f)))
           (do
             (fun--detach-folding-fptrs! f)
             (n-in f 1))
@@ -490,7 +527,9 @@
     (loop (if (>= (load i) n)
               (break 0)
               (do
-                (push! [i64] (mut members) (if (= (load i) 0) ret (ty-tuple-at sig (load i))))
+                (push! [i64]
+                       (mut members)
+                       (if (= (load i) 0) ret (ty-tuple-at sig (load i))))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
     (let [answer (ty-tuple (al-slice (load members)))]
@@ -498,7 +537,9 @@
       answer)))
 
 (impl NodeOps FunNode
-  (hdr [(self (ptr FunNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (hdr [(self (ptr FunNode))]
+       (-> (ptr NodeHdr))
+       (primitive/cast (ptr NodeHdr) self))
   (label [(self (ptr FunNode))] (-> (slice u8)) (.name self))
   (is-const? [(self (ptr FunNode))] (-> bool) false)
   (no-const-fold? [(self (ptr FunNode))] (-> bool) true)
@@ -506,7 +547,9 @@
   (binop-copy [(self (ptr FunNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
               (-> (Option (dyn NodeOps)))
               (None [(dyn NodeOps)]))
-  (compute [(self (ptr FunNode))] (-> i64) (fun-compute (primitive/make-dyn NodeOps self)))
+  (compute [(self (ptr FunNode))]
+           (-> i64)
+           (fun-compute (primitive/make-dyn NodeOps self)))
   (idealize [(self (ptr FunNode))]
             (-> (Option (dyn NodeOps)))
             (fun-idealize (primitive/make-dyn NodeOps self)))
@@ -521,7 +564,9 @@
   (hash-extra [(self (ptr FunNode))] (-> i64) (.nid (.hdr self))))
 
 (impl CFGOps FunNode
-  (cfg-node [(self (ptr FunNode))] (-> (dyn NodeOps)) (primitive/make-dyn NodeOps self))
+  (cfg-node [(self (ptr FunNode))]
+            (-> (dyn NodeOps))
+            (primitive/make-dyn NodeOps self))
   (block-head? [(self (ptr FunNode))] (-> bool) true)
   ;; Final Simple deliberately bypasses Region dominance for a Fun.  Call edges can be recursive,
   ;; so taking their LCA would walk a cyclic interprocedural CFG.  A function is its own CFG root
@@ -652,10 +697,12 @@
                                                   0
                                                   (match (n-in p (load i))
                                                     (Some [v]
-                                                          (if (= (n-ty v) TY-INVALID)
+                                                          (if (= (n-ty v)
+                                                                 TY-INVALID)
                                                               0
                                                               (set! (mut t)
-                                                                    (ty-meet (load t) (n-ty v)))))
+                                                                    (ty-meet (load t)
+                                                                             (n-ty v)))))
                                                     (None [] 0)))))
                                       (None [] 0))
                                     (set! (mut i) (+ (load i) 1))
@@ -668,7 +715,8 @@
                         (let [constrained (ty-join (load t) (parm-declared p))
                               old (n-ty p)]
                           (if (and (= (load t) TY-TOP)
-                                   (and (!= old TY-INVALID) (ty-isa? old constrained)))
+                                   (and (!= old TY-INVALID)
+                                        (ty-isa? old constrained)))
                               old
                               constrained)))))))))
 
@@ -690,7 +738,9 @@
                   (None [(dyn NodeOps)]))))))
 
 (impl NodeOps ParmNode
-  (hdr [(self (ptr ParmNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (hdr [(self (ptr ParmNode))]
+       (-> (ptr NodeHdr))
+       (primitive/cast (ptr NodeHdr) self))
   (label [(self (ptr ParmNode))] (-> (slice u8)) (.name self))
   (is-const? [(self (ptr ParmNode))] (-> bool) false)
   ;; While the Fun has unknown callers the Parm reports its DECLARED type, which may well be
@@ -703,7 +753,9 @@
   (binop-copy [(self (ptr ParmNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
               (-> (Option (dyn NodeOps)))
               (None [(dyn NodeOps)]))
-  (compute [(self (ptr ParmNode))] (-> i64) (parm-compute (primitive/make-dyn NodeOps self)))
+  (compute [(self (ptr ParmNode))]
+           (-> i64)
+           (parm-compute (primitive/make-dyn NodeOps self)))
   (idealize [(self (ptr ParmNode))]
             (-> (Option (dyn NodeOps)))
             (parm-idealize (primitive/make-dyn NodeOps self)))
@@ -711,10 +763,14 @@
             (-> bool)
             (if (!= (n-op other) OP-PARM)
                 false
-                (= (.idx self) (.idx (primitive/cast (ptr ParmNode) (hdr other))))))
+                (= (.idx self)
+                   (.idx (primitive/cast (ptr ParmNode) (hdr other))))))
   (hash-extra [(self (ptr ParmNode))] (-> i64) (+ 179 (.idx self))))
 
-(defn parm-make-slot [(fun (dyn NodeOps)) (slot i64) (declared i64) (name (slice u8))] (-> (dyn NodeOps))
+(defn parm-make-slot [(fun (dyn NodeOps))
+                      (slot i64)
+                      (declared i64)
+                      (name (slice u8))] (-> (dyn NodeOps))
   (let [a (alloc/malloc-allocator)
         p (alloc/unwrap-ptr [ParmNode] (alloc/create [ParmNode] a))
         d (primitive/make-dyn NodeOps p)]
@@ -745,7 +801,8 @@
               (do
                 (match (n-out f (load i))
                   (Some [u]
-                        (if (and (= (n-op u) OP-PARM) (= (parm-call-slot u) (+ CALL-ARG0 idx)))
+                        (if (and (= (n-op u) OP-PARM)
+                                 (= (parm-call-slot u) (+ CALL-ARG0 idx)))
                             (set! (mut found) (Some u))
                             0))
                   (None [] 0))
@@ -762,7 +819,8 @@
               (do
                 (match (n-out f (load i))
                   (Some [u]
-                        (if (and (= (n-op u) OP-PARM) (= (parm-call-slot u) CALL-MEM))
+                        (if (and (= (n-op u) OP-PARM)
+                                 (= (parm-call-slot u) CALL-MEM))
                             (set! (mut found) (Some u))
                             0))
                   (None [] 0))
@@ -797,7 +855,9 @@
 (defstruct FunPtrNode [(hdr NodeHdr) (fptr-ty i64)])
 
 (impl NodeOps FunPtrNode
-  (hdr [(self (ptr FunPtrNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (hdr [(self (ptr FunPtrNode))]
+       (-> (ptr NodeHdr))
+       (primitive/cast (ptr NodeHdr) self))
   (label [(self (ptr FunPtrNode))] (-> (slice u8)) "FunPtr")
   ;; It IS a constant — of function-pointer type. Saying so stops the engine trying to replace it
   ;; with a Con, which would loop.
@@ -808,12 +868,15 @@
               (-> (Option (dyn NodeOps)))
               (None [(dyn NodeOps)]))
   (compute [(self (ptr FunPtrNode))] (-> i64) (.fptr-ty self))
-  (idealize [(self (ptr FunPtrNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
+  (idealize [(self (ptr FunPtrNode))]
+            (-> (Option (dyn NodeOps)))
+            (None [(dyn NodeOps)]))
   (eq-extra [(self (ptr FunPtrNode)) (other (dyn NodeOps))]
             (-> bool)
             (if (!= (n-op other) OP-FUNPTR)
                 false
-                (= (.fptr-ty self) (.fptr-ty (primitive/cast (ptr FunPtrNode) (hdr other))))))
+                (= (.fptr-ty self)
+                   (.fptr-ty (primitive/cast (ptr FunPtrNode) (hdr other))))))
   (hash-extra [(self (ptr FunPtrNode))] (-> i64) (* (.fptr-ty self) 181)))
 
 ;; Our FunPtr has a real Fun input, so signature sharpening can update every pointer directly when
@@ -834,7 +897,8 @@
                                   (panic-i "funptr-refresh-from-fun!: FunPtr payload is TY_INVALID; nid"
                                            (n-nid use))
                                   0)
-                              (let [fresh (ty-funptr sig (ty-funptr-fidxs prior))]
+                              (let [fresh
+                                      (ty-funptr sig (ty-funptr-fidxs prior))]
                                 (if (= fresh (.fptr-ty p))
                                     0
                                     (do
@@ -911,7 +975,9 @@
   (do (set! (.cend-nid (primitive/cast (ptr CallNode) (hdr c))) (n-nid e)) 0))
 
 (impl NodeOps CallNode
-  (hdr [(self (ptr CallNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (hdr [(self (ptr CallNode))]
+       (-> (ptr NodeHdr))
+       (primitive/cast (ptr NodeHdr) self))
   (label [(self (ptr CallNode))] (-> (slice u8)) "Call")
   (is-const? [(self (ptr CallNode))] (-> bool) false)
   (no-const-fold? [(self (ptr CallNode))] (-> bool) true)
@@ -935,16 +1001,20 @@
                       (let [fptr (call-fptr c)
                             ft (n-ty fptr)]
                         (if (and (and (!= ft TY-INVALID)
-                                      (and (ty-funptr? ft) (ty-funptr-single? ft)))
+                                      (and (ty-funptr? ft)
+                                           (ty-funptr-single? ft)))
                                  (and (not (ty-high? (n-ty c)))
-                                      (= (call-nargs c) (- (ty-tuple-len (ty-funptr-sig ft)) 1))))
+                                      (= (call-nargs c)
+                                         (- (ty-tuple-len (ty-funptr-sig ft)) 1))))
                             ;; Final Simple resolves the target through CodeGen's linker table by
                             ;; function index. The pointer node's input 0 is the Fun only for a
                             ;; FunPtr literal; a singleton-typed Load or Phi has a control input
                             ;; there, and following it would link the ENCLOSING function.
                             (match (arena-function (ty-funptr-the-fidx ft))
                               (Some [fun]
-                                    (if (or (!= (n-op fun) OP-FUN) (not (fun-linkable? fun)) (call-linked? c fun))
+                                    (if (or (!= (n-op fun) OP-FUN)
+                                            (not (fun-linkable? fun))
+                                            (call-linked? c fun))
                                         (None [(dyn NodeOps)])
                                         (do (call-link! c fun) (Some c))))
                               (None [] (None [(dyn NodeOps)])))
@@ -956,13 +1026,16 @@
   (eq-extra [(self (ptr CallNode)) (other (dyn NodeOps))]
             (-> bool)
             (and (= (n-op other) OP-CALL)
-                 (= (.nid (hdr (primitive/make-dyn NodeOps self))) (n-nid other))))
+                 (= (.nid (hdr (primitive/make-dyn NodeOps self)))
+                    (n-nid other))))
   (hash-extra [(self (ptr CallNode))]
               (-> i64)
               (+ 191 (.nid (hdr (primitive/make-dyn NodeOps self))))))
 
 (impl CFGOps CallNode
-  (cfg-node [(self (ptr CallNode))] (-> (dyn NodeOps)) (primitive/make-dyn NodeOps self))
+  (cfg-node [(self (ptr CallNode))]
+            (-> (dyn NodeOps))
+            (primitive/make-dyn NodeOps self))
   ;; A Call is a block TAIL; the CallEnd that follows is the head.
   (block-head? [(self (ptr CallNode))] (-> bool) false)
   (cfg-idom [(self (ptr CallNode))]
@@ -1012,7 +1085,8 @@
 ;;
 ;; Input 0 is the Call. Inputs 1.. are the linked Returns — one per function this call site may
 ;; reach. Exactly one means a resolved direct call.
-(defstruct CallEndNode [(hdr NodeHdr) (folding bool) (never-inline bool) (decision i64)])
+(defstruct CallEndNode
+  [(hdr NodeHdr) (folding bool) (never-inline bool) (decision i64)])
 
 (defn cend-call [(e (dyn NodeOps))] (-> (dyn NodeOps))
   (n-in! e 0))
@@ -1064,7 +1138,8 @@
                               ;; transient data-shaped CallEnd is collected.
                               (None [] (n-ty e)))
                             ;; Otherwise meet the full state tuples from every linked Return.
-                            (cend--linked-state e (ty-sig-ret (ty-funptr-sig ft)))))))))))
+                            (cend--linked-state e
+                                                (ty-sig-ret (ty-funptr-sig ft)))))))))))
 
 ;; Preserve control and memory, and constrain only the value member by the declared return type.
 (defn cend--state-with-declared-ret [(state i64) (declared i64)] (-> i64)
@@ -1091,7 +1166,8 @@
                   (Some [r]
                         (let [rt (n-ty r)]
                           (if (and (!= rt TY-INVALID)
-                                   (and (ty-tuple? rt) (> (ty-tuple-len rt) RETURN-VALUE)))
+                                   (and (ty-tuple? rt)
+                                        (> (ty-tuple-len rt) RETURN-VALUE)))
                               (do
                                 (set! (mut any) true)
                                 (set! (mut state) (ty-meet (load state) rt)))
@@ -1122,7 +1198,9 @@
                 (ty-tuple-of3 TY-CTRL (ty-mem 1 TY-BOT) declared))))))
 
 (impl NodeOps CallEndNode
-  (hdr [(self (ptr CallEndNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (hdr [(self (ptr CallEndNode))]
+       (-> (ptr NodeHdr))
+       (primitive/cast (ptr NodeHdr) self))
   (label [(self (ptr CallEndNode))] (-> (slice u8)) "CallEnd")
   (is-const? [(self (ptr CallEndNode))] (-> bool) false)
   (no-const-fold? [(self (ptr CallEndNode))] (-> bool) true)
@@ -1130,16 +1208,24 @@
   (binop-copy [(self (ptr CallEndNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
               (-> (Option (dyn NodeOps)))
               (None [(dyn NodeOps)]))
-  (compute [(self (ptr CallEndNode))] (-> i64) (cend-compute (primitive/make-dyn NodeOps self)))
+  (compute [(self (ptr CallEndNode))]
+           (-> i64)
+           (cend-compute (primitive/make-dyn NodeOps self)))
   ;; Simple's CallEnd has no `idealize` at all — the inline decision is driven by the SEPARATE inline
   ;; worklist, not by the ordinary peephole. Keeping that split is what rations inlining to one per
   ;; round, with a full cleanup between.
-  (idealize [(self (ptr CallEndNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
-  (eq-extra [(self (ptr CallEndNode)) (other (dyn NodeOps))] (-> bool) (= (n-op other) OP-CALLEND))
+  (idealize [(self (ptr CallEndNode))]
+            (-> (Option (dyn NodeOps)))
+            (None [(dyn NodeOps)]))
+  (eq-extra [(self (ptr CallEndNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (= (n-op other) OP-CALLEND))
   (hash-extra [(self (ptr CallEndNode))] (-> i64) 193))
 
 (impl CFGOps CallEndNode
-  (cfg-node [(self (ptr CallEndNode))] (-> (dyn NodeOps)) (primitive/make-dyn NodeOps self))
+  (cfg-node [(self (ptr CallEndNode))]
+            (-> (dyn NodeOps))
+            (primitive/make-dyn NodeOps self))
   ;; A CallEnd IS a block head.
   (block-head? [(self (ptr CallEndNode))] (-> bool) true)
   (cfg-idom [(self (ptr CallEndNode))]
@@ -1195,7 +1281,8 @@
                     (Some [u]
                           (if (= (n-op u) OP-PARM)
                               (let [slot (parm-call-slot u)]
-                                (if (and (>= slot CALL-MEM) (< slot (- (n-nins c) 1)))
+                                (if (and (>= slot CALL-MEM)
+                                         (< slot (- (n-nins c) 1)))
                                     (n-add-def! u (n-in c slot))
                                     ;; The caller passes fewer arguments than the callee declares.
                                     ;; That is an arity error, not something to paper over with a
@@ -1213,7 +1300,9 @@
     (match (call-cend c)
       (Some [e]
             (do
-              (match (fun-ret fun) (Some [r] (n-add-def! e (Some r))) (None [] 0))
+              (match (fun-ret fun)
+                (Some [r] (n-add-def! e (Some r)))
+                (None [] 0))
               (code-add! e)))
       (None [] 0))
     (invalidate-cfg!)
@@ -1257,7 +1346,9 @@
                                                 0)
                                               0))
                                     (None [] 0))
-                                  (if (load removed) 0 (set! (mut j) (+ (load j) 1)))
+                                  (if (load removed)
+                                      0
+                                      (set! (mut j) (+ (load j) 1)))
                                   (continue))))
                       (if (load removed)
                           0
@@ -1302,12 +1393,14 @@
                                                 (if (= (n-op caller) OP-CALL)
                                                     (do
                                                       (call-unlink! caller fun)
-                                                      (set! (mut removed) (+ (load removed) 1))
+                                                      (set! (mut removed)
+                                                            (+ (load removed) 1))
                                                       ;; Region/Parm arms compressed; examine this
                                                       ;; same index again.
                                                       (continue))
                                                     (do
-                                                      (set! (mut i) (+ (load i) 1))
+                                                      (set! (mut i)
+                                                            (+ (load i) 1))
                                                       (continue))))
                                           (None []
                                                 (do
@@ -1364,7 +1457,9 @@
                           INLINE-DEFER
                           (callend--candidate-with-target e c (n-in! e 1)))))))))
 
-(defn callend--candidate-with-target [(e (dyn NodeOps)) (c (dyn NodeOps)) (ret (dyn NodeOps))] (-> i64)
+(defn callend--candidate-with-target [(e (dyn NodeOps))
+                                      (c (dyn NodeOps))
+                                      (ret (dyn NodeOps))] (-> i64)
   ;; A linked Return can finish folding one worklist turn before the CallEnd and its projections.
   ;; Its arena identity remains available as ownership metadata, but it is not an inline target.
   (if (= (n-ty ret) TY-INVALID)
@@ -1389,7 +1484,8 @@
                             ;; The function pointer must be a CONSTANT, non-empty, singleton set. Anything else
                             ;; may still sharpen, so depend on it and defer.
                             (if (or (= ft TY-INVALID)
-                                    (not (and (ty-funptr? ft) (ty-funptr-single? ft))))
+                                    (not (and (ty-funptr? ft)
+                                              (ty-funptr-single? ft))))
                                 (do (n-add-dep! fptr e) INLINE-DEFER)
                                 ;; Arguments must match the formals. `call-good-args?` depends on any that do
                                 ;; not yet.
@@ -1397,13 +1493,19 @@
                                     INLINE-DEFER
                                     ;; SIZE. Over the hard cap: never. Under it: trivial when this is the only
                                     ;; caller, otherwise the clone path.
-                                    (if (>= (fun-approx-size fun) INLINE-MAX-SIZE)
+                                    (if (>= (fun-approx-size fun)
+                                            INLINE-MAX-SIZE)
                                         INLINE-NEVER
-                                        (if (>= (fun-live-body-size fun) INLINE-MAX-SIZE)
+                                        (if (>= (fun-live-body-size fun)
+                                                INLINE-MAX-SIZE)
                                             (do (n-add-dep! fun e) INLINE-DEFER)
                                             (if (fun-unknown-callers? fun)
-                                                (do (n-add-dep! fun e) INLINE-DEFER)
-                                                (if (> (n-nins fun) 2) INLINE-CLONE INLINE-TRIVIAL))))))))))))))
+                                                (do
+                                                  (n-add-dep! fun e)
+                                                  INLINE-DEFER)
+                                                (if (> (n-nins fun) 2)
+                                                    INLINE-CLONE
+                                                    INLINE-TRIVIAL))))))))))))))
 
 ;; The Fun a Return belongs to is metadata, not an input edge. Simple likewise keeps `_fun`
 ;; separately from input 3, which is the RPC edge cleared during inlining.
@@ -1420,60 +1522,94 @@
 ;; FunPtr can be visible one turn before its Call has become a Fun input. Inspecting the Fun's sparse
 ;; FunPtr outputs closes that ordering window without scanning the arena or inventing a second call
 ;; graph. Once linked, the first loop remains the authoritative Simple path.
+;; Arena-indexed marks for the control-ownership walk, process-wide scratch grown to the arena once
+;; and cleared through the ids a walk set; a fresh arena-sized map per walk, per candidate check,
+;; was the largest single cost of a compile.
+(defstruct ControlOwnedScratch
+  [(seen (ArrayList bool)) (touched (ArrayList i64)) (booted bool)])
+
+(defn control-owned-scratch [] (-> (ptr ControlOwnedScratch))
+  (primitive/alloc-static ControlOwnedScratch))
+
 (defn fun--control-owned? [(f (dyn NodeOps)) (start (dyn NodeOps))] (-> bool)
   (let [a (alloc/malloc-allocator)
+        s (control-owned-scratch)
         limit (+ (arena-node-count) 1)
-        (mut seen) (al-new [bool] a)
         (mut work) (al-new [(dyn NodeOps)] a)
-        (mut i) 0
         (mut yes) false]
-    (loop (if (>= (load i) limit)
-              (break 0)
-              (do
-                (push! [bool] (mut seen) false)
-                (set! (mut i) (+ (load i) 1))
-                (continue))))
-    (push! [(dyn NodeOps)] (mut work) start)
-    (loop (if (or (= (len (load work)) 0) (load yes))
-              (break 0)
-              (match (pop! (mut work))
-                (None [] (break 0))
-                (Some [n]
-                      (let [id (n-nid n)]
-                        (if (or (<= id 0) (>= id limit) (get (load seen) id))
-                            0
-                            (do
-                              (set! (mut seen) id true)
-                              (if (n-same? n f)
-                                  (set! (mut yes) true)
-                                  (if (= (n-op n) OP-FUN)
-                                      0
-                                      ;; This is control ownership, not arbitrary graph reachability.
-                                      ;; Simple's recursion guard walks the caller's dominators. A
-                                      ;; CallEnd also references its callee Return; following that
-                                      ;; edge misclassifies two sequential calls as self-recursion.
-                                      ;; Before dominators settle, visit all Region predecessors but
-                                      ;; only input zero of other control nodes (CallEnd -> Call).
-                                      (let [merge (or (= (n-op n) OP-REGION) (= (n-op n) OP-LOOP))
-                                            limit (if merge (n-nins n) (if (> (n-nins n) 0) 1 0))
-                                            (mut input) (if merge 1 0)]
-                                        (loop (if (>= (load input) limit)
-                                                  (break 0)
-                                                  (do
-                                                    (match (n-in n (load input))
-                                                      (Some [def]
-                                                            (push! [(dyn NodeOps)]
-                                                                   (mut work)
-                                                                   def))
-                                                      (None [] 0))
-                                                    (set! (mut input) (+ (load input) 1))
-                                                    (continue)))))))))
-                        (continue))))))
-    (al-free! [bool] (mut seen))
-    (al-free! [(dyn NodeOps)] (mut work))
-    (load yes)))
+    (if (.booted s)
+        0
+        (do
+          (set! (.seen s) (al-new [bool] a))
+          (set! (.touched s) (al-new [i64] a))
+          (set! (.booted s) true)
+          0))
+    (do
+      (loop (if (>= (len (.seen s)) limit)
+                (break 0)
+                (do (push! [bool] (mut (.seen s)) false) (continue))))
+      (push! [(dyn NodeOps)] (mut work) start)
+      (loop (if (or (= (len (load work)) 0) (load yes))
+                (break 0)
+                (match (pop! (mut work))
+                  (None [] (break 0))
+                  (Some [n]
+                        (let [id (n-nid n)]
+                          (if (or (<= id 0) (>= id limit) (get (.seen s) id))
+                              0
+                              (do
+                                (set! (mut (.seen s)) id true)
+                                (push! [i64] (mut (.touched s)) id)
+                                (if (n-same? n f)
+                                    (set! (mut yes) true)
+                                    (if (= (n-op n) OP-FUN)
+                                        0
+                                        ;; This is control ownership, not arbitrary graph reachability.
+                                        ;; Simple's recursion guard walks the caller's dominators. A
+                                        ;; CallEnd also references its callee Return; following that
+                                        ;; edge misclassifies two sequential calls as self-recursion.
+                                        ;; Before dominators settle, visit all Region predecessors but
+                                        ;; only input zero of other control nodes (CallEnd -> Call).
+                                        (let [merge
+                                                (or (= (n-op n) OP-REGION)
+                                                    (= (n-op n) OP-LOOP))
+                                              limit
+                                                (if merge
+                                                    (n-nins n)
+                                                    (if (> (n-nins n) 0) 1 0))
+                                              (mut input) (if merge 1 0)]
+                                          (loop (if (>= (load input) limit)
+                                                    (break 0)
+                                                    (do
+                                                      (match (n-in n
+                                                                   (load input))
+                                                        (Some [def]
+                                                              (push! [(dyn NodeOps)]
+                                                                     (mut work)
+                                                                     def))
+                                                        (None [] 0))
+                                                      (set! (mut input)
+                                                            (+ (load input) 1))
+                                                      (continue)))))))))
+                          (continue))))))
+      (al-free! [(dyn NodeOps)] (mut work))
+      (al-for [id (.touched s)] (set! (mut (.seen s)) id false))
+      (al-clear! [i64] (mut (.touched s)))
+      (load yes))))
 
+;; Memoized per inlining epoch (see `fun-size-epoch`): every deferred candidate asks each round, and
+;; the answer only changes when the graph does.
 (defn fun-self-recursive? [(f (dyn NodeOps))] (-> bool)
+  (let [p (primitive/cast (ptr FunNode) (hdr f))
+        epoch (+ (load (fun-size-epoch)) 1)]
+    (if (= (.self-recursive-epoch p) epoch)
+        (.self-recursive p)
+        (let [answer (fun--self-recursive-walk? f)]
+          (set! (.self-recursive p) answer)
+          (set! (.self-recursive-epoch p) epoch)
+          answer))))
+
+(defn fun--self-recursive-walk? [(f (dyn NodeOps))] (-> bool)
   (let [cnt (n-nins f)
         (mut i) 1
         (mut yes) false]
@@ -1484,7 +1620,10 @@
                   (Some [caller]
                         (if (= (n-op caller) OP-CALL)
                             (match (call-cend caller)
-                              (Some [ce] (if (fun--reaches? f ce) (set! (mut yes) true) 0))
+                              (Some [ce]
+                                    (if (fun--reaches? f ce)
+                                        (set! (mut yes) true)
+                                        0))
                               (None [] 0))
                             0))
                   (None [] 0))
@@ -1498,13 +1637,15 @@
                   (Some [fp]
                         (if (= (n-op fp) OP-FUNPTR)
                             (let [(mut oi) 0]
-                              (loop (if (or (>= (load oi) (n-nouts fp)) (load yes))
+                              (loop (if (or (>= (load oi) (n-nouts fp))
+                                            (load yes))
                                         (break 0)
                                         (do
                                           (match (n-out fp (load oi))
                                             (Some [use_]
                                                   (if (= (n-op use_) OP-CALL)
-                                                      (if (fun--control-owned? f (call-ctrl use_))
+                                                      (if (fun--control-owned? f
+                                                                               (call-ctrl use_))
                                                           (set! (mut yes) true)
                                                           0)
                                                       0))
@@ -1523,7 +1664,9 @@
         (mut yes) false
         (mut guard) 0]
     (loop (if (> (load guard) 100000)
-              (do (broken "fun--reaches?: dominator walk did not converge") (break 0))
+              (do
+                (broken "fun--reaches?: dominator walk did not converge")
+                (break 0))
               (match (load cur)
                 (None [] (break 0))
                 (Some [n]
@@ -1552,7 +1695,10 @@
                             (set! (mut ok) false)
                             (if (ty-isa? (n-ty arg) formal)
                                 0
-                                (do (n-add-dep! arg dep) (set! (mut ok) false) 0))))
+                                (do
+                                  (n-add-dep! arg dep)
+                                  (set! (mut ok) false)
+                                  0))))
                       (set! (mut i) (+ (load i) 1))
                       (continue))))
           (load ok)))))
@@ -1667,9 +1813,12 @@
     (if (= op OP-FUN)
         (Some (primitive/make-dyn CFGOps (primitive/cast (ptr FunNode) (hdr n))))
         (if (= op OP-CALL)
-            (Some (primitive/make-dyn CFGOps (primitive/cast (ptr CallNode) (hdr n))))
+            (Some (primitive/make-dyn CFGOps
+                                      (primitive/cast (ptr CallNode) (hdr n))))
             (if (= op OP-CALLEND)
-                (Some (primitive/make-dyn CFGOps (primitive/cast (ptr CallEndNode) (hdr n))))
+                (Some (primitive/make-dyn CFGOps
+                                          (primitive/cast (ptr CallEndNode)
+                                                          (hdr n))))
                 (prop-access-cfg n))))))
 
 ;; Simple's CallEndNode.pcopy: once folding begins, the CallEnd tuple is its single linked Return.

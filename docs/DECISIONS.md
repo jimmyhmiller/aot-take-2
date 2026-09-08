@@ -1,5 +1,40 @@
 # Decisions
 
+## 2026-09-08 — Compile time is measured, and the inline decision is memoized
+
+Compiling one harness-backed test262 case took 5.65 s while a trivial script took 0.06 s, and a
+campaign of 90,000 cases at that rate is days: what looked like a hung campaign was a compiler
+that is superlinear in program size. `AOT_TIME=1` now prints every phase's wall time and the
+arena size at its end, from `code-enter-phase!`, so a slow compile names its phase before anyone
+guesses. The first two answers: the inline candidate check asked `fun-self-recursive?` per
+candidate per round, and that walked control ownership over the whole arena with a fresh
+arena-sized map each time; the body-size walk was asked the same way. Both are memoized per Fun
+per inlining epoch (an epoch is one inline that fired; a stale answer can only delay an inline to
+the next epoch, never admit one wrongly), and every arena-sized mark map in the inliner and the
+body copier is process-wide scratch grown once and cleared through the ids it set. The harness
+case is 3.45 s now; register allocation (eleven full interference-graph rounds), mask allocation
+churn, dependency dedup scans and the stack-map liveness fixpoint share the rest and are the next
+targets. Campaigns must not be run against an edited tree, and their per-case time is the number to
+watch, not their completion.
+
+## 2026-09-08 — `finally` is a completion record and a jump
+
+Simple has no exceptions; a `finally` block here is ordinary structured control flow. A try with a
+finally defines two synthetic Scope variables, the completion's kind (normal, return, throw) and
+its value, and pushes a JUMP-FINALLY target. A `return` inside the try records kind and value and
+takes the Scope-merging jump a `break` takes; a throw the statement does not catch (no handler, or
+a throw inside the handler) arrives at a catch-like target that continues into the block as a
+throw completion; the normal path arrives with kind 0. The block runs once over that merge, then
+two Scope diamonds resume the completion: kind 1 returns the value (into an outer finally first if
+there is one), kind 2 throws it (to the nearest catch, or pending and out). A return inside the
+block itself simply records a return first, so it replaces the pending completion as JavaScript
+says. A break or continue that would cross a finally refuses for now. Unlabeled break and continue
+never match a catch or finally target; they matched any non-block target before, which would have
+sent a `break` inside a `try` inside a loop to the catch clause. A jump that carries a value binds
+the synthetic exception variable AFTER unwinding to the target's Scope depth: a nested try's own
+level holds another binding of that name, and binding first filled the wrong one (a throw from an
+inner finally reached the outer catch as `undefined`).
+
 ## 2026-09-08 — The language's TypeErrors are TypeError objects
 
 A JSL builtin throws by `%SetPendingException`: the pending word of the runtime heap record takes

@@ -120,6 +120,13 @@ methods (`Object.prototype.toString`/`hasOwnProperty`, `Error.prototype.toString
 `%Object.prototype%` — an ordinary object's [[Prototype]] is null unless set, so
 `Object.prototype.x = 1` is not visible through `{}`.
 
+### 2026-09-08 — finally
+
+Abrupt completions run their finally blocks (docs/DECISIONS.md, finally): return, throw with or
+without a catch, rethrow from a handler, a return in the block replacing the completion. Missing:
+break and continue crossing a finally (refused by name); a finally's own throw replacing a
+pending completion is handled by the same mechanism but has no test yet.
+
 ### 2026-09-08 — Exceptions
 
 `throw` and `try`/`catch` execute (docs/DECISIONS.md, exceptions): a throw inside a try is a jump
