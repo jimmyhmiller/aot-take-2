@@ -80,6 +80,25 @@ in selection, `ALIAS-FIRST-PROPERTY` follows the function aliases, and `ra-build
 undefined live range. A boxed live range with a fixed definition and a conflicting fixed use also
 no longer loops in the managed-root splitters: those apply only to ranges a safepoint restricted.
 
+### 2026-09-08 — Graph size after TypeError objects
+
+A store to an unknown receiver costs about 24 nodes (object-like test, store, two nullish-base
+arms calling the shared throw builtin, the pending check); the smallest realm is about 790 nodes
+because it instantiates `Error`, `TypeError` and their prototype objects and carries the throw
+builtin. Follow-ups: intrinsic function and prototype objects as static data rather than realm
+setup code; a throw arm that jumps straight to the unwinding path instead of setting the pending
+word and re-checking it; hoisting a function's pending checks when the base is proven non-nullish
+by an earlier access in the same function.
+
+### 2026-09-08 — TypeError objects
+
+Property access on undefined/null, calls on non-callables, `instanceof` with a non-callable right
+operand and strict writes to non-writable globals throw TypeError objects. Missing: an operator's
+TypeError (`Symbol` in ToString/ToNumber) is checked only at the next call or member site, not
+right after the operator; `new` on a non-constructor; the runtime's remaining traps (ToPrimitive,
+ToObject) are still hard refusals, not exceptions; error messages are ours, not any engine's;
+`Error.prototype.toString`; uncaught exceptions print the boxed word, not the message.
+
 ### 2026-09-08 — Strict code
 
 Strict code compiles and runs (docs/DECISIONS.md, strict code runs). Still missing under strict

@@ -1,5 +1,20 @@
 # Decisions
 
+## 2026-09-08 — The language's TypeErrors are TypeError objects
+
+A JSL builtin throws by `%SetPendingException`: the pending word of the runtime heap record takes
+the value and the flag, exactly as a source `throw` outside a `try` does, and the builtin yields a
+stand-in value on the (dead) fall-through. `JsThrowTypeError` builds the object on
+%TypeError.prototype% — every realm materializes `TypeError` — with its message. Who unwinds: the
+enclosing source function's next pending check. The parser places one after a property read,
+write or call whose base may be undefined or null (the base's dynamic type decides; a base the
+compiler can type costs nothing), after every value call (the non-callable arm now throws the
+object instead of trapping, and the check follows the merge so both arms share it), and after a
+strict write to a non-writable global. The may-throw analysis counts member accesses as throw
+sites, so callers check after calling such a function. A TypeError raised inside an operator
+(`ToString(Symbol)`, `Symbol - 1`) is delivered at the next check rather than immediately: the
+operator itself is not followed by one (docs/GAPS.md).
+
 ## 2026-09-08 — Strict code runs
 
 The baseline campaign refused 22,921 files at "strict-mode runtime semantics" — every strict

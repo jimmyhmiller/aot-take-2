@@ -78,6 +78,7 @@
 (import "aot.type.type" :use *)
 (import "aot.shape" :use *)
 (import "aot.jsl.lower" :use *)
+(import "aot.jsl.reader" :use [jsl-noinline?])
 (import "aot.parse.lexer" :use *)
 (import "aot.parse.tstype" :use *)
 (import "aot.parse.regex" :use *)
@@ -5324,6 +5325,9 @@
           (al-free! [(dyn NodeOps)] (mut args))
           (parser-set-current-ctrl! (.ctrl loaded))
           (scope-set-mem! scope (.mem loaded))
+          (n-keep! (.value loaded))
+          (lower-nullish-base-check! (parser-node (.owner-nid ref)))
+          (n-unkeep! (.value loaded))
           (.value loaded)))
       (lower-name (.name ref))))
 
@@ -5347,6 +5351,7 @@
             (al-free! [(dyn NodeOps)] (mut args))
             (parser-set-current-ctrl! (.ctrl stored))
             (scope-set-mem! scope (.mem stored))
+            (lower-nullish-base-check! (parser-node (.owner-nid ref)))
             0))
         (if (.bound ref)
             (scope-update! scope (.name ref) value)
@@ -5354,12 +5359,8 @@
                 ;; `undefined = 1`: silently ignored in sloppy code; a TypeError in strict code
                 ;; (the runtime's TypeError trap until exception objects exist).
                 (if (syntax-fun-strict (.current-fun (parser-state)))
-                    (let [scope (parser-node (.current-scope (parser-state)))
-                          trap (jsop-make (parser-node (.current-ctrl (parser-state)))
-                                          (scope-mem scope)
-                                          JS-THROW-TYPE-ERROR)]
-                      (scope-set-mem! scope (proj-make trap 1 "strict.restricted-write.mem"))
-                      0)
+                    (do (lower-throw-type-error! "Cannot assign to read only property")
+                        (lower-pending-check!))
                     0)
                 ;; Var-like globals are properties of the realm's global object; an undeclared
                 ;; name would create one at run time and refuses until that is implemented.
@@ -5546,6 +5547,14 @@
       (let [right (lower-syntax-expr right-id)
             result (lower-js-binary left right name)]
         (n-unkeep! left)
+        ;; `instanceof` throws a TypeError for a non-callable right operand; when its type does not
+        ;; prove a function, the operator is followed by the pending check that unwinds.
+        (if (and (= name "JsInstanceof")
+                 (match (ty-kind (n-ty right))
+                   (TDyn [tags high] (or high (!= tags TAG-FUNCTION)))
+                   (_ true)))
+            (do (n-keep! result) (lower-pending-check!) (n-unkeep! result) 0)
+            0)
         result))))
 
 (defn lower-conditional [(condition-id i64) (yes-id i64) (no-id i64)] (-> (dyn NodeOps))
@@ -5860,26 +5869,68 @@
           (n-keep! value)
           (parser-set-current-ctrl! (cproj-make end RETURN-CTRL "value-call.ctrl"))
           (scope-set-mem! scope (proj-make end RETURN-MEM "value-call.mem"))
-          (lower-pending-check!)
           (let [called-scope (parser-node (.current-scope (parser-state)))]
             (set! (.current-scope (parser-state)) (n-nid false-scope))
             (parser-set-current-ctrl! (guard-false g))
-            (let [false-ctrl (parser-node (.current-ctrl (parser-state)))
-                  trap (jsop-make false-ctrl (scope-mem false-scope) JS-THROW-TYPE-ERROR)]
-              (scope-set-mem! false-scope (proj-make trap 1 "value-call.throw.mem")))
-            (let [merged (scope-merge! called-scope false-scope)
+            ;; Not callable: a TypeError object goes pending; the check after the merge unwinds
+            ;; this arm and any exception the callee left alike.
+            (lower-throw-type-error! "value is not a function")
+            (let [merged (scope-merge! called-scope (parser-node (.current-scope (parser-state))))
                   region (scope-ctrl merged)
                   phi (phi-make region (ty-dyn TAG-ANY) "value-call")]
               (phi-add-value! phi value)
               (phi-add-value! phi (dyn-undefined-make))
               (set! (.current-scope (parser-state)) (n-nid merged))
               (set! (.current-ctrl (parser-state)) (n-nid region))
+              (n-keep! phi)
+              (lower-pending-check!)
+              (n-unkeep! phi)
               (n-unkeep! value)
               (al-for [v (load actuals)] (n-unkeep! v))
               (n-unkeep! receiver)
               (n-unkeep! callee)
               (al-free! [(dyn NodeOps)] (mut actuals))
               phi)))))))
+
+;; A property access on undefined or null is a TypeError raised inside JsGetNamed; when the base's
+;; type admits either, the access is followed by a pending check so the function unwinds at once.
+(defn lower-nullish-base-check! [(base (dyn NodeOps))] (-> i64)
+  (let [t (n-ty base)
+        may-be-nullish (match (ty-kind t)
+                         (TDyn [tags high] (and (not high) (!= (primitive/iand tags (primitive/ior TAG-UNDEFINED TAG-NULL)) 0)))
+                         (_ true))]
+    (if may-be-nullish (lower-pending-check!) 0)))
+
+;; The language raising a TypeError at a source site: JsThrowTypeError with the message, then the
+;; pending check that unwinds.
+(defn lower-throw-type-error! [(message (slice u8))] (-> i64)
+  (let [(mut values) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))
+        text (lower-ascii-string message)]
+    (n-keep! text)
+    (push! [(dyn NodeOps)] (mut values) text)
+    (let [scope (parser-node (.current-scope (parser-state)))
+          r (lower-jsl-call-values "JsThrowTypeError" (load values))]
+      (n-unkeep! text)
+      (al-free! [(dyn NodeOps)] (mut values))
+      (parser-set-current-ctrl! (.ctrl r))
+      (scope-set-mem! scope (.mem r))
+      0)))
+
+;; A string constant at the current point, built directly: lowering never adds syntax nodes (the
+;; syntax tables may be reallocated under callers holding elements).
+(defn lower-ascii-string [(text (slice u8))] (-> (dyn NodeOps))
+  (let [(mut units) (al-new [i64] (alloc/malloc-allocator)) (mut i) 0]
+    (loop (if (>= (load i) (len text))
+              (break 0)
+              (do (push! [i64] (mut units) (primitive/cast i64 (get text (load i))))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+    (let [scope (parser-node (.current-scope (parser-state)))
+          lowered (jsl-lower-string-units (load units) (parser-node (.current-ctrl (parser-state))) (scope-mem scope))]
+      (al-free! [i64] (mut units))
+      (parser-set-current-ctrl! (.ctrl lowered))
+      (scope-set-mem! scope (.mem lowered))
+      (box-make-at (Some (.ctrl lowered)) (.value lowered)))))
 
 ;; A JSL macro with no arguments at the current point.
 (defn lower-jsl-nullary [(name (slice u8))] (-> (dyn NodeOps))
@@ -5910,6 +5961,7 @@
     (al-for [v values] (call-add-arg! c v))
     (call-set-fptr! c (funptr-make target (jsl-fidx-of name)))
     (let [end (callend-make c)]
+      (if (jsl-noinline? name) (callend-set-never-inline! end) 0)
       (jsl-expr-result (proj-make end RETURN-VALUE "jsl.call.value")
                        (cproj-make end RETURN-CTRL "jsl.call.ctrl")
                        (proj-make end RETURN-MEM "jsl.call.mem")))))
@@ -5927,9 +5979,12 @@
       (let [r (lower-jsl-call-values "JsGetKeyed" (load args))]
         (al-free! [(dyn NodeOps)] (mut args))
         (n-unkeep! k)
-        (n-unkeep! owner)
         (parser-set-current-ctrl! (.ctrl r))
         (scope-set-mem! scope (.mem r))
+        (n-keep! (.value r))
+        (lower-nullish-base-check! owner)
+        (n-unkeep! (.value r))
+        (n-unkeep! owner)
         (.value r)))))
 
 (defn lower-keyed-call [(owner-id i64) (key-id i64) (args (ArrayList i64))] (-> (dyn NodeOps))
@@ -5946,6 +6001,9 @@
         (n-unkeep! k)
         (parser-set-current-ctrl! (.ctrl r))
         (scope-set-mem! scope (.mem r))
+        (n-keep! (.value r))
+        (lower-nullish-base-check! owner)
+        (n-unkeep! (.value r))
         (let [answer (lower-value-call-with-receiver (.value r) owner args)]
           (n-unkeep! owner)
           answer)))))
@@ -6007,6 +6065,9 @@
         (al-free! [(dyn NodeOps)] (mut margs))
         (parser-set-current-ctrl! (.ctrl loaded))
         (scope-set-mem! scope (.mem loaded))
+        (n-keep! (.value loaded))
+        (lower-nullish-base-check! owner)
+        (n-unkeep! (.value loaded))
         (let [answer (lower-value-call-with-receiver (.value loaded) owner args)]
           (n-unkeep! owner)
           answer)))))
@@ -6072,6 +6133,9 @@
       (al-free! [(dyn NodeOps)] (mut args))
       (parser-set-current-ctrl! (.ctrl lowered))
       (scope-set-mem! scope (.mem lowered))
+      (n-keep! (.value lowered))
+      (lower-nullish-base-check! owner)
+      (n-unkeep! (.value lowered))
       (.value lowered))))
 
 (defn lower-named-call [(name (slice u8)) (args (ArrayList i64))] (-> (dyn NodeOps))
@@ -7174,6 +7238,9 @@
                                   (push! [i64] (mut edges) idx))))
                     (_ (set! direct true)))))
       (SxNew [callee args] (if protected 0 (set! direct true)))
+      ;; A property access on undefined or null is a TypeError.
+      (SxMember [owner name optional] (if protected 0 (set! direct true)))
+      (SxIndex [owner key optional] (if protected 0 (set! direct true)))
       (_ 0))
     (let [(mut kids) (al-new [i64] (alloc/malloc-allocator))]
       (syntax-expr-children! id (mut kids))
@@ -7450,6 +7517,10 @@
 ;; own declarations so a Script redefining `Object` shadows it as JavaScript says it does.
 (defn syntax-declare-intrinsics! [] (-> i64)
   (let [table (intrinsic-table) (mut i) 0]
+    ;; The language itself throws TypeErrors (a call on a non-callable, a property of null), so
+    ;; %TypeError.prototype% exists in every realm.
+    (syntax-declare-intrinsic! (get table (intrinsic-index table "Error")))
+    (syntax-declare-intrinsic! (get table (intrinsic-index table "TypeError")))
     (loop (if (>= (load i) (len table))
               (break 0)
               (let [entry (get table (load i))]
@@ -7482,16 +7553,6 @@
       (scope-set-mem! scope (.mem r))
       (.value r))))
 
-;; A string constant as a syntax node, for the values instantiation passes to JSL setups.
-(defn syntax-ascii-string-node [(text (slice u8))] (-> i64)
-  (let [(mut units) (al-new [i64] (alloc/malloc-allocator)) (mut i) 0]
-    (loop (if (>= (load i) (len text))
-              (break 0)
-              (do (push! [i64] (mut units) (primitive/cast i64 (get text (load i))))
-                  (set! (mut i) (+ (load i) 1))
-                  (continue))))
-    (syntax-add-node! (SxString :raw text :units (load units) :legacy-escape false) 0 0)))
-
 ;; Realm creation, intrinsics part: every materialized intrinsic's function object goes into its
 ;; global slot, then each setup runs — `Error.prototype.name`, the prototype chain to the parent.
 (defn lower-intrinsic-instantiation! [] (-> i64)
@@ -7514,16 +7575,25 @@
                           entry (get table (intrinsic-index table (.name f)))]
                       (if (= (.setup entry) "")
                           0
-                          (let [(mut args) (al-new [i64] (alloc/malloc-allocator))]
-                            (push! [i64] (mut args) (syntax-add-node! (SxName :name (.name f)) 0 0))
-                            (push! [i64] (mut args)
-                                   (if (= (.parent entry) "")
-                                       (syntax-add-node! (SxName :name "undefined") 0 0)
-                                       (syntax-add-node! (SxName :name (.parent entry)) 0 0)))
-                            (push! [i64] (mut args) (syntax-ascii-string-node (.name f)))
-                            (lower-intrinsic-call (.setup entry) (load args))
-                            (al-free! [i64] (mut args))
-                            0)))
+                          (let [(mut values) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))
+                                ctor (lower-name (.name f))]
+                            (n-keep! ctor)
+                            (let [parent (if (= (.parent entry) "") (dyn-undefined-make) (lower-name (.parent entry)))]
+                              (n-keep! parent)
+                              (let [name-string (lower-ascii-string (.name f))]
+                                (n-keep! name-string)
+                                (push! [(dyn NodeOps)] (mut values) ctor)
+                                (push! [(dyn NodeOps)] (mut values) parent)
+                                (push! [(dyn NodeOps)] (mut values) name-string)
+                                (let [scope (parser-node (.current-scope (parser-state)))
+                                      r (lower-jsl-call-values (.setup entry) (load values))]
+                                  (parser-set-current-ctrl! (.ctrl r))
+                                  (scope-set-mem! scope (.mem r))
+                                  (n-unkeep! name-string)
+                                  (n-unkeep! parent)
+                                  (n-unkeep! ctor)
+                                  (al-free! [(dyn NodeOps)] (mut values))
+                                  0))))))
                     0)
                 (set! (mut fi) (+ (load fi) 1))
                 (continue))))
@@ -7889,7 +7959,9 @@
                                         0)
                                     (set! (mut i) (+ (load i) 1))
                                     (continue)))))
-                      (if (.script-mode (parser-state))
+                      ;; An intrinsic belongs to no Script (`script` -1): it leaves the current
+                      ;; Script index as it is.
+                      (if (and (.script-mode (parser-state)) (>= (.script f) 0))
                           (set! (.script-index (parser-state))
                                 (get (.scripts (parser-state)) (.script f)))
                           0)
