@@ -1,5 +1,63 @@
 # Decisions
 
+## 2026-09-08 — Generic property access is a runtime operation over the shape tree
+
+The compiler's hidden-class tree (`aot.shape`) is the first part of the runtime's (`aot.rt.shapes`).
+It is emitted into the object file as the `__aot_shapes` blob beside the stack maps, the runtime
+boots its tree from it, and a store the compiler could not resolve continues the same tree at run
+time: `shapes-transition` memoises `(parent, key)` exactly as the compiler does and hands out ids
+past every static one, so no fast path can mistake a runtime layout for one it proved. Offsets
+follow the compiler's rule (fixed by the introducing edge, inherited by descendants), so a static
+Load and a runtime lookup on a static shape name the same word.
+
+An own-property access whose owner's backing store is not statically visible when optimization
+ends is therefore ONE runtime operation — `JsOp` `JS-PROP-GET-OWN`, `JS-PROP-HAS-OWN` or the
+transitioning `JS-PROP-SET-OWN` (`aot_rt_prop_get_own`/`has_own`/`set_own`) — whose memory result
+is public BOT: the object escaped to the runtime and any slice may have changed. `[[Get]]` stays
+the JSL definition (own step, then the prototype chain); only its own-property step is the runtime
+call. Static paths are unchanged: a visible backing store folds to a Load, a constant or the static
+transition, and the realm's global object keeps its fixed-shape path with trap arms.
+
+This replaces a closed-world dispatch that enumerated every compile-time shape holding the key at
+each unresolved site. It was unsound — the shape universe is not closed at expansion: a store
+expanded later creates a transition no earlier dispatch tests for, so a load read `undefined` from
+an object that had the property (`P.prototype.constructor`, `p.k` through a chain) — and it was
+the bloat class the budgets exist for: k runtime keys over n shapes reach n·k! layouts.
+`property-expand-all!` now panics if the shape count changes during expansion.
+
+A transitioning `JsOp` continues its argument registers with an optional allocation shape (string
+capabilities only), the safepoint id and a snapshot of SP; the runtime store roots its raw object
+and boxed value (`rt-alloc-rooted`, a boxed-root variant of the collector entry) across the
+allocation of a child backing store and re-reads both afterwards.
+
+Two backend defects surfaced by the first raw object pointer live across a mid-block safepoint:
+
+- Stack maps compute their own liveness over the FINAL graph (`gc-compute-liveness!`), one backward
+  dataflow over live-range ids with phi arms as edge uses. The allocator's live-out table names
+  definition nodes as they stood when the interference graph was built; a phi arm it recorded may
+  since have been coalesced away, which left a phi's range "live" through a predecessor it was
+  never in and asked for a stack home it does not have.
+- A before-use split is anchored immediately before its use (final Simple's `insertBefore`),
+  never left to the list scheduler, which floated it above a safepoint between it and the use,
+  where a register copy cannot legally live; every round re-made the same copy in the same place
+  until the budget ran out. The copies anchored to one use move as a group in scheduled order, so
+  a copy of a copy stays after its input. A range allowed exactly one register that fails while a
+  neighbour BORN in that register (an allocation or call result in X0) still holds it is resolved
+  the neighbour's way — split after its definition — because copies of the failing range cannot
+  free the register and each round would re-make one. `AOT_RA_TRACE=1` narrates failed rounds:
+  the failing range, its members and uses, its neighbours, the block schedule, the policy taken.
+
+Also decided here: `new F(args)` creates an ordinary object whose [[Prototype]] is F's
+`prototype` property, calls F with it as receiver and yields F's result if that is an object;
+every function object owns a `prototype` object with `constructor` (MakeConstructor).
+`instanceof` is OrdinaryHasInstance over the represented chain (`JsInstanceof`,
+`JsInstanceofWalk`). A name nothing in the realm declares is unresolvable: `typeof` of it is
+"undefined"; a read or write of it compiles and refuses at run time (`aot_rt_unimplemented_
+unresolved_global`) — except a standard global (`JSON`, `Object`, …, `syntax-standard-global?`),
+which the realm does not provide yet and which is a runtime refusal under `typeof` too, never
+"undefined". `o[k]` compiles as `JsGetKeyed`/`JsSetKeyed` and refuses at run time until keys
+intern at run time and arrays exist.
+
 ## 2026-09-08 — Receivers, function objects and total coercions
 
 `this` is the receiver slot (slot 0 of the shared ABI). A non-strict function binds it through

@@ -212,7 +212,8 @@ Encoding is layout-sensitive and iterative. It must:
 - emit exact bytes only after allocation and frame layout are final;
 - record internal branches, external symbols, literals, and compilation-unit references as typed
   relocations;
-- emit stack maps keyed by final return-PC/safepoint offsets;
+- emit stack maps keyed by final return-PC/safepoint offsets, and the static shape table
+  (`__aot_shapes`, `shape-table-bytes`) the runtime boots its transition tree from;
 - write a valid arm64 Mach-O object first, then add ELF and x86-64 without changing the generic
   machine contract;
 - link with `cc` only as a linker and execute without any authored C shim.
@@ -235,8 +236,9 @@ independently validated arm64 Mach-O and ELF64 relocatable objects with definiti
 targets and branch relocations; its typed subprocess path links Mach-O with `cc` as a linker and
 executes a selected `main` returning 42.
 
-`gcmeta.coil` now reconstructs liveness backwards from the allocator's final block live-outs,
-recognizes calls and allocations as safepoints, and records raw-reference or reference-bearing
+`gcmeta.coil` computes its own liveness over the final allocated graph (one backward dataflow over
+live-range ids, phi arms as edge uses; docs/DECISIONS.md, generic property access), recognizes
+calls, allocations and runtime primitives as safepoints, and records raw-reference or reference-bearing
 boxed-word locations at their final encoded return PCs. Scalars and proven non-reference boxed
 words are deliberately omitted. Direct tests cover both an empty
 call map keyed at byte four and a typed raw-reference register entry. It serializes one versioned,

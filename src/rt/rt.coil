@@ -24,6 +24,7 @@
 (import "coil.time" :as time)
 (import "aot.util.panic" :use *)
 (import "aot.rt.abi" :use *)
+(import "aot.rt.shapes" :use *)
 
 ;; Darwin publishes the main executable header and libSystem's section lookup routine. This keeps
 ;; stack-map discovery inside Coil while avoiding an unresolved generated-data symbol in the
@@ -79,6 +80,12 @@
 (const RT-DYNAMIC-PAYLOAD-MASK 0x0000ffffffffffff)
 
 (const RT-SHAPE-NOSCAN-BIT 0x4000000000000000)
+
+;; The boxed `undefined` word and an ordinary object's payload layout, as the compiler fixes them
+;; (`aot.node.dynamic`, `aot.shape`); tests/rt-shapes-test.coil asserts the agreement.
+(const RT-DYNAMIC-UNDEFINED-WORD 0x7ffa000000000000)
+
+(const RT-OFFSET-OBJECT-PROPERTIES 8)
 
 
 (defstruct RtStats
@@ -225,6 +232,7 @@
               0)
           (set! (.fast-disabled (rt-heap))
                 (if (or (.stress (rt-heap)) (.enabled (rt-stats))) 1 0))
+          (rt-shapes-boot!)
           0))))
 
 (defn rt-align8 [(bytes i64)] (-> i64)
@@ -815,7 +823,7 @@
                                         (caller-sp i64)
                                         (root-a (ptr i64))
                                         (root-b (ptr i64))] (-> i64)
-  (rt-collect-from-maps-with-roots-at! maps map-bytes map-id caller-sp root-a root-b 0 false))
+  (rt-collect-from-maps-with-roots-at! maps map-bytes map-id caller-sp root-a root-b false 0 false))
 
 (defn rt-collect-from-maps-with-roots-at! [(maps (ptr u8))
                                            (map-bytes i64)
@@ -823,6 +831,7 @@
                                            (caller-sp i64)
                                            (root-a (ptr i64))
                                            (root-b (ptr i64))
+                                           (boxed-b bool)
                                            (text-base i64)
                                            (walk-callers bool)] (-> i64)
   (let [record (rt-stackmap-find maps map-bytes map-id)]
@@ -839,8 +848,10 @@
           (if (!= (primitive/cast i64 root-a) 0)
               (set! root-a (rt-forward (load root-a)))
               0)
+          ;; `root-b` is a raw payload address, or a boxed word when `boxed-b` (the runtime helper
+          ;; holds a JavaScript value, whose prefix the forwarding keeps).
           (if (!= (primitive/cast i64 root-b) 0)
-              (set! root-b (rt-forward (load root-b)))
+              (set! root-b (if boxed-b (rt-forward-boxed (load root-b)) (rt-forward (load root-b))))
               0)
           (let [(mut current-record) record
                 (mut current-sp) caller-sp
@@ -904,13 +915,15 @@
                                              caller-sp
                                              (primitive/cast (ptr i64) 0)
                                              (primitive/cast (ptr i64) 0)
+                                             false
                                              (primitive/cast i64 linked-text)
                                              true))))
 
 (defn rt-collect-linked-with-roots! [(map-id i64)
                                      (caller-sp i64)
                                      (root-a (ptr i64))
-                                     (root-b (ptr i64))] (-> i64)
+                                     (root-b (ptr i64))
+                                     (boxed-b bool)] (-> i64)
   (let [size (primitive/alloc-stack u64)
         text-size (primitive/alloc-stack u64)
         maps (rt-linked-stackmaps size)
@@ -923,6 +936,7 @@
                                              caller-sp
                                              root-a
                                              root-b
+                                             boxed-b
                                              (primitive/cast i64 linked-text)
                                              true))))
 
@@ -1118,7 +1132,7 @@
     (set! right-root right)
     (rt-heap-boot!)
     (if (and (.stress (rt-heap)) (> map-id 0))
-        (rt-collect-linked-with-roots! map-id caller-sp left-root right-root)
+        (rt-collect-linked-with-roots! map-id caller-sp left-root right-root false)
         0)
     (let [left-length (rt-string-length left)
           right-length (rt-string-length right)
@@ -1138,7 +1152,7 @@
                   initial
                   (do
                     (if large (set! (.force-major (rt-heap)) true) 0)
-                    (rt-collect-linked-with-roots! map-id caller-sp left-root right-root)
+                    (rt-collect-linked-with-roots! map-id caller-sp left-root right-root false)
                     (let [retry
                             (if large
                                 (rt-heap-allocate-old bytes shape)
@@ -1169,6 +1183,128 @@
 
 (defn rt-collect [(map-id i64) (caller-sp i64)] (-> i64)
   (rt-collect-linked! map-id caller-sp))
+
+;; ---------------------------------------------------------------------------
+;; Generic own-property access over the runtime shape tree (`aot.rt.shapes`).
+;;
+;; Generated code takes these when the owner's layout is not statically known: a raw ordinary
+;; object payload, a property-key id, and for a store the boxed value. An object's properties word
+;; (payload offset 8) is null or a boxed backing store whose header shape says where each key is.
+
+(defn rt-linked-shapes [(size (ptr u64))] (-> (ptr u8))
+  (getsectiondata (primitive/cast (ptr u8) (primitive/linker-address _mh_execute_header))
+                  c"__DATA"
+                  c"__aot_shapes"
+                  size))
+
+(defn rt-shapes-boot! [] (-> i64)
+  (if (shapes-booted?)
+      0
+      (let [size (primitive/alloc-stack u64)]
+        (set! size 0)
+        (let [blob (rt-linked-shapes size)]
+          (shapes-boot! blob (primitive/cast i64 (load size)))))))
+
+(defn rt-box-object [(payload i64)] (-> i64)
+  (| (primitive/ishl RT-DYNAMIC-PREFIX-OBJECT 48) payload))
+
+;; The backing-store payload of an ordinary object, or zero when it has none yet.
+(defn rt-storage-of [(obj i64)] (-> i64)
+  (let [word (load (primitive/cast (ptr i64) (+ obj RT-OFFSET-OBJECT-PROPERTIES)))]
+    (if (= (rt-word-prefix word) RT-DYNAMIC-PREFIX-OBJECT)
+        (& word RT-DYNAMIC-PAYLOAD-MASK)
+        0)))
+
+;; The byte offset of `key` in `obj`'s backing store, or -1 when `obj` has no such own property.
+(defn rt-prop-offset [(obj i64) (key i64)] (-> i64)
+  (let [storage (rt-storage-of obj)]
+    (if (= storage 0)
+        -1
+        (shapes-lookup-offset (rt-payload-shape storage) key))))
+
+(defn rt-prop-get-own [(obj i64) (key i64)] (-> i64)
+  (do
+    (rt-heap-boot!)
+    (let [off (rt-prop-offset obj key)]
+      (if (< off 0)
+          RT-DYNAMIC-UNDEFINED-WORD
+          (load (primitive/cast (ptr i64) (+ (rt-storage-of obj) off)))))))
+
+(defn rt-prop-has-own [(obj i64) (key i64)] (-> i64)
+  (do
+    (rt-heap-boot!)
+    (if (< (rt-prop-offset obj key) 0) 0 1)))
+
+;; Allocate for a runtime helper that holds a raw managed argument and a boxed JavaScript value
+;; across the allocation: both are roots of any collection it triggers, and the caller re-reads them
+;; afterwards. Mirrors `rt-alloc` for generated code, with the helper's frame as the extra roots.
+(defn rt-alloc-rooted [(bytes i64)
+                       (shape i64)
+                       (map-id i64)
+                       (caller-sp i64)
+                       (root-a (ptr i64))
+                       (root-b (ptr i64))
+                       (boxed-b bool)] (-> i64)
+  (do
+    (if (and (.stress (rt-heap)) (> map-id 0))
+        (rt-collect-linked-with-roots! map-id caller-sp root-a root-b boxed-b)
+        0)
+    (let [large (> (rt-align8 (+ bytes RT-HEADER-BYTES)) (.capacity (rt-heap)))
+          initial (if large (rt-heap-allocate-old bytes shape) (rt-heap-allocate-active bytes shape))]
+      (if (!= initial 0)
+          initial
+          (do
+            (if large (set! (.force-major (rt-heap)) true) 0)
+            (rt-collect-linked-with-roots! map-id caller-sp root-a root-b boxed-b)
+            (let [retry
+                    (if large
+                        (rt-heap-allocate-old bytes shape)
+                        (rt-heap-allocate-active bytes shape))]
+              (if (= retry 0)
+                  (alloc/oom-at c"aot_rt_alloc_rooted: object exceeds generation" bytes)
+                  retry)))))))
+
+;; [[DefineOwnProperty]] of a data property on an ordinary object at run time. A present key is a
+;; store in place; a new key is a transition: a fresh backing store of the child shape receives the
+;; old fields and the value, then replaces the object's properties word. Both writes pass the
+;; generational barrier, as generated stores do.
+(defn rt-prop-set-own [(obj i64) (key i64) (value i64) (map-id i64) (caller-sp i64)] (-> i64)
+  (let [obj-root (primitive/alloc-stack i64)
+        value-root (primitive/alloc-stack i64)]
+    (set! obj-root obj)
+    (set! value-root value)
+    (rt-heap-boot!)
+    (let [storage (rt-storage-of obj)
+          shape (if (= storage 0) SHAPES-ROOT (rt-payload-shape storage))
+          off (if (= storage 0) -1 (shapes-lookup-offset shape key))]
+      (if (>= off 0)
+          (do
+            (set! (primitive/cast (ptr i64) (+ storage off)) value)
+            (aot-rt-write-barrier storage value RT-BARRIER-BOXED)
+            value)
+          (let [child (shapes-transition shape key)
+                fields (shapes-field-count shape)
+                fresh (rt-alloc-rooted (* (+ fields 1) SHAPES-WORD-BYTES)
+                                       child map-id caller-sp obj-root value-root true)
+                ;; The collection inside the allocation may have moved both; the old store is
+                ;; reached through the object again.
+                moved-obj (load obj-root)
+                moved-value (load value-root)
+                old (rt-storage-of moved-obj)
+                (mut i) 0]
+            (loop (if (>= (load i) fields)
+                      (break 0)
+                      (do
+                        (set! (primitive/cast (ptr i64) (+ fresh (* (load i) SHAPES-WORD-BYTES)))
+                              (load (primitive/cast (ptr i64) (+ old (* (load i) SHAPES-WORD-BYTES)))))
+                        (set! (mut i) (+ (load i) 1))
+                        (continue))))
+            (set! (primitive/cast (ptr i64) (+ fresh (* fields SHAPES-WORD-BYTES))) moved-value)
+            (aot-rt-write-barrier fresh moved-value RT-BARRIER-BOXED)
+            (let [boxed (rt-box-object fresh)]
+              (set! (primitive/cast (ptr i64) (+ moved-obj RT-OFFSET-OBJECT-PROPERTIES)) boxed)
+              (aot-rt-write-barrier moved-obj boxed RT-BARRIER-BOXED)
+              moved-value))))))
 
 ;; Non-collecting post-write boundary. An old object that receives a young reference dirties its
 ;; 512-byte address card with the compiler-proven raw/boxed value kind. Minor collection uses the
@@ -1231,6 +1367,12 @@
 (defn rt-unimplemented-string-to-number [] (-> i64)
   (do (unimplemented "StringToNumber of a runtime string" "docs/GAPS.md — conversions") 0))
 
+(defn rt-unimplemented-keyed-access [] (-> i64)
+  (do (unimplemented "computed property access with a runtime key (`o[k]`, arrays)" "docs/GAPS.md — property keys") 0))
+
+(defn rt-unimplemented-unresolved-global [] (-> i64)
+  (do (unimplemented "reference to an undeclared global (global object property or ReferenceError)" "docs/GAPS.md — global environments") 0))
+
 (defn rt-unimplemented-no-realm [] (-> i64)
   (do (unimplemented "sloppy `this` with an undefined receiver in a function-entry program (no global object)" "docs/GAPS.md — receivers and the global object") 0))
 
@@ -1253,4 +1395,9 @@
           [rt-unimplemented-to-string :as "aot_rt_unimplemented_to_string"]
           [rt-unimplemented-string-to-number :as "aot_rt_unimplemented_string_to_number"]
           [rt-unimplemented-no-realm :as "aot_rt_unimplemented_no_realm"]
-          [rt-uncaught :as "aot_rt_uncaught"])
+          [rt-uncaught :as "aot_rt_uncaught"]
+          [rt-prop-get-own :as "aot_rt_prop_get_own"]
+          [rt-prop-has-own :as "aot_rt_prop_has_own"]
+          [rt-prop-set-own :as "aot_rt_prop_set_own"]
+          [rt-unimplemented-keyed-access :as "aot_rt_unimplemented_keyed_access"]
+          [rt-unimplemented-unresolved-global :as "aot_rt_unimplemented_unresolved_global"])

@@ -80,9 +80,12 @@ Global restricted-property failures belong to initialization and cannot count as
 parse errors. Runtime negative tests still lack a typed abrupt-completion protocol.
 
 The runner now compiles each variant's harness Scripts into the same realm as the test, as
-separate sources in plan order (`aot compile-script HARNESS... TEST OUT.o`). The upstream assertion
-harness itself still needs constructors (`new`, `instanceof`, `prototype`) and the conversions the
-remaining runtime refusals name; `throw` and `try`/`catch` execute. Module plans and async
+separate sources in plan order (`aot compile-script HARNESS... TEST OUT.o`). Constructors (`new`,
+`instanceof`, `prototype` objects), dynamic property stores on objects the compiler cannot see
+(the runtime shape tree), `throw` and `try`/`catch` execute; undeclared globals and computed
+member access compile and refuse at run time; the upstream assertion harness still needs the
+conversions the remaining runtime refusals name (ToString for its messages, key interning for
+`o[k]`, arrays) and the standard globals. Module plans and async
 execution receive explicit unsupported results and remain in the denominator. Typed JavaScript abrupt-completion
 reporting at runtime and realm host bindings remain unimplemented. Do not convert a nonzero native exit into
 an expected exception by parsing its diagnostics.

@@ -95,6 +95,7 @@
 (import "coil.arraylist" :use *)
 (import "coil.hashmap" :use *)
 (import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
 (import "aot.node.control" :use *)
@@ -370,6 +371,9 @@
 
 (defn ra-lrg-failed? [(id i64)] (-> bool)
   (get (.failed (ra-state)) (ra-find! id)))
+
+(defn ra-lrg-root-restricted? [(id i64)] (-> bool)
+  (get (.root-restricted (ra-state)) (ra-find! id)))
 
 (defn ra-lrg-mask [(id i64)] (-> (Option (ptr RegMask)))
   (get (.masks (ra-state)) (ra-find! id)))
@@ -1335,6 +1339,71 @@
 
 ;; Insert CalleeSave nodes, cache register masks for New and Call, then round after round of
 ;; colour-or-split until coloured or the budget is exhausted.
+;; `AOT_RA_TRACE=1` narrates each failed round: the first failing live range, what it is, and the
+;; split policy applied. Diagnostic only; never changes the allocation.
+(defn ra-trace? [] (-> bool)
+  (!= (primitive/cast i64 (os/getenv c"AOT_RA_TRACE")) 0))
+
+(defn ra-trace-lrg! [(round i64) (lrg i64)] (-> i64)
+  (if (not (ra-trace?))
+      0
+      (let [leader (ra-find! lrg)
+            state (ra-state)]
+        (println "ra: round {} failing lrg {} kind {} root-restricted {} mask-empty {} fixed-defs {} fixed-uses {} multi-defs {} self-conflict {}"
+                 round leader (ra-lrg-kind leader)
+                 (if (get (.root-restricted state) leader) 1 0)
+                 (if (ra-lrg-mask-empty? leader) 1 0)
+                 (get (.fixed-def-counts state) leader)
+                 (get (.fixed-use-counts state) leader)
+                 (if (get (.multi-defs state) leader) 1 0)
+                 (if (ra-lrg-has-self-conflict? leader) 1 0))
+        ;; The neighbours that deny it registers.
+        (let [(mut edge) (get (.adj-heads state) leader)]
+          (loop (if (< (load edge) 0)
+                    (break 0)
+                    (let [other (ra-find! (get (.adj-to state) (load edge)))]
+                      (match (arena-node (ra-lrg-sample-nid other))
+                        (Some [sample]
+                              (do (println "    neighbour lrg {} reg {} kind {} : {s}"
+                                           other (ra-lrg-reg other) (ra-lrg-kind other) (n-text sample))
+                                  0))
+                        (None [] 0))
+                      (set! (mut edge) (get (.adj-next state) (load edge)))
+                      (continue)))))
+        (let [(mut nid) 1]
+          (loop (if (> (load nid) (arena-node-count))
+                    (break 0)
+                    (do
+                      (match (arena-node (load nid))
+                        (Some [n]
+                              (if (and (!= (n-lrg n) 0) (not (n-dead? n)) (= (ra-find! (n-lrg n)) leader))
+                                  (let [(mut oi) 0]
+                                    (println "    member: {s}" (n-text n))
+                                    (loop (if (>= (load oi) (n-nouts n))
+                                              (break 0)
+                                              (do
+                                                (match (n-out n (load oi))
+                                                  (Some [use_] (do (println "      use: {s}" (n-text use_)) 0))
+                                                  (None [] 0))
+                                                (set! (mut oi) (+ (load oi) 1))
+                                                (continue))))
+                                    (match (arena-node (n-block-nid n))
+                                      (Some [block]
+                                            (let [(mut si) 0]
+                                              (loop (if (>= (load si) (code-schedule-count block))
+                                                        (break 0)
+                                                        (do
+                                                          (println "      sched[{}]: {s}" (load si) (n-text (code-schedule-at block (load si))))
+                                                          (set! (mut si) (+ (load si) 1))
+                                                          (continue))))))
+                                      (None [] 0))
+                                    0)
+                                  0))
+                        (None [] 0))
+                      (set! (mut nid) (+ (load nid) 1))
+                      (continue)))))
+        0)))
+
 (defn ra-run! [] (-> i64)
   (let [(mut round) 0]
     (ra-insert-callee-saves!)
@@ -1342,6 +1411,7 @@
               (break 0)
               (let [leader (ra-find! (ra-first-failed))
                     sample (ra-lrg-sample-nid leader)]
+                (ra-trace-lrg! (load round) leader)
                 (if (>= (load round) (- RA-MAX-ROUNDS 1))
                     (match (arena-node sample)
                       (Some [n] (n-panic! "ra-run!: allocator exceeded its split budget; a live range of this node still fails" n))
@@ -2189,9 +2259,12 @@
           (None []
                 (let [split (mach-make-split lrg kind round block value)]
                   (ra-place-copy! split block)
-                  (if (ra-clone-crosses-use-clobber? value use_ idx)
-                      (ra-anchor-before-use! split value use_ block)
-                      0)
+                  ;; Final Simple's `insertBefore(use)`: the copy sits immediately before its use.
+                  ;; Left to the list scheduler it floats up the block and may cross a safepoint
+                  ;; (a runtime property store, an allocation) between it and the use; a managed
+                  ;; copy live across a safepoint must live on the stack, which a register copy
+                  ;; cannot, and every later round re-makes the same copy in the same place.
+                  (ra-anchor-before-use! split value use_ block)
                   (n-set-def! use_ idx (Some split))
                   ;; Simple's insertBefore bypasses an older same-block Split after placing the new
                   ;; one. Rebinding after the use moves preserves the old Split until the new input
@@ -3424,6 +3497,11 @@
     (load changed)))
 
 (defn ra-split-one! [(round i64) (lrg i64)] (-> bool)
+  (do
+    (if (ra-trace?) (do (println "ra: split lrg {}" (ra-find! lrg)) 0) 0)
+    (ra-split-one-policy! round lrg)))
+
+(defn ra-split-one-policy! [(round i64) (lrg i64)] (-> bool)
   (if (ra-lrg-has-self-conflict? lrg)
       (ra-split-self-conflict! round lrg)
       (if (ra-lrg-has-callee-save-def? lrg)
@@ -3461,9 +3539,54 @@
                             (if (ra-split-empty-single-uses! round leader)
                                 true
                                 (ra-split-by-loop-boundary! round leader))
-                            (if (ra-split-by-loop-boundary! round leader)
+                            (if (ra-split-fixed-neighbour-defs! round leader)
                                 true
-                                (ra-split-pressure-use! round leader))))))))))
+                                (if (ra-split-by-loop-boundary! round leader)
+                                    true
+                                    (ra-split-pressure-use! round leader)))))))))))
+
+;; A range whose only allowed register is R fails while a neighbour BORN in R — a fixed
+;; single-register definition such as an allocation or call result in X0 — still holds R at our
+;; definition (its last use, a copy into another argument register, comes after ours). Copies of
+;; our own range cannot help; every round would re-make one. The answer is the neighbour's: split
+;; it after its definition, so it leaves R at once and R is free where we need it.
+(defn ra-split-fixed-neighbour-defs! [(round i64) (lrg i64)] (-> bool)
+  (let [state (ra-state)
+        leader (ra-find! lrg)]
+    (match (ra-lrg-mask leader)
+      (None [] false)
+      (Some [mask]
+            (if (not (mask-singleton? mask))
+                false
+                (let [reg (mask-first mask)
+                      (mut edge) (get (.adj-heads state) leader)
+                      (mut changed) false]
+                  (loop (if (< (load edge) 0)
+                            (break 0)
+                            (let [other (ra-find! (get (.adj-to state) (load edge)))
+                                  def-id (get (.mach-defs state) other)]
+                              (if (and (= (ra-lrg-reg other) reg)
+                                       (!= def-id 0)
+                                       (= (get (.fixed-def-counts state) other) 1))
+                                  (match (arena-node def-id)
+                                    (Some [def]
+                                          (match (mach-of def)
+                                            (Some [mach]
+                                                  (if (m-clone-cheap? mach)
+                                                      0
+                                                      (do
+                                                        (if (ra-trace?)
+                                                            (do (println "ra:   splitting neighbour lrg {} after its fixed definition" other) 0)
+                                                            0)
+                                                        (ra-split-after-def-node! round other def SPLIT-KIND-AFTER-DEF)
+                                                        (set! (mut changed) true)
+                                                        0)))
+                                            (None [] 0)))
+                                    (None [] 0))
+                                  0)
+                              (set! (mut edge) (get (.adj-next state) (load edge)))
+                              (continue))))
+                  (load changed)))))))
 
 ;; A live range that conflicts with ITSELF — typically a Phi whose inputs need different registers.
 ;; Loop Phis are split cold-edges-first; see the header.

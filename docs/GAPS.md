@@ -112,20 +112,42 @@ TypeError for Symbol), so programs whose operands the compiler cannot type still
 the unimplemented conversion refuses when actually reached. ToPrimitive, ToString of numbers and
 StringToNumber are the conversions still to write.
 
-### 2026-09-08 — Property access as a node, and the graph-size budgets
+### 2026-09-08 — Property access as a node, the runtime shape tree, and the graph-size budgets
 
 Own-property loads, has-checks and stores are `PropAccess` nodes (docs/DECISIONS.md, property
 access is a node): they fold to a Load, a constant or the static transition when the owner's
-backing store is visible through memory SSA, and expand once before type checking otherwise.
-Keyed (runtime-key) accesses still take the eager keyed dispatch at the site. Global names no
-longer enter the write-key shape closure. Memory slices carry the private flag. Remaining costs,
-in order: the unresolved expansion is the full closed-world dispatch rather than a call to one
-shared slow path; the dynamic axis does not carry a struct, so a value that crosses a Box loses
-its shape and every access through it pays the storage type test and shape compare. The realm
-root is a Load through the heap-state register (`HeapState`, a host pointer), no longer a runtime
-call. `tests/bloat-test.coil`
-holds node-count ceilings that fail on any regression of this class; `iter-peeps!` and
-`iter-run!` panic with a trace of recent rewrites or inlined sites instead of spinning.
+backing store is visible through memory SSA, and expand once before type checking otherwise — into
+one runtime operation over the shape tree (docs/DECISIONS.md, generic property access), never an
+enumeration of shapes. The static shape table travels in the `__aot_shapes` section; the runtime
+extends it. Remaining: the dynamic axis does not carry a struct, so a value that crosses a Box
+loses its shape and every access through it pays the runtime call; a guarded small-set fast path
+(a few shape compares before the call) is not built; the runtime transition lookup is linear over
+all shapes; property keys are interned only at compile time, so `o[k]` with a runtime key
+(`JsGetKeyed`/`JsSetKeyed`) refuses at run time — the key names are already in the blob, so
+runtime interning is the next step, followed by arrays; deletion, accessors, attributes and
+dictionary mode do not exist. `tests/bloat-test.coil` holds node-count ceilings that fail on any
+regression of this class; `iter-peeps!` and `iter-run!` panic with a trace of recent rewrites or
+inlined sites instead of spinning; `property-expand-all!` panics if the shape universe grows.
+
+Constructors and chains: `new` on a non-callable takes the value call's TypeError trap; class
+constructors, `new.target`, bound functions and `Symbol.hasInstance` are unimplemented;
+`instanceof` on a non-callable right operand traps as a TypeError. A function DECLARATION nested
+in a function is instantiated at every evaluation of its name, not once per FunctionDeclaration-
+Instantiation, so `inner === inner` and `inner.prototype` identity are wrong there (top-level
+declarations are instantiated once by GlobalDeclarationInstantiation and are correct); this is
+the closures slice's job.
+
+Unresolvable names: a read or write of a name no Script declares refuses at run time with the
+undeclared-global message; the correct semantics (global object property lookup, ReferenceError
+on a missing read, implicit global on a sloppy write) wait for global-object bindings as
+properties. `typeof` of such a name is "undefined". Standard globals (`syntax-standard-global?`)
+refuse at run time even under `typeof`.
+
+Backend: a Script whose control never reaches its Return (`for (;;) ;`) panics in the loop tree
+(`looptree-walk!: postvisited child has no loop tree`) — an infinite loop with no exit has no
+path to Stop; a program with such a loop does not compile yet. The CallEnd optimistic rule that
+keeps a continuation reachable while every linked Return is provisionally dead now defers to the
+pessimistic answer when the parse already proved the continuation dead.
 
 ### 2026-09-07 — Diagnostics
 

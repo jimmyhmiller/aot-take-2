@@ -1,0 +1,222 @@
+;; The runtime's hidden-class tree: the compiler's static shapes, then the ones programs make.
+
+;;
+;; `aot.shape` builds the transition tree the compiler proves things about: every object literal,
+;; every statically visible store, every global-object layout has a shape id there, and a fast
+;; path is a Load at an offset that id fixes. That tree is emitted into the object file as the
+;; `__aot_shapes` blob and is the first `static-count` entries of this one.
+;;
+;; A store the compiler could not see — `assert.sameValue = ...` on an object read from a global,
+;; a property added inside a function whose receiver has many shapes — adds a property at run
+;; time. Enumerating every compile-time shape at such a site is unsound (a later store's transition
+;; is a shape the site never tests for) and unbounded (k dynamic keys on n shapes reach n·k!
+;; layouts). So the generic path is the same tree, continued at run time: `shapes-transition`
+;; memoises `(parent, key)` exactly as the compiler does, and a shape it creates has an id past
+;; every static one, so no fast path can mistake it for a layout it proved.
+;;
+;; Offsets follow the compiler's rule — a field's offset is fixed by the edge introducing it and
+;; inherited by every descendant — so a static fast path and a runtime lookup on a static shape
+;; name the same word.
+;;
+;; Blob layout (little-endian), written by `shape-table-bytes`:
+;;   0   "AOTSHAPE"
+;;   8   u32 version (1), u32 shape count (slot 0 invalid, slot 1 the field-less root)
+;;   16  u32 key count (slot 0 invalid), u32 name bytes
+;;   24  per shape: u32 parent, u32 key, u32 byte offset, u32 field count
+;;       per key: u32 name offset, u32 name length
+;;       name bytes
+(module aot.rt.shapes)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+
+;; The field-less root; every object starts here. Agrees with `SHAPE-EMPTY`.
+(const SHAPES-ROOT 1)
+
+(const SHAPES-VERSION 1)
+
+(const SHAPES-HEADER-BYTES 24)
+
+(const SHAPES-RECORD-BYTES 16)
+
+(const SHAPES-KEY-RECORD-BYTES 8)
+
+(const SHAPES-WORD-BYTES 8)
+
+(defstruct RtShapes
+  [(blob (ptr u8))
+   (blob-bytes i64)
+   (static-count i64)
+   (key-count i64)
+   (name-bytes i64)
+   (parent (ArrayList i64))
+   (key (ArrayList i64))
+   (offset (ArrayList i64))
+   (field-count (ArrayList i64))
+   (booted bool)])
+
+(defn rt-shapes [] (-> (ptr RtShapes))
+  (primitive/alloc-static RtShapes))
+
+(defn shapes-read-u32 [(p (ptr u8)) (off i64)] (-> i64)
+  (| (primitive/cast i64 (load (primitive/index p off)))
+     (| (primitive/ishl (primitive/cast i64 (load (primitive/index p (+ off 1)))) 8)
+        (| (primitive/ishl (primitive/cast i64 (load (primitive/index p (+ off 2)))) 16)
+           (primitive/ishl (primitive/cast i64 (load (primitive/index p (+ off 3)))) 24)))))
+
+(defn shapes-blob-magic? [(p (ptr u8))] (-> bool)
+  (and (= (primitive/cast i64 (load (primitive/index p 0))) 0x41)
+       (and (= (primitive/cast i64 (load (primitive/index p 1))) 0x4f)
+            (and (= (primitive/cast i64 (load (primitive/index p 2))) 0x54)
+                 (and (= (primitive/cast i64 (load (primitive/index p 3))) 0x53)
+                      (and (= (primitive/cast i64 (load (primitive/index p 4))) 0x48)
+                           (and (= (primitive/cast i64 (load (primitive/index p 5))) 0x41)
+                                (and (= (primitive/cast i64 (load (primitive/index p 6))) 0x50)
+                                     (= (primitive/cast i64 (load (primitive/index p 7))) 0x45)))))))))
+
+;; Adopt the static table. A null blob is a program that made no shapes: the tree is the root
+;; alone and keys start after the invalid slot.
+(defn shapes-boot! [(blob (ptr u8)) (bytes i64)] (-> i64)
+  (let [s (rt-shapes)]
+    (if (.booted s)
+        0
+        (let [a (alloc/malloc-allocator)]
+          (set! (.parent s) (al-new [i64] a))
+          (set! (.key s) (al-new [i64] a))
+          (set! (.offset s) (al-new [i64] a))
+          (set! (.field-count s) (al-new [i64] a))
+          (if (= (primitive/cast i64 blob) 0)
+              (do
+                (set! (.blob s) blob)
+                (set! (.blob-bytes s) 0)
+                (set! (.static-count s) (+ SHAPES-ROOT 1))
+                (set! (.key-count s) 1)
+                (set! (.name-bytes s) 0)
+                0)
+              (do
+                (if (< bytes SHAPES-HEADER-BYTES)
+                    (panic-i "shapes-boot!: __aot_shapes is shorter than its header" bytes)
+                    0)
+                (if (not (shapes-blob-magic? blob))
+                    (panic "shapes-boot!: __aot_shapes has the wrong magic")
+                    0)
+                (if (!= (shapes-read-u32 blob 8) SHAPES-VERSION)
+                    (panic-i "shapes-boot!: unsupported __aot_shapes version" (shapes-read-u32 blob 8))
+                    0)
+                (set! (.blob s) blob)
+                (set! (.blob-bytes s) bytes)
+                (set! (.static-count s) (shapes-read-u32 blob 12))
+                (set! (.key-count s) (shapes-read-u32 blob 16))
+                (set! (.name-bytes s) (shapes-read-u32 blob 20))
+                (if (< (.static-count s) (+ SHAPES-ROOT 1))
+                    (panic-i "shapes-boot!: static table lacks the root" (.static-count s))
+                    0)
+                (if (!= bytes
+                        (+ SHAPES-HEADER-BYTES
+                           (+ (* (.static-count s) SHAPES-RECORD-BYTES)
+                              (+ (* (.key-count s) SHAPES-KEY-RECORD-BYTES) (.name-bytes s)))))
+                    (panic-i "shapes-boot!: __aot_shapes size disagrees with its counts" bytes)
+                    0)
+                0))
+          (set! (.booted s) true)
+          0))))
+
+(defn shapes-booted? [] (-> bool)
+  (.booted (rt-shapes)))
+
+;; Every shape id in existence: static ones then runtime ones, contiguous.
+(defn shapes-count [] (-> i64)
+  (let [s (rt-shapes)] (+ (.static-count s) (len (.parent s)))))
+
+(defn shapes-valid? [(shape i64)] (-> bool)
+  (and (>= shape SHAPES-ROOT) (< shape (shapes-count))))
+
+(defn shapes-check! [(shape i64) (who (slice u8))] (-> i64)
+  (if (shapes-valid? shape) 0 (panic-i who shape)))
+
+(defn shapes-static-field [(shape i64) (field i64)] (-> i64)
+  (let [s (rt-shapes)]
+    (shapes-read-u32 (.blob s) (+ SHAPES-HEADER-BYTES (+ (* shape SHAPES-RECORD-BYTES) (* field 4))))))
+
+(defn shapes-parent [(shape i64)] (-> i64)
+  (let [s (rt-shapes)]
+    (shapes-check! shape "shapes-parent: invalid shape")
+    (if (< shape (.static-count s))
+        (shapes-static-field shape 0)
+        (get (.parent s) (- shape (.static-count s))))))
+
+;; The key the edge into `shape` introduced; zero for the root.
+(defn shapes-key [(shape i64)] (-> i64)
+  (let [s (rt-shapes)]
+    (shapes-check! shape "shapes-key: invalid shape")
+    (if (< shape (.static-count s))
+        (shapes-static-field shape 1)
+        (get (.key s) (- shape (.static-count s))))))
+
+;; The byte offset of the field the edge into `shape` introduced.
+(defn shapes-offset [(shape i64)] (-> i64)
+  (let [s (rt-shapes)]
+    (shapes-check! shape "shapes-offset: invalid shape")
+    (if (< shape (.static-count s))
+        (shapes-static-field shape 2)
+        (get (.offset s) (- shape (.static-count s))))))
+
+(defn shapes-field-count [(shape i64)] (-> i64)
+  (let [s (rt-shapes)]
+    (shapes-check! shape "shapes-field-count: invalid shape")
+    (if (< shape (.static-count s))
+        (shapes-static-field shape 3)
+        (get (.field-count s) (- shape (.static-count s))))))
+
+(defn shapes-key-count [] (-> i64)
+  (- (.key-count (rt-shapes)) 1))
+
+;; The byte offset of `key` in `shape`, or -1 when the shape has no such field. Walks toward the
+;; root: a field is found at the edge that introduced it.
+(defn shapes-lookup-offset [(shape0 i64) (key i64)] (-> i64)
+  (let [(mut shape) shape0 (mut answer) -1]
+    (shapes-check! shape0 "shapes-lookup-offset: invalid shape")
+    (if (<= key 0) (panic-i "shapes-lookup-offset: invalid key" key) 0)
+    (loop (if (or (= (load shape) SHAPES-ROOT) (>= (load answer) 0))
+              (break 0)
+              (do
+                (if (= (shapes-key (load shape)) key)
+                    (set! (mut answer) (shapes-offset (load shape)))
+                    (set! (mut shape) (shapes-parent (load shape))))
+                (continue))))
+    (load answer)))
+
+(defn shapes-has-key? [(shape i64) (key i64)] (-> bool)
+  (>= (shapes-lookup-offset shape key) 0))
+
+;; Follow (or create) the edge adding `key` to `shape`, memoised on `(shape, key)` so identical
+;; property orders share a layout and its transition. Adding a present key changes no layout.
+(defn shapes-transition [(shape i64) (key i64)] (-> i64)
+  (do
+    (shapes-check! shape "shapes-transition: invalid parent shape")
+    (if (<= key 0) (panic-i "shapes-transition: invalid key" key) 0)
+    (if (shapes-has-key? shape key)
+        shape
+        (let [s (rt-shapes)
+              count (shapes-count)
+              (mut child) (+ SHAPES-ROOT 1)
+              (mut found) 0]
+          ;; Linear over all shapes, as the compiler's table is: transitions are cold next to the
+          ;; accesses they serve. A per-parent index can replace this without changing identities.
+          (loop (if (or (>= (load child) count) (!= (load found) 0))
+                    (break 0)
+                    (do
+                      (if (and (= (shapes-parent (load child)) shape)
+                               (= (shapes-key (load child)) key))
+                          (set! (mut found) (load child))
+                          (set! (mut child) (+ (load child) 1)))
+                      (continue))))
+          (if (!= (load found) 0)
+              (load found)
+              (let [fields (shapes-field-count shape)]
+                (push! [i64] (mut (.parent s)) shape)
+                (push! [i64] (mut (.key s)) key)
+                (push! [i64] (mut (.offset s)) (* fields SHAPES-WORD-BYTES))
+                (push! [i64] (mut (.field-count s)) (+ fields 1))
+                count))))))

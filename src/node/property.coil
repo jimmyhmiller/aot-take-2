@@ -7,7 +7,9 @@
 ;;   proven single shape  -> the fast path: a Load at a known alias class and byte offset, with no
 ;;                           check at all, because the shape was established by a guard upstream.
 ;;   proven small set     -> a guarded chain of fast paths, generic as the final fallback.
-;;   nothing proven       -> the generic path: a full [[Get]] through the JSL definition.
+;;   nothing proven       -> the generic path: [[Get]] stays the JSL definition (own step, then
+;;                           the prototype chain), and its own-property step is one runtime
+;;                           operation over the shape tree (`property-generic-access`).
 ;;
 ;; The generic path is not a runtime call to a C function. It is the JSL definition of the ECMA-262
 ;; abstract operation, lowered into this same graph — which is why it can be inlined and
@@ -25,7 +27,7 @@
 ;; constant, or the static store transition, and the projections forward to those. Inlining exposes
 ;; exactly this pattern at call sites that were opaque at parse time, which is why the access has
 ;; to be a node and not an expansion. Whatever is still unresolved when optimization ends is
-;; expanded once, before type checking, into the guarded closed-world shape dispatch below.
+;; expanded once, before type checking, into the runtime shape-tree operation below.
 ;;
 ;; Simple has no such node because a field access in Simple is a Load: the struct type IS the
 ;; layout. The dispatch here is the JavaScript divergence; the folding rule is Simple's
@@ -282,6 +284,7 @@
 ;; dispatch below. Nothing may remain afterwards; a later phase seeing an access is a wiring bug.
 (defn property-expand-all! [] (-> i64)
   (let [cnt (arena-node-count)
+        shapes-before (shape-count)
         (mut i) 1
         (mut expanded) 0]
     (loop (if (> (load i) cnt)
@@ -322,6 +325,13 @@
                   (None [] 0))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
+    ;; Every dispatch above enumerated the shape universe as it stood when that access expanded.
+    ;; A transition created by a later store's expansion is a shape no earlier dispatch tests for:
+    ;; a load would read `undefined` from an object that has the property.
+    (if (!= (shape-count) shapes-before)
+        (panic-i2 "property-expand-all!: the shape universe grew during expansion (before, after)"
+                  shapes-before (shape-count))
+        0)
     (load expanded)))
 
 (defstruct PropertyStorageResult
@@ -427,11 +437,33 @@
                 (continue))))
     merged))
 
-;; Closed-world ordinary-own-property dispatch. The owner carries a boxed backing-store reference;
-;; each backing store carries its hidden-class ID in the runtime header. Every matching shape arm
-;; then performs an ordinary precise-alias Load. Missing storage and every nonmatching shape join at
-;; the fallback value. Prototype traversal is deliberately the JSL caller's job: this primitive is
-;; the representation-level [[GetOwnProperty]] capability, not JavaScript [[Get]].
+;; The generic path: one runtime operation over the shape tree (`aot.rt.shapes`). The owner is a
+;; proven raw ordinary object; the runtime reads its properties word, finds the key in the backing
+;; store's shape, and loads, tests, or stores (transitioning to a child shape for a new key). Its
+;; memory result is public BOT: the object escaped to the runtime and any slice may have changed.
+;;
+;; This replaced a closed-world dispatch that enumerated every compile-time shape holding the key.
+;; That dispatch was unsound — a store expanded later creates a shape no earlier arm tests for —
+;; and unbounded, k runtime keys over n shapes reaching n·k! layouts; docs/DECISIONS.md, property
+;; access. Prototype traversal is deliberately the JSL caller's job: this is the representation
+;; [[GetOwnProperty]]/[[DefineOwnProperty]] capability, not JavaScript [[Get]]/[[Set]].
+(defn property-generic-access [(ctrl (dyn NodeOps))
+                               (mem (dyn NodeOps))
+                               (object (dyn NodeOps))
+                               (key (dyn NodeOps))
+                               (value (Option (dyn NodeOps)))
+                               (prim i64)] (-> PropertyAccessResult)
+  (let [op (jsop-make ctrl mem prim)]
+    (jsop-add-arg! op object)
+    (jsop-add-arg! op key)
+    (match value (Some [v] (jsop-add-arg! op v)) (None [] 0))
+    ;; A store's value is the value stored; the graph keeps using that node, not the call's copy.
+    (property-access-result (match value
+                              (Some [v] v)
+                              (None [] (proj-make op 2 "property.generic.value")))
+                            ctrl
+                            (proj-make op 1 "property.generic.mem"))))
+
 (defn property-own-named [(ctrl (dyn NodeOps))
                           (mem (dyn NodeOps))
                           (object (dyn NodeOps))
@@ -441,66 +473,39 @@
     (if (or (<= key 0) (> key (shape-key-count)))
         (panic-i "property-own-named: invalid property key" key)
         0)
-    (let [storage-word
-            (load-make ctrl
-                       mem
-                       object
-                       (con-int OFFSET-OBJECT-PROPERTIES)
-                       ALIAS-OBJECT-PROPERTIES
-                       (ty-dyn TAG-ANY))
-          is-storage (typetest-make storage-word TAG-OBJECT)
-          storage-if (if-make ctrl is-storage)
-          storage-arms (if-arms! storage-if)
-          storage-cast (cast-make (arms-true storage-arms) storage-word (ty-dyn TAG-OBJECT))
-          storage (unbox-make storage-cast REP-OBJECT)
-          shape-value
-            (load-make (arms-true storage-arms)
-                       mem
-                       storage
-                       (con-int -8)
-                       ALIAS-OBJECT-SHAPE
-                       (ty-int-bot))
-          region (region-make)
-          result-ty (if load-value? (ty-dyn TAG-ANY) (ty-bool))
-          phi (phi-make region result-ty "property.own")
-          fallback (if load-value? (dyn-undefined-make) (con-int 0))
-          (mut current-ctrl-nid) (n-nid (arms-true storage-arms))
-          (mut shape) 2]
-      ;; No backing store means no own property.
-      (region-add-path! region (arms-false storage-arms))
-      (phi-add-value! phi fallback)
-      (loop (if (>= (load shape) (shape-count))
-                (break 0)
-                (if (shape-has-key? (load shape) key)
-                    (let [test
-                            (eq-make shape-value (con-int (load shape)))
-                          iff (if-make (match (arena-node (load current-ctrl-nid))
-                                         (Some [n] n)
-                                         (None [] (unreachable-node)))
-                                       test)
-                          arms (if-arms! iff)
-                          value
-                            (if load-value?
-                                (load-make (arms-true arms)
-                                           mem
-                                           storage
-                                           (con-int (shape-offset-key (load shape) key))
-                                           (shape-alias-key (load shape) key)
-                                           (ty-dyn TAG-ANY))
-                                (con-int 1))]
-                      (region-add-path! region (arms-true arms))
-                      (phi-add-value! phi value)
-                      (set! (mut current-ctrl-nid) (n-nid (arms-false arms)))
-                      (set! (mut shape) (+ (load shape) 1))
-                      (continue))
-                    (do
-                      (set! (mut shape) (+ (load shape) 1))
-                      (continue)))))
-      (region-add-path! region (match (arena-node (load current-ctrl-nid))
-                                 (Some [n] n)
-                                 (None [] (unreachable-node))))
-      (phi-add-value! phi fallback)
-      (property-access-result phi region mem))))
+    (property-generic-access ctrl
+                             mem
+                             object
+                             (con-int key)
+                             (None [(dyn NodeOps)])
+                             (if load-value? JS-PROP-GET-OWN JS-PROP-HAS-OWN))))
+
+;; A store to a key the backing store's shape already carries: the field's word changes, the
+;; layout does not. Only that field's slice moves; every other slice continues unchanged.
+(defn property-store-in-shape [(ctrl (dyn NodeOps))
+                               (mem (dyn NodeOps))
+                               (storage (dyn NodeOps))
+                               (shape i64)
+                               (key i64)
+                               (value (dyn NodeOps))] (-> PropertyAccessResult)
+  (let [alias (shape-alias-key shape key)
+        stored
+          (store-make ctrl mem storage (con-int (shape-offset-key shape key)) value alias (ty-dyn TAG-ANY))
+        merged (memmerge-make)
+        fields (shape-field-count shape)
+        (mut i) 0]
+    (memmerge-set-alias! merged ALIAS-BULK (mem-effective mem ALIAS-BULK))
+    (memmerge-set-alias! merged ALIAS-OBJECT-PROTOTYPE (mem-effective mem ALIAS-OBJECT-PROTOTYPE))
+    (memmerge-set-alias! merged ALIAS-OBJECT-PROPERTIES (mem-effective mem ALIAS-OBJECT-PROPERTIES))
+    (loop (if (>= (load i) fields)
+              (break 0)
+              (let [field-alias (shape-field-alias-at shape (load i))]
+                (memmerge-set-alias! merged
+                                     field-alias
+                                     (if (= field-alias alias) stored (mem-effective mem field-alias)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (property-access-result value ctrl merged)))
 
 ;; An owner whose backing store is statically fixed to exactly one hidden class — the realm's
 ;; global object after instantiation — needs no dispatch over the shape universe. The two guards
@@ -555,7 +560,7 @@
                                                (ty-dyn TAG-ANY)))
                 (memphi-add-state! memphi mem)))
         (Some [v]
-              (let [stored (property-store-shaped-storage (arms-true shape-arms) mem object storage shape key v)]
+              (let [stored (property-store-in-shape (arms-true shape-arms) mem storage shape key v)]
                 (region-add-path! region (.ctrl stored))
                 (phi-add-value! phi v)
                 (memphi-add-state! memphi (.mem stored)))))
@@ -588,46 +593,18 @@
                               (key i64)] (-> PropertyAccessResult)
   (property-own-named ctrl mem object key false))
 
-;; Runtime key-ID dispatch remains a representation operation: key IDs and shape tables are
-;; compiler-owned layout facts. JavaScript's choice between own lookup, prototype traversal and
-;; undefined is deliberately not encoded here.
+;; A runtime key id takes the same runtime operation; the key is simply not a constant.
 (defn property-own-keyed [(ctrl (dyn NodeOps))
                           (mem (dyn NodeOps))
                           (object (dyn NodeOps))
                           (key (dyn NodeOps))
                           (load-value? bool)] (-> PropertyAccessResult)
-  (let [region (region-make)
-        result-ty (if load-value? (ty-dyn TAG-ANY) (ty-bool))
-        phi (phi-make region result-ty "property.keyed")
-        fallback (if load-value? (dyn-undefined-make) (con-int 0))
-        (mut current-ctrl-nid) (n-nid ctrl)
-        (mut key-id) 1]
-    (loop (if (> (load key-id) (shape-key-count))
-              (break 0)
-              (let [test
-                      (eq-make key (con-int (load key-id)))
-                    iff
-                      (if-make (match (arena-node (load current-ctrl-nid))
-                                 (Some [n] n)
-                                 (None [] (unreachable-node)))
-                               test)
-                    arms (if-arms! iff)
-                    access
-                      (property-own-named (arms-true arms)
-                                          mem
-                                          object
-                                          (load key-id)
-                                          load-value?)]
-                (region-add-path! region (.ctrl access))
-                (phi-add-value! phi (.value access))
-                (set! (mut current-ctrl-nid) (n-nid (arms-false arms)))
-                (set! (mut key-id) (+ (load key-id) 1))
-                (continue))))
-    (region-add-path! region (match (arena-node (load current-ctrl-nid))
-                               (Some [n] n)
-                               (None [] (unreachable-node))))
-    (phi-add-value! phi fallback)
-    (property-access-result phi region mem)))
+  (property-generic-access ctrl
+                           mem
+                           object
+                           key
+                           (None [(dyn NodeOps)])
+                           (if load-value? JS-PROP-GET-OWN JS-PROP-HAS-OWN)))
 
 (defn property-load-own-keyed [(ctrl (dyn NodeOps))
                                (mem (dyn NodeOps))
@@ -641,146 +618,16 @@
                               (key (dyn NodeOps))] (-> PropertyAccessResult)
   (property-own-keyed ctrl mem object key false))
 
-(defn property-store-shaped-storage [(ctrl (dyn NodeOps))
-                                     (mem (dyn NodeOps))
-                                     (object (dyn NodeOps))
-                                     (storage (dyn NodeOps))
-                                     (shape i64)
-                                     (key i64)
-                                     (value (dyn NodeOps))] (-> PropertyAccessResult)
-  ;; A backing-store header proves its complete immutable layout. Updating an existing field keeps
-  ;; that storage and shape; introducing a field allocates the child shape, copies the ordered
-  ;; values, appends the new value, then atomically publishes the fully initialized backing store.
-  (if (shape-has-key? shape key)
-      (let [alias (shape-alias-key shape key)
-            stored
-              (store-make ctrl
-                          mem
-                          storage
-                          (con-int (shape-offset-key shape key))
-                          value
-                          alias
-                          (ty-dyn TAG-ANY))
-            merged (memmerge-make)
-            fields (shape-field-count shape)
-            (mut i) 0]
-        (memmerge-set-alias! merged ALIAS-BULK (mem-effective mem ALIAS-BULK))
-        (memmerge-set-alias! merged
-                             ALIAS-OBJECT-PROTOTYPE
-                             (mem-effective mem ALIAS-OBJECT-PROTOTYPE))
-        (memmerge-set-alias! merged
-                             ALIAS-OBJECT-PROPERTIES
-                             (mem-effective mem ALIAS-OBJECT-PROPERTIES))
-        (loop (if (>= (load i) fields)
-                  (break 0)
-                  (let [field-alias (shape-field-alias-at shape (load i))]
-                    (memmerge-set-alias! merged
-                                         field-alias
-                                         (if (= field-alias alias)
-                                             stored
-                                             (mem-effective mem field-alias)))
-                    (set! (mut i) (+ (load i) 1))
-                    (continue))))
-        (property-access-result value ctrl merged))
-      (let [next-shape (shape-transition shape (shape-key-name key))
-            fields (shape-field-count shape)
-            (mut values) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))
-            (mut i) 0]
-        (loop (if (>= (load i) fields)
-                  (break 0)
-                  (do
-                    (push! [(dyn NodeOps)]
-                           (mut values)
-                           (load-make ctrl
-                                      mem
-                                      storage
-                                      (con-int (* (load i) SHAPE-WORD-BYTES))
-                                      (shape-field-alias-at shape (load i))
-                                      (ty-dyn TAG-ANY)))
-                    (set! (mut i) (+ (load i) 1))
-                    (continue))))
-        (push! [(dyn NodeOps)] (mut values) value)
-        (let [next-storage (property-storage-new ctrl mem next-shape (load values))
-              installed (property-storage-install ctrl mem object next-shape next-storage)]
-          (property-access-result value ctrl installed)))))
-
 (defn property-store-generic-owner [(ctrl (dyn NodeOps))
                                     (mem (dyn NodeOps))
                                     (object (dyn NodeOps))
                                     (key i64)
                                     (value (dyn NodeOps))] (-> PropertyAccessResult)
-  ;; Runtime shape dispatch is representation mechanics, not JavaScript semantics. The JSL caller
-  ;; has already proved that `object` is an ordinary raw object and chosen DefineOwnProperty. Each
-  ;; arm below performs the same immutable-layout transition as the statically known fast path.
-  (let [storage-word
-          (load-make ctrl
-                     mem
-                     object
-                     (con-int OFFSET-OBJECT-PROPERTIES)
-                     ALIAS-OBJECT-PROPERTIES
-                     (ty-dyn TAG-ANY))
-        is-storage (typetest-make storage-word TAG-OBJECT)
-        storage-if (if-make ctrl is-storage)
-        storage-arms (if-arms! storage-if)
-        storage-cast (cast-make (arms-true storage-arms) storage-word (ty-dyn TAG-OBJECT))
-        storage (unbox-make storage-cast REP-OBJECT)
-        shape-value
-          (load-make (arms-true storage-arms)
-                     mem
-                     storage
-                     (con-int -8)
-                     ALIAS-OBJECT-SHAPE
-                     (ty-int-bot))
-        region (region-make)
-        memphi (memphi-make region 1 TY-BOT "property.store.mem")
-        empty-shape (shape-transition SHAPE-EMPTY (shape-key-name key))
-        shape-limit (shape-count)
-        (mut empty-values) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))
-        (mut current-ctrl-nid) (n-nid (arms-true storage-arms))
-        (mut shape) 2]
-    ;; A null storage slot is the empty hidden class.
-    (push! [(dyn NodeOps)] (mut empty-values) value)
-    (let [fresh
-            (property-storage-new (arms-false storage-arms) mem empty-shape (load empty-values))
-          installed
-            (property-storage-install (arms-false storage-arms)
-                                      mem
-                                      object
-                                      empty-shape
-                                      fresh)]
-      (region-add-path! region (arms-false storage-arms))
-      (memphi-add-state! memphi installed))
-    (loop (if (>= (load shape) shape-limit)
-              (break 0)
-              (if (= (load shape) SHAPE-STRING)
-                  (do (set! (mut shape) (+ (load shape) 1)) (continue))
-                  (let [test (eq-make shape-value (con-int (load shape)))
-                        iff
-                          (if-make (match (arena-node (load current-ctrl-nid))
-                                     (Some [n] n)
-                                     (None [] (unreachable-node)))
-                                   test)
-                        arms (if-arms! iff)
-                        stored
-                          (property-store-shaped-storage (arms-true arms)
-                                                         mem
-                                                         object
-                                                         storage
-                                                         (load shape)
-                                                         key
-                                                         value)]
-                    (region-add-path! region (.ctrl stored))
-                    (memphi-add-state! memphi (.mem stored))
-                    (set! (mut current-ctrl-nid) (n-nid (arms-false arms)))
-                    (set! (mut shape) (+ (load shape) 1))
-                    (continue)))))
-    ;; Every backing store is compiler-created with a declared shape. Retain the corrupt-header
-    ;; arm in the graph so control remains total; it cannot occur in a valid generated program.
-    (region-add-path! region (match (arena-node (load current-ctrl-nid))
-                               (Some [n] n)
-                               (None [] (unreachable-node))))
-    (memphi-add-state! memphi mem)
-    (property-access-result value region memphi)))
+  (do
+    (if (or (<= key 0) (> key (shape-key-count)))
+        (panic-i "property-store-generic-owner: invalid property key" key)
+        0)
+    (property-generic-access ctrl mem object (con-int key) (Some value) JS-PROP-SET-OWN)))
 
 (defn property-store-known-owner [(ctrl (dyn NodeOps))
                                   (mem (dyn NodeOps))

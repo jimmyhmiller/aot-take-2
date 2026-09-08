@@ -226,7 +226,8 @@ aot-take-2/
 │   │
 │   ├── rt/                  ; the runtime, in Coil, built as its own object (Coil.toml `runtime`)
 │   │   ├── abi.coil         ; RtHeap layout + folded field offsets shared with the encoders
-│   │   └── rt.coil          ; allocation, generational collector, strings, throw entry points
+│   │   ├── shapes.coil      ; the runtime shape tree: static `__aot_shapes` blob + runtime transitions
+│   │   └── rt.coil          ; allocation, generational collector, strings, generic property access, throw entry points
 │   │
 │   ├── print/
 │   │   ├── ir.coil          ; the pretty printer                          IRPrinter
@@ -243,7 +244,7 @@ aot-take-2/
 │   ├── graph-property-test.coil ; structural and optimizer properties over generated graphs
 │   ├── program-graph-test.coil ; complete Stop-rooted graph structure against Simple
 │   ├── type-test.coil  node-test.coil  peephole-test.coil  gvn-test.coil
-│   ├── scope-test.coil  loop-test.coil  mem-test.coil  shape-test.coil
+│   ├── scope-test.coil  loop-test.coil  mem-test.coil  shape-test.coil  rt-shapes-test.coil
 │   ├── opto-test.coil  gcm-test.coil  sched-test.coil  regalloc-test.coil
 │   ├── encode-test.coil  compunit-test.coil  verify-test.coil  text-test.coil
 │   ├── lex-test.coil  parse-test.coil  regex-test.coil  tstype-test.coil  jsl-test.coil

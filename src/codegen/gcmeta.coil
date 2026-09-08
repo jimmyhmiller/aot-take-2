@@ -12,7 +12,7 @@
 ;;
 ;; SCAFFOLD: signatures are final; bodies hard-error. Filled in at S8.
 (module aot.codegen.gcmeta)
-(import "coil.alloc" :as alloc)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
 (import "coil.arraylist" :use *)
 (import "coil.primitive" :as primitive)
 (import "aot.util.panic" :use *)
@@ -286,41 +286,272 @@
                 (continue))))
     (load valid)))
 
-(defn gc-live-new [(block (dyn NodeOps))] (-> (ArrayList i64))
-  (let [a (alloc/malloc-allocator) (mut live) (al-new [i64] a) (mut lrg) 0]
-    (loop (if (> (load lrg) (ra-lrg-count))
+;; ---------------------------------------------------------------------------
+;; Liveness for the stack maps
+;;
+;; The maps need, at each safepoint, exactly the live ranges that hold a managed value across it.
+;; That is a liveness fact about the FINAL graph — after coalescing removed copies and rewired
+;; phi arms — so it is computed here from that graph, as one backward dataflow over live-range
+;; ids. The allocator's own live-out table is the wrong source: it names definition nodes as they
+;; stood when the interference graph was built, and a phi arm it recorded may since have been
+;; coalesced away (the node is dead, the arm now another node in another live range), which once
+;; left a phi's range "live" through a predecessor it was never in and asked the map for a stack
+;; home that range legitimately does not have.
+;;
+;; Phi arms are uses on their predecessor edge, not in the merge block, exactly as the allocator
+;; treats them; phi definitions kill at the merge head.
+
+(defstruct GcLiveness
+  [(lrgs i64)
+   (blocks i64)
+   (index (ArrayList i64))      ; node id -> block index + 1, zero for non-blocks
+   (out (ArrayList bool))       ; blocks x lrgs
+   (samples (ArrayList i64))])  ; lrg -> some node in it, for messages
+
+(defn gc-liveness-block-index [(lv (ptr GcLiveness)) (block (dyn NodeOps))] (-> i64)
+  (let [nid (n-nid block)]
+    (if (or (< nid 0) (>= nid (len (.index lv))))
+        (do (n-panic! "gc-liveness-block-index: node outside the arena" block) -1)
+        (- (get (.index lv) nid) 1))))
+
+(defn gc-liveness-out? [(lv (ptr GcLiveness)) (b i64) (lrg i64)] (-> bool)
+  (get (.out lv) (+ (* b (.lrgs lv)) lrg)))
+
+;; One backward step over a scheduled node: its definition dies, its register uses become live.
+;; Phi inputs are edge uses handled by the propagation, never uses at the merge.
+(defn gc-live-step! [(n (dyn NodeOps)) (live (mut (ArrayList bool)))] (-> i64)
+  (match (mach-of n)
+    (None [] 0)
+    (Some [mach]
+          (do
+            (if (!= (n-lrg n) 0) (set! (mut live) (ra-find! (n-lrg n)) false) 0)
+            (if (or (= (m-ideal-op mach) OP-PHI) (= (m-ideal-op mach) OP-MEMPHI))
+                0
+                (let [(mut i) 1]
+                  (loop (if (>= (load i) (n-nins n))
+                            (break 0)
+                            (do
+                              (match (m-regmap mach (load i))
+                                (Some [_]
+                                      (match (n-in n (load i))
+                                        (Some [def]
+                                              (if (!= (n-lrg def) 0)
+                                                  (set! (mut live) (ra-find! (n-lrg def)) true)
+                                                  0))
+                                        (None [] 0)))
+                                (None [] 0))
+                              (set! (mut i) (+ (load i) 1))
+                              (continue))))))
+            0))))
+
+(defn gc-live-copy-out! [(lv (ptr GcLiveness)) (b i64) (live (mut (ArrayList bool)))] (-> i64)
+  (let [(mut l) 0]
+    (loop (if (>= (load l) (.lrgs lv))
+              (break 0)
+              (do
+                (set! (mut live) (load l) (gc-liveness-out? lv b (load l)))
+                (set! (mut l) (+ (load l) 1))
+                (continue))))))
+
+;; Walk a block backward from its live-out to its live-in.
+(defn gc-live-in! [(lv (ptr GcLiveness)) (block (dyn NodeOps)) (b i64) (live (mut (ArrayList bool)))] (-> i64)
+  (do
+    (gc-live-copy-out! lv b (mut live))
+    (if (code-schedule-ready? block)
+        (let [(mut i) (- (code-schedule-count block) 1)]
+          (loop (if (< (load i) 0)
+                    (break 0)
+                    (do
+                      (gc-live-step! (code-schedule-at block (load i)) (mut live))
+                      (set! (mut i) (- (load i) 1))
+                      (continue)))))
+        0)))
+
+;; Merge `live-in` of `block`, plus the phi arms `arm` feeds, into the live-out of the predecessor
+;; block that owns `pred-ctrl`. True when that live-out grew.
+(defn gc-live-flow-to-pred! [(lv (ptr GcLiveness))
+                             (block (dyn NodeOps))
+                             (pred-ctrl (dyn NodeOps))
+                             (arm i64)
+                             (live-in (ArrayList bool))] (-> bool)
+  (let [pred (ra-ifg-block-of pred-ctrl)
+        pb (gc-liveness-block-index lv pred)
+        (mut changed) false]
+    (if (< pb 0)
+        (do (n-panic! "gc-live-flow-to-pred!: predecessor is not a CFG block" pred) false)
+        (do
+          (let [(mut l) 0]
+            (loop (if (>= (load l) (.lrgs lv))
+                      (break 0)
+                      (do
+                        (if (and (get live-in (load l)) (not (gc-liveness-out? lv pb (load l))))
+                            (do (set! (mut (.out lv)) (+ (* pb (.lrgs lv)) (load l)) true)
+                                (set! (mut changed) true))
+                            0)
+                        (set! (mut l) (+ (load l) 1))
+                        (continue)))))
+          (if (and (> arm 0) (code-schedule-ready? block))
+              (let [(mut si) 0]
+                (loop (if (>= (load si) (code-schedule-count block))
+                          (break 0)
+                          (let [phi (code-schedule-at block (load si))]
+                            (if (and (ra-phi? phi) (< arm (n-nins phi)))
+                                (match (n-in phi arm)
+                                  (Some [input]
+                                        (if (!= (n-lrg input) 0)
+                                            (let [l (ra-find! (n-lrg input))]
+                                              (if (not (gc-liveness-out? lv pb l))
+                                                  (do (set! (mut (.out lv)) (+ (* pb (.lrgs lv)) l) true)
+                                                      (set! (mut changed) true))
+                                                  0))
+                                            0))
+                                  (None [] 0))
+                                0)
+                            (set! (mut si) (+ (load si) 1))
+                            (continue)))))
+              0)
+          (load changed)))))
+
+;; Propagate one block's live-in to every predecessor, as the allocator walks them: a Region,
+;; Loop or Stop head lists its predecessor controls from input 1 (arm = input index); any other
+;; head has its one predecessor at input 0; Start and Fun have none.
+(defn gc-live-propagate! [(lv (ptr GcLiveness)) (block (dyn NodeOps)) (live-in (ArrayList bool))] (-> bool)
+  (match (mach-of block)
+    (None [] false)
+    (Some [mach]
+          (let [op (m-ideal-op mach) (mut changed) false]
+            (if (or (= op OP-START) (= op OP-FUN))
+                false
+                (if (or (= op OP-REGION) (= op OP-LOOP) (= op OP-STOP))
+                    (let [(mut i) 1]
+                      (loop (if (>= (load i) (n-nins block))
+                                (break 0)
+                                (do
+                                  (match (n-in block (load i))
+                                    (Some [pred]
+                                          (if (gc-live-flow-to-pred! lv block pred (load i) live-in)
+                                              (set! (mut changed) true)
+                                              0))
+                                    (None [] 0))
+                                  (set! (mut i) (+ (load i) 1))
+                                  (continue))))
+                      (load changed))
+                    (match (n-in block 0)
+                      (Some [pred] (gc-live-flow-to-pred! lv block pred 0 live-in))
+                      (None [] false))))))))
+
+(defn gc-compute-liveness! [] (-> (ptr GcLiveness))
+  (let [a (alloc/malloc-allocator)
+        lv (alloc/unwrap-ptr [GcLiveness] (alloc/create [GcLiveness] a))
+        lrgs (+ (ra-lrg-count) 1)
+        blocks (code-cfg-count)
+        (mut live) (al-new [bool] a)]
+    (set! (.lrgs lv) lrgs)
+    (set! (.blocks lv) blocks)
+    (set! (.index lv) (al-new [i64] a))
+    (set! (.out lv) (al-new [bool] a))
+    (set! (.samples lv) (al-new [i64] a))
+    (let [(mut i) 0]
+      (loop (if (> (load i) (arena-node-count))
+                (break 0)
+                (do (push! [i64] (mut (.index lv)) 0) (set! (mut i) (+ (load i) 1)) (continue))))
+      (set! (mut i) 0)
+      (loop (if (>= (load i) blocks)
+                (break 0)
+                (do
+                  (set! (mut (.index lv)) (n-nid (code-cfg-at (load i))) (+ (load i) 1))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      (set! (mut i) 0)
+      (loop (if (>= (load i) (* blocks lrgs))
+                (break 0)
+                (do (push! [bool] (mut (.out lv)) false) (set! (mut i) (+ (load i) 1)) (continue))))
+      (set! (mut i) 0)
+      (loop (if (>= (load i) lrgs)
+                (break 0)
+                (do (push! [i64] (mut (.samples lv)) 0) (push! [bool] (mut live) false)
+                    (set! (mut i) (+ (load i) 1)) (continue))))
+      ;; A representative node per live range, live nodes preferred, for the messages.
+      (set! (mut i) 1)
+      (loop (if (> (load i) (arena-node-count))
+                (break 0)
+                (do
+                  (match (arena-node (load i))
+                    (Some [n]
+                          (if (and (!= (n-lrg n) 0) (not (n-dead? n)))
+                              (let [l (ra-find! (n-lrg n))]
+                                (if (= (get (.samples lv) l) 0) (set! (mut (.samples lv)) l (load i)) 0))
+                              0))
+                    (None [] 0))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    ;; The fixpoint. Bounded: a live-out bit only ever turns on.
+    (let [(mut changed) true (mut rounds) 0]
+      (loop (if (not (load changed))
+                (break 0)
+                (do
+                  (set! (mut changed) false)
+                  (set! (mut rounds) (+ (load rounds) 1))
+                  (if (> (load rounds) (+ (* blocks lrgs) 2))
+                      (panic "gc-compute-liveness!: liveness did not converge")
+                      0)
+                  (let [(mut b) (- blocks 1)]
+                    (loop (if (< (load b) 0)
+                              (break 0)
+                              (let [block (code-cfg-at (load b))]
+                                (gc-live-in! lv block (load b) (mut live))
+                                (if (gc-live-propagate! lv block (load live)) (set! (mut changed) true) 0)
+                                (set! (mut b) (- (load b) 1))
+                                (continue)))))
+                  (continue)))))
+    lv))
+
+;; The live-out of a block as the map recorder wants it: a node id per live range, zero when dead.
+(defn gc-live-new [(lv (ptr GcLiveness)) (block (dyn NodeOps))] (-> (ArrayList i64))
+  (let [a (alloc/malloc-allocator)
+        (mut live) (al-new [i64] a)
+        b (gc-liveness-block-index lv block)
+        (mut lrg) 0]
+    (if (< b 0) (n-panic! "gc-live-new: block is not in the CFG table" block) 0)
+    (loop (if (>= (load lrg) (.lrgs lv))
               (break 0)
               (do
                 (push! [i64]
                        (mut live)
-                       (if (= (load lrg) 0) 0 (ra-liveout-nid block (load lrg))))
+                       (if (and (> (load lrg) 0) (gc-liveness-out? lv b (load lrg)))
+                           (let [sample (get (.samples lv) (load lrg))]
+                             (if (= sample 0)
+                                 (do (panic-i "gc-live-new: a live range with no live node is live-out" (load lrg)) 0)
+                                 sample))
+                           0))
                 (set! (mut lrg) (+ (load lrg) 1))
                 (continue))))
     (load live)))
 
-(defn gc-live-step! [(n (dyn NodeOps)) (live (mut (ArrayList i64)))] (-> i64)
+;; A step of the recorder's own walk within a block, over the node-id form of the live set.
+(defn gc-live-step-nids! [(n (dyn NodeOps)) (lv (ptr GcLiveness)) (live (mut (ArrayList i64)))] (-> i64)
   (match (mach-of n)
     (None [] 0)
     (Some [mach]
           (do
             (if (!= (n-lrg n) 0) (set! (mut live) (ra-find! (n-lrg n)) 0) 0)
-            (let [(mut i) 1]
-              (loop (if (>= (load i) (n-nins n))
-                        (break 0)
-                        (do
-                          (match (m-regmap mach (load i))
-                            (Some [_]
-                                  (match (n-in n (load i))
-                                    (Some [def]
-                                          (if (!= (n-lrg def) 0)
-                                              (set! (mut live)
-                                                    (ra-find! (n-lrg def))
-                                                    (n-nid def))
-                                              0))
-                                    (None [] 0)))
-                            (None [] 0))
-                          (set! (mut i) (+ (load i) 1))
-                          (continue)))))
+            (if (or (= (m-ideal-op mach) OP-PHI) (= (m-ideal-op mach) OP-MEMPHI))
+                0
+                (let [(mut i) 1]
+                  (loop (if (>= (load i) (n-nins n))
+                            (break 0)
+                            (do
+                              (match (m-regmap mach (load i))
+                                (Some [_]
+                                      (match (n-in n (load i))
+                                        (Some [def]
+                                              (if (!= (n-lrg def) 0)
+                                                  (set! (mut live) (ra-find! (n-lrg def)) (n-nid def))
+                                                  0))
+                                        (None [] 0)))
+                                (None [] 0))
+                              (set! (mut i) (+ (load i) 1))
+                              (continue))))))
             0))))
 
 (defn gc-safepoint-fun [(safepoint (dyn NodeOps))] (-> (dyn NodeOps))
@@ -354,7 +585,12 @@
                       (Some [value]
                             (let [location (ra-lrg-reg (load lrg))]
                             (if (< location (mach-active-max-reg))
-                                (panic-i "gc-record-stackmap!: live reference has no location" nid)
+                                (do
+                                  (println "gc-record-stackmap!: live across {s}" (n-text safepoint))
+                                  (println "  lrg {} kind {} reg {} root-restricted {}"
+                                           (load lrg) kind location
+                                           (if (ra-lrg-root-restricted? (load lrg)) 1 0))
+                                  (n-panic! "gc-record-stackmap!: live reference has no stack home (register-allocated across a safepoint)" value))
                                 (do
                                   (push! [i64]
                                          (mut (.locations state))
@@ -379,11 +615,11 @@
 (defn gc-build-stackmaps! [] (-> i64)
   (do
     (gcmeta-reset!)
-    (let [(mut ci) 0]
+    (let [lv (gc-compute-liveness!) (mut ci) 0]
       (loop (if (>= (load ci) (code-cfg-count))
               (break 0)
               (let [block (code-cfg-at (load ci))
-                    (mut live) (gc-live-new block)
+                    (mut live) (gc-live-new lv block)
                     (mut i) (if (code-schedule-ready? block)
                                 (- (code-schedule-count block) 1)
                                 -1)]
@@ -401,7 +637,7 @@
                                   (if (gc-safepoint-op? n)
                                       (gc-record-stackmap! n (load live))
                                       0)
-                                  (gc-live-step! n (mut live))
+                                  (gc-live-step-nids! n lv (mut live))
                                   (set! (mut i) (- (load i) 1))
                                   (continue))))
                       0)
