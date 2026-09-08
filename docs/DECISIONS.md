@@ -1,5 +1,41 @@
 # Decisions
 
+## 2026-09-08 — Receivers, function objects and total coercions
+
+`this` is the receiver slot (slot 0 of the shared ABI). A non-strict function binds it through
+`JsSloppyThis` (undefined or null becomes the global object, per OrdinaryCallBindThis); strict
+code takes the slot as it is; a Script's top level is the global object; an arrow's `this` is a
+capture and waits for closures. `o.m(args)` evaluates the owner once and passes it as the receiver.
+Function objects are objects: the function payload begins with the object's two words, so the
+object-like guard (`%IsObjectLike` on the two heap prefixes, `%UnboxObjectLike` to the object
+payload) admits functions to the same property machinery, and `Unbox(Box(x))` cancels across the
+two prefixes. A value-taken function inlines like any other — every call through its object is a
+linked site in the closed world — and a Fun left without callers names the runtime invariant trap
+from its code word. Duplicate hoisted declarations keep distinct linker symbols; the last one,
+the binding JavaScript observes, keeps the plain name.
+
+Arithmetic and comparison are total over the dynamic axis. `JsPrimitiveNumber` and `JsAdd` route
+every tag either to a conversion or to a named runtime refusal (ToPrimitive on objects, ToString
+of a non-string in concatenation, StringToNumber, a TypeError for Symbol). The refusals are
+no-operand runtime primitives whose nominal result lets the arm stand in for the value, so the
+final `%UnboxNumber` is proven on numbers alone and a program whose operands the compiler cannot
+type still compiles; only the missing conversion refuses, and only when actually reached.
+
+## 2026-09-08 — Exceptions are a pending word and ordinary control flow
+
+Simple has no exceptions. Ours are a value in the runtime heap record — `RtHeap.pending-exception`,
+a boxed word the collector forwards, reached through `HeapState` on its own alias — plus control
+flow the optimizer already understands. A `throw` inside a `try` is a jump to the catch target,
+exactly the Scope-merging jump `break` makes to a labeled block, carrying the value in a synthetic
+Scope variable the catch clause binds. A `throw` outside any `try` stores the value into the pending
+word and returns `undefined`. After every source call, the caller loads the pending word and, if it
+is set, jumps to its enclosing catch (clearing the word) or propagates by returning. There are no
+unwind tables and no non-local control transfer; the cost is a load and a branch per call site,
+which GVN and the branch encoder already handle. `finally` runs on normal completions first; an
+abrupt completion through a `finally` refuses by name until the finally region is lowered as a
+shared continuation. The entry wrapper reports a pending exception after the last Script through
+a runtime entry with a nonzero status.
+
 ## 2026-09-08 — A property access is a node that folds through memory SSA, never an eager dispatch
 
 Simple has no property dispatch: a field access is a `Load` whose alias and offset come from the

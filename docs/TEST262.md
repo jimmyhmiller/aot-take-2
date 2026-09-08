@@ -79,9 +79,11 @@ a function directive into siblings. Strict runtime compilation remains unsupport
 Global restricted-property failures belong to initialization and cannot count as
 parse errors. Runtime negative tests still lack a typed abrupt-completion protocol.
 
-The compiler still lacks the shared global environment and exception/function-expression support
-needed by the upstream assertion harness. Multi-Script evaluation, module plans, and async execution receive
-explicit unsupported results and remain in the denominator. Typed JavaScript abrupt-completion
+The runner now compiles each variant's harness Scripts into the same realm as the test, as
+separate sources in plan order (`aot compile-script HARNESS... TEST OUT.o`). The upstream assertion
+harness itself still needs exceptions (`throw`, `try`), constructors (`new`, `instanceof`,
+`prototype`) and the conversions the remaining runtime refusals name. Module plans and async
+execution receive explicit unsupported results and remain in the denominator. Typed JavaScript abrupt-completion
 reporting at runtime and realm host bindings remain unimplemented. Do not convert a nonzero native exit into
 an expected exception by parsing its diagnostics.
 

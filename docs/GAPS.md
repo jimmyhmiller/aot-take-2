@@ -80,6 +80,25 @@ in selection, `ALIAS-FIRST-PROPERTY` follows the function aliases, and `ra-build
 undefined live range. A boxed live range with a fixed definition and a conflicting fixed use also
 no longer loops in the managed-root splitters: those apply only to ranges a safepoint restricted.
 
+### 2026-09-08 — Receivers, function objects and total coercions
+
+`this` is the receiver slot of the enclosing non-strict function mapped by `JsSloppyThis`
+(undefined or null becomes the global object; outside a realm that case refuses at run time) or,
+in strict code, the slot itself; at a Script's top level it is the global object. `o.m(args)`
+evaluates the owner once and passes it as the receiver. Function objects carry properties: the
+object-like guard (`%IsObjectLike`, `%UnboxObjectLike`) admits the FUNCTION prefix to the same
+property machinery, since the function payload begins with the object's two words. Value-taken
+functions inline like any other; a Fun left without callers names the runtime invariant trap from
+its code word. Duplicate hoisted declarations keep distinct symbols; the last one keeps the plain
+name. Arrow `this` is a capture and refuses by name.
+
+Arithmetic and comparison are total over the dynamic axis: `JsPrimitiveNumber` and `JsAdd` route
+every tag either to a conversion or to a named runtime refusal (`aot_rt_unimplemented_to_primitive`
+for objects, `..._to_string` for concatenation with a non-string, `..._string_to_number`, a
+TypeError for Symbol), so programs whose operands the compiler cannot type still compile and only
+the unimplemented conversion refuses when actually reached. ToPrimitive, ToString of numbers and
+StringToNumber are the conversions still to write.
+
 ### 2026-09-08 — Property access as a node, and the graph-size budgets
 
 Own-property loads, has-checks and stores are `PropAccess` nodes (docs/DECISIONS.md, property

@@ -5033,6 +5033,28 @@
     (set! (.abi-sig (parser-state)) (ty-tuple (al-slice (load members))))
     0))
 
+;; The object-file symbol of a hoisted declaration: its source name for the LAST declaration of
+;; that name in the realm (the binding JavaScript observes), a compiler-owned dotted name for every
+;; earlier one, so duplicate declarations within or across Scripts stay distinct for the linker.
+(defn parser-hoisted-fun-symbol [(index i64)] (-> (slice u8))
+  (let [f (syntax-fun-at index)
+        (mut taken) false
+        (mut j) (+ index 1)]
+    (loop (if (>= (load j) (len (.funs (parser-state))))
+              (break 0)
+              (let [g (syntax-fun-at (load j))]
+                (if (and (.hoisted g) (= (.name g) (.name f))) (set! (mut taken) true) 0)
+                (set! (mut j) (+ (load j) 1))
+                (continue))))
+    (if (load taken)
+        (let [(mut sb) (sb-new (alloc/malloc-allocator))]
+          (sb-push-str! (mut sb) "$aot$.")
+          (sb-push-str! (mut sb) (.name f))
+          (sb-push-str! (mut sb) ".")
+          (sb-push-i64! (mut sb) index)
+          (sb-str (mut sb)))
+        (.name f))))
+
 ;; Compiler-owned symbol for a function value; a dot keeps it outside the source namespace.
 (defn parser-value-fun-name [(index i64)] (-> (slice u8))
   (let [(mut sb) (sb-new (alloc/malloc-allocator))]
@@ -5589,10 +5611,17 @@
 ;; orders them; then a FUNCTION guard either loads the code word and calls through the shared
 ;; ABI or hands the value to the runtime's abrupt-completion entry (a TypeError once exceptions
 ;; exist). Both arms merge as an ordinary Scope diamond.
+;; A call through a value with `this` = undefined: a plain `f(...)`.
 (defn lower-value-call [(callee (dyn NodeOps)) (args (ArrayList i64))] (-> (dyn NodeOps))
+  (lower-value-call-with-receiver callee (dyn-undefined-make) args))
+
+;; A call through a value. `receiver` becomes the callee's `this` slot; sloppy functions map an
+;; undefined receiver to the global object at their entry (JsSloppyThis).
+(defn lower-value-call-with-receiver [(callee (dyn NodeOps)) (receiver (dyn NodeOps)) (args (ArrayList i64))] (-> (dyn NodeOps))
   (let [slots (parser-abi-slots)
         (mut actuals) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))]
     (n-keep! callee)
+    (n-keep! receiver)
     (al-for [a args]
             (let [v (lower-syntax-expr a)]
               (n-keep! v)
@@ -5610,7 +5639,7 @@
                             ALIAS-FUNCTION-CODE (parser-value-funptr-ty))
             c (call-make-with-mem true-ctrl mem)
             (mut i) 0]
-        (call-add-arg! c (dyn-undefined-make))
+        (call-add-arg! c receiver)
         (loop (if (>= (load i) slots)
                   (break 0)
                   (do
@@ -5640,9 +5669,60 @@
               (set! (.current-ctrl (parser-state)) (n-nid region))
               (n-unkeep! value)
               (al-for [v (load actuals)] (n-unkeep! v))
+              (n-unkeep! receiver)
               (n-unkeep! callee)
               (al-free! [(dyn NodeOps)] (mut actuals))
               phi)))))))
+
+;; `o.m(args)`: the owner is evaluated once and is both the property base and the receiver.
+(defn lower-member-call [(owner-id i64) (name (slice u8)) (args (ArrayList i64))] (-> (dyn NodeOps))
+  (let [owner (lower-syntax-expr owner-id)]
+    (n-keep! owner)
+    (let [scope (parser-node (.current-scope (parser-state)))
+          (mut margs) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))]
+      (push! [(dyn NodeOps)] (mut margs) owner)
+      (push! [(dyn NodeOps)] (mut margs) (con-int (shape-key-intern name)))
+      (let [loaded (jsl-lower-macro-values "JsGetNamed"
+                                           (load margs)
+                                           (parser-node (.current-ctrl (parser-state)))
+                                           (scope-mem scope))]
+        (al-free! [(dyn NodeOps)] (mut margs))
+        (parser-set-current-ctrl! (.ctrl loaded))
+        (scope-set-mem! scope (.mem loaded))
+        (let [answer (lower-value-call-with-receiver (.value loaded) owner args)]
+          (n-unkeep! owner)
+          answer)))))
+
+;; `this`: the receiver slot of the enclosing non-arrow function, mapped for sloppy code; the
+;; global object at a Script's top level. An arrow's `this` is a capture of its enclosing
+;; function's and waits for closures.
+(defn lower-this [] (-> (dyn NodeOps))
+  (let [p (parser-state)
+        f (syntax-fun-at (.current-fun p))]
+    (if (syntax-script-root? (.current-fun p))
+        (lower-global-object)
+        (match (.kind f)
+          (FunArrow []
+                    (do
+                      (unimplemented "arrow function `this` (a capture of the enclosing receiver)"
+                                     "docs/GAPS.md — function values and closures")
+                      (unreachable-node)))
+          (_
+           (let [fun (parser-node (.fun-nid f))
+                 receiver (match (fun-parm fun 0) (Some [r] r) (None [] (unreachable-node)))]
+             (if (.strict f)
+                 receiver
+                 (let [scope (parser-node (.current-scope p))
+                       (mut margs) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))]
+                   (push! [(dyn NodeOps)] (mut margs) receiver)
+                   (let [mapped (jsl-lower-macro-values (if (.script-mode p) "JsSloppyThis" "JsSloppyThisNoRealm")
+                                                        (load margs)
+                                                        (parser-node (.current-ctrl p))
+                                                        (scope-mem scope))]
+                     (al-free! [(dyn NodeOps)] (mut margs))
+                     (parser-set-current-ctrl! (.ctrl mapped))
+                     (scope-set-mem! scope (.mem mapped))
+                     (.value mapped))))))))))
 
 ;; FunctionDeclarations at the top level of a function body are var-like bindings initialized
 ;; with their function objects on entry (FunctionDeclarationInstantiation).
@@ -5831,10 +5911,12 @@
                           (match (syntax-node (syntax-ungroup-id callee))
                             (SxName [name] (lower-named-call name args))
                             (SxMember [owner member optional]
-                                      (do
-                                        (unimplemented "method calls (this binding)"
-                                                       "docs/GAPS.md — function values and closures")
-                                        (unreachable-node)))
+                                      (if optional
+                                          (do
+                                            (unimplemented "optional chaining"
+                                                           "docs/GAPS.md — nullish short-circuit chains")
+                                            (unreachable-node))
+                                          (lower-member-call owner member args)))
                             (SxPrivateMember [owner member optional]
                                              (do
                                                (unimplemented "private method calls"
@@ -5856,11 +5938,7 @@
                              (unimplemented "new.target"
                                             "docs/GAPS.md — function objects")
                              (unreachable-node)))
-              (SxThis []
-                      (do
-                        (unimplemented "this binding"
-                                       "docs/GAPS.md — receivers and the global object")
-                        (unreachable-node)))
+              (SxThis [] (lower-this))
               (SxSpread [expr]
                         (do
                           (unimplemented "spread arguments"
@@ -6889,12 +6967,7 @@
         (parser-node (.global-object-nid p))
         ;; A Load of the realm root through the heap-state pointer: GVN and load uplift share
         ;; one read per function, and the root only ever holds the boxed global object.
-        (load-make (parser-node (.current-ctrl p))
-                   (scope-mem scope)
-                   (heapstate-make)
-                   (con-int RT-HEAP-OFFSET-GLOBAL-OBJECT)
-                   ALIAS-REALM-ROOT
-                   (ty-dyn TAG-OBJECT)))))
+        (realm-global-object-load (parser-node (.current-ctrl p)) (scope-mem scope)))))
 
 (defn lower-global-load [(name (slice u8))] (-> (dyn NodeOps))
   (let [g (syntax-global-index name)
@@ -7095,7 +7168,7 @@
                                                (syntax-find-fun "main"))
                                             (parser-internal-main-name)
                                             (if (.hoisted fp)
-                                                (.name fp)
+                                                (parser-hoisted-fun-symbol (load fi))
                                                 (parser-value-fun-name (load fi)))))
                             (mut i) 0]
                         ;; JSL declarations reserved the low closed-world identities. Every source
