@@ -222,8 +222,13 @@
             TY-BOT
             (if (not (ty-mem? mt))
                 TY-BOT
-                (let [elem (ty-mem-elem mt)]
-                  (if (= elem TY-TOP) TY-TOP (ty-join declared elem))))))))
+                (let [elem (ty-mem-elem mt)
+                      slice (mem-effective (n-in! d MEM-STATE) (.alias (primitive/cast (ptr LoadNode) (hdr d))))]
+                  ;; A private slice is another object's exact state unless this load reads that
+                  ;; very object; then only the declared type is known.
+                  (if (and (ty-mem-one? mt) (not (mem-slice-owned-by? slice (n-in! d MEM-PTR))))
+                      declared
+                      (if (= elem TY-TOP) TY-TOP (ty-join declared elem)))))))))
 
 (defn load-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
   (let [p (primitive/cast (ptr LoadNode) (hdr d))
@@ -254,8 +259,11 @@
                                (and (n-same? ptr_ (n-in! mem MEM-PTR))
                                     (n-same? off (n-in! mem MEM-OFF))))
                           (Some (n-in! mem STORE-VAL))
-                          ;; Distinct alias slices cannot clobber one another.
-                          (if (!= alias (.alias st))
+                          ;; Distinct alias slices cannot clobber one another, and neither can a
+                          ;; store into a provably different object: two distinct allocations
+                          ;; never alias (Simple's Load-after-Store bypass of unrelated stores).
+                          (if (or (!= alias (.alias st))
+                                  (mem-provably-distinct? ptr_ (n-in! mem MEM-PTR)))
                               (do (n-set-def! d MEM-STATE (Some (n-in! mem MEM-STATE))) (Some d))
                               (None [(dyn NodeOps)]))))
                     ;; Uplift to an equivalent load whose control dominates ours.
@@ -285,6 +293,13 @@
                                   (set! (mut i) (+ (load i) 1))
                                   (continue))))
                       (load prior)))))))))
+
+;; Two pointers that are each the result of a different New can never address the same object.
+(defn mem-provably-distinct? [(a (dyn NodeOps)) (b (dyn NodeOps))] (-> bool)
+  (and (= (n-op a) OP-PROJ) (= (n-op b) OP-PROJ)
+       (= (proj-idx a) 0) (= (proj-idx b) 0)
+       (= (n-op (n-in! a 0)) OP-NEW) (= (n-op (n-in! b 0)) OP-NEW)
+       (not (n-same? (n-in! a 0) (n-in! b 0)))))
 
 (defn load-alias [(d (dyn NodeOps))] (-> i64)
   (.alias (primitive/cast (ptr LoadNode) (hdr d))))
@@ -332,7 +347,7 @@
         pt (n-ty (n-in! d MEM-PTR))
         vt (n-ty (n-in! d STORE-VAL))]
     (if (or (ty-high? mt) (ty-high? pt) (ty-high? vt))
-        (ty-mem (.alias p) TY-TOP)
+        (ty-mem-top (.alias p))
         (if (or (not (ty-mem? mt)) (not (ty-memptr? pt)))
             (ty-mem (.alias p) TY-BOT)
             ;; Final Simple: the slice after a store is `val.meet(tfld)`, the stored value MET with
@@ -340,12 +355,29 @@
             ;; private memory (`mem._one`) is the exception and tracks just the value. Here that
             ;; private state is the New's own bulk slice typed by its struct; a fresh slice with a
             ;; TOP remainder also contributes nothing.
+            ;; Final Simple: the slice after a store is `val.meet(tfld)`, the stored value MET with
+            ;; what the slice already held, because other objects share the alias. An allocation's
+            ;; private memory (`mem._one`) is the exception and tracks just the value. A private
+            ;; slice describes ONE object: continuing it for that same object keeps it private and
+            ;; exact; a store to any other object cannot use it as a prior at all (BOT), because the
+            ;; alias's public state is not what that slice holds.
             (let [sharpened (ty-join (.declared p) vt)
                   prior (ty-mem-elem mt)
-                  private (and (= (ty-mem-alias mt) 1)
-                               (match (ty-kind prior) (TStruct [_ _ _ _] true) (_ false)))]
-              (ty-mem (.alias p)
-                      (if (or private (= prior TY-TOP)) sharpened (ty-meet sharpened prior))))))))
+                  same-object (mem-slice-owned-by? (mem-effective (n-in! d MEM-STATE) (.alias p)) (n-in! d MEM-PTR))]
+              (if (ty-mem-one? mt)
+                  (if same-object
+                      (ty-mem-private (.alias p) sharpened)
+                      (ty-mem (.alias p) TY-BOT))
+                  (ty-mem (.alias p) (if (= prior TY-TOP) sharpened (ty-meet sharpened prior)))))))))
+
+;; Whether a memory node is the private state of exactly the object `ptr`: the allocation's own
+;; projection, or a store to that same pointer continuing it.
+(defn mem-slice-owned-by? [(slice (dyn NodeOps)) (ptr_ (dyn NodeOps))] (-> bool)
+  (if (= (n-op slice) OP-STORE)
+      (n-same? (n-in! slice MEM-PTR) ptr_)
+      (if (and (= (n-op slice) OP-PROJ) (= (n-op (n-in! slice 0)) OP-NEW))
+          (and (= (n-op ptr_) OP-PROJ) (n-same? (n-in! ptr_ 0) (n-in! slice 0)))
+          false)))
 
 (defn store-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
   (let [p (primitive/cast (ptr StoreNode) (hdr d))
@@ -472,7 +504,7 @@
         (ty-tuple-of2 TY-TOP TY-TOP)
         (if (= ctrl-ty TY-XCTRL)
             (ty-tuple-of2 TY-TOP TY-TOP)
-            (ty-tuple-of2 (ty-memptr false object-ty) (ty-mem ALIAS-BULK object-ty))))))
+            (ty-tuple-of2 (ty-memptr false object-ty) (ty-mem-private ALIAS-BULK object-ty))))))
 
 (impl NodeOps NewNode
   (hdr [(self (ptr NewNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
@@ -503,6 +535,9 @@
 
 ;; The graph copier's constructor: every input is a placeholder rewired afterwards, so the memory
 ;; ordering check above does not apply. Shape and object type are still validated.
+;; New's inputs: control, byte size, the public memory it allocates in.
+(const NEW-MEM 2)
+
 (defn new-make-shell [(ctrl (dyn NodeOps))
                       (size (dyn NodeOps))
                       (mem (dyn NodeOps))
@@ -560,8 +595,8 @@
 
 (defn memmerge-compute [(d (dyn NodeOps))] (-> i64)
   (match (n-in d 1)
-    (Some [mem] (if (ty-mem? (n-ty mem)) (n-ty mem) (if (ty-high? (n-ty mem)) (ty-mem 1 TY-TOP) (ty-mem 1 TY-BOT))))
-    (None [] (ty-mem 1 TY-TOP))))
+    (Some [mem] (if (ty-mem? (n-ty mem)) (n-ty mem) (if (ty-high? (n-ty mem)) (ty-mem-top 1) (ty-mem 1 TY-BOT))))
+    (None [] (ty-mem-top 1))))
 
 (defn memmerge-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
   (let [p (primitive/cast (ptr MemMergeNode) (hdr d))]
@@ -616,7 +651,7 @@
     (n-init! d OP-MEMMERGE)
     (n-add-def! d (None [(dyn NodeOps)]))
     (n-add-def! d (None [(dyn NodeOps)]))
-    (n-set-ty! d (ty-mem 1 TY-TOP))
+    (n-set-ty! d (ty-mem-top 1))
     d))
 
 (defn memmerge-alias [(m (dyn NodeOps)) (alias i64)] (-> (dyn NodeOps))

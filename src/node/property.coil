@@ -17,21 +17,312 @@
 ;; Keyed access (`o[k]`) with a non-constant key stays generic unless the key is proven to be an
 ;; array index, which is the one case worth its own node.
 ;;
-;; SCAFFOLD: signatures are final; bodies hard-error. Filled in at S3.
+;; The node: `PropAccess` is a call-like multi — (control, memory, value) — carrying a constant key
+;; and a kind (load, has, store). It is what the frontend and JSL emit for an own-property access
+;; whose owner's backing store is not statically visible at that moment. Its idealize is the fast
+;; path: when the memory SSA shows the owner's properties word to be a Store of a known allocation
+;; (the same pattern a literal's definitions leave behind), the access becomes one Load, one
+;; constant, or the static store transition, and the projections forward to those. Inlining exposes
+;; exactly this pattern at call sites that were opaque at parse time, which is why the access has
+;; to be a node and not an expansion. Whatever is still unresolved when optimization ends is
+;; expanded once, before type checking, into the guarded closed-world shape dispatch below.
+;;
+;; Simple has no such node because a field access in Simple is a Load: the struct type IS the
+;; layout. The dispatch here is the JavaScript divergence; the folding rule is Simple's
+;; Load-after-Store idealization reached through the owner's properties word.
 (module aot.node.property)
 (import "coil.primitive" :as primitive)
-(import "coil.alloc" :as alloc)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
 (import "coil.arraylist" :use *)
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
 (import "aot.node.constant" :use *)
 (import "aot.node.control" :use *)
+(import "aot.node.cfg" :use *)
 (import "aot.node.compare" :use *)
 (import "aot.node.phi" :use *)
 (import "aot.node.dynamic" :use *)
 (import "aot.node.memory" :use *)
+(import "aot.node.jsops" :use *)
 (import "aot.type.type" :use *)
 (import "aot.shape" :use *)
+
+(const PROP-LOAD 0)
+
+(const PROP-HAS 1)
+
+(const PROP-STORE 2)
+
+(const PROP-CTRL 0)
+
+(const PROP-MEM 1)
+
+(const PROP-OBJECT 2)
+
+(const PROP-VALUE 3)
+
+;; Projection indices of the tuple `(control, memory, value)`.
+(const PROP-RESULT-CTRL 0)
+
+(const PROP-RESULT-MEM 1)
+
+(const PROP-RESULT-VALUE 2)
+
+(defstruct PropAccessNode
+  [(hdr NodeHdr)
+   (key i64)
+   (kind i64)
+   (res-mem i64)  ; once resolved: the memory the mem projection forwards to
+   (res-value i64)])  ; once resolved: the value the value projection forwards to
+
+;; What the memory SSA says about an owner's backing store at a program point.
+(defsum PropStatic
+  (PropUnknown)
+  (PropNoStorage)
+  (PropStorage [(storage i64) (shape i64)]))  ; the storage pointer's nid and its hidden class
+
+(defn prop-access-node [(n (dyn NodeOps))] (-> (ptr PropAccessNode))
+  (if (not (or (= (n-op n) OP-PROPLOAD) (= (n-op n) OP-PROPSTORE)))
+      (do (panic-i "prop-access-node: not a property access" (n-op n))
+          (primitive/cast (ptr PropAccessNode) (hdr n)))
+      (primitive/cast (ptr PropAccessNode) (hdr n))))
+
+(defn prop-access-key [(n (dyn NodeOps))] (-> i64) (.key (prop-access-node n)))
+
+(defn prop-access-kind [(n (dyn NodeOps))] (-> i64) (.kind (prop-access-node n)))
+
+;; The owner's properties word must be a Store to this very object of either the null word (no
+;; backing store yet) or a boxed fresh allocation whose hidden class New declares.
+(defn prop-static-storage [(mem (dyn NodeOps)) (object (dyn NodeOps))] (-> PropStatic)
+  (let [owner-state (mem-effective mem ALIAS-OBJECT-PROPERTIES)]
+    (if (or (!= (n-op owner-state) OP-STORE)
+            (not (n-same? (n-in! owner-state MEM-PTR) object)))
+        (PropUnknown)
+        (let [word (n-in! owner-state STORE-VAL)]
+          (if (= (n-ty word) (ty-dyn TAG-NULL))
+              (PropNoStorage)
+              (if (!= (n-op word) OP-BOX)
+                  (PropUnknown)
+                  (let [storage (n-in! word 1)]
+                    (if (and (= (n-op storage) OP-PROJ) (= (n-op (n-in! storage 0)) OP-NEW))
+                        (PropStorage (n-nid storage) (new-shape (n-in! storage 0)))
+                        (PropUnknown)))))))))
+
+(defn prop-access-result-ty [(kind i64) (value-ty i64)] (-> i64)
+  (if (= kind PROP-HAS) (ty-bool) (if (= kind PROP-STORE) value-ty (ty-dyn TAG-ANY))))
+
+(defn prop-access-compute [(d (dyn NodeOps))] (-> i64)
+  (let [p (prop-access-node d)]
+    (ty-tuple-of3 (match (n-in d PROP-CTRL) (Some [c] (n-ty c)) (None [] TY-TOP))
+                  (match (n-in d PROP-MEM) (Some [m] (n-ty m)) (None [] (ty-mem-top 1)))
+                  (prop-access-result-ty (.kind p)
+                                         (if (> (n-nins d) PROP-VALUE)
+                                             (match (n-in d PROP-VALUE) (Some [v] (n-ty v)) (None [] (ty-dyn TAG-ANY)))
+                                             (ty-dyn TAG-ANY))))))
+
+;; Forward every projection of a resolved access and let the worklist collect the access itself.
+(defn prop-access-forward! [(d (dyn NodeOps)) (ctrl (dyn NodeOps)) (mem (dyn NodeOps)) (value (dyn NodeOps))] (-> i64)
+  (let [(mut projs) (al-new [i64] (alloc/malloc-allocator))
+        (mut i) 0]
+    (n-keep! ctrl)
+    (n-keep! mem)
+    (n-keep! value)
+    (loop (if (>= (load i) (n-nouts d))
+              (break 0)
+              (do
+                (match (n-out d (load i))
+                  (Some [u] (if (or (= (n-op u) OP-PROJ) (= (n-op u) OP-CPROJ))
+                                (push! [i64] (mut projs) (n-nid u))
+                                (n-panic! "prop-access-forward!: a property access has a non-projection user" u)))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (al-for [id (load projs)]
+            (match (arena-node id)
+              (Some [u]
+                    (if (n-dead? u)
+                        0
+                        (let [idx (if (= (n-op u) OP-CPROJ) (cproj-idx u) (proj-idx u))]
+                          (n-subsume! u (if (= idx PROP-RESULT-CTRL) ctrl (if (= idx PROP-RESULT-MEM) mem value))))))
+              (None [] 0)))
+    (al-free! [i64] (mut projs))
+    (n-unkeep! ctrl)
+    (n-unkeep! mem)
+    (n-unkeep! value)
+    0))
+
+;; The fast path: resolve against a statically visible backing store.
+(defn prop-access-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [p (prop-access-node d)]
+    (if (!= (.res-mem p) 0)
+        (None [(dyn NodeOps)])
+        (match (n-in d PROP-MEM)
+          (None [] (None [(dyn NodeOps)]))
+          (Some [mem]
+                (let [ctrl (n-in! d PROP-CTRL)
+                      object (n-in! d PROP-OBJECT)
+                      key (.key p)]
+                  (match (prop-static-storage mem object)
+                    (PropUnknown [] (None [(dyn NodeOps)]))
+                    (PropNoStorage []
+                                   (if (= (.kind p) PROP-STORE)
+                                       (let [stored (property-store-known-owner ctrl mem object key (n-in! d PROP-VALUE))]
+                                         (prop-access-resolve! d ctrl (.mem stored) (.value stored)))
+                                       (prop-access-resolve! d ctrl mem
+                                                             (if (= (.kind p) PROP-HAS) (con-int 0) (dyn-undefined-make)))))
+                    (PropStorage [storage-nid shape]
+                                 (let [storage (match (arena-node storage-nid) (Some [n] n) (None [] (unreachable-node)))
+                                       present (shape-has-key? shape key)]
+                                   (if (= (.kind p) PROP-STORE)
+                                       (let [stored (property-store-known-owner ctrl mem object key (n-in! d PROP-VALUE))]
+                                         (prop-access-resolve! d ctrl (.mem stored) (.value stored)))
+                                       (if (= (.kind p) PROP-HAS)
+                                           (prop-access-resolve! d ctrl mem (con-int (if present 1 0)))
+                                           (prop-access-resolve! d ctrl mem
+                                                                 (if present
+                                                                     (load-make ctrl mem storage
+                                                                                (con-int (shape-offset-key shape key))
+                                                                                (shape-alias-key shape key)
+                                                                                (ty-dyn TAG-ANY))
+                                                                     (dyn-undefined-make))))))))))))))
+
+(defn prop-access-resolve! [(d (dyn NodeOps)) (ctrl (dyn NodeOps)) (mem (dyn NodeOps)) (value (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [p (prop-access-node d)]
+    (set! (.res-mem p) (n-nid mem))
+    (set! (.res-value p) (n-nid value))
+    (prop-access-forward! d ctrl mem value)
+    (Some d)))
+
+;; Simple's MultiNode.pcopy for a resolved access: a projection created after resolution still
+;; forwards. Control forwards to the incoming control; the access itself never had any.
+(defn prop-access-pcopy [(d (dyn NodeOps)) (idx i64)] (-> (Option (dyn NodeOps)))
+  (let [p (prop-access-node d)]
+    (if (= (.res-mem p) 0)
+        (None [(dyn NodeOps)])
+        (if (= idx PROP-RESULT-CTRL)
+            (n-in d PROP-CTRL)
+            (arena-node (if (= idx PROP-RESULT-MEM) (.res-mem p) (.res-value p)))))))
+
+(impl NodeOps PropAccessNode
+  (hdr [(self (ptr PropAccessNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr PropAccessNode))] (-> (slice u8))
+         (if (= (.kind self) PROP-LOAD) "PropLoad" (if (= (.kind self) PROP-HAS) "PropHas" "PropStore")))
+  (is-const? [(self (ptr PropAccessNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr PropAccessNode))] (-> bool) true)
+  (is-pinned? [(self (ptr PropAccessNode))] (-> bool) true)
+  (binop-copy [(self (ptr PropAccessNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)]))
+  (compute [(self (ptr PropAccessNode))] (-> i64) (prop-access-compute (primitive/make-dyn NodeOps self)))
+  (idealize [(self (ptr PropAccessNode))] (-> (Option (dyn NodeOps)))
+            (prop-access-idealize (primitive/make-dyn NodeOps self)))
+  ;; A control-bearing multi is a site, as a Call is: never GVN-merged.
+  (eq-extra [(self (ptr PropAccessNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (= (.nid (hdr (primitive/make-dyn NodeOps self))) (n-nid other)))
+  (hash-extra [(self (ptr PropAccessNode))] (-> i64) (+ 401 (.nid (hdr (primitive/make-dyn NodeOps self))))))
+
+;; An access is control, as a Call is: it sits in the middle of a block and its control
+;; projection heads the next one. `aot.node.call` contributes this to `cfg-of`.
+(impl CFGOps PropAccessNode
+  (cfg-node [(self (ptr PropAccessNode))] (-> (dyn NodeOps)) (primitive/make-dyn NodeOps self))
+  (block-head? [(self (ptr PropAccessNode))] (-> bool) false)
+  (cfg-idom [(self (ptr PropAccessNode))]
+            (-> (Option (dyn NodeOps)))
+            (n-in-safe (primitive/make-dyn NodeOps self) PROP-CTRL))
+  (cfg-idepth [(self (ptr PropAccessNode))]
+              (-> i64)
+              (cfg-idepth-default (primitive/make-dyn NodeOps self))))
+
+(defn prop-access-cfg [(n (dyn NodeOps))] (-> (Option (dyn CFGOps)))
+  (if (or (= (n-op n) OP-PROPLOAD) (= (n-op n) OP-PROPSTORE))
+      (Some (primitive/make-dyn CFGOps (prop-access-node n)))
+      (None [(dyn CFGOps)])))
+
+;; Build an access. `value` is Some only for a store.
+(defn prop-access-make [(ctrl (dyn NodeOps))
+                        (mem (dyn NodeOps))
+                        (object (dyn NodeOps))
+                        (value (Option (dyn NodeOps)))
+                        (key i64)
+                        (kind i64)] (-> (dyn NodeOps))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [PropAccessNode] (alloc/create [PropAccessNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (if (or (<= key 0) (> key (shape-key-count)))
+        (panic-i "prop-access-make: invalid property key" key)
+        0)
+    (set! (.key p) key)
+    (set! (.kind p) kind)
+    (set! (.res-mem p) 0)
+    (set! (.res-value p) 0)
+    (n-init! d (if (= kind PROP-STORE) OP-PROPSTORE OP-PROPLOAD))
+    (n-add-def! d (Some ctrl))
+    (n-add-def! d (Some mem))
+    (n-add-def! d (Some object))
+    (match value
+      (Some [v] (n-add-def! d (Some v)))
+      (None [] (if (= kind PROP-STORE) (panic "prop-access-make: a store needs a value") 0)))
+    (n-set-ty! d (compute p))
+    d))
+
+;; An access as the three values the frontend threads: its control, memory and value projections.
+(defn prop-access-emit [(ctrl (dyn NodeOps))
+                        (mem (dyn NodeOps))
+                        (object (dyn NodeOps))
+                        (value (Option (dyn NodeOps)))
+                        (key i64)
+                        (kind i64)] (-> PropertyAccessResult)
+  (let [d (prop-access-make ctrl mem object value key kind)]
+    (property-access-result (proj-make d PROP-RESULT-VALUE "prop.value")
+                            (cproj-make d PROP-RESULT-CTRL "prop.ctrl")
+                            (proj-make d PROP-RESULT-MEM "prop.mem"))))
+
+;; The generic path, once per unresolved access, after optimization: the guarded closed-world
+;; dispatch below. Nothing may remain afterwards; a later phase seeing an access is a wiring bug.
+(defn property-expand-all! [] (-> i64)
+  (let [cnt (arena-node-count)
+        (mut i) 1
+        (mut expanded) 0]
+    (loop (if (> (load i) cnt)
+              (break 0)
+              (do
+                (match (arena-node (load i))
+                  (Some [n]
+                        (if (and (not (n-dead? n)) (or (= (n-op n) OP-PROPLOAD) (= (n-op n) OP-PROPSTORE)))
+                            (let [p (prop-access-node n)]
+                              (if (!= (.res-mem p) 0)
+                                  0
+                                  (let [ctrl (n-in! n PROP-CTRL)
+                                        mem (n-in! n PROP-MEM)
+                                        object (n-in! n PROP-OBJECT)
+                                        access
+                                          (if (= (.kind p) PROP-STORE)
+                                              (property-store-generic-owner ctrl mem object (.key p) (n-in! n PROP-VALUE))
+                                              (property-own-named ctrl mem object (.key p) (= (.kind p) PROP-LOAD)))]
+                                    (set! (mut expanded) (+ (load expanded) 1))
+                                    (set! (.res-mem p) (n-nid (.mem access)))
+                                    (set! (.res-value p) (n-nid (.value access)))
+                                    (prop-access-forward! n (.ctrl access) (.mem access) (.value access))
+                                    (if (n-unused? n) (n-kill! n) 0)
+                                    0)))
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (set! (mut i) 1)
+    (loop (if (> (load i) cnt)
+              (break 0)
+              (do
+                (match (arena-node (load i))
+                  (Some [n]
+                        (if (and (not (n-dead? n)) (or (= (n-op n) OP-PROPLOAD) (= (n-op n) OP-PROPSTORE)) (> (n-nouts n) 0))
+                            (n-panic! "property-expand-all!: a property access survived expansion" n)
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load expanded)))
 
 (defstruct PropertyStorageResult
   [(ptr_ (dyn NodeOps)) (mem (dyn NodeOps))])
@@ -210,6 +501,80 @@
                                  (None [] (unreachable-node))))
       (phi-add-value! phi fallback)
       (property-access-result phi region mem))))
+
+;; An owner whose backing store is statically fixed to exactly one hidden class — the realm's
+;; global object after instantiation — needs no dispatch over the shape universe. The two guards
+;; stay (a backing store is present, its shape is the fixed one) so this path remains a
+;; specialization of the generic one and never asserts an unproven representation; but the arms
+;; the compiler proved impossible trap at run time instead of quietly yielding `undefined` or
+;; dropping a store. `value` None is a load; Some is a store of that value.
+(defn property-shaped-named [(ctrl (dyn NodeOps))
+                             (mem (dyn NodeOps))
+                             (object (dyn NodeOps))
+                             (shape i64)
+                             (key i64)
+                             (value (Option (dyn NodeOps)))] (-> PropertyAccessResult)
+  (do
+    (if (or (<= key 0) (> key (shape-key-count)))
+        (panic-i "property-shaped-named: invalid property key" key)
+        0)
+    (if (not (shape-has-key? shape key))
+        (panic-i "property-shaped-named: the fixed shape does not carry the key" key)
+        0)
+    (let [storage-word
+            (load-make ctrl mem object (con-int OFFSET-OBJECT-PROPERTIES) ALIAS-OBJECT-PROPERTIES (ty-dyn TAG-ANY))
+          is-storage (typetest-make storage-word TAG-OBJECT)
+          storage-if (if-make ctrl is-storage)
+          storage-arms (if-arms! storage-if)
+          storage-cast (cast-make (arms-true storage-arms) storage-word (ty-dyn TAG-OBJECT))
+          storage (unbox-make storage-cast REP-OBJECT)
+          shape-value (load-make (arms-true storage-arms) mem storage (con-int -8) ALIAS-OBJECT-SHAPE (ty-int-bot))
+          shape-if (if-make (arms-true storage-arms) (eq-make shape-value (con-int shape)))
+          shape-arms (if-arms! shape-if)
+          region (region-make)
+          load? (match value (Some [_] false) (None [] true))
+          phi (phi-make region (ty-dyn TAG-ANY) "property.shaped")
+          memphi (memphi-make region 1 TY-BOT "property.shaped.mem")
+          no-storage-trap (jsop-make (arms-false storage-arms) mem JS-TRAP-INVARIANT)
+          wrong-shape-trap (jsop-make (arms-false shape-arms) mem JS-TRAP-INVARIANT)]
+      (region-add-path! region (arms-false storage-arms))
+      (phi-add-value! phi (dyn-undefined-make))
+      (memphi-add-state! memphi (proj-make no-storage-trap 1 "property.shaped.trap.mem"))
+      (region-add-path! region (arms-false shape-arms))
+      (phi-add-value! phi (dyn-undefined-make))
+      (memphi-add-state! memphi (proj-make wrong-shape-trap 1 "property.shaped.trap.mem"))
+      (match value
+        (None []
+              (do
+                (region-add-path! region (arms-true shape-arms))
+                (phi-add-value! phi (load-make (arms-true shape-arms)
+                                               mem
+                                               storage
+                                               (con-int (shape-offset-key shape key))
+                                               (shape-alias-key shape key)
+                                               (ty-dyn TAG-ANY)))
+                (memphi-add-state! memphi mem)))
+        (Some [v]
+              (let [stored (property-store-shaped-storage (arms-true shape-arms) mem object storage shape key v)]
+                (region-add-path! region (.ctrl stored))
+                (phi-add-value! phi v)
+                (memphi-add-state! memphi (.mem stored)))))
+      (property-access-result (if load? phi (match value (Some [v] v) (None [] phi))) region memphi))))
+
+(defn property-load-shaped-named [(ctrl (dyn NodeOps))
+                                  (mem (dyn NodeOps))
+                                  (object (dyn NodeOps))
+                                  (shape i64)
+                                  (key i64)] (-> PropertyAccessResult)
+  (property-shaped-named ctrl mem object shape key (None [(dyn NodeOps)])))
+
+(defn property-store-shaped-named [(ctrl (dyn NodeOps))
+                                   (mem (dyn NodeOps))
+                                   (object (dyn NodeOps))
+                                   (shape i64)
+                                   (key i64)
+                                   (value (dyn NodeOps))] (-> PropertyAccessResult)
+  (property-shaped-named ctrl mem object shape key (Some value)))
 
 (defn property-load-own-named [(ctrl (dyn NodeOps))
                                (mem (dyn NodeOps))

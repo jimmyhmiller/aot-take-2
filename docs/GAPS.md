@@ -80,6 +80,21 @@ in selection, `ALIAS-FIRST-PROPERTY` follows the function aliases, and `ra-build
 undefined live range. A boxed live range with a fixed definition and a conflicting fixed use also
 no longer loops in the managed-root splitters: those apply only to ranges a safepoint restricted.
 
+### 2026-09-08 — Property access as a node, and the graph-size budgets
+
+Own-property loads, has-checks and stores are `PropAccess` nodes (docs/DECISIONS.md, property
+access is a node): they fold to a Load, a constant or the static transition when the owner's
+backing store is visible through memory SSA, and expand once before type checking otherwise.
+Keyed (runtime-key) accesses still take the eager keyed dispatch at the site. Global names no
+longer enter the write-key shape closure. Memory slices carry the private flag. Remaining costs,
+in order: the realm root is read through a runtime call at every global access (the heap-state
+register as a typed host pointer with the root as a memory slice is the planned shape); the
+unresolved expansion is the full closed-world dispatch rather than a call to one shared slow
+path; the dynamic axis does not carry a struct, so a value that crosses a Box loses its shape and
+every access through it pays the storage type test and shape compare. `tests/bloat-test.coil`
+holds node-count ceilings that fail on any regression of this class; `iter-peeps!` and
+`iter-run!` panic with a trace of recent rewrites or inlined sites instead of spinning.
+
 ### 2026-09-07 — Diagnostics
 
 `aot dump FILE PHASE [--dot] [--script]` prints the graph after parse, iter, opto, typecheck,

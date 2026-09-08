@@ -71,6 +71,7 @@
 ;; STATUS: implemented, including the INLINE worklist and its interleaving.
 (module aot.codegen.iterpeeps)
 (import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
 (import "coil.arraylist" :use *)
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
@@ -102,8 +103,48 @@
 ;;             push x's OUTPUTS
 ;;             n.subsume(x)          ; <<< THE REPLACEMENT. Without this the loop peepholes
 ;;                                   ;     nodes and never wires the result into the graph.
+;; A fixpoint over N nodes converges in a small multiple of N visits; a pair of peepholes undoing
+;; each other never does. The budget is generous enough never to fire on a converging graph, and
+;; the ring of recent rewrites names the oscillation when it trips.
+(const ITER-VISITS-PER-NODE 256)
+
+(const ITER-TRACE-RING 16)
+
+(defn iter--budget-exceeded! [(trace (ArrayList i64)) (next i64) (count i64)] (-> i64)
+  (do
+    (p--str "\naot: PANIC: iter-peeps!: the peephole fixpoint did not converge after ")
+    (p--int count)
+    (p--str " visits over ")
+    (p--int (arena-node-count))
+    (p--str " nodes; the most recent rewrites, oldest first (rewritten node -> replacement):\n")
+    (let [(mut i) 0]
+      (loop (if (>= (load i) ITER-TRACE-RING)
+                (break 0)
+                (let [slot (% (+ next (load i)) ITER-TRACE-RING)
+                      from (get trace (* 2 slot))
+                      to (get trace (+ (* 2 slot) 1))]
+                  (if (!= from 0)
+                      (do
+                        (p--str "  ")
+                        (match (arena-node from) (Some [a] (p--str (n-text a))) (None [] (p--str "(collected)")))
+                        (p--str "\n    -> ")
+                        (match (arena-node to) (Some [b] (p--str (n-text b))) (None [] (p--str "(collected)")))
+                        (p--str "\n")
+                        0)
+                      0)
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    (panic "iter-peeps!: peephole fixpoint did not converge")))
+
 (defn iter-peeps! [] (-> i64)
-  (let [(mut count) 0]
+  (let [(mut count) 0
+        budget (* ITER-VISITS-PER-NODE (+ (arena-node-count) 4096))
+        (mut trace) (al-new [i64] (alloc/malloc-allocator))
+        (mut next) 0]
+    (let [(mut fill) 0]
+      (loop (if (>= (load fill) (* 2 ITER-TRACE-RING))
+                (break 0)
+                (do (push! [i64] (mut trace) 0) (set! (mut fill) (+ (load fill) 1)) (continue)))))
     (loop (match (code-work-pop!)
             (None [] (break 0))
             (Some [id]
@@ -114,6 +155,9 @@
                               (continue)
                               (do
                                 (set! (mut count) (+ (load count) 1))
+                                (if (> (load count) budget)
+                                    (iter--budget-exceeded! (load trace) (load next) (load count))
+                                    0)
                                 ;; Every CallEnd VISITED becomes an inline candidate. This is how a
                                 ;; call that sharpens enters the inline worklist without anyone
                                 ;; tracking candidates explicitly.
@@ -122,6 +166,9 @@
                                   (None [] 0)
                                   (Some [x]
                                         (do
+                                          (set! (mut trace) (* 2 (load next)) (n-nid n))
+                                          (set! (mut trace) (+ (* 2 (load next)) 1) (n-nid x))
+                                          (set! (mut next) (% (+ (load next) 1) ITER-TRACE-RING))
                                           (iter--apply! n x)
                                           ;; A peephole can depend on nodes outside its immediate
                                           ;; input/output neighbourhood.  Simple wakes and clears
@@ -136,6 +183,7 @@
                                     (n-kill! n)
                                     0)
                                 (continue))))))))
+    (al-free! [i64] (mut trace))
     (load count)))
 
 ;; The replacement half of the loop above.
@@ -191,7 +239,11 @@
   ;;   `iter-peeps!` pushes every CallEnd it visits onto the inline worklist, so a call that
   ;;   sharpens becomes a candidate without anyone tracking that explicitly.
   (let [(mut did-inline) false
-        (mut rounds) 0]
+        (mut rounds) 0
+        ;; Every round inlines exactly one call site and never creates a new source-level site,
+        ;; so the number of rounds is bounded by the sites the graph ever holds. A round count far
+        ;; beyond the arena means cloning keeps manufacturing sites: report the recent ones.
+        (mut recent) (al-new [i64] (alloc/malloc-allocator))]
     (loop (do
             (iter-peeps!)
             (let [fired (iter--one-inline!)]
@@ -199,6 +251,10 @@
                   (do
                     (set! (mut did-inline) true)
                     (set! (mut rounds) (+ (load rounds) 1))
+                    (push! [i64] (mut recent) (iter-last-inlined))
+                    (if (> (load rounds) (+ 1024 (arena-node-count)))
+                        (iter--rounds-exceeded! (load recent) (load rounds))
+                        0)
                     (continue))
                   (if (not (load did-inline))
                       (break 0)
@@ -364,6 +420,35 @@
 ;; ready and retrying would spin.
 ;;
 ;; Returns true when an inline happened.
+(defstruct IterInlineTrace [(last i64)])
+
+(defn iter-inline-trace [] (-> (ptr IterInlineTrace))
+  (primitive/alloc-static IterInlineTrace))
+
+;; The CallEnd the most recent inline round fired on.
+(defn iter-last-inlined [] (-> i64)
+  (.last (iter-inline-trace)))
+
+(defn iter--rounds-exceeded! [(recent (ArrayList i64)) (rounds i64)] (-> i64)
+  (do
+    (p--str "\naot: PANIC: iter-run!: inlining did not converge after ")
+    (p--int rounds)
+    (p--str " rounds over ")
+    (p--int (arena-node-count))
+    (p--str " nodes; the most recently inlined CallEnds, oldest first:\n")
+    (let [(mut i) (if (> (len recent) 12) (- (len recent) 12) 0)]
+      (loop (if (>= (load i) (len recent))
+                (break 0)
+                (do
+                  (p--str "  ")
+                  (match (arena-node (get recent (load i)))
+                    (Some [c] (p--str (n-text c)))
+                    (None [] (do (p--str "#") (p--int (get recent (load i))) (p--str " (collected)"))))
+                  (p--str "\n")
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    (panic "iter-run!: inlining did not converge")))
+
 (defn iter--one-inline! [] (-> bool)
   (let [(mut fired) false]
     (loop (match (code-inline-pop!)
@@ -379,6 +464,7 @@
                                     (do (code-defer-inline! id) (continue))
                                     (if (> d 0)
                                         (do
+                                          (set! (.last (iter-inline-trace)) id)
                                           (set! (mut fired) true)
                                           (break 0))
                                         (continue))))))))))

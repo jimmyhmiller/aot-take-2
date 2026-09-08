@@ -180,7 +180,7 @@ aot-take-2/
 │   │   ├── call.coil        ; Fun, Parm, Call, CallEnd, Return, Escape
 │   │   ├── scope.coil       ; ScopeNode + Var — the parser's SSA helper
 │   │   ├── dynamic.coil     ; ✦ Box, Unbox, TypeTest, Cast — the guard mechanism
-│   │   ├── property.coil    ; ✦ PropLoad/Store (named + keyed), ArrayLoad/Store/Len
+│   │   ├── property.coil    ; ✦ PropAccess node (load/has/store), its fold and late expansion
 │   │   ├── jsops.coil       ; ✦ string, symbol and number primitives the JSL layer bottoms out on
 │   │   ├── closure.coil     ; ✦ closure creation and captured-environment access
 │   │   ├── exception.coil   ; ✦ Throw and the exceptional control edge
@@ -224,6 +224,10 @@ aot-take-2/
 │   │   ├── lower.coil       ; JSL → ideal graph, and the transition check over it
 │   │   └── decls.coil       ; (intrinsic …), (internal-slot …), (slot-list …)
 │   │
+│   ├── rt/                  ; the runtime, in Coil, built as its own object (Coil.toml `runtime`)
+│   │   ├── abi.coil         ; RtHeap layout + folded field offsets shared with the encoders
+│   │   └── rt.coil          ; allocation, generational collector, strings, throw entry points
+│   │
 │   ├── print/
 │   │   ├── ir.coil          ; the pretty printer                          IRPrinter
 │   │   ├── asm.coil         ; the disassembly printer                     ASMPrinter
@@ -245,6 +249,7 @@ aot-take-2/
 │   ├── lex-test.coil  parse-test.coil  regex-test.coil  tstype-test.coil  jsl-test.coil
 │   ├── test262-test.coil            ; metadata, runner policy and accounting regressions
 │   ├── harness.coil                 ; source in → linked binary out → node's answer beside it
+│   ├── bloat-test.coil              ; graph-size budgets: node-count ceilings after optimization
 │   ├── execution-test.coil          ; cases that must RUN, not merely compile
 │   └── differential-test.coil       ; compiled output vs. a JavaScript engine
 ├── benchmarks/              ; JavaScript/TypeScript input fixtures for native comparisons

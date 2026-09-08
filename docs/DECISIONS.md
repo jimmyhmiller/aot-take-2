@@ -1,5 +1,69 @@
 # Decisions
 
+## 2026-09-08 — A property access is a node that folds through memory SSA, never an eager dispatch
+
+Simple has no property dispatch: a field access is a `Load` whose alias and offset come from the
+struct type, and `LoadNode.idealize` folds a load after a store to the same address, bypassing
+stores to provably unrelated objects. JavaScript's hidden classes force a dispatch when the shape
+is unknown, but the *site* must not pay for it. An own-property access is therefore `PropAccess`, a
+call-like node (control, memory, value) carrying its constant key and kind (load, has, store). Its
+idealize is Simple's fold reached through the owner's properties word: when memory SSA shows that
+word to be a Store of a boxed fresh allocation, the access becomes one Load, one constant, or the
+static store transition, and its projections forward. Inlining is what exposes that pattern at
+sites opaque at parse time, which is why this is a node and not an expansion; whatever is still
+unresolved when optimization ends expands exactly once, before type checking, into the guarded
+closed-world dispatch. `JsGetNamed` peels the own-property step off the prototype walk so a
+receiver the compiler can see folds to a single Load at the site and only the chain remains a call.
+Measured on `let o = {a: 1}; return o.a + o.a`: 178 nodes after optimization became 37, the sum a
+constant. `tests/bloat-test.coil` holds the ceilings.
+
+Two neighbours were fixed with it. Global names never enter the shape universe's write-key
+closure: a lexically resolved global is a field access over the realm's one hidden class, and
+adding the names had multiplied the universe by every permutation of the globals (47,000 nodes
+for a ten-line realm, a 105-second fixpoint). And a memory slice now carries Simple's `_one`:
+an allocation's private memory and the stores continuing it for that same object are private and
+track just the stored value; a store to any other object may not use a private slice as its
+prior (BOT) and a load through any other object reads only its declared type from it. Without the
+flag a fresh object's `null` properties word typed the shared slice every other object read, and a
+shaped store folded to its impossible-arm trap. TOP memory is private TOP and the dual flips the
+flag, so the memory lattice has a proper high end.
+
+The next cost is the realm root itself: every global access still reads the global object
+through a runtime call. The intended shape is the heap-state register as a typed host pointer and
+the root as an ordinary memory slice, so the read is a Load that GVN hoists once per function.
+
+## 2026-09-07 — A realm is an ordered list of Scripts compiled together over one global object
+
+Simple has no global environment: its top level is a function. JavaScript's is a Global
+Environment Record shared by every Script a realm evaluates, and test262 runs its harness Scripts
+before each test in exactly that shared record. A realm here is therefore an ordered list of
+Script sources compiled into one binary. Each Script keeps its own directive prologue, its own
+strictness and its own root function; the function table, the property-key universe and the
+closed world are shared; the entry code runs the roots in order.
+
+The global object is a real heap object created by the first Script's root before any of its
+statements run, published once to the runtime root `RtHeap.global-object` (forwarded by every
+collection, checked by `AOT_RT_GC_VERIFY`) and read back through `aot_rt_global_object` from any
+other function. It is built with the ordinary object machinery — `JsNewObjectRaw` and one
+`JsCreateDataPropertyNamed` per name, initialized to `undefined` — so its hidden class is the
+same transition path any literal with those keys would take and the generic property path agrees
+with it. Its property set is the closed world's var-like global names: every top-level `var` and
+function declaration of every Script. A lexically resolved global reference is then an ordinary
+`JsGetNamedObject`/`JsDefineOwnNamed` against that object; a direct field access over the
+statically known layout is a later optimization, not a different semantics.
+
+GlobalDeclarationInstantiation is static: every property exists from the start (holding
+`undefined`), so a Script's var step is a no-op, and its function step stores each declared
+function object at the Script's start in declaration order (later declarations win). A read of a
+global declared only by a later Script would be a ReferenceError and refuses by name until
+exceptions exist. Reading a function declaration as a value loads the same object every time, so
+`f === f` holds. A call names the declared Fun directly only when nothing in the realm ever assigns
+that name — a fact the closed world settles syntactically, conservatively counting any assignment
+to an identifier of that name — and otherwise calls through the loaded value. Top-level `let`,
+`const` and `class` remain Script-local Scope bindings that functions may not read yet; their
+shared cells with TDZ arrive with exceptions. Undeclared names remain global-object property
+accesses the compiler refuses by name.
+
 ## 2026-09-07 — `dyn{null}` is a constant type, and a non-constant `Con` never reaches selection silently
 
 `undefined` and `null` are the two dynamic tags with exactly one value, so both are constant
