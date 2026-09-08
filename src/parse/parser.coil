@@ -60,7 +60,7 @@
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use [subslice slice-data])
-(import "coil.str" :use [sb-new sb-push-byte! sb-push-i64! sb-str sb-free!])
+(import "coil.str" :use [sb-new sb-push-byte! sb-push-str! sb-push-i64! sb-str sb-free!])
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
 (import "aot.node.constant" :use *)
@@ -69,6 +69,7 @@
 (import "aot.node.call" :use *)
 (import "aot.node.dynamic" :use *)
 (import "aot.node.memory" :use *)
+(import "aot.node.jsops" :use *)
 (import "aot.node.scope" :use *)
 (import "aot.type.type" :use *)
 (import "aot.shape" :use *)
@@ -278,6 +279,7 @@
    (strict bool)
    (in-class bool)  ; class bodies are strict code
    (hoisted bool)  ; a top-level declaration (or the Script root): lowered as a closed-world Fun
+   (value-taken bool)  ; materialized as a function object: its pointer escapes into values
    (lo i64)
    (hi i64)
    (fidx i64)
@@ -323,6 +325,8 @@
    (cover-consumed (ArrayList i64))  ; literals reinterpreted as patterns
    (rest-comma (ArrayList i64))  ; literals whose final `...` element was followed by a comma
    (annexb-blocks (ArrayList i64))  ; synthetic Blocks around `if (x) function f() {}`
+   (abi-slots i64)  ; program-wide maximum formal count: every function's argument slots
+   (abi-sig i64)  ; the shared boxed signature [ret this slot…]
    (class-depth i64)  ; open class bodies: private-name scope
    (class-strict i64)  ; open class definitions, including name and heritage: strict code
    (private-refs (ArrayList PrivateRef))
@@ -3776,6 +3780,7 @@
     (set! (.parent (mut f)) (parser-current-fun))
     (set! (.in-class (mut f)) (> (.class-strict (parser-state)) 0))
     (set! (.hoisted (mut f)) false)
+    (set! (.value-taken (mut f)) false)
     (set! (.strict (mut f)) false)
     (set! (.lo (mut f)) lo)
     (push! [SyntaxFun] (mut (.funs (parser-state))) (load f))
@@ -4953,6 +4958,96 @@
 (defn syntax-top-level-declaration? [(i i64)] (-> bool)
   (let [f (syntax-fun-at i)] (.hoisted f)))
 
+;; Whether the header pass gave this function record a Fun: hoisted declarations and admitted
+;; function values.
+(defn syntax-fun-lowered? [(i i64)] (-> bool)
+  (let [f (syntax-fun-at i)] (!= (.fun-nid f) 0)))
+
+;; Function values the closed world lowers today: plain declarations, expressions and arrows with
+;; simple parameter lists. Methods, accessors, generators and async functions refuse at their use.
+(defn syntax-fun-value-admitted? [(f SyntaxFun)] (-> bool)
+  (and (match (.kind f)
+         (FunDeclaration [] true)
+         (FunExpression [] true)
+         (FunArrow [] true)
+         (_ false))
+       (.simple-params f)
+       (not (.generator f))
+       (not (.async f))
+       (not (syntax-fun-has-patterns? f))))
+
+;; Every source function shares one boxed signature: `this`, then the program-wide maximum formal
+;; count of slots (docs/DECISIONS.md, function values).
+(defn parser-abi-slots [] (-> i64)
+  (.abi-slots (parser-state)))
+
+(defn parser-abi-sig [] (-> i64)
+  (.abi-sig (parser-state)))
+
+(defn parser-settle-abi! [] (-> i64)
+  (let [(mut slots) 0 (mut members) (al-new [i64] (alloc/malloc-allocator))]
+    (al-for [f (.funs (parser-state))]
+            (let [fun f]
+              (if (> (len (.params fun)) (load slots)) (set! (mut slots) (len (.params fun))) 0)))
+    (push! [i64] (mut members) (ty-dyn TAG-ANY))
+    (let [(mut i) 0]
+      (loop (if (> (load i) (load slots))
+                (break 0)
+                (do (push! [i64] (mut members) (ty-dyn TAG-ANY)) (set! (mut i) (+ (load i) 1)) (continue)))))
+    (set! (.abi-slots (parser-state)) (load slots))
+    (set! (.abi-sig (parser-state)) (ty-tuple (al-slice (load members))))
+    0))
+
+;; Compiler-owned symbol for a function value; a dot keeps it outside the source namespace.
+(defn parser-value-fun-name [(index i64)] (-> (slice u8))
+  (let [(mut sb) (sb-new (alloc/malloc-allocator))]
+    (sb-push-str! (mut sb) "$aot$.fn.")
+    (sb-push-i64! (mut sb) index)
+    (sb-str (mut sb))))
+
+;; The function-pointer set a code word loaded from any function object may hold: every function
+;; the program lowered. Finite, so Opto links a value call to exactly these targets.
+(defn parser-value-funptr-ty [] (-> i64)
+  (let [(mut fidxs) (al-new [i64] (alloc/malloc-allocator)) (mut i) 0]
+    (loop (if (>= (load i) (len (.funs (parser-state))))
+              (break 0)
+              (do
+                (if (syntax-fun-lowered? (load i))
+                    (let [f (syntax-fun-at (load i))] (push! [i64] (mut fidxs) (.fidx f)))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (let [t (ty-funptr (parser-abi-sig) (fidx-set-intern (al-slice (load fidxs))))]
+      (al-free! [i64] (mut fidxs))
+      t)))
+
+;; Whether `name` is bound by an enclosing function of `fun`: a parameter, a var, a lexical
+;; declaration or a nested function declaration. Such a reference is a capture.
+(defn syntax-enclosing-binding? [(fun i64) (name (slice u8))] (-> bool)
+  (let [(mut current) (let [f (syntax-fun-at fun)] (.parent f))
+        (mut found) false]
+    (loop (if (or (load found) (< (load current) 0))
+              (break 0)
+              (let [f (syntax-fun-at (load current))
+                    (mut names) (al-new [(slice u8)] (alloc/malloc-allocator))]
+                (if (.hoisted f)
+                    0  ; the Script root and top-level declarations own globals and hoisted Funs, not captures
+                    (do
+                      (al-for [p (.params f)] (push! [(slice u8)] (mut names) p))
+                      (match (.rest-param f) (Some [r] (push! [(slice u8)] (mut names) r)) (None [] 0))
+                      (syntax-collect-declarations! (.body f) false (mut names))
+                      (syntax-collect-declarations! (.body f) true (mut names))
+                      (syntax-function-decl-names! (.body f) (mut names))
+                      (match (.kind f)
+                        (FunExpression [] (push! [(slice u8)] (mut names) (.name f)))
+                        (_ 0))
+                      (al-for [n (load names)] (if (= n name) (set! (mut found) true) 0))
+                      0))
+                (al-free! [(slice u8)] (mut names))
+                (set! (mut current) (.parent f))
+                (continue))))
+    (load found)))
+
 ;; The program loop marks the declarations it parsed at the top level as hoisted Funs.
 (defn syntax-mark-hoisted! [(stmt i64)] (-> i64)
   (match (syntax-stmt-node stmt)
@@ -5052,13 +5147,19 @@
                                            "JsInfinity"
                                            "JsNaN"))
                       (if (>= (syntax-find-fun name) 0)
-                          (do
-                            (unimplemented "first-class reference to a function declaration"
-                                           "docs/GAPS.md — function values and closures")
-                            (unreachable-node))
-                          (do
-                            (panic "parser: unknown binding during lowering")
-                            (unreachable-node)))))))))
+                          (lower-function-object (syntax-find-fun name))
+                          (if (syntax-enclosing-binding? (.current-fun (parser-state)) name)
+                              (do
+                                (unimplemented "captured variables (closures)"
+                                               "docs/GAPS.md — function values and closures")
+                                (unreachable-node))
+                              ;; Nothing in the Script or any enclosing function declares the
+                              ;; name: it is a Reference into the global object, resolved at
+                              ;; runtime as a property read or a ReferenceError.
+                              (do
+                                (unimplemented "unresolved global Reference resolution (global object lookup or ReferenceError)"
+                                               "docs/GAPS.md — global environments and function values")
+                                (unreachable-node))))))))))
 
 (defn parser-set-current-ctrl! [(ctrl (dyn NodeOps))] (-> i64)
   (do
@@ -5192,9 +5293,14 @@
             (parser-set-current-ctrl! (.ctrl stored))
             (scope-set-mem! scope (.mem stored))
             0))
-        (if (and (not (.bound ref)) (syntax-restricted-global? (.name ref)))
-            0
-            (scope-update! scope (.name ref) value)))))
+        (if (.bound ref)
+            (scope-update! scope (.name ref) value)
+            (if (syntax-restricted-global? (.name ref))
+                0
+                ;; Script-level function declarations and undeclared names are global-object
+                ;; properties; a write to one is a property write, not a Scope update.
+                (unimplemented "PutValue to a Script-level function declaration or unresolved global"
+                               "docs/GAPS.md — shared global-object bindings"))))))
 
 (defn lower-ref-release! [(ref SyntaxRef)] (-> i64)
   (if (.member ref)
@@ -5398,6 +5504,123 @@
           (n-unkeep! no)
           phi)))))
 
+;; A function object: an ordinary object's two words, the raw code word and a boxed environment
+;; (null until closures exist), boxed under the FUNCTION prefix. Representation only; property
+;; semantics on functions arrive with the object model.
+(defn lower-function-object [(fun-index i64)] (-> (dyn NodeOps))
+  (let [f (syntax-fun-at fun-index)]
+    (if (not (syntax-fun-lowered? fun-index))
+        (do (unimplemented "methods, accessors, generators and async functions as values"
+                           "docs/GAPS.md — function values and closures")
+            (unreachable-node))
+        (let [scope (parser-node (.current-scope (parser-state)))
+              ctrl (parser-node (.current-ctrl (parser-state)))
+              mem (scope-mem scope)
+              target (parser-node (.fun-nid f))
+              fp (syntax-fun-ptr fun-index)
+              fresh (new-make ctrl (con-int FUNCTION-PAYLOAD-BYTES) mem SHAPE-EMPTY
+                              (ty-struct "JsFunctionPayload"))
+              ptr_ (proj-make fresh 0 "function.ptr")
+              private (proj-make fresh 1 "function.private-memory")
+              null-value (dyn-null-make)
+              prototype-state (store-make ctrl private ptr_ (con-int OFFSET-OBJECT-PROTOTYPE) null-value
+                                          ALIAS-OBJECT-PROTOTYPE (ty-dyn TAG-ANY))
+              properties-state (store-make ctrl prototype-state ptr_ (con-int OFFSET-OBJECT-PROPERTIES)
+                                           null-value ALIAS-OBJECT-PROPERTIES (ty-dyn TAG-ANY))
+              code-state (store-make ctrl properties-state ptr_ (con-int OFFSET-FUNCTION-CODE)
+                                     (funptr-make target (.fidx f))
+                                     ALIAS-FUNCTION-CODE (parser-value-funptr-ty))
+              env-state (store-make ctrl code-state ptr_ (con-int OFFSET-FUNCTION-ENV) null-value
+                                    ALIAS-FUNCTION-ENV (ty-dyn TAG-ANY))
+              merged (memmerge-make)]
+          (memmerge-set-alias! merged ALIAS-BULK mem)
+          (memmerge-set-alias! merged ALIAS-OBJECT-PROTOTYPE prototype-state)
+          (memmerge-set-alias! merged ALIAS-OBJECT-PROPERTIES properties-state)
+          (memmerge-set-alias! merged ALIAS-FUNCTION-CODE code-state)
+          (memmerge-set-alias! merged ALIAS-FUNCTION-ENV env-state)
+          ;; The pointer now escapes into a value: the Fun is never inlined away from under its
+          ;; address. Callers stay closed-world: every value call site links the finite set, so
+          ;; parameter evidence still comes from actual arguments.
+          (set! (.value-taken fp) true)
+          (fun-set-escapes! target)
+          (scope-set-mem! scope merged)
+          (box-make-rep-at (Some ctrl) ptr_ REP-FUNCTION)))))
+
+;; Call through a value. The callee and every actual are evaluated first, as the specification
+;; orders them; then a FUNCTION guard either loads the code word and calls through the shared
+;; ABI or hands the value to the runtime's abrupt-completion entry (a TypeError once exceptions
+;; exist). Both arms merge as an ordinary Scope diamond.
+(defn lower-value-call [(callee (dyn NodeOps)) (args (ArrayList i64))] (-> (dyn NodeOps))
+  (let [slots (parser-abi-slots)
+        (mut actuals) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))]
+    (n-keep! callee)
+    (al-for [a args]
+            (let [v (lower-syntax-expr a)]
+              (n-keep! v)
+              (push! [(dyn NodeOps)] (mut actuals) v)))
+    (let [scope (parser-node (.current-scope (parser-state)))
+          g (guard! (parser-node (.current-ctrl (parser-state))) callee TAG-FUNCTION)
+          false-scope (scope-dup scope false)]
+      (parser-set-current-ctrl! (guard-true g))
+      ;; `if-arms!` peepholes both arms: a provably callable callee folds the true arm into the
+      ;; incoming control, so re-read the current control instead of holding the projection.
+      (let [true-ctrl (parser-node (.current-ctrl (parser-state)))
+            mem (scope-mem scope)
+            raw (unbox-make (guard-narrowed g) REP-FUNCTION)
+            code (load-make true-ctrl mem raw (con-int OFFSET-FUNCTION-CODE)
+                            ALIAS-FUNCTION-CODE (parser-value-funptr-ty))
+            c (call-make-with-mem true-ctrl mem)
+            (mut i) 0]
+        (call-add-arg! c (dyn-undefined-make))
+        (loop (if (>= (load i) slots)
+                  (break 0)
+                  (do
+                    (call-add-arg! c (if (< (load i) (len (load actuals)))
+                                         (get (load actuals) (load i))
+                                         (dyn-undefined-make)))
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        (call-set-fptr! c code)
+        (let [end (callend-make c)
+              value (proj-make end RETURN-VALUE "value-call.value")]
+          (n-keep! value)
+          (parser-set-current-ctrl! (cproj-make end RETURN-CTRL "value-call.ctrl"))
+          (scope-set-mem! scope (proj-make end RETURN-MEM "value-call.mem"))
+          (let [called-scope (parser-node (.current-scope (parser-state)))]
+            (set! (.current-scope (parser-state)) (n-nid false-scope))
+            (parser-set-current-ctrl! (guard-false g))
+            (let [false-ctrl (parser-node (.current-ctrl (parser-state)))
+                  trap (jsop-make false-ctrl (scope-mem false-scope) JS-THROW-TYPE-ERROR)]
+              (scope-set-mem! false-scope (proj-make trap 1 "value-call.throw.mem")))
+            (let [merged (scope-merge! called-scope false-scope)
+                  region (scope-ctrl merged)
+                  phi (phi-make region (ty-dyn TAG-ANY) "value-call")]
+              (phi-add-value! phi value)
+              (phi-add-value! phi (dyn-undefined-make))
+              (set! (.current-scope (parser-state)) (n-nid merged))
+              (set! (.current-ctrl (parser-state)) (n-nid region))
+              (n-unkeep! value)
+              (al-for [v (load actuals)] (n-unkeep! v))
+              (n-unkeep! callee)
+              (al-free! [(dyn NodeOps)] (mut actuals))
+              phi)))))))
+
+;; FunctionDeclarations at the top level of a function body are var-like bindings initialized
+;; with their function objects on entry (FunctionDeclarationInstantiation).
+(defn lower-bind-body-functions! [(stmts (ArrayList i64))] (-> i64)
+  (do
+    (al-for [id stmts]
+            (match (syntax-stmt-node id)
+              (SsFunctionDecl [fun]
+                              (let [f (syntax-fun-at fun)]
+                                (if (.hoisted f)
+                                    0
+                                    (scope-update! (parser-node (.current-scope (parser-state)))
+                                                   (.name f)
+                                                   (lower-function-object fun)))))
+              (_ 0)))
+    0))
+
 (defn lower-member-read [(owner-id i64) (name (slice u8))] (-> (dyn NodeOps))
   (let [owner (lower-syntax-expr owner-id)
         scope (parser-node (.current-scope (parser-state)))
@@ -5418,25 +5641,22 @@
   (let [target-idx (syntax-find-fun name)]
     (if (or (>= (scope-find (parser-node (.current-scope (parser-state))) name)
                 0)
-            (syntax-script-binding? name))
-        (unimplemented "indirect call through a lexical binding"
-                       "docs/GAPS.md — function values and closures")
-        0)
-    (if (< target-idx 0)
-        (do
-          (panic "parser: call to undeclared function")
-          (unreachable-node))
+            (syntax-script-binding? name)
+            (< target-idx 0))
+        ;; A binding, not a hoisted declaration: call through whatever value it holds.
+        (lower-value-call (lower-name name) args)
         (let [target-syntax (syntax-fun-at target-idx)
               target (parser-node (.fun-nid target-syntax))
               scope (parser-node (.current-scope (parser-state)))
               c
                 (call-make-with-mem (parser-node (.current-ctrl (parser-state)))
                                     (scope-mem scope))
-              formal-count (len (.params target-syntax))
+              formal-count (parser-abi-slots)
               (mut i) 0]
-          ;; JavaScript evaluates every actual left-to-right. The current fixed internal ABI
-          ;; carries only declared formals: extra actuals still run for effects, while omitted
-          ;; formals receive the canonical boxed undefined.
+          ;; JavaScript evaluates every actual left-to-right. The shared ABI carries `this` and
+          ;; the program-wide slot count: extra actuals still run for effects, while omitted
+          ;; slots receive the canonical boxed undefined.
+          (call-add-arg! c (dyn-undefined-make))
           (loop (if (>= (load i) (len args))
                     (break 0)
                     (do
@@ -5565,10 +5785,22 @@
                             (unreachable-node))
                           (match (syntax-node (syntax-ungroup-id callee))
                             (SxName [name] (lower-named-call name args))
-                            (_ (do
-                                 (unimplemented "calls through callable values"
-                                                "docs/GAPS.md — function values and closures")
-                                 (unreachable-node))))))
+                            (SxMember [owner member optional]
+                                      (do
+                                        (unimplemented "method calls (this binding)"
+                                                       "docs/GAPS.md — function values and closures")
+                                        (unreachable-node)))
+                            (SxPrivateMember [owner member optional]
+                                             (do
+                                               (unimplemented "private method calls"
+                                                              "docs/GAPS.md — classes")
+                                               (unreachable-node)))
+                            (SxIndex [owner key optional]
+                                     (do
+                                       (unimplemented "computed member calls (this binding)"
+                                                      "docs/GAPS.md — function values and closures")
+                                       (unreachable-node)))
+                            (_ (lower-value-call (lower-syntax-expr callee) args)))))
               (SxNew [callee args]
                      (do
                        (unimplemented "constructor calls"
@@ -5612,11 +5844,7 @@
                          (unimplemented "regular expression objects"
                                         "docs/GAPS.md — RegExp")
                          (unreachable-node)))
-              (SxFunction [fun]
-                          (do
-                            (unimplemented "function expressions and arrow functions (function values)"
-                                           "docs/GAPS.md — function values and closures")
-                            (unreachable-node)))
+              (SxFunction [fun] (lower-function-object fun))
               (SxYield [argument delegate]
                        (do
                          (unimplemented "generator yield"
@@ -5873,6 +6101,16 @@
                             (unimplemented "destructuring declarations" "docs/GAPS.md — destructuring"))
               (SsDeclList [decls] (lower-instantiate-lexicals! decls))
               (SsCase [selector body] (lower-instantiate-lexicals! body))
+              ;; A block-level FunctionDeclaration is a lexical binding initialized on block entry.
+              ;; The function body's own list is instantiated var-like by `lower-bind-body-functions!`
+              ;; instead, which finds the var already defined.
+              (SsFunctionDecl [fun]
+                              (let [f (syntax-fun-at fun)
+                                    scope (parser-node (.current-scope (parser-state)))]
+                                (if (or (.hoisted f) (>= (scope-find scope (.name f)) 0))
+                                    0
+                                    (scope-define! scope (.name f) (ty-dyn TAG-ANY) false
+                                                   (lower-function-object fun)))))
               (_ 0)))
     0))
 
@@ -6233,11 +6471,12 @@
     ;; `debugger` has no observable semantics outside a debugger and lowers to nothing.
     (SsDebugger [] 0)
     ;; A hoisted top-level declaration is already a Fun; nothing executes at its statement.
+    ;; A nested declaration was bound on entry; nothing executes at the statement itself.
     (SsFunctionDecl [fun]
-                    (if (syntax-top-level-declaration? fun)
+                    (if (syntax-fun-lowered? fun)
                         0
-                        (unimplemented "nested function declarations (closures)"
-                                       "docs/GAPS.md — function values and closures")))
+                        (unimplemented "generator and async function declarations"
+                                       "docs/GAPS.md — function environments")))
     (SsClassDecl [cls] (unimplemented "class definitions" "docs/GAPS.md — classes"))))
 
 (defn lower-syntax-statements [(stmts (ArrayList i64))] (-> i64)
@@ -6277,7 +6516,7 @@
           (n-keep! mem-parm)
           (let [c (call-make-with-mem wrapper mem-parm)]
             (let [(mut i) 0]
-              (loop (if (>= (load i) (len (.params syntax)))
+              (loop (if (> (load i) (parser-abi-slots))
                         (break 0)
                         (do
                           (call-add-arg! c (dyn-undefined-make))
@@ -6407,44 +6646,41 @@
     ;; the complete layout universe while JavaScript prototype traversal remains recursive JSL.
     (syntax-declare-object-shapes!)
     (jsl-lower-index! "jsl/compiler/index")
+    (parser-settle-abi!)
     (let [start (start-make (ty-int-bot))
           stop (stop-make)
           (mut fi) 0]
-      ;; Header pass: install all Fun/Parm nodes before lowering any call-bearing body. Only
-      ;; hoisted top-level declarations are Funs; function values are refused at their use.
+      ;; Header pass: install all Fun/Parm nodes before lowering any call-bearing body. Hoisted
+      ;; top-level declarations and admitted function values are Funs, all over the shared ABI;
+      ;; other function forms are refused at their use.
       (loop (if (>= (load fi) (len (.funs (parser-state))))
                 (break 0)
-                (if (not (syntax-top-level-declaration? (load fi)))
+                (if (not (or (syntax-top-level-declaration? (load fi))
+                             (syntax-fun-value-admitted? (syntax-fun-at (load fi)))))
                     (do (set! (mut fi) (+ (load fi) 1)) (continue))
                     (let [fp
                             (al-elem [SyntaxFun]
                                      (mut (.funs (parser-state)))
                                      (load fi))
-                          argc (len (.params fp))
-                          (mut members) (al-new [i64] (alloc/malloc-allocator))]
+                          argc (+ 1 (parser-abi-slots))]
                       (if (or (not (.simple-params fp))
                               (.generator fp)
                               (.async fp))
                           (unimplemented "default, rest, generator and async functions"
                                          "docs/GAPS.md — function environments")
                           0)
-                      ;; JavaScript calling convention: return and arguments are dynamic values.
-                      ;; `number` is evidence to discharge later, never a raw representation claim.
-                      (push! [i64] (mut members) (ty-dyn TAG-ANY))
-                      (let [(mut i) 0]
-                        (loop (if (>= (load i) argc)
-                                  (break 0)
-                                  (do
-                                    (push! [i64] (mut members) (ty-dyn TAG-ANY))
-                                    (set! (mut i) (+ (load i) 1))
-                                    (continue)))))
+                      ;; JavaScript calling convention: return, `this` and every argument slot are
+                      ;; dynamic values. `number` is evidence to discharge later, never a raw
+                      ;; representation claim.
                       (let [fun
                               (fun-make start
-                                        (ty-tuple (al-slice (load members)))
+                                        (parser-abi-sig)
                                         (if (= (load fi)
                                                (syntax-find-fun "main"))
                                             (parser-internal-main-name)
-                                            (.name fp)))
+                                            (if (.hoisted fp)
+                                                (.name fp)
+                                                (parser-value-fun-name (load fi)))))
                             (mut i) 0]
                         ;; JSL declarations reserved the low closed-world identities. Every source
                         ;; declaration receives a distinct identity from the same compilation-local
@@ -6468,12 +6704,15 @@
                                   (break 0)
                                   (do
                                     ;; Headers precede bodies, so hold parameter Phis alive until every
-                                    ;; body and call edge has been installed.
+                                    ;; body and call edge has been installed. Slot 0 is `this`.
                                     (n-keep! (parm-make fun
                                                         (load i)
                                                         (ty-dyn TAG-ANY)
-                                                        (get (.params fp)
-                                                             (load i))))
+                                                        (if (= (load i) 0)
+                                                            "this"
+                                                            (if (< (- (load i) 1) (len (.params fp)))
+                                                                (get (.params fp) (- (load i) 1))
+                                                                "$slot"))))
                                     (set! (mut i) (+ (load i) 1))
                                     (continue)))))
                       (set! (mut fi) (+ (load fi) 1))
@@ -6483,16 +6722,12 @@
       (set! (mut fi) 0)
       (loop (if (>= (load fi) (len (.funs (parser-state))))
                 (break 0)
-                (if (not (syntax-top-level-declaration? (load fi)))
+                (if (not (syntax-fun-lowered? (load fi)))
                     (do (set! (mut fi) (+ (load fi) 1)) (continue))
                     (let [f (syntax-fun-at (load fi))
                           fun (parser-node (.fun-nid f))
                           body-start (arena-node-count)
                           scope (scope-make)]
-                      (if (syntax-contains-function-decl? (.body f))
-                          (unimplemented "nested function declarations (closures)"
-                                         "docs/GAPS.md — function values and closures")
-                          0)
                       (if (syntax-fun-has-patterns? f)
                           (unimplemented "destructuring parameters" "docs/GAPS.md — destructuring")
                           0)
@@ -6535,7 +6770,7 @@
                                                        (ty-dyn TAG-ANY)
                                                        false
                                                        (match (fun-parm fun
-                                                                        (load i))
+                                                                        (+ (load i) 1))
                                                          (Some [p] p)
                                                          (None []
                                                                (unreachable-node))))
@@ -6544,7 +6779,11 @@
                                     (continue)))))
                       (lower-instantiate-vars! (.body f))
                       (lower-instantiate-lexicals! (.body f))
-                      (let [terminated (lower-syntax-statements (.body f))]
+                      (lower-bind-body-functions! (.body f))
+                      (let [terminated
+                              (match (.expression-body f)
+                                (Some [e] (do (parser-record-return! (lower-syntax-expr e)) 1))
+                                (None [] (lower-syntax-statements (.body f))))]
                         ;; JavaScript functions return undefined when control reaches the closing brace.
                         (if (= terminated 0)
                             (parser-record-return! (dyn-undefined-make))
@@ -6587,7 +6826,7 @@
   (let [(mut fi) 0]
     (loop (if (>= (load fi) (len (.funs (parser-state))))
               (break 0)
-              (if (not (syntax-top-level-declaration? (load fi)))
+              (if (not (syntax-fun-lowered? (load fi)))
                   (do (set! (mut fi) (+ (load fi) 1)) (continue))
                   (let [f (syntax-fun-at (load fi))]
                     ;; Every source function, including source-level `main`, is closed-world. The
@@ -6595,7 +6834,7 @@
                     (fun-drop-unknown-callers! (parser-node (.fun-nid f)))
                     (let [fun (parser-node (.fun-nid f))
                           (mut i) 0]
-                      (loop (if (>= (load i) (len (.params f)))
+                      (loop (if (> (load i) (parser-abi-slots))
                                 (break 0)
                                 (do
                                   (match (fun-parm fun (load i))
@@ -6640,7 +6879,7 @@
         (mut retained) 0]
     (loop (if (>= (load fi) (len (.funs (parser-state))))
               (break (load retained))
-              (if (not (syntax-top-level-declaration? (load fi)))
+              (if (not (syntax-fun-lowered? (load fi)))
                   (do (set! (mut fi) (+ (load fi) 1)) (continue))
                   (let [syntax (syntax-fun-at (load fi))
                         fun (parser-node (.fun-nid syntax))]
@@ -6673,7 +6912,7 @@
     (loop (if (>= (load fi) (len (.funs (parser-state))))
               (break (+ (load prepared)
                         (fun-prepare-codegen! (parser-entry-fun) start)))
-              (if (not (syntax-top-level-declaration? (load fi)))
+              (if (not (syntax-fun-lowered? (load fi)))
                   (do (set! (mut fi) (+ (load fi) 1)) (continue))
                   (let [syntax (syntax-fun-at (load fi))
                         fun (parser-node (.fun-nid syntax))]

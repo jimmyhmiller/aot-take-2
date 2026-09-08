@@ -147,7 +147,7 @@ aot-take-2/
 │           ; frontend numeric calls plus a guarded generic/fast-path specialization proof
 │       function/ array-buffer/ data-view/ typed-array/
 ├── src/
-│   ├── main.coil            ; CLI driver: compile, emit, run
+│   ├── main.coil            ; CLI driver: compile, emit, run, dump
 │   │
 │   ├── util/
 │   │   ├── ary.coil         ; growable arrays: nodes, ints, bitsets     Ary/AryInt
@@ -229,7 +229,7 @@ aot-take-2/
 │   │   ├── asm.coil         ; the disassembly printer                     ASMPrinter
 │   │   ├── dot.coil         ; Graphviz                                    GraphVisualizer
 │   │   ├── web.coil         ; structured semantic snapshots for the browser visualizer
-│   │   └── text.coil        ; ✦ round-trippable graph and type text
+│   │   └── text.coil        ; ✦ graph and type text: printers live, parsers pending
 │   │
 │   ├── verify.coil          ; ✦ the graph verifier, one named code per check
 │   └── eval.coil            ; ✦ the IR interpreter — the differential oracle

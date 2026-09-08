@@ -67,6 +67,13 @@
 
 (const RT-DYNAMIC-PREFIX-OBJECT 0x7fff)
 
+;; Heap references also travel under the string and function prefixes; the collector must
+;; forward all three. A function payload's raw code word is a text address whose high half is
+;; never one of these, so payload scanning leaves it alone.
+(const RT-DYNAMIC-PREFIX-STRING 0x7ffd)
+
+(const RT-DYNAMIC-PREFIX-FUNCTION 0xfff9)
+
 (const RT-DYNAMIC-PAYLOAD-MASK 0x0000ffffffffffff)
 
 (const RT-SHAPE-NOSCAN-BIT 0x4000000000000000)
@@ -92,6 +99,9 @@
    (major bool)
    (force-major bool)
    (stress bool)
+   ;; `AOT_RT_GC_VERIFY`: check every frame root and every heap reference word before and after
+   ;; each collection, naming the first stale pointer by frame, return PC and slot.
+   (verify bool)
    (booted bool)
    (fast-disabled i64)])
 
@@ -228,6 +238,8 @@
                     (rt-heap-reset-generational! bytes bytes))))
           (set! (.stress (rt-heap))
                 (!= (primitive/cast i64 (getenv c"AOT_RT_GC_STRESS")) 0))
+          (set! (.verify (rt-heap))
+                (!= (primitive/cast i64 (getenv c"AOT_RT_GC_VERIFY")) 0))
           (if (!= (primitive/cast i64 (getenv c"AOT_RT_GC_STATS")) 0)
               (do
                 (set! (.enabled (rt-stats)) true)
@@ -381,13 +393,21 @@
                 (set! (primitive/index old-header 2) (- 0 (primitive/cast i64 new-payload)))
                 (primitive/cast i64 new-payload)))))))
 
+;; The high 16 bits of a boxed word, as an unsigned prefix.
+(defn rt-word-prefix [(word i64)] (-> i64)
+  (& (primitive/ishr word 48) 0xffff))
+
+;; Whether a boxed word carries a heap reference: an object, a string or a function object.
 (defn rt-word-object? [(word i64)] (-> bool)
-  (= (primitive/ishr word 48) RT-DYNAMIC-PREFIX-OBJECT))
+  (let [prefix (rt-word-prefix word)]
+    (or (= prefix RT-DYNAMIC-PREFIX-OBJECT)
+        (= prefix RT-DYNAMIC-PREFIX-STRING)
+        (= prefix RT-DYNAMIC-PREFIX-FUNCTION))))
 
 (defn rt-forward-boxed [(word i64)] (-> i64)
   (if (not (rt-word-object? word))
       word
-      (| (primitive/ishl RT-DYNAMIC-PREFIX-OBJECT 48)
+      (| (primitive/ishl (rt-word-prefix word) 48)
          (& (rt-forward (& word RT-DYNAMIC-PAYLOAD-MASK)) RT-DYNAMIC-PAYLOAD-MASK))))
 
 (defn rt-scan-copied! [] (-> i64)
@@ -586,6 +606,158 @@
         0)
     (.used heap)))
 
+;; ---------------------------------------------------------------------------
+;; Heap and root verification (`AOT_RT_GC_VERIFY`)
+;;
+;; Between collections every reference — a frame root the maps describe, or a payload word of a
+;; live object — must point into the active young space or the active old space. A pointer into
+;; the inactive semispace of either generation is a reference the collector never saw: a root
+;; missing from a stack map, a wrongly typed live range, or a store the barrier did not cover.
+;; The checks run outside the collection proper, so the space predicates describe settled state.
+
+(defn rt-live-payload? [(payload i64)] (-> bool)
+  (or (rt-in-from-space? payload) (rt-in-old-space? payload)))
+
+(defn rt-stale-payload? [(payload i64)] (-> bool)
+  (let [heap (rt-heap)
+        young-base (primitive/cast i64 (.young-other heap))
+        old-base (primitive/cast i64 (.old-other heap))]
+    (or (and (>= payload young-base) (< payload (+ young-base (.capacity heap))))
+        (and (>= payload old-base) (< payload (+ old-base (.old-capacity heap)))))))
+
+(defn rt-verify-print! [(label (slice u8)) (value i64)] (-> i64)
+  (try (let [stream (io/stderr)
+             _ (try-or! (io/print-str stream "  ") 0)
+             _ (try-or! (io/print-str stream label) 0)
+             _ (try-or! (io/print-int stream value) 0)
+             _ (try-or! (io/print-str stream "\n") 0)]
+         0)))
+
+(defn rt-verify-fail! [(what (slice u8)) (phase (slice u8)) (word i64) (kind i64)] (-> i64)
+  (do
+    (try (let [stream (io/stderr)
+               _ (try-or! (io/print-str stream "aot-gc-verify: ") 0)
+               _ (try-or! (io/print-str stream what) 0)
+               _ (try-or! (io/print-str stream " (") 0)
+               _ (try-or! (io/print-str stream phase) 0)
+               _ (try-or! (io/print-str stream " collection)\n") 0)]
+           0))
+    (rt-verify-print! "word=" word)
+    (rt-verify-print! "kind=" kind)
+    (rt-verify-print! "young_base=" (primitive/cast i64 (.from (rt-heap))))
+    (rt-verify-print! "young_used=" (.used (rt-heap)))
+    (rt-verify-print! "old_base=" (primitive/cast i64 (.to (rt-heap))))
+    (rt-verify-print! "old_used=" (.to-used (rt-heap)))
+    (rt-verify-print! "stale_young_base=" (primitive/cast i64 (.young-other (rt-heap))))
+    (rt-verify-print! "stale_old_base=" (primitive/cast i64 (.old-other (rt-heap))))
+    0))
+
+;; The referenced payload of a root or field word, or zero when the word is not a reference.
+;; Raw kinds are always addresses; boxed kinds reference only under a heap prefix.
+(defn rt-reference-payload [(word i64) (raw bool)] (-> i64)
+  (if raw word (if (rt-word-object? word) (& word RT-DYNAMIC-PAYLOAD-MASK) 0)))
+
+(defn rt-verify-reference? [(word i64) (raw bool)] (-> bool)
+  (let [payload (rt-reference-payload word raw)]
+    (or (= payload 0)
+        (and (rt-live-payload? payload)
+             (> (load (primitive/index (primitive/cast (ptr i64) payload) -1)) 0)))))
+
+(defn rt-verify-frames! [(maps (ptr u8))
+                         (map-bytes i64)
+                         (record i64)
+                         (caller-sp i64)
+                         (text-base i64)
+                         (walk-callers bool)
+                         (phase (slice u8))] (-> i64)
+  (let [(mut current-record) record
+        (mut current-sp) caller-sp
+        (mut frame) 0
+        count (rt-read-u32 maps 12)]
+    (loop (if (< (load current-record) 0)
+              (break 0)
+              (let [slots (rt-stackmap-slot-count maps (load current-record))
+                    (mut i) 0]
+                (loop (if (>= (load i) slots)
+                          (break 0)
+                          (let [location (rt-stackmap-slot-location maps (load current-record) (load i))
+                                kind (rt-stackmap-slot-kind maps (load current-record) (load i))
+                                word (load (primitive/cast (ptr i64) (+ (load current-sp) location)))]
+                            (if (rt-verify-reference? word (= kind 1))
+                                0
+                                (do
+                                  (rt-verify-fail! "stale frame root" phase word kind)
+                                  (rt-verify-print! "frame=" (load frame))
+                                  (rt-verify-print! "return_pc="
+                                                    (rt-read-u64 maps (+ (load current-record) 8)))
+                                  (rt-verify-print! "safepoint_map_id="
+                                                    (rt-read-u64 maps (load current-record)))
+                                  (rt-verify-print! "slot=" (load i))
+                                  (rt-verify-print! "location=" location)
+                                  (rt-verify-print! "frame_size="
+                                                    (rt-stackmap-frame-size maps (load current-record)))
+                                  (panic "aot-gc-verify: a frame root is not a live reference")))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (if walk-callers
+                    (let [return-address
+                            (load (primitive/cast (ptr i64)
+                                                  (+ (load current-sp)
+                                                     (rt-stackmap-rpc-offset maps (load current-record)))))
+                          parent-sp (+ (load current-sp) (rt-stackmap-frame-size maps (load current-record)))]
+                      (set! (mut current-record)
+                            (rt-stackmap-find-return-pc maps map-bytes (- return-address text-base)))
+                      (set! (mut current-sp) parent-sp))
+                    (set! (mut current-record) -1))
+                (set! (mut frame) (+ (load frame) 1))
+                (if (> (load frame) count)
+                    (panic "rt-verify-frames!: cyclic frame walk")
+                    (continue)))))))
+
+(defn rt-verify-space! [(space (ptr u8)) (used i64) (phase (slice u8)) (old bool)] (-> i64)
+  (let [(mut offset) 0]
+    (loop (if (>= (load offset) used)
+              (break 0)
+              (let [header (primitive/cast (ptr i64) (primitive/index space (load offset)))
+                    bytes (load (primitive/index header 0))
+                    meta (load (primitive/index header 1))
+                    shape (load (primitive/index header 2))
+                    payload (primitive/cast (ptr i64) (primitive/index space (+ (load offset) RT-HEADER-BYTES)))
+                    words (if (!= (& shape RT-SHAPE-NOSCAN-BIT) 0) 0 (/ bytes 8))
+                    (mut i) 0]
+                (if (or (< bytes 0) (<= shape 0))
+                    (do
+                      (rt-verify-fail! "malformed live object header" phase shape 0)
+                      (rt-verify-print! "space_offset=" (load offset))
+                      (rt-verify-print! "bytes=" bytes)
+                      (panic "aot-gc-verify: live object header is malformed"))
+                    0)
+                (loop (if (>= (load i) words)
+                          (break 0)
+                          (let [word (load (primitive/index payload (load i)))
+                                raw-stale (and (!= (& meta RT-META-HAS-RAW) 0) (rt-stale-payload? word))]
+                            (if (or raw-stale (not (rt-verify-reference? word false)))
+                                (do
+                                  (rt-verify-fail! (if old "stale field in old object" "stale field in young object")
+                                                   phase
+                                                   word
+                                                   (if raw-stale 1 2))
+                                  (rt-verify-print! "object_payload=" (primitive/cast i64 payload))
+                                  (rt-verify-print! "field_word_index=" (load i))
+                                  (rt-verify-print! "object_shape=" shape)
+                                  (rt-verify-print! "object_meta=" meta)
+                                  (panic "aot-gc-verify: a live object holds a stale reference"))
+                                0)
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (set! (mut offset) (+ (load offset) (rt-align8 (+ bytes RT-HEADER-BYTES))))
+                (continue))))))
+
+(defn rt-verify-heap! [(phase (slice u8))] (-> i64)
+  (let [heap (rt-heap)]
+    (rt-verify-space! (.from heap) (.used heap) phase false)
+    (rt-verify-space! (.to heap) (.to-used heap) phase true)))
+
 (defn rt-collect-one-root! [(root (ptr i64))] (-> i64)
   (let [heap (rt-heap)]
     (rt-begin-collection!)
@@ -648,6 +820,11 @@
     (if (< record 0)
         (do (panic-i "rt-collect-from-maps-with-roots!: missing safepoint map" map-id) 0)
         (let [heap (rt-heap)]
+          (if (.verify heap)
+              (do
+                (rt-verify-frames! maps map-bytes record caller-sp text-base walk-callers "before")
+                (rt-verify-heap! "before"))
+              0)
           (rt-begin-collection!)
           (if (!= (primitive/cast i64 root-a) 0)
               (set! root-a (rt-forward (load root-a)))
@@ -684,7 +861,13 @@
                             (continue))))))
           (if (not (.major heap)) (rt-scan-remembered!) 0)
           (rt-scan-copied!)
-          (rt-finish-collection!)))))
+          (let [used (rt-finish-collection!)]
+            (if (.verify heap)
+                (do
+                  (rt-verify-frames! maps map-bytes record caller-sp text-base walk-callers "after")
+                  (rt-verify-heap! "after"))
+                0)
+            used)))))
 
 (defn rt-linked-stackmaps [(size (ptr u64))] (-> (ptr u8))
   (getsectiondata (primitive/cast (ptr u8) (primitive/linker-address _mh_execute_header))
@@ -1016,6 +1199,11 @@
 (defn rt-throw [(val i64)] (-> i64)
   (do (unimplemented "rt-throw" "S8 — src/rt/rt.coil") 0))
 
+;; TypeError completions raised by compiler-recognized guards, such as calling a value that is
+;; not callable. Exceptions are unimplemented, so this is a hard error with the JavaScript name.
+(defn rt-throw-type-error [] (-> i64)
+  (do (unimplemented "TypeError: value is not callable (exception completions)" "S8 — src/rt/rt.coil") 0))
+
 ;; Generated objects speak a deliberately small C-ABI-shaped boundary to the Coil runtime object.
 ;; These names are part of the object format: target selection emits relocations against them, so
 ;; namespace-mangled Coil symbols would make a correct runtime body unreachable at final link.
@@ -1028,4 +1216,5 @@
           [rt-string-compare :as "aot_rt_string_compare"]
           [rt-string-concat :as "aot_rt_string_concat"]
           [aot-rt-write-barrier :as "aot_rt_write_barrier"]
-          [rt-throw :as "aot_rt_throw"])
+          [rt-throw :as "aot_rt_throw"]
+          [rt-throw-type-error :as "aot_rt_throw_type_error"])

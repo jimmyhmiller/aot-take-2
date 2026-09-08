@@ -1,5 +1,78 @@
 # Decisions
 
+## 2026-09-07 — `dyn{null}` is a constant type, and a non-constant `Con` never reaches selection silently
+
+`undefined` and `null` are the two dynamic tags with exactly one value, so both are constant
+types: `ty-constant?` admits them, SCCP replaces any node that proves either with a `Con`, and
+selection materializes each as one immediate. Every other singleton tag (bool, int, string,
+object…) covers many payloads and stays non-constant. A `Con` of a register type that is not
+constant has no machine form and is a selection panic naming the node; only a `Con` that is not a
+register value at all — memory, control, a tuple, or the dead placeholders TOP and BOT — selects
+to the zero-size pseudo node with no register class. Hand-built test graphs therefore take an
+opaque register value from a `Parm`, never from a non-constant `Con`. The allocator enforces the same fact from the
+other side: a live range with a register use and no machine definition is a hard error in
+`ra-build-lrg!`. Before these rules a `Con dyn{null}` selected to a placeholder with no register
+class, and every use read an uninitialized stack slot.
+
+## 2026-09-07 — A store meets its value with what the slice already holds
+
+Final Simple types the memory after a `Store` as `val.meet(tfld)`: the stored value met with the
+slice's current element type, because other objects share the alias. Only an allocation's private
+memory tracks just the stored value. We follow that exactly: the slice after a store is
+`join(declared, value)` met with the prior element type, except for a New's own private bulk slice
+(alias 1 with a struct element) and a TOP remainder. The earlier rule replaced the slice type with
+the value type, which typed a later load too narrowly and made a dispatch select the wrong case.
+
+## 2026-09-07 — Call targets resolve through the function registry, never through the pointer node's edge
+
+Final Simple's `CallNode` links a singleton function-pointer type through CodeGen's linker table by
+function index. Following the pointer node's input 0 instead is correct only for a `FunPtr`
+literal; a singleton-typed `Load` or `Phi` has a control input there, and following it links the
+ENCLOSING function. `CallNode.idealize` and direct-call selection both use `arena-function` on the
+type's function index. A `FunPtr` machine node likewise carries its symbol from the registry and
+keeps no graph input, since GCM would otherwise be asked to place it below a block that does not
+dominate its uses.
+
+## 2026-09-07 — Managed-root split boundaries apply only to ranges a safepoint restricted
+
+A boxed value live across a Call, New, JSOP or Safepoint is restricted to the collector's root
+homes, and a later register-only consumer needs a reload boundary; splitting the definition side
+would only reproduce the empty range. That rule was firing for every boxed range with a
+register-defined member, including an ordinary boxed parameter with a fixed definition and a
+conflicting fixed use, which then split after its definition every round and never converged. The
+allocator now records `root-restricted` on a live range when the safepoint mask is applied (joined
+on union) and consults the managed-root splitters only for those ranges; everything else takes
+Simple's ordinary empty-mask and pressure splitters.
+
+## 2026-09-07 — Function values are heap objects over a uniform boxed ABI with a finite target set
+
+Simple's function literal is a `FunPtrNode` constant: a raw code address typed by its signature and
+function index, callable through `Call` and linkable because the pointer's type names a finite set
+of functions (chapter 18, `func()` and `TFPARM`). JavaScript functions are also objects with
+properties and, later, captured environments, so a function value here is a heap object whose
+payload begins exactly like an ordinary object (prototype word, properties word) followed by the raw
+code word and a boxed environment word, boxed under the distinct FUNCTION NaN prefix. `%IsFunction`
+is therefore one prefix test, property machinery can treat the first two words as it treats any
+object, and the collector scans the payload as boxed words: a text address never carries a
+reference prefix, so the code word is inert to tracing.
+
+Every source function — declaration, expression, arrow, top-level `main` — shares one internal
+signature: `this`, then the program-wide maximum formal count of dynamic slots, all boxed. An
+indirect call cannot know its callee's arity, and Simple's linker requires one signature per
+function-pointer set, so the closed world pays with padded `undefined` slots (register slots first,
+then stack) rather than with a second entry point per function. The wrapper and direct calls pad
+the same way; missing formals still read `undefined` and extra actuals are still evaluated and
+dropped. A code word loaded from a function object is typed as the function-pointer set of every
+function the program ever materializes as a value; Opto links a value call to exactly that finite
+set, which keeps `f(x)` an ordinary `Call` that the ordinary inliner can specialize when the set is
+a singleton. Materializing a function pointer as a value is `ADRP`/`ADD` against the function's
+symbol with page relocations, as Simple's arm port does.
+
+Calling a non-callable value is a TypeError; until exceptions exist the guard's false arm reaches
+the runtime `aot_rt_throw_type_error` entry, which hard-errors. Captured variables are not admitted yet: a
+nested function referring to an enclosing function's binding refuses by name, because capture is
+by reference and needs the environment cells `node/closure.coil` describes.
+
 ## 2026-09-07 — Tokens have a spelling and a StringValue, and the grammar reads only the spelling
 
 An IdentifierName written with `\u` escapes is one token whose `token-text` is its decoded

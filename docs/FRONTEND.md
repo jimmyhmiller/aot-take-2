@@ -180,12 +180,17 @@ and argument signature; the annotation never selects a raw representation.
 
 The native entry point is a distinct compiler-owned `main` wrapper. It calls the boxed source
 function under the deliberately unspellable internal symbol `$aot$.source_main`, supplies the
-canonical boxed `undefined` for every omitted source parameter in both register and stack slots,
-and converts the boxed JavaScript result to a host process status. An ordinary source call uses the
-same fixed internal ABI: missing formals receive `undefined`; every extra actual is still evaluated
-left-to-right for effects and is then omitted from the callee's formal input bank. Internal
-parameters remain fully dynamic and specialize only from closed-world call evidence; annotations
-are never used to bypass representation proof.
+canonical boxed `undefined` for `this` and for every omitted source parameter in both register and
+stack slots, and converts the boxed JavaScript result to a host process status. Every source
+function — declaration, expression, arrow or `main` — shares one internal signature: `this`, then
+the program-wide maximum formal count of boxed slots (`parser-abi-slots`), so an indirect call
+through a function object needs no arity knowledge. An ordinary source call pads the same way:
+missing formals receive `undefined`; every extra actual is still evaluated left-to-right for
+effects and is then omitted from the callee's formal input bank. Function expressions, arrows and
+nested declarations lower to function objects (docs/DECISIONS.md, function values); a call through
+a binding loads the code word and links to the finite set of lowered functions. Internal parameters
+remain fully dynamic and specialize only from closed-world call evidence; annotations are never
+used to bypass representation proof.
 
 The sole admitted global value is the shadowable binding `undefined`. This source slice is
 non-strict (duplicate formal parameters follow non-strict last-binding semantics), so assigning to

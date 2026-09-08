@@ -194,7 +194,10 @@ Current producer: `regmask.coil` represents arbitrary fixed locations plus the i
 and is covered beyond location 512. `regalloc.coil` builds and unions LRGs, carries conservative GC
 kinds, builds the IFG backwards over the durable schedule, applies fixed constraints and call kills,
 coalesces, colours, inserts fixed-use and pressure splits, retries, removes no-op copies, inserts the
-AAPCS64 callee-save ranges and finalizes stack frames. Safepoint relocation nodes, typed stack maps,
+AAPCS64 callee-save ranges and finalizes stack frames. A live range restricted to root homes by a
+safepoint is flagged `root-restricted`, and only such ranges take the managed-root split
+boundaries; every live range with a register use must have a machine definition, checked after
+BuildLRG. Safepoint relocation nodes, typed stack maps,
 and aligned object sections are implemented as described below.
 Direct regression coverage proves conservative copy coalescing unions a legal Split/source pair,
 while interference and fixed masks prevent illegal unions.
@@ -269,7 +272,10 @@ collection copies the reachable young-and-old closure into the other old space. 
 linked `__DATA,__aot_stackmaps` section, selects the record by X2 identity, rewrites SP-relative
 raw and boxed roots, walks generated callers by saved return PC, traces boxed object fields, and
 retries the allocation. `AOT_RT_GC_STRESS` runs the same collection path before every generated
-allocation without changing normal policy when it is absent.
+allocation without changing normal policy when it is absent. `AOT_RT_GC_VERIFY` checks, before and
+after every collection, that each mapped frame root and each field of every live object points
+into the active young or old space, and aborts naming the frame, return PC and slot of the first
+stale pointer; `AOT_RT_GC_STATS` reports collection counts and barrier activity at exit.
 
 Work outside this nine-stage backend slice remains: compilation-unit/serialized-IR sections,
 explicit loop-backedge safepoint placement, and cross-platform linked execution coverage. The

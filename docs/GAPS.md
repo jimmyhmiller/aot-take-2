@@ -11,7 +11,7 @@ this file owns completeness.
 |---|---|---|
 | Dynamic values | Box/Unbox construction and payload access beyond numeric tags | Every checker-admitted singleton TypeTest is selected and encoded; producing and consuming the remaining tagged payload families still requires their runtime nodes |
 | Return | Concrete RPC nodes/types for the final four-input shape | Source/JSL Returns carry concrete bulk memory; RPC is reconstructed as a Parm before code generation while Fun ownership remains separate metadata |
-| Calls | Escaping function pointers, cross-unit resolution and JavaScript callable objects | Finite multi-target SCCP lookup uses the compilation-local function registry; member-call receivers and callable object allocation remain absent |
+| Calls | Cross-unit resolution, captured environments and member-call receivers | Finite multi-target SCCP lookup and direct-call selection resolve targets through the compilation-local function registry; function objects exist and a value-taken Fun is never inlined away |
 | Node API | Complete for every implemented node family | Includes cycle-safe two-pass selected-subgraph copy, payload preservation and Fun/Return + Call/CallEnd cross-link repair |
 | Phi | Memory-specific same-op guards and the dominance-walk null merge | MemPhi construction, unary/binary scalar pull-down and structural zero/truthy-Cast merging are complete; Load/Store/MemMerge exist |
 | Verification | Pointer/control/safepoint/unreachable-use checks | Core edge, dead-input, Phi arity, type and GVN checks are live; the remaining checks require their node families |
@@ -54,6 +54,43 @@ If folding recognizes the dominating predicate through a true-arm truthiness Cas
 pull-down covers every currently implemented eligible unary and binary scalar arity.
 
 ## Partial frontend and JavaScript semantics
+
+### 2026-09-07 — Function values over the shared ABI
+
+Function expressions, arrow functions, nested and block-level function declarations (including the
+Annex B `if`-arm and labelled forms), immediately invoked functions, a declaration read as a value
+and a call through a binding all lower and execute natively. A function value is a heap object
+under the FUNCTION prefix whose payload is prototype, properties, raw code word and boxed
+environment; every source function shares the `[ret this slot…]` ABI with the program-wide formal
+count; a value call loads the code word, guards `%IsFunction` and traps to
+`aot_rt_throw_type_error` otherwise (docs/DECISIONS.md, function values). Remaining in this
+subsystem: captured variables (a reference to an enclosing function's binding refuses by name),
+`this` binding, `new`, prototypes on function objects, methods, accessors, generators, async
+functions, default and rest parameters, and reads or writes of Script-level global-object bindings
+(a Script-level function declaration read as a value works; assigning to it, or touching an
+undeclared global, refuses as a global-object property access).
+
+Landing this exposed three latent defects, each now a hard error where it used to be silent:
+a `Con dyn{null}` was not a constant type, so selection produced a zero-size placeholder with no
+register class and every use read an uninitialized stack slot (wrong answers only once a
+collection had reused the stack); property aliases started at the same number as the new function
+payload aliases; and the allocator could colour a live range that had register uses but no machine
+definition. `ty-constant?` now admits the null tag, a non-constant `Con` other than TOP/BOT panics
+in selection, `ALIAS-FIRST-PROPERTY` follows the function aliases, and `ra-build-lrg!` refuses an
+undefined live range. A boxed live range with a fixed definition and a conflicting fixed use also
+no longer loops in the managed-root splitters: those apply only to ranges a safepoint restricted.
+
+### 2026-09-07 — Diagnostics
+
+`aot dump FILE PHASE [--dot] [--script]` prints the graph after parse, iter, opto, typecheck,
+select, gcm, sched or regalloc as one `n-text` line per node (`#nid label :type <- inputs @block
+rN`, where `rN` is the assigned location after allocation and numbers past the register file are
+stack slots). `n-panic!` prints the offending node and its inputs before exiting; `ty-text` is the
+one type notation. The runtime's `AOT_RT_GC_VERIFY` checks every mapped frame root and every live
+object field before and after each collection and names the first stale pointer by frame, return
+PC and slot. A pointer held in a location the maps do not describe remains invisible to it; the
+allocator invariant above is what closes that hole from the compiler side. Not yet built: a
+backtrace on panic without a debugger, and a per-safepoint dump of the stack maps.
 
 ### 2026-09-07 — Grammar-closure campaign follow-up
 
@@ -205,11 +242,10 @@ Sloppy `let` names, Annex B function-in-`if` and labelled functions were admitte
 day, as were destructuring parameters.
 
 The Script statement list is parsed under a root context so nested functions have a parent; only
-declarations the program loop saw at the top level are hoisted closed-world Funs. Every other
-function is a value the lowering refuses by name: nested declarations, expressions, arrows,
-methods, `yield`, `await`, `super`, and first-class references to hoisted declarations. Default,
-rest, generator and async top-level declarations refuse at the Fun header. Closures and function
-objects are the next semantic subsystem.
+declarations the program loop saw at the top level are hoisted closed-world Funs. Nested
+declarations, expressions, arrows and first-class references to hoisted declarations became
+function values later the same day (see above). Methods, `yield`, `await`, `super`, default, rest,
+generator and async functions still refuse by name.
 
 ### 2026-09-07 — Primary expressions, member chains, templates and regex tokens
 
@@ -367,7 +403,7 @@ The frontend lowers typeof through JsTypeof in production JSL. The native regres
 undefined, null, booleans, strings, objects and both Number representations, including NaN,
 infinities and signed zero. It also covers operand effects, nested typeof, local shadowing and
 deliberately false TypeScript annotations. The JSL definition classifies the represented Symbol
-and Function tags, but the frontend still lacks their constructors/first-class value production.
+and Function tags; function values are produced now, Symbol construction is not.
 BigInt and HTMLDDA production remain absent.
 
 Unresolved names require a complete global environment. The compiler refuses this path by name,
@@ -527,8 +563,10 @@ available current contracts; missing documents must not be treated as reviewed e
 - GCM, memory anti-dependencies, durable local scheduling, register masks, LRG/IFG construction,
   coalescing, colouring, splitting/spilling retries and frame finalization are implemented. Phi
   edge copies follow final Simple's shared-LRG plus edge-Split model; cold-edge-first loop-Phi
-  splitting and legal Split coalescing have direct coverage. Safepoint-specific allocation evidence
-  and broader pressure stress coverage remain.
+  splitting and legal Split coalescing have direct coverage. Managed-root split boundaries apply
+  only to ranges a safepoint restricted, and every live range with a register use must have a
+  machine definition. Safepoint-specific allocation evidence and broader pressure stress coverage
+  remain.
 - AArch64 encoding, checked local/symbol relocation, literal pools, valid Mach-O/ELF arm64 objects,
   native Mach-O linking and a complete implemented ideal-to-native execution test are implemented.
   Split encoding includes IFG-proved X16 scratch expansion for stack-to-stack copies. Preference-
@@ -537,9 +575,9 @@ available current contracts; missing documents must not be treated as reviewed e
   stack-map/object metadata. The ordered source-to-object driver and native execution matrix cover
   every currently admitted source form.
 - Ideal-graph serialization, compilation units and dependency resolution.
-- Assembly and ordinary IR printers. Graphviz is implemented.
-- CLI `compile`, `run`, `compile-script`, and `run-script` are implemented; a user-facing
-  IR/assembly dump command remains.
+- The assembly printer and the graph/type text parsers. Graphviz, the graph text printer and the
+  type printer are implemented.
+- CLI `compile`, `run`, `compile-script`, `run-script` and `dump` are implemented.
 
 ## Current Simple comparison boundary
 
