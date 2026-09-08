@@ -275,7 +275,11 @@ retries the allocation. `AOT_RT_GC_STRESS` runs the same collection path before 
 allocation without changing normal policy when it is absent. `AOT_RT_GC_VERIFY` checks, before and
 after every collection, that each mapped frame root and each field of every live object points
 into the active young or old space, and aborts naming the frame, return PC and slot of the first
-stale pointer; `AOT_RT_GC_STATS` reports collection counts and barrier activity at exit.
+stale pointer; `AOT_RT_GC_STATS` reports collection counts and barrier activity at exit. Generated code reaches
+the heap record through the reserved heap-state register: `HeapState` selects to a read of that
+register, and the record's field offsets come from `aot.rt.abi`, folded from the struct itself.
+The realm's global object root is one such field, published and read as ordinary memory on its
+own alias class; the collector forwards it, and no write barrier covers host memory.
 
 Work outside this nine-stage backend slice remains: compilation-unit/serialized-IR sections,
 explicit loop-backedge safepoint placement, and cross-platform linked execution coverage. The

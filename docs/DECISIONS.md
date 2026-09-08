@@ -28,9 +28,12 @@ flag a fresh object's `null` properties word typed the shared slice every other 
 shaped store folded to its impossible-arm trap. TOP memory is private TOP and the dual flips the
 flag, so the memory lattice has a proper high end.
 
-The next cost is the realm root itself: every global access still reads the global object
-through a runtime call. The intended shape is the heap-state register as a typed host pointer and
-the root as an ordinary memory slice, so the read is a Load that GVN hoists once per function.
+The realm root itself is ordinary memory: `HeapState` is the runtime heap record's address as a
+value — a constant of the HOST pointer kind `TPtr`, never a managed `TMemPtr`, so it is neither a
+collector root nor a barrier target and the allocator treats it as a scalar — and the global
+object is published by one Store and read by Loads on the realm-root alias through it. GVN and
+load uplift share one read per function; the register itself is the reserved heap-state register
+the process entry installs. Simple's analogue is a static field's base address.
 
 ## 2026-09-07 — A realm is an ordered list of Scripts compiled together over one global object
 
