@@ -75,7 +75,8 @@ without an enclosing target.
 Unknown grammar still fails outside the syntax-error channel. Strict validation also checks
 restricted bindings/assignments, reserved references, duplicate simple parameters and legacy
 numeric literals and string escapes. It derives strictness from each body and Script inheritance, without leaking
-a function directive into siblings. Strict runtime compilation remains unsupported.
+a function directive into siblings. Strict code compiles and runs: a strict function takes its
+receiver as it is, a strict write to a non-writable global is a runtime TypeError refusal.
 Global restricted-property failures belong to initialization and cannot count as
 parse errors. Runtime negative tests still lack a typed abrupt-completion protocol.
 
@@ -90,6 +91,14 @@ linked and ran (exit 0), and a failing assertion refused at `String(value)` by n
 execution receive explicit unsupported results and remain in the denominator. Typed JavaScript abrupt-completion
 reporting at runtime and realm host bindings remain unimplemented. Do not convert a nonzero native exit into
 an expected exception by parsing its diagnostics.
+
+## Latest measured campaign, 2026-09-08
+
+The realm/exceptions/receivers/constructors campaign measured **4,225 / 53,582 files passing
+(7.88%)**, up from 257 (0.48%): verdict-pass 8,014, verdict-fail 123, verdict-unsupported 57,058,
+verdict-compiler-error 37,731, no crashes or timeouts (`build/test262-campaign-20260908`). Compiler
+errors are dominated by the missing standard globals and by refusals the runtime names; the
+intrinsics slice (Object, String, Number, Boolean, the Error family) lands next.
 
 ## Latest measured campaign, 2026-09-06
 

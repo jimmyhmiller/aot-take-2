@@ -80,6 +80,20 @@ in selection, `ALIAS-FIRST-PROPERTY` follows the function aliases, and `ra-build
 undefined live range. A boxed live range with a fixed definition and a conflicting fixed use also
 no longer loops in the managed-root splitters: those apply only to ranges a safepoint restricted.
 
+### 2026-09-08 — Standard globals
+
+`Object`, `String`, `Number`, `Boolean`, `Error`, `TypeError`, `RangeError`, `SyntaxError`,
+`ReferenceError`, `EvalError` and `URIError` exist as intrinsics (docs/DECISIONS.md, standard
+globals) when a program names them. Missing: every other global (`Math`, `JSON`, `Array`,
+`Function`, `Symbol`, `parseInt`, `isNaN`, …, still refused by name at run time); prototype
+methods (`Object.prototype.toString`/`hasOwnProperty`, `Error.prototype.toString`,
+`String.prototype.*`) — the table has no slot for methods yet; wrapper objects (`new String(x)`,
+`Object(1)`: `ToObject` refuses by name); zero-argument calls read as `undefined` arguments
+(`String()`, `Number()`); the runtime's TypeError traps are not `TypeError` objects, so
+`assert.throws(TypeError, …)` cannot see them; object literals and `new Object()` do not share one
+`%Object.prototype%` — an ordinary object's [[Prototype]] is null unless set, so
+`Object.prototype.x = 1` is not visible through `{}`.
+
 ### 2026-09-08 — Exceptions
 
 `throw` and `try`/`catch` execute (docs/DECISIONS.md, exceptions): a throw inside a try is a jump

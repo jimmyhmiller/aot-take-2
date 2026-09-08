@@ -171,6 +171,8 @@
   (SxMember [(owner i64) (name (slice u8)) (optional bool)])  ; optional: this link is `?.`
   (SxIndex [(owner i64) (key i64) (optional bool)])
   (SxCall [(callee i64) (args (ArrayList i64)) (optional bool)])
+  ;; The body of a standard global: a call to a JSL builtin (docs/DECISIONS.md, intrinsics).
+  (SxIntrinsic [(builtin (slice u8)) (args (ArrayList i64))])
   (SxNew [(callee i64) (args (ArrayList i64))])
   (SxNewTarget)
   (SxThis)
@@ -876,6 +878,7 @@
                0))
       (SxNewTarget [] 0)
       (SxThis [] 0)
+      (SxIntrinsic [builtin args] (al-for [a args] (push! [i64] (mut out) a)))
       (SxSpread [expr] (push! [i64] (mut out) expr))
       (SxImportCall [specifier options]
                     (do
@@ -6249,6 +6252,7 @@
                                             "docs/GAPS.md — function objects")
                              (unreachable-node)))
               (SxThis [] (lower-this))
+              (SxIntrinsic [builtin args] (lower-intrinsic-call builtin args))
               (SxSpread [expr]
                         (do
                           (unimplemented "spread arguments"
@@ -7108,7 +7112,7 @@
                   (parse-syntax-one-source! (get sources (load si)) (load si) script-mode syntax-only)
                   (set! (mut si) (+ (load si) 1))
                   (continue)))))
-    (if script-mode (syntax-collect-globals!) 0)
+    (if script-mode (do (syntax-declare-intrinsics!) (syntax-collect-globals!)) 0)
     (syntax-compute-may-throw!)
     (syntax-settle-strictness!)
     (syntax-check-cover-initializers!)
@@ -7343,6 +7347,182 @@
                 (_ 0))))
     0))
 
+;; ---------------------------------------------------------------------------
+;; Standard globals — the builtin library (docs/DECISIONS.md, intrinsics)
+;;
+;; A standard global is a hoisted function whose body is one JSL builtin: `Error(m)` is the
+;; function record `Error(a0)` with the expression body `(SxIntrinsic "JsIntrinsicError" [this,
+;; Error, a0])`. Everything else — its Fun, its function object with a `prototype` object, direct
+;; and value calls, inlining, `new`, `instanceof` — is what every source function already gets.
+;; Only the intrinsics a program names (and the ones those depend on, an Error subclass's parent)
+;; are materialized: the realm is closed, so the rest simply do not exist in it.
+
+(defstruct Intrinsic
+  [(name (slice u8))
+   (builtin (slice u8))
+   (arity i64)
+   (parent (slice u8))   ; a constructor whose prototype heads this one's prototype chain, or ""
+   (setup (slice u8))])  ; a JSL builtin run once at instantiation: (constructor parent name), or ""
+
+(defn intrinsic-table [] (-> (ArrayList Intrinsic))
+  (let [(mut t) (al-new [Intrinsic] (alloc/malloc-allocator))]
+    (push! [Intrinsic] (mut t) (Intrinsic :name "Object" :builtin "JsIntrinsicObject" :arity 1 :parent "" :setup ""))
+    (push! [Intrinsic] (mut t) (Intrinsic :name "String" :builtin "JsIntrinsicString" :arity 1 :parent "" :setup ""))
+    (push! [Intrinsic] (mut t) (Intrinsic :name "Number" :builtin "JsIntrinsicNumber" :arity 1 :parent "" :setup ""))
+    (push! [Intrinsic] (mut t) (Intrinsic :name "Boolean" :builtin "JsIntrinsicBoolean" :arity 1 :parent "" :setup ""))
+    (push! [Intrinsic] (mut t) (Intrinsic :name "Error" :builtin "JsIntrinsicError" :arity 1 :parent "" :setup "JsSetupErrorPrototype"))
+    (push! [Intrinsic] (mut t) (Intrinsic :name "TypeError" :builtin "JsIntrinsicError" :arity 1 :parent "Error" :setup "JsSetupErrorPrototype"))
+    (push! [Intrinsic] (mut t) (Intrinsic :name "RangeError" :builtin "JsIntrinsicError" :arity 1 :parent "Error" :setup "JsSetupErrorPrototype"))
+    (push! [Intrinsic] (mut t) (Intrinsic :name "SyntaxError" :builtin "JsIntrinsicError" :arity 1 :parent "Error" :setup "JsSetupErrorPrototype"))
+    (push! [Intrinsic] (mut t) (Intrinsic :name "ReferenceError" :builtin "JsIntrinsicError" :arity 1 :parent "Error" :setup "JsSetupErrorPrototype"))
+    (push! [Intrinsic] (mut t) (Intrinsic :name "EvalError" :builtin "JsIntrinsicError" :arity 1 :parent "Error" :setup "JsSetupErrorPrototype"))
+    (push! [Intrinsic] (mut t) (Intrinsic :name "URIError" :builtin "JsIntrinsicError" :arity 1 :parent "Error" :setup "JsSetupErrorPrototype"))
+    (load t)))
+
+(defn intrinsic-index [(table (ArrayList Intrinsic)) (name (slice u8))] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
+    (loop (if (or (>= (load i) (len table)) (>= (load found) 0))
+              (break 0)
+              (do
+                (let [entry (get table (load i))]
+                  (if (= (.name entry) name) (set! (mut found) (load i)) 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
+;; Does any expression in the realm name `name` as an identifier?
+(defn syntax-names-identifier? [(name (slice u8))] (-> bool)
+  (let [(mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) (len (.exprs (parser-state)))) (load found))
+              (break 0)
+              (do
+                (let [x (get (.exprs (parser-state)) (load i))]
+                  (match (.node x)
+                    (SxName [n] (if (= n name) (set! (mut found) true) 0))
+                    (_ 0)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
+(defn syntax-intrinsic-fun? [(i i64)] (-> bool)
+  (let [f (syntax-fun-at i)] (and (.hoisted f) (< (.script f) 0))))
+
+;; Reserve the function record and the global binding of one intrinsic (once).
+(defn syntax-declare-intrinsic! [(entry Intrinsic)] (-> i64)
+  (if (>= (syntax-find-fun (.name entry)) 0)
+      0
+      (let [index (syntax-fun-reserve! (.name entry) (FunDeclaration) false false 0)
+            fp (syntax-fun-ptr index)
+            (mut args) (al-new [i64] (alloc/malloc-allocator))
+            (mut i) 0]
+        (set! (.hoisted fp) true)
+        (set! (.script fp) -1)
+        (set! (.parent fp) -1)
+        ;; (this callee a0 a1 ...): the receiver, the constructor's own function object (its
+        ;; `prototype` is what `new` and a plain call both need), then the arguments.
+        (push! [i64] (mut args) (syntax-add-node! (SxThis) 0 0))
+        (push! [i64] (mut args) (syntax-add-node! (SxName :name (.name entry)) 0 0))
+        (loop (if (>= (load i) (.arity entry))
+                  (break 0)
+                  (let [(mut sb) (sb-new (alloc/malloc-allocator))]
+                    (sb-push-str! (mut sb) "$aot$arg")
+                    (sb-push-i64! (mut sb) (load i))
+                    (let [pname (sb-str (mut sb))]
+                      (push! [(slice u8)] (mut (.params fp)) pname)
+                      (push! [i64] (mut (.param-annotations fp)) (ty-dyn TAG-ANY))
+                      (push! [(Option i64)] (mut (.param-defaults fp)) (None [i64]))
+                      (push! [(Option i64)] (mut (.param-patterns fp)) (None [i64]))
+                      (push! [i64] (mut args) (syntax-add-node! (SxName :name pname) 0 0)))
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        (set! (.expression-body fp)
+              (Some (syntax-add-node! (SxIntrinsic :builtin (.builtin entry) :args (load args)) 0 0)))
+        (syntax-global-declare! (.name entry) -1 index)
+        0)))
+
+;; Materialize the intrinsics the program names, with their parents. Runs before the Scripts'
+;; own declarations so a Script redefining `Object` shadows it as JavaScript says it does.
+(defn syntax-declare-intrinsics! [] (-> i64)
+  (let [table (intrinsic-table) (mut i) 0]
+    (loop (if (>= (load i) (len table))
+              (break 0)
+              (let [entry (get table (load i))]
+                (if (syntax-names-identifier? (.name entry))
+                    (do
+                      (if (!= (.parent entry) "")
+                          (let [pi (intrinsic-index table (.parent entry))]
+                            (if (< pi 0)
+                                (panic "syntax-declare-intrinsics!: an intrinsic names an unknown parent")
+                                (syntax-declare-intrinsic! (get table pi))))
+                          0)
+                      (syntax-declare-intrinsic! entry))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))
+
+;; The body of an intrinsic: its JSL builtin over the lowered operands.
+(defn lower-intrinsic-call [(builtin (slice u8)) (args (ArrayList i64))] (-> (dyn NodeOps))
+  (let [(mut values) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))]
+    (al-for [a args]
+            (let [v (lower-syntax-expr a)]
+              (n-keep! v)
+              (push! [(dyn NodeOps)] (mut values) v)))
+    (let [scope (parser-node (.current-scope (parser-state)))
+          r (lower-jsl-call-values builtin (load values))]
+      (al-for [v (load values)] (n-unkeep! v))
+      (al-free! [(dyn NodeOps)] (mut values))
+      (parser-set-current-ctrl! (.ctrl r))
+      (scope-set-mem! scope (.mem r))
+      (.value r))))
+
+;; A string constant as a syntax node, for the values instantiation passes to JSL setups.
+(defn syntax-ascii-string-node [(text (slice u8))] (-> i64)
+  (let [(mut units) (al-new [i64] (alloc/malloc-allocator)) (mut i) 0]
+    (loop (if (>= (load i) (len text))
+              (break 0)
+              (do (push! [i64] (mut units) (primitive/cast i64 (get text (load i))))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+    (syntax-add-node! (SxString :raw text :units (load units) :legacy-escape false) 0 0)))
+
+;; Realm creation, intrinsics part: every materialized intrinsic's function object goes into its
+;; global slot, then each setup runs — `Error.prototype.name`, the prototype chain to the parent.
+(defn lower-intrinsic-instantiation! [] (-> i64)
+  (let [table (intrinsic-table) (mut fi) 0]
+    (loop (if (>= (load fi) (len (.funs (parser-state))))
+              (break 0)
+              (do
+                (if (syntax-intrinsic-fun? (load fi))
+                    (let [f (syntax-fun-at (load fi))]
+                      (lower-global-store! (.name f) (lower-function-object (load fi))))
+                    0)
+                (set! (mut fi) (+ (load fi) 1))
+                (continue))))
+    (set! (mut fi) 0)
+    (loop (if (>= (load fi) (len (.funs (parser-state))))
+              (break 0)
+              (do
+                (if (syntax-intrinsic-fun? (load fi))
+                    (let [f (syntax-fun-at (load fi))
+                          entry (get table (intrinsic-index table (.name f)))]
+                      (if (= (.setup entry) "")
+                          0
+                          (let [(mut args) (al-new [i64] (alloc/malloc-allocator))]
+                            (push! [i64] (mut args) (syntax-add-node! (SxName :name (.name f)) 0 0))
+                            (push! [i64] (mut args)
+                                   (if (= (.parent entry) "")
+                                       (syntax-add-node! (SxName :name "undefined") 0 0)
+                                       (syntax-add-node! (SxName :name (.parent entry)) 0 0)))
+                            (push! [i64] (mut args) (syntax-ascii-string-node (.name f)))
+                            (lower-intrinsic-call (.setup entry) (load args))
+                            (al-free! [i64] (mut args))
+                            0)))
+                    0)
+                (set! (mut fi) (+ (load fi) 1))
+                (continue))))
+    0))
+
 (defn syntax-collect-globals! [] (-> i64)
   (let [p (parser-state)
         (mut si) 0]
@@ -7544,7 +7724,7 @@
 ;; holds `undefined`); the function step stores each declared function object in order.
 (defn lower-global-instantiation! [(root-index i64)] (-> i64)
   (let [f (syntax-fun-at root-index)]
-    (if (= (.script f) 0) (lower-create-global-object!) 0)
+    (if (= (.script f) 0) (do (lower-create-global-object!) (lower-intrinsic-instantiation!)) 0)
     (al-for [id (.body f)]
             (match (syntax-stmt-node id)
               (SsFunctionDecl [fun]

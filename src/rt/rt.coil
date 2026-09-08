@@ -37,6 +37,10 @@
 
 (extern strtoll :cc c [(ptr i8) (ptr (ptr i8)) i32] (-> i64))
 
+(extern snprintf :cc c [(ptr i8) i64 (ptr i8) ...] (-> i32))
+
+(extern strtod :cc c [(ptr i8) (ptr (ptr i8))] (-> f64))
+
 (extern atexit :cc c [(fnptr c [] i64)] (-> i32))
 
 (const RT-HEADER-BYTES 24)
@@ -77,6 +81,9 @@
 (const RT-DYNAMIC-PREFIX-STRING 0x7ffd)
 
 (const RT-DYNAMIC-PREFIX-FUNCTION 0xfff9)
+
+;; A boxed compact integer: prefix 0x7ff9 over a signed 48-bit payload (`aot.node.dynamic`).
+(const RT-DYNAMIC-PREFIX-INT 0x7ff9)
 
 (const RT-DYNAMIC-PAYLOAD-MASK 0x0000ffffffffffff)
 
@@ -1186,6 +1193,188 @@
   (rt-collect-linked! map-id caller-sp))
 
 ;; ---------------------------------------------------------------------------
+;; Number::toString(x, 10) — ECMA-262 §6.1.6.1.20.
+;;
+;; The digits are the shortest decimal that reads back as the same double (the spec's "k is as
+;; small as possible"): try one more significant digit at a time through `snprintf("%.*e")` and
+;; accept the first that `strtod` returns unchanged; the spec's tie rule (the closest such digit
+;; string, then the even one) is what a correctly rounded printf produces for that precision. The
+;; layout rules then place the point or choose the exponent form exactly as the section lists them.
+
+(defn rt-number-word-value [(word i64)] (-> f64)
+  (if (= (rt-word-prefix word) RT-DYNAMIC-PREFIX-INT)
+      (let [payload (& word RT-DYNAMIC-PAYLOAD-MASK)
+            signed (if (!= (& payload 0x800000000000) 0) (- payload 0x1000000000000) payload)]
+        (primitive/cast f64 signed))
+      (let [slot (primitive/alloc-stack i64)]
+        (set! slot word)
+        (load (primitive/cast (ptr f64) slot)))))
+
+(defn rt-ascii-push! [(buf (ptr u8)) (n (ptr i64)) (c i64)] (-> i64)
+  (do
+    (set! (primitive/index buf (load n)) (primitive/cast u8 c))
+    (set! n (+ (load n) 1))
+    0))
+
+(defn rt-ascii-push-int! [(buf (ptr u8)) (n (ptr i64)) (v0 i64)] (-> i64)
+  (let [tmp (primitive/alloc-stack (array u8 24))
+        tp (primitive/cast (ptr u8) tmp)
+        (mut v) v0
+        (mut k) 0]
+    (if (= (load v) 0) (rt-ascii-push! buf n 48) 0)
+    (loop (if (= (load v) 0)
+              (break 0)
+              (do
+                (set! (primitive/index tp (load k)) (primitive/cast u8 (+ 48 (% (load v) 10))))
+                (set! (mut k) (+ (load k) 1))
+                (set! (mut v) (/ (load v) 10))
+                (continue))))
+    (loop (if (= (load k) 0)
+              (break 0)
+              (do
+                (set! (mut k) (- (load k) 1))
+                (rt-ascii-push! buf n (primitive/cast i64 (load (primitive/index tp (load k)))))
+                (continue))))
+    0))
+
+;; The shortest digit string of a positive finite double into `digits` (k bytes, returned) and its
+;; decimal exponent `n` such that value = 0.d1d2...dk × 10^n.
+(defn rt-shortest-digits! [(x f64) (digits (ptr u8)) (n (ptr i64))] (-> i64)
+  (let [buf (primitive/alloc-stack (array i8 64))
+        bp (primitive/cast (ptr i8) buf)
+        end (primitive/alloc-stack (ptr i8))
+        (mut precision) 0
+        (mut k) 0]
+    (loop (if (> (load precision) 17)
+              (break 0)
+              (do
+                (snprintf bp 64 c"%.*e" (primitive/cast i32 (load precision)) x)
+                (if (primitive/fcmp-eq (strtod bp end) x)
+                    (let [(mut i) 0 (mut count) 0 (mut exp) 0 (mut neg) false (mut at-exp) false]
+                      ;; d.ddd…e±XX: collect the digits, then the exponent.
+                      (loop (if (= (primitive/cast i64 (load (primitive/index bp (load i)))) 0)
+                                (break 0)
+                                (let [c (primitive/cast i64 (load (primitive/index bp (load i))))]
+                                  (if (load at-exp)
+                                      (if (= c 45)
+                                          (set! (mut neg) true)
+                                          (if (and (>= c 48) (<= c 57))
+                                              (set! (mut exp) (+ (* (load exp) 10) (- c 48)))
+                                              0))
+                                      (if (= c 101)
+                                          (set! (mut at-exp) true)
+                                          (if (and (>= c 48) (<= c 57))
+                                              (do
+                                                (set! (primitive/index digits (load count)) (primitive/cast u8 c))
+                                                (set! (mut count) (+ (load count) 1)))
+                                              0)))
+                                  (set! (mut i) (+ (load i) 1))
+                                  (continue))))
+                      ;; Trailing zeros are not significant.
+                      (loop (if (and (> (load count) 1)
+                                     (= (primitive/cast i64 (load (primitive/index digits (- (load count) 1)))) 48))
+                                (do (set! (mut count) (- (load count) 1)) (continue))
+                                (break 0)))
+                      (set! n (+ (if (load neg) (- 0 (load exp)) (load exp)) 1))
+                      (set! (mut k) (load count))
+                      (break 0))
+                    (do (set! (mut precision) (+ (load precision) 1)) (continue))))))
+    (if (= (load k) 0) (panic "rt-shortest-digits!: no precision reproduced the double") 0)
+    (load k)))
+
+;; Write Number::toString(x) as ASCII into `out` (at most 32 bytes), returning its length.
+(defn rt-number-to-ascii! [(x0 f64) (out (ptr u8))] (-> i64)
+  (let [n (primitive/alloc-stack i64)
+        count (primitive/alloc-stack i64)
+        digits (primitive/alloc-stack (array u8 32))
+        dp (primitive/cast (ptr u8) digits)
+        (mut x) x0]
+    (set! count 0)
+    (if (not (primitive/fcmp-eq (load x) (load x)))
+        (do (rt-ascii-push! out count 78) (rt-ascii-push! out count 97) (rt-ascii-push! out count 78) 0)
+        (if (primitive/fcmp-eq (load x) 0.0)
+            (rt-ascii-push! out count 48)
+            (do
+              (if (primitive/fcmp-lt (load x) 0.0)
+                  (do (rt-ascii-push! out count 45) (set! (mut x) (primitive/fsub 0.0 (load x))) 0)
+                  0)
+              (if (primitive/fcmp-eq (load x) (primitive/fdiv 1.0 0.0))
+                  (let [word "Infinity" (mut i) 0]
+                    (loop (if (>= (load i) (len word))
+                              (break 0)
+                              (do (rt-ascii-push! out count (primitive/cast i64 (get word (load i))))
+                                  (set! (mut i) (+ (load i) 1))
+                                  (continue)))))
+                  (let [k (rt-shortest-digits! (load x) dp n)
+                        nn (load n)]
+                    (if (and (<= k nn) (<= nn 21))
+                        ;; Digits then zeros.
+                        (let [(mut i) 0]
+                          (loop (if (>= (load i) nn)
+                                    (break 0)
+                                    (do (rt-ascii-push! out count (if (< (load i) k) (primitive/cast i64 (load (primitive/index dp (load i)))) 48))
+                                        (set! (mut i) (+ (load i) 1))
+                                        (continue)))))
+                        (if (and (< 0 nn) (<= nn 21))
+                            ;; The point inside the digits.
+                            (let [(mut i) 0]
+                              (loop (if (>= (load i) k)
+                                        (break 0)
+                                        (do (if (= (load i) nn) (rt-ascii-push! out count 46) 0)
+                                            (rt-ascii-push! out count (primitive/cast i64 (load (primitive/index dp (load i)))))
+                                            (set! (mut i) (+ (load i) 1))
+                                            (continue)))))
+                            (if (and (< -6 nn) (<= nn 0))
+                                ;; 0.000ddd
+                                (let [(mut i) 0]
+                                  (rt-ascii-push! out count 48)
+                                  (rt-ascii-push! out count 46)
+                                  (loop (if (>= (load i) (- 0 nn))
+                                            (break 0)
+                                            (do (rt-ascii-push! out count 48) (set! (mut i) (+ (load i) 1)) (continue))))
+                                  (set! (mut i) 0)
+                                  (loop (if (>= (load i) k)
+                                            (break 0)
+                                            (do (rt-ascii-push! out count (primitive/cast i64 (load (primitive/index dp (load i)))))
+                                                (set! (mut i) (+ (load i) 1))
+                                                (continue)))))
+                                ;; d.ddde±x
+                                (let [(mut i) 1 e (- nn 1)]
+                                  (rt-ascii-push! out count (primitive/cast i64 (load (primitive/index dp 0))))
+                                  (if (> k 1)
+                                      (do
+                                        (rt-ascii-push! out count 46)
+                                        (loop (if (>= (load i) k)
+                                                  (break 0)
+                                                  (do (rt-ascii-push! out count (primitive/cast i64 (load (primitive/index dp (load i)))))
+                                                      (set! (mut i) (+ (load i) 1))
+                                                      (continue)))))
+                                      0)
+                                  (rt-ascii-push! out count 101)
+                                  (rt-ascii-push! out count (if (< e 0) 45 43))
+                                  (rt-ascii-push-int! out count (if (< e 0) (- 0 e) e))
+                                  0)))))))))
+    (load count)))
+
+;; The runtime capability behind `%NumberToString`: a boxed number word to a fresh string.
+(defn rt-number-to-string [(word i64) (shape i64) (map-id i64) (caller-sp i64)] (-> i64)
+  (let [ascii (primitive/alloc-stack (array u8 32))
+        ap (primitive/cast (ptr u8) ascii)]
+    (rt-heap-boot!)
+    (let [length (rt-number-to-ascii! (rt-number-word-value word) ap)
+          result (rt-alloc-rooted (+ 8 (* length 2)) shape map-id caller-sp
+                                  (primitive/cast (ptr i64) 0) (primitive/cast (ptr i64) 0) false)
+          (mut i) 0]
+      (set! (primitive/cast (ptr i64) result) length)
+      (loop (if (>= (load i) length)
+                (break 0)
+                (do
+                  (rt-string-set-code-unit! result (load i) (primitive/cast i64 (load (primitive/index ap (load i)))))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      result)))
+
+;; ---------------------------------------------------------------------------
 ;; Generic own-property access over the runtime shape tree (`aot.rt.shapes`).
 ;;
 ;; Generated code takes these when the owner's layout is not statically known: a raw ordinary
@@ -1368,6 +1557,9 @@
 (defn rt-unimplemented-string-to-number [] (-> i64)
   (do (unimplemented "StringToNumber of a runtime string" "docs/GAPS.md — conversions") 0))
 
+(defn rt-unimplemented-to-object [] (-> i64)
+  (do (unimplemented "ToObject on a primitive (wrapper objects: `new String(x)`, `Object(1)`)" "docs/GAPS.md — builtins") 0))
+
 (defn rt-unimplemented-keyed-access [] (-> i64)
   (do (unimplemented "computed property access with a runtime key (`o[k]`, arrays)" "docs/GAPS.md — property keys") 0))
 
@@ -1403,8 +1595,10 @@
           [rt-unimplemented-string-to-number :as "aot_rt_unimplemented_string_to_number"]
           [rt-unimplemented-no-realm :as "aot_rt_unimplemented_no_realm"]
           [rt-uncaught :as "aot_rt_uncaught"]
+          [rt-number-to-string :as "aot_rt_number_to_string"]
           [rt-prop-get-own :as "aot_rt_prop_get_own"]
           [rt-prop-has-own :as "aot_rt_prop_has_own"]
           [rt-prop-set-own :as "aot_rt_prop_set_own"]
+          [rt-unimplemented-to-object :as "aot_rt_unimplemented_to_object"]
           [rt-unimplemented-keyed-access :as "aot_rt_unimplemented_keyed_access"]
           [rt-unimplemented-unresolved-global :as "aot_rt_unimplemented_unresolved_global"])

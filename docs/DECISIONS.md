@@ -1,5 +1,47 @@
 # Decisions
 
+## 2026-09-08 — Strict code runs
+
+The baseline campaign refused 22,921 files at "strict-mode runtime semantics" — every strict
+variant test262 runs. What strict mode changes at run time is small and already here: a strict
+function's `this` is its receiver unmapped (`lower-this`), a Script's top-level `this` is the
+global object either way, and an assignment to an undeclared name is a refusal in both modes. The
+one sloppy-only silence — a write to `undefined`, `NaN` or `Infinity` is ignored — becomes the
+TypeError the strict code requires (the runtime's TypeError trap until exception objects exist).
+Early errors, `arguments`, `eval` and `with` are unchanged: parse-time or refused by name.
+
+## 2026-09-08 — Standard globals are intrinsics: hoisted functions over JSL bodies
+
+A standard global (`Object`, `String`, `Number`, `Boolean`, `Error` and the NativeErrors) is a
+hoisted function record whose body is one syntax node, `SxIntrinsic`, naming a JSL builtin and
+its operands: the receiver, the constructor's own function object, then the arguments (the table
+is `intrinsic-table` in the parser). Everything else is what every source function already gets:
+a Fun over the shared ABI, a function object with a `prototype` object, direct and value calls,
+inlining, `new`, `instanceof`, `p.constructor`. The realm materializes only the intrinsics a
+program names (plus their parents — a NativeError needs `Error.prototype`): the world is closed,
+so the rest do not exist in it, and a Script's own declaration of the name shadows the intrinsic
+exactly as any later declaration shadows an earlier one. Instantiation stores their function
+objects into the global object before the first Script's own declarations and runs each entry's
+setup builtin (`Error.prototype.name`/`message`, the chain to the parent's prototype).
+
+Why not a JavaScript prelude: the second rule — JavaScript is input, never implementation. Why not
+adapters: the function record IS the adapter, and it costs nothing new. The builtin can tell a
+plain call from a construct because a sloppy plain call arrives with the global object as
+receiver (`JsCalledAsFunction`); `NewTarget` proper waits for the closures/classes slice. Known
+consequence of the slot ABI: a zero-argument call is indistinguishable from an `undefined`
+argument (`String()` is "undefined", `Number()` is NaN).
+
+A Load or Store that reads its slice through a MemMerge depends on that slot node directly
+(`n-add-dep!`): the merge's own type does not move when one slot's does, and SCCP once left a
+store at the optimistic TOP it computed while the slot was still TOP, to fall from it in the
+pessimistic pass afterwards. `AOT_TRACE_TOP=1` narrates memory nodes rising to TOP.
+
+ToString (`JsToString`) is total over primitives; `Number::toString` is the runtime capability
+`aot_rt_number_to_string`: shortest round-trip digits by `snprintf`/`strtod` at increasing
+precision, then the section's layout rules. `+` concatenates through it. An object operand still
+refuses by name (ToPrimitive); the non-returning arms yield the empty string so a caller's
+`%UnboxString` stays proven.
+
 ## 2026-09-08 — Generic property access is a runtime operation over the shape tree
 
 The compiler's hidden-class tree (`aot.shape`) is the first part of the runtime's (`aot.rt.shapes`).
