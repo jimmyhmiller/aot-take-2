@@ -92,7 +92,34 @@ execution receive explicit unsupported results and remain in the denominator. Ty
 reporting at runtime and realm host bindings remain unimplemented. Do not convert a nonzero native exit into
 an expected exception by parsing its diagnostics.
 
-## Latest measured campaign, 2026-09-08
+## Running campaigns
+
+The runner shards files across forked workers (`AOT_T262_JOBS`, default 8; worker k takes every
+k-th eligible file in suite order and writes `shard-k.tsv`/`shard-k.counts`, which the parent
+merges into `results.tsv` and `summary.txt`). `AOT_T262_SAMPLE=N` runs every N-th file only: a
+quick campaign over 1/20 of the suite takes about nine minutes on eight workers and its pass rate
+is over the sampled files (the summary records `jobs=` and `sample=`). Artifacts are
+`case-<file-index>-<variant>`. Stage deadlines: compile `AOT_T262_COMPILE_SECONDS` (default 30),
+link 10 s, run 2 s; a compile past its deadline is a `timeout` verdict, so when timeouts appear the
+per-case compile time is what to fix. Never edit `jsl/` or run `coil build` during a campaign.
+
+```
+AOT_T262_SAMPLE=20 AOT_T262_JOBS=8 coil run tools/test262.coil -- run /Users/jimmyhmiller/Documents/Code/open-source/test262 ./build/aot-test262-compiler build/release/aot-runtime.o build/test262-sample-YYYYMMDD
+```
+
+## Latest measured campaign, 2026-09-08 (sampled)
+
+After strict mode, intrinsics, keyed access, TypeError objects and `finally`, a 1-in-20 sample
+(2,680 files, 8 workers, 8m50s) measured **259 / 2,680 files passing (9.66%)**, up from 7.88% on
+the full baseline: verdict-pass 493, verdict-fail 1,013, verdict-unsupported 3,497,
+verdict-compiler-error 117, verdict-timeout 17 (compiles past 10 s under load; the deadline is 30 s
+now). Run-stage refusals by frequency: undeclared standard globals 661 (the builtin library),
+uncaught exceptions 260, wrapper objects 64, StringToNumber 15, ToPrimitive 9, one invariant trap
+(top-level `this.x = v`, fixed). Compile-stage: array literals 1,165, BigInt 483, classes 366,
+default/rest/generator/async functions 127, object methods and accessors 105, regular expressions
+91, methods as values 89, Script lexical TDZ 64. Arrays are the largest single blocker.
+
+## Earlier measured campaign, 2026-09-08 (full)
 
 The realm/exceptions/receivers/constructors campaign measured **4,225 / 53,582 files passing
 (7.88%)**, up from 257 (0.48%): verdict-pass 8,014, verdict-fail 123, verdict-unsupported 57,058,

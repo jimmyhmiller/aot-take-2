@@ -8,6 +8,7 @@
 (import "coil.args" :as args)
 (import "coil.arraylist" :use *)
 (import "coil.fs" :as fs)
+(import "coil.os" :as os)
 (import "coil.print" :use *)
 (import "coil.primitive" :as primitive)
 (import "coil.slice" :use *)
@@ -26,6 +27,97 @@
 (extern mkdir :cc c [(ptr i8) i32] (-> i32))
 
 
+;; One test file of a campaign: every variant the metadata asks for, each compiled, linked and run
+;; as its own process. Appends one report row per variant, updates the verdict counts, and says
+;; whether the file passed. `file-index` names the artifacts (`case-<file>-<variant>`), so shards
+;; running in parallel never collide.
+(defn t262-run-file! [(root (slice u8)) (compiler (slice u8)) (runtime (slice u8)) (directory (slice u8))
+                      (path (slice u8)) (file-index i64)
+                      (report (mut StrBuf)) (counts (mut (ArrayList i64)))] (-> bool)
+  (let [a (alloc/malloc-allocator)
+        source (t262-read root path)
+        (mut meta) (t262-metadata source)
+        (mut modes) (t262-variants (load meta))
+        (mut results) (al-new [Test262VariantResult] a)
+        (mut variant) 0]
+    (for mode (iter (load modes))
+      (let [(mut verdict) T262-HARNESS-ERROR (mut reason) (.error meta)]
+        (set! (mut variant) (+ (load variant) 1))
+        (match (t262-plan (load meta) path mode)
+          (Err [why] (set! (mut reason) why))
+          (Ok [planned]
+            (let [(mut units) planned]
+              (set! (mut reason) (t262-unavailable (load meta) mode (load units)))
+              (if (!= (load reason) "") (set! (mut verdict) T262-UNSUPPORTED)
+                  (let [(mut prefix) (sb-new a)]
+                    (sb-push-str! (mut prefix) directory)
+                    (sb-push-str! (mut prefix) "/case-")
+                    (sb-push-i64! (mut prefix) file-index)
+                    (sb-push-str! (mut prefix) "-")
+                    (sb-push-i64! (mut prefix) (load variant))
+                    ;; The test is the plan's last unit; the harness Scripts precede it.
+                    (let [test-unit (get (load units) (- (len (load units)) 1))
+                          (mut harness) (al-new [(slice u8)] a)]
+                      (for unit (iter (load units))
+                        (let [u unit]
+                          (if (.harness u)
+                              (push! [(slice u8)] (mut harness) (t262-harness-path a root (.path u)))
+                              0)))
+                      (match (t262-unit-source test-unit source)
+                        (None [] (set! (mut reason) "source-allocation"))
+                        (Some [input]
+                          (set! (mut verdict) (t262-execute-script! compiler runtime (load harness) input
+                                                                           (sb-str (load prefix)) (load meta)))
+                          (alloc/free [u8] a input)))
+                      (for hp (iter (load harness)) (alloc/free [u8] a hp))
+                      (al-free! (mut harness)))
+                    (sb-free! (mut prefix))))
+              (al-free! (mut units)))))
+        (push! [Test262VariantResult] (mut results)
+               (Test262VariantResult :mode mode :verdict (load verdict)))
+        (set! (mut counts) (load verdict) (+ (get (load counts) (load verdict)) 1))
+        (sb-push-str! (mut report) path)
+        (sb-push-str! (mut report) "\t")
+        (sb-push-i64! (mut report) mode)
+        (sb-push-str! (mut report) "\t")
+        (sb-push-str! (mut report) (t262-verdict-name (load verdict)))
+        (sb-push-str! (mut report) "\t")
+        (sb-push-str! (mut report) (load reason))
+        (sb-push-str! (mut report) "\tcase-")
+        (sb-push-i64! (mut report) file-index)
+        (sb-push-str! (mut report) "-")
+        (sb-push-i64! (mut report) (load variant))
+        (sb-push-str! (mut report) "\n")))
+    (let [passed (t262-file-passed? (load meta) (load results))]
+      (al-free! (mut results))
+      (al-free! (mut modes))
+      (t262-metadata-free! (mut meta))
+      (alloc/free [u8] a source)
+      passed)))
+
+;; A positive integer from the environment, or the default.
+(defn t262-env-int [(name (ptr i8)) (default i64)] (-> i64)
+  (let [raw (os/getenv name)]
+    (if (= (primitive/cast i64 raw) 0)
+        default
+        (match (str-parse-int (cstr->str raw))
+          (Some [n] (if (> n 0) n default))
+          (None [] default)))))
+
+(defn t262-shard-path [(directory (slice u8)) (shard i64) (suffix (slice u8))] (-> (slice u8))
+  (let [(mut b) (sb-new (alloc/malloc-allocator))]
+    (sb-push-str! (mut b) directory)
+    (sb-push-str! (mut b) "/shard-")
+    (sb-push-i64! (mut b) shard)
+    (sb-push-str! (mut b) suffix)
+    (sb-str (mut b))))
+
+;; A campaign runs its files across `AOT_T262_JOBS` forked workers (default 8): worker k takes every
+;; k-th eligible file, in suite order, and writes its rows and counts to `shard-k.tsv` /
+;; `shard-k.counts`; the parent merges them into `results.tsv` and `summary.txt`. `AOT_T262_SAMPLE=N`
+;; runs every N-th file only, for a quick campaign whose pass rate is over the sampled files; the
+;; summary records both settings. Each case is still one compile, one link and one run, so the
+;; per-case time — not the campaign's length — is the number to watch (docs/TEST262.md).
 (defn t262-campaign [(root (slice u8)) (compiler (slice u8))
                      (runtime (slice u8)) (directory (slice u8))] (-> i64)
   (let [a (alloc/malloc-allocator)
@@ -34,7 +126,8 @@
         compiler-hash (t262-file-hash compiler)
         runtime-hash (t262-file-hash runtime)
         cdir (t262-concat directory "\0")
-        (mut report) (sb-new a)
+        jobs (t262-env-int c"AOT_T262_JOBS" 8)
+        sample (t262-env-int c"AOT_T262_SAMPLE" 1)
         (mut files) 0 (mut passed) 0 (mut variants) 0
         (mut counts) (al-new [i64] a)]
     (if (!= (str-trim revision) TEST262-REVISION) (panic "test262: unexpected suite revision") 0)
@@ -46,96 +139,116 @@
     (let [(mut i) 0]
       (loop (if (> (load i) T262-NOT-RUN) (break 0)
                 (do (push! [i64] (mut counts) 0) (set! (mut i) (+ (load i) 1)) (continue)))))
-    (sb-push-str! (mut report) "path\tmode\tverdict\treason\tartifact-id\n")
     (let [listing (t262-git root "ls-files -z -- test")
-          (mut paths) (str-split a listing "\0")]
-      (for path (iter (load paths))
-        (if (t262-test-path? path)
-            (let [source (t262-read root path)
-                  (mut meta) (t262-metadata source)
-                  (mut modes) (t262-variants (load meta))
-                  (mut results) (al-new [Test262VariantResult] a)]
-              (set! (mut files) (+ (load files) 1))
-              (for mode (iter (load modes))
-                (let [(mut verdict) T262-HARNESS-ERROR (mut reason) (.error meta)]
-                  (set! (mut variants) (+ (load variants) 1))
-                  (match (t262-plan (load meta) path mode)
-                    (Err [why] (set! (mut reason) why))
-                    (Ok [planned]
-                      (let [(mut units) planned]
-                        (set! (mut reason) (t262-unavailable (load meta) mode (load units)))
-                        (if (!= (load reason) "") (set! (mut verdict) T262-UNSUPPORTED)
-                            (let [(mut prefix) (sb-new a)]
-                              (sb-push-str! (mut prefix) directory)
-                              (sb-push-str! (mut prefix) "/case-")
-                              (sb-push-i64! (mut prefix) (load variants))
-                              ;; The test is the plan's last unit; the harness Scripts precede it.
-                              (let [test-unit (get (load units) (- (len (load units)) 1))
-                                    (mut harness) (al-new [(slice u8)] a)]
-                                (for unit (iter (load units))
-                                  (let [u unit]
-                                    (if (.harness u)
-                                        (push! [(slice u8)] (mut harness) (t262-harness-path a root (.path u)))
-                                        0)))
-                                (match (t262-unit-source test-unit source)
-                                  (None [] (set! (mut reason) "source-allocation"))
-                                  (Some [input]
-                                    (set! (mut verdict) (t262-execute-script! compiler runtime (load harness) input
-                                                                                     (sb-str (load prefix)) (load meta)))
-                                    (alloc/free [u8] a input)))
-                                (for path (iter (load harness)) (alloc/free [u8] a path))
-                                (al-free! (mut harness)))
-                              (sb-free! (mut prefix))))
-                        (al-free! (mut units)))))
-                  (push! [Test262VariantResult] (mut results)
-                         (Test262VariantResult :mode mode :verdict (load verdict)))
-                  (set! (mut counts) (load verdict) (+ (get (load counts) (load verdict)) 1))
-                  (sb-push-str! (mut report) path)
-                  (sb-push-str! (mut report) "\t")
-                  (sb-push-i64! (mut report) mode)
-                  (sb-push-str! (mut report) "\t")
-                  (sb-push-str! (mut report) (t262-verdict-name (load verdict)))
-                  (sb-push-str! (mut report) "\t")
-                  (sb-push-str! (mut report) (load reason))
-                  (sb-push-str! (mut report) "\tcase-")
-                  (sb-push-i64! (mut report) (load variants))
-                  (sb-push-str! (mut report) "\n")))
-              (if (t262-file-passed? (load meta) (load results)) (set! (mut passed) (+ (load passed) 1)) 0)
-              (al-free! (mut results))
-              (al-free! (mut modes))
-              (t262-metadata-free! (mut meta))
-              (alloc/free [u8] a source)) 0))
-      (al-free! (mut paths)) (alloc/free [u8] a listing))
-    ;; Do not publish a scored report if the checkout changed during this campaign.
-    (let [after (t262-git root "status --porcelain --untracked-files=normal -- test harness")
-          after-revision (t262-git root "rev-parse HEAD")]
-      (if (or (!= (len after) 0) (!= after-revision revision))
-          (panic "test262: suite changed during campaign; results not published") 0)
-      (alloc/free [u8] a after) (alloc/free [u8] a after-revision))
-    (let [result-path (t262-concat directory "/results.tsv")
-          summary-path (t262-concat directory "/summary.txt")
-          (mut summary) (sb-new a)]
-      (sb-push-str! (mut summary) "revision=") (sb-push-str! (mut summary) (str-trim revision))
-      (sb-push-str! (mut summary) "\ncompiler-git-blob=") (sb-push-str! (mut summary) (str-trim compiler-hash))
-      (sb-push-str! (mut summary) "\nruntime-git-blob=") (sb-push-str! (mut summary) (str-trim runtime-hash))
-      (sb-push-str! (mut summary) "\nfiles=") (sb-push-i64! (mut summary) (load files))
-      (sb-push-str! (mut summary) "\npassed-files=") (sb-push-i64! (mut summary) (load passed))
-      (sb-push-str! (mut summary) "\nvariants=") (sb-push-i64! (mut summary) (load variants))
-      (sb-push-str! (mut summary) "\npass-rate-basis-points=")
-      (sb-push-i64! (mut summary) (if (= (load files) 0) 0 (/ (* 10000 (load passed)) (load files))))
-      (let [(mut i) T262-PASS]
-        (loop (if (> (load i) T262-NOT-RUN) (break 0)
-                  (do (sb-push-str! (mut summary) "\nverdict-")
-                      (sb-push-str! (mut summary) (t262-verdict-name (load i)))
-                      (sb-push-str! (mut summary) "=")
-                      (sb-push-i64! (mut summary) (get (load counts) (load i)))
-                      (set! (mut i) (+ (load i) 1)) (continue)))))
-      (sb-push-str! (mut summary) "\n")
-      (t262-write! result-path (sb-str (load report)))
-      (t262-write! summary-path (sb-str (load summary)))
-      (print "{}" (sb-str (load summary)))
-      (alloc/free [u8] a result-path) (alloc/free [u8] a summary-path) (sb-free! (mut summary)))
-    (sb-free! (mut report)) (al-free! (mut counts))
+          (mut all) (str-split a listing "\0")
+          (mut tests) (al-new [(slice u8)] a)]
+      (for path (iter (load all)) (if (t262-test-path? path) (push! [(slice u8)] (mut tests) path) 0))
+      ;; Workers.
+      (let [(mut shard) 0 (mut pids) (al-new [i64] a)]
+        (loop (if (>= (load shard) jobs)
+                  (break 0)
+                  (let [pid (os/fork)]
+                    (if (< pid 0) (panic "test262: fork failed") 0)
+                    (if (= pid 0)
+                        (let [(mut report) (sb-new a)
+                              (mut summary) (sb-new a)
+                              (mut shard-files) 0 (mut shard-passed) 0
+                              (mut eligible) 0
+                              (mut index) 0]
+                          (for path (iter (load tests))
+                            (do
+                              (if (= (% (load index) sample) 0)
+                                  (do
+                                    (if (= (% (load eligible) jobs) (load shard))
+                                        (do
+                                          (set! (mut shard-files) (+ (load shard-files) 1))
+                                          (if (t262-run-file! root compiler runtime directory path (load index) (mut report) (mut counts))
+                                              (set! (mut shard-passed) (+ (load shard-passed) 1))
+                                              0))
+                                        0)
+                                    (set! (mut eligible) (+ (load eligible) 1)))
+                                  0)
+                              (set! (mut index) (+ (load index) 1))))
+                          (sb-push-i64! (mut summary) (load shard-files))
+                          (sb-push-str! (mut summary) " ")
+                          (sb-push-i64! (mut summary) (load shard-passed))
+                          (let [(mut v) 0]
+                            (loop (if (> (load v) T262-NOT-RUN) (break 0)
+                                      (do (sb-push-str! (mut summary) " ")
+                                          (sb-push-i64! (mut summary) (get (load counts) (load v)))
+                                          (set! (mut v) (+ (load v) 1)) (continue)))))
+                          (t262-write! (t262-shard-path directory (load shard) ".tsv") (sb-str (load report)))
+                          (t262-write! (t262-shard-path directory (load shard) ".counts") (sb-str (load summary)))
+                          (os/_exit 0)
+                          0)
+                        (push! [i64] (mut pids) (primitive/cast i64 pid)))
+                    (set! (mut shard) (+ (load shard) 1))
+                    (continue))))
+        (for pid (iter (load pids))
+          (let [status (primitive/alloc-stack i32)]
+            (if (!= (os/waitpid (primitive/cast i32 pid) status 0) (primitive/cast i32 pid))
+                (panic "test262: waitpid failed") 0)
+            (if (!= (primitive/cast i64 (load status)) 0) (panic "test262: a campaign worker failed") 0)))
+        (al-free! [i64] (mut pids)))
+      ;; Merge.
+      (let [(mut report) (sb-new a) (mut shard) 0]
+        (sb-push-str! (mut report) "path\tmode\tverdict\treason\tartifact-id\n")
+        (loop (if (>= (load shard) jobs)
+                  (break 0)
+                  (let [rows-path (t262-shard-path directory (load shard) ".tsv")
+                        counts-path (t262-shard-path directory (load shard) ".counts")
+                        rows (try (try-or! (fs/read-file a rows-path) (do (panic "test262: missing shard rows") "")))
+                        text (try (try-or! (fs/read-file a counts-path) (do (panic "test262: missing shard counts") "")))
+                        (mut fields) (str-split a (str-trim text) " ")]
+                    (sb-push-str! (mut report) rows)
+                    (let [(mut f) 0]
+                      (for field (iter (load fields))
+                        (let [n (match (str-parse-int field) (Some [v] v) (None [] 0))]
+                          (if (= (load f) 0) (set! (mut files) (+ (load files) n))
+                              (if (= (load f) 1) (set! (mut passed) (+ (load passed) n))
+                                  (set! (mut counts) (- (load f) 2) (+ (get (load counts) (- (load f) 2)) n))))
+                          (set! (mut f) (+ (load f) 1)))))
+                    (al-free! (mut fields))
+                    (set! (mut shard) (+ (load shard) 1))
+                    (continue))))
+        (let [(mut v) 0]
+          (loop (if (> (load v) T262-NOT-RUN) (break 0)
+                    (do (set! (mut variants) (+ (load variants) (get (load counts) (load v))))
+                        (set! (mut v) (+ (load v) 1)) (continue)))))
+        (al-free! (mut tests)) (al-free! (mut all)) (alloc/free [u8] a listing)
+        ;; Do not publish a scored report if the checkout changed during this campaign.
+        (let [after (t262-git root "status --porcelain --untracked-files=normal -- test harness")
+              after-revision (t262-git root "rev-parse HEAD")]
+          (if (or (!= (len after) 0) (!= after-revision revision))
+              (panic "test262: suite changed during campaign; results not published") 0)
+          (alloc/free [u8] a after) (alloc/free [u8] a after-revision))
+        (let [result-path (t262-concat directory "/results.tsv")
+              summary-path (t262-concat directory "/summary.txt")
+              (mut summary) (sb-new a)]
+          (sb-push-str! (mut summary) "revision=") (sb-push-str! (mut summary) (str-trim revision))
+          (sb-push-str! (mut summary) "\ncompiler-git-blob=") (sb-push-str! (mut summary) (str-trim compiler-hash))
+          (sb-push-str! (mut summary) "\nruntime-git-blob=") (sb-push-str! (mut summary) (str-trim runtime-hash))
+          (sb-push-str! (mut summary) "\njobs=") (sb-push-i64! (mut summary) jobs)
+          (sb-push-str! (mut summary) "\nsample=") (sb-push-i64! (mut summary) sample)
+          (sb-push-str! (mut summary) "\nfiles=") (sb-push-i64! (mut summary) (load files))
+          (sb-push-str! (mut summary) "\npassed-files=") (sb-push-i64! (mut summary) (load passed))
+          (sb-push-str! (mut summary) "\nvariants=") (sb-push-i64! (mut summary) (load variants))
+          (sb-push-str! (mut summary) "\npass-rate-basis-points=")
+          (sb-push-i64! (mut summary) (if (= (load files) 0) 0 (/ (* 10000 (load passed)) (load files))))
+          (let [(mut i) T262-PASS]
+            (loop (if (> (load i) T262-NOT-RUN) (break 0)
+                      (do (sb-push-str! (mut summary) "\nverdict-")
+                          (sb-push-str! (mut summary) (t262-verdict-name (load i)))
+                          (sb-push-str! (mut summary) "=")
+                          (sb-push-i64! (mut summary) (get (load counts) (load i)))
+                          (set! (mut i) (+ (load i) 1)) (continue)))))
+          (sb-push-str! (mut summary) "\n")
+          (t262-write! result-path (sb-str (load report)))
+          (t262-write! summary-path (sb-str (load summary)))
+          (print "{}" (sb-str (load summary)))
+          (alloc/free [u8] a result-path) (alloc/free [u8] a summary-path) (sb-free! (mut summary)))
+        (sb-free! (mut report))))
+    (al-free! (mut counts))
     (alloc/free [u8] a revision) (alloc/free [u8] a dirty)
     (alloc/free [u8] a compiler-hash) (alloc/free [u8] a runtime-hash)
     (if (and (> (load files) 0) (= (load passed) (load files))) 0 1)))

@@ -1,5 +1,19 @@
 # Decisions
 
+## 2026-09-08 — Campaigns are sharded and sampled; `this.x` at Script level is a global
+
+The test262 runner forks `AOT_T262_JOBS` workers over the file list (round-robin by eligible file
+index, so shards are deterministic and artifacts `case-<file>-<variant>` never collide) and merges
+their shard files; `AOT_T262_SAMPLE=N` takes every N-th file for a quick campaign. Nine minutes for
+a twentieth of the suite on eight workers is the feedback loop; a full campaign is for records. A
+compile deadline is per case (`AOT_T262_COMPILE_SECONDS`, 30 s): a timeout verdict means the
+compiler is slow on that input, and that is a compiler bug to profile, not a runner setting.
+
+`this.name = v` in a Script's own statements creates a property of the global object, which in this
+realm is the binding `name`: the collector declares it with the Script's vars, so the global
+object's fixed shape carries it. Before, the store transitioned the global object at run time and
+every fixed-shape read of a global then hit the invariant trap.
+
 ## 2026-09-08 — Compile time is measured, and the inline decision is memoized
 
 Compiling one harness-backed test262 case took 5.65 s while a trivial script took 0.06 s, and a

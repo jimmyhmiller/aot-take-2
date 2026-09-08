@@ -120,6 +120,14 @@ methods (`Object.prototype.toString`/`hasOwnProperty`, `Error.prototype.toString
 `%Object.prototype%` — an ordinary object's [[Prototype]] is null unless set, so
 `Object.prototype.x = 1` is not visible through `{}`.
 
+### 2026-09-08 — Global object properties
+
+`this.name = v` in a Script's own code declares the global `name` (the global object's fixed shape
+carries it, so the property and the binding are one word). Missing: properties created through
+any other alias of the global object (`globalThis`, a variable holding it, a function's sloppy
+`this`) — such a store transitions the global object at run time and the fixed-shape reads then
+trap the invariant; `delete` of a global; the global object's own prototype chain.
+
 ### 2026-09-08 — finally
 
 Abrupt completions run their finally blocks (docs/DECISIONS.md, finally): return, throw with or
