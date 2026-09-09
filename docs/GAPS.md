@@ -101,7 +101,7 @@ operand and strict writes to non-writable globals throw TypeError objects. Missi
 TypeError (`Symbol` in ToString/ToNumber) is checked only at the next call or member site, not
 right after the operator; `new` on a non-constructor; the runtime's remaining traps (ToPrimitive,
 ToObject) are still hard refusals, not exceptions; error messages are ours, not any engine's;
-`Error.prototype.toString`; uncaught exceptions print the boxed word, not the message.
+`Error.prototype.toString` (an uncaught exception's report renders the value — an Error's name and message, a string, a number — in the runtime, `rt-render-value!`, not through the library).
 
 ### 2026-09-08 — Strict code
 
@@ -717,6 +717,23 @@ available current contracts; missing documents must not be treated as reviewed e
   are implemented.
 
 ## Unwritten optimizer, backend and compilation infrastructure
+
+### 2026-09-09 — Register allocation: a boxed array value merged by a many-armed Phi does not converge
+
+The allocator exceeds its split budget (`ra-run!: allocator exceeded its split budget`) on a loop
+whose body calls a method through an object and indexes an array with the loop variable:
+
+```
+var obj = {}; var arr = [1, 2]; var r = 0;
+for (var i = 0; i < arr.length; i++) { r = obj.f(arr[i]); }
+```
+
+The failing live range is a Phi over several JSL dispatch arms that all carry the same boxed
+array value (and the same `mov 0` constant on more than one arm); the loop-boundary splitter
+splits that value before each Phi edge every round while the value stays live across the arms'
+calls, and after eight rounds a range still fails. Four cases of the 1-in-20 test262 sample
+(`Object.keys`, `decodeURI`, `Error.prototype.stack`, reserved-words tests) hit it. Simple's
+`splitByLoop` and spill choice are the reference to re-read before changing the policy.
 
 - Multi-target/escaping-function SCCP integration and semantic checks for the remaining JavaScript
   value families. Direct-call SCCP, node-aware proof, Stop-reachable type checking and the ordered
