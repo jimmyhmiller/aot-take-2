@@ -44,10 +44,19 @@ definition after the facts are computed, and a query about an image entry added 
 panics. `delete` and `Object.defineProperty` are refusals today; when they land they are stores in
 this pass's sense and must mark what they touch.
 
-**Effect.** The budget harness (docs/COMPILE-TIME.md §7): 7,349 → 2,957 machine nodes, 1,611 →
+**Effect.** The budget harness (docs/COMPILE-TIME.md §7): 7,349 → 3,015 machine nodes, 1,611 →
 517 blocks, 138 → about 105 ms. `Test262Error`, `assert` and the intrinsic constructors are
 constants at every use; `x` after `var x = 1` is one load; `(255).toString(16)` is a direct call of
-the image method.
+the image method. With it, `prop-owner-store` applies Simple's Load-after-Store bypass to the
+properties word: the walk to an owner's governing Store steps over Stores into provably distinct
+allocations, over other slices' Stores on an initialization chain, and from a fresh allocation's
+private memory to the public memory its New consumed — so a function expression's own `prototype`
+definition, which follows its prototype object's initialization, resolves statically instead of
+taking the runtime shape-tree store (six sites in the harness; 2,957 → 3,015 nodes, the static
+transition being larger than the call it replaces and free of the runtime lookup). An access the
+optimistic pass has not reached (dead control, memory at TOP) is not folded: nodes built for it
+would carry memory types below the TOP its projections hold, which SCCP reports as a monotonicity
+violation (three cases of the 1-in-20 campaign).
 
 **Found on the way.** Three latent backend faults that the new graph shapes exposed, each fixed at
 its cause. The runtime's frame walk panicked as "cyclic" when the call depth exceeded the number of
