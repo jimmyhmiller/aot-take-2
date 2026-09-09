@@ -213,7 +213,7 @@ not yet folded to its compile-time id; an array index key takes the element path
 regression of this class; `iter-peeps!` and `iter-run!` panic with a trace of recent rewrites or
 inlined sites instead of spinning; `property-expand-all!` panics if the shape universe grows.
 
-Constructors and chains: `new` on a non-callable takes the value call's TypeError trap; class
+Constructors and chains: `new` on a non-callable reads `prototype` before it tests callability, so `new undefined` reports `Cannot read properties of undefined` where the specification's EvaluateNew reports `X is not a constructor` (the type is right, the text is not); class
 constructors, bound functions and `Symbol.hasInstance` are unimplemented (`new.target` is an
 argument slot and executes in non-arrow functions: docs/DECISIONS.md, new.target);
 `instanceof` on a non-callable right operand traps as a TypeError. A function DECLARATION nested
