@@ -165,6 +165,7 @@ aot-take-2/
 │   │   └── dyn.coil         ; ✦ the dynamic tag axis, shape sets, the JS string type
 │   │
 │   ├── shape.coil           ; ✦ the shape transition tree; alias classes at the introducing edge
+│   ├── heap.coil            ; ✦ the static heap image: the realm's initial objects and string literals as data (`__aot_heap`)
 │   │
 │   ├── node/
 │   │   ├── node.coil        ; NodeHdr, NodeOps, edges, peephole/peepholeOpt, GVN, deps,
@@ -228,7 +229,7 @@ aot-take-2/
 │   ├── rt/                  ; the runtime, in Coil, built as its own object (Coil.toml `runtime`)
 │   │   ├── abi.coil         ; RtHeap layout + folded field offsets shared with the encoders
 │   │   ├── shapes.coil      ; the runtime shape tree: static `__aot_shapes` blob + runtime transitions
-│   │   └── rt.coil          ; allocation, generational collector, strings, generic property access, throw entry points
+│   │   └── rt.coil          ; allocation, generational collector, the static heap image as a root region, strings, generic property access, throw entry points
 │   │
 │   ├── print/
 │   │   ├── ir.coil          ; the pretty printer                          IRPrinter

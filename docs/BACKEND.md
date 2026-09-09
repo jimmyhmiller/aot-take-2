@@ -217,9 +217,10 @@ Encoding is layout-sensitive and iterative. It must:
 - record internal branches, external symbols, literals, and compilation-unit references as typed
   relocations;
 - emit stack maps keyed by final return-PC/safepoint offsets, the static shape table
-  (`__aot_shapes`, `shape-table-bytes`) the runtime boots its transition tree from, and the string
-  literal table (`__aot_strings`, `code-string-table-bytes`: header words then payload per literal,
-  each a local symbol the `StrConst` ADRP/ADD pair relocates against);
+  (`__aot_shapes`, `shape-table-bytes`) the runtime boots its transition tree from, and the static
+  heap image (`__aot_heap`, `heap-image-build!`: the realm's initial objects and string literals,
+  header words then payload per entry, each a local symbol the `StaticRef` ADRP/ADD pair relocates
+  against, code words relocated absolutely against their functions);
 - write a valid arm64 Mach-O object first, then add ELF and x86-64 without changing the generic
   machine contract;
 - link with `cc` only as a linker and execute without any authored C shim.

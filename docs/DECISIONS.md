@@ -1,5 +1,73 @@
 # Decisions
 
+## 2026-09-08 — The realm's initial heap is data: the static heap image
+
+A realm begins with objects no statement made: the global object with one property per var-like
+global, a function object and its `prototype` object per hoisted declaration, the intrinsics the
+program names with the properties CreateIntrinsics gives their prototypes, and every string
+literal. Until now the compiler lowered their creation as code — a `New` and its Stores per object,
+the JSL property-definition path per property, the intrinsic setup as a JSL builtin call — and then
+optimized, scheduled and allocated that code on every compile, although its result was the same
+bytes every time: about 600 nodes in the smallest realm and about 100 per function declaration
+(docs/COMPILE-TIME.md §10).
+
+**Decision.** Objects that are allocated exactly once per program run, before the first statement,
+with initial contents that are constants or other such objects, are laid out by the compiler as
+data. `aot.heap` is that layout: a table of entries in the runtime's own object format (three
+header words, then the payload), emitted as the `__aot_heap` / `.aot_heap` section, each entry a
+local symbol. `StaticRef` (aot.node.dynamic) is the address of an entry as a raw pointer of its
+representation — the generalization of `StrConst`, which it replaces; a string literal is an
+image entry of shape `SHAPE-STRING`. The parser lays the realm out in `realm-image-build!` after
+the header pass: the global object's properties in table order (its hidden class is checked to be
+the table's), every hoisted function's object and prototype (MakeConstructor), the intrinsics into
+their slots, an Error prototype's `name`, `message` and chain (ECMA-262 §20.5.3, §20.5.6.3), then
+the first Script's function declarations in order. A later Script's function step remains a store
+at that Script's start, because the first Script runs before it and must see `undefined`.
+
+**Why this is not a semantic shortcut.** Nothing a program can observe distinguishes an object the
+entry code allocated and initialized from the same object in a data section: identity, mutability,
+shape and prototype chain are the same, and every later access — the shaped global paths, the
+generic runtime property operations, `new`, `instanceof` — runs the same code over the same words.
+Property definition on an image object is `shape-transition` on the compiler's own table, so a
+fast path proved against a shape id and a runtime lookup over the shape blob name the same word of
+an image object as of a heap one. The intrinsic setup moved from a JSL builtin to the layout
+because CreateIntrinsics is a table of initial state in the specification, not a computation; it
+is the table the layout consumes, and `jsl/intrinsics.jsl` is where that table will come from when
+its reader lands.
+
+**The runtime contract.** The image is a permanent, immovable root region. The process entry boots
+the heap before any generated code runs; `rt-statics-adopt!` validates the header, adds the
+section's load address to every reference word the header lists (a NaN-boxed reference carries a
+tag in its high half, which linkers do not relocate; a function object's raw code word is a plain
+pointer and is relocated by the linker, `ARM64_RELOC_UNSIGNED` / `R_AARCH64_ABS64`), and publishes
+the global object root from the header. Every collection, minor or major, forwards every reference
+word of every scanned entry (`rt-scan-static-roots!`); the post-write barrier records value kinds
+stored into image objects as it does for heap objects but dirties no card, since the whole image is
+rescanned; `rt-forward` leaves an image payload where it is; `AOT_RT_GC_VERIFY` checks the image's
+words. This is what V8 does with its startup snapshot (built once, deserialized and relocated at
+boot) and what JavaScriptCore does with statically laid out intrinsics; Simple has no heap to
+initialize, and its analogue is that a constant is a constant, never code that computes it.
+
+**Consequences.** The global object is a constant address in every function, so `%GlobalObject`
+and the shaped global accesses no longer load the runtime root (a function-entry program without a
+realm still does, and reads zero). `lower-create-global-object!`, `lower-intrinsic-instantiation!`
+and the JSL `JsSetupErrorPrototype` are gone; `code-string-table-bytes` and the `__aot_strings`
+section are gone, subsumed by the image. A selected Fun takes its closed-world index from the
+registry (`arena-function-fidx`), which the image fills as a FunPtr would; a code word of a function
+the optimizer proved unreachable relocates against the runtime's invariant trap, the FunPtr rule.
+Supersedes the string-literal half of the entry below.
+
+**Found on the way: a memo that could lie.** `fun-self-recursive?` cached its answer per inlining
+epoch. Value calls are linked lazily (`opto-link-cg!`), so a callee could gain a body-local self
+call after a cached "not recursive" and still be cloned and folded: the clone kept the self call as
+its input 1, the trivial fold bypassed *that* edge instead of the entering call, and the Fun was
+left with a control node as a caller and a leaf frame whose safepoint had no saved return PC. The
+same program compiled or crashed depending on the worklist seed (the previous commit failed seed 2).
+Rule, from Simple: a decision that can flip in either direction is recomputed at every candidate
+check; only a quantity whose staleness is safe in one direction (a body size, stale upward) may be
+memoized. The trivial fold now also refuses, by name, a callee whose only caller is not the folding
+call.
+
 ## 2026-09-08 — The compile-time architecture: frames, exceptions, inlining evidence, and budgets
 
 Compiling the test262 harness realm (212 lines) produced 11,200 machine nodes, 3,246 blocks, eight

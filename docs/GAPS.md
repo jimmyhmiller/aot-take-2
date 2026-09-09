@@ -85,10 +85,14 @@ no longer loops in the managed-root splitters: those apply only to ranges a safe
 A store to an unknown receiver costs about 24 nodes (object-like test, store, two nullish-base
 arms calling the shared throw builtin, the pending check); the smallest realm is about 790 nodes
 because it instantiates `Error`, `TypeError` and their prototype objects and carries the throw
-builtin. Follow-ups: intrinsic function and prototype objects as static data rather than realm
-setup code; a throw arm that jumps straight to the unwinding path instead of setting the pending
-word and re-checking it; hoisting a function's pending checks when the base is proven non-nullish
-by an earlier access in the same function.
+builtin. Follow-ups: a throw arm that jumps straight to the unwinding path instead of setting the
+pending word and re-checking it; hoisting a function's pending checks when the base is proven
+non-nullish by an earlier access in the same function. (Intrinsic function and prototype objects as
+static data landed 2026-09-08 as the static heap image, docs/DECISIONS.md; the smallest realm is
+now 56 nodes after opto. Still allocated per evaluation: function expressions and object literals in
+a Script's straight-line top-level code, which also run exactly once — the test262 harness builds
+`assert.sameValue = function …` that way — and would join the image under a "runs once" rule for
+top-level straight-line statements.)
 
 ### 2026-09-08 — TypeError objects
 
@@ -541,7 +545,7 @@ BigInt and HTMLDDA production remain absent.
 Unresolved names require a complete global environment. The compiler refuses this path by name,
 including parenthesized references, instead of treating unimplemented globals such as JSON as
 absent. Declared uninitialized names take the existing TDZ refusal. Result strings are static data
-(`StrConst` in the `__aot_strings` section; docs/DECISIONS.md, string literals are static data),
+(a string `StaticRef` in the `__aot_heap` image; docs/DECISIONS.md, the static heap image),
 so `typeof` no longer allocates. The regression reuses its compiled binary under GC stress.
 
 ### 2026-09-06 — Lexical instantiation and initializer-free let

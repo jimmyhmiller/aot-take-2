@@ -46,7 +46,12 @@ fixes recorded in §6.
 | User time | 1.30 s | 0.28 s | < 0.1 s |
 
 The volume rows are unchanged because they are the front end's (§4, §5); the time rows are what
-the backend corrections bought.
+the backend corrections bought. The realm image (§8, row 8) landed after this table: it removes the
+realm's fixed part (611 → 56 nodes after opto for `var x = 1;`) and every hoisted function
+declaration's object (about 100 → 0 nodes after opto), but the test262 harness builds its
+functions as expressions assigned to properties (`assert.sameValue = function …`), which are not
+run-once by syntax, so its user time stayed at 0.28 s; the budget test's harness realm, which
+declares its functions, went from 5,649 to 4,870 machine nodes and 1,171 to 1,066 blocks.
 
 ---
 
@@ -268,6 +273,7 @@ order is chosen so that each step shrinks what the next one has to handle.
 | 5 | Evidence-gated JSL inlining (§5) | Bottom-typed sites are calls; typed fixtures unchanged in node count; bloat ceilings hold | **Landed**, but see §10: it removed little on the harness, because almost every argument carries a partial tag set and the volume is made at lowering, per site |
 | 6 | Word-level GC liveness, once (§6) | Stack-map tests green; encoding phase under 20 ms on the harness | **Landed.** 205 → 31 ms (the remainder is layout and emission) |
 | 7 | Gates (§7) | The listed assertions exist and are red when any of 1–6 is reverted | **Landed in part**: `tests/budget-test.coil` gates CalleeSaves, Casts, rounds, node and block ceilings and a 1 s wall ceiling on a harness realm; per-token and campaign gates remain |
+| 8 | The realm's initial heap as data: the static heap image (docs/DECISIONS.md, the realm image) | Realm creation and hoisted function objects are `__aot_heap` entries; no New for them in any graph; GC stress and verify green over image objects | **Landed 2026-09-08.** Smallest realm 611 → 56 nodes after opto; a function declaration 100 → 0; budget harness 5,649 → 4,870 machine nodes, 1,171 → 1,066 blocks. Reordered ahead of 4 on the §10 measurements: cheaper to build, no runtime trade-off, more nodes removed per site |
 
 Milestones 1, 2 and 6 are backend-local and touch no semantics. Milestone 3 changes the frame
 contract and is the one with runtime exposure; it lands with the GC stress suite. Milestone 4
@@ -317,10 +323,11 @@ What this says:
   post-call pending-exception check, the boxing of arguments and result, and the call's
   projections are the bulk. Milestone 4 (the exceptional projection) is the direct answer to the
   first of those.
-- **A function declaration costs about 100 nodes** at parse: the function object, its `prototype`
-  object, and their property storage, each a New with stores. The prototype object could be made
-  lazily (V8 does), and intrinsic prototypes as static data would remove the 600-node realm setup
-  every compile pays.
+- **A function declaration cost about 100 nodes** at parse: the function object, its `prototype`
+  object, and their property storage, each a New with stores; the realm setup another 600. Both are
+  now data (§8, row 8): a declaration is 7 parse nodes and 0 after opto, the realm 56. A function
+  *expression* at a Script's top level still allocates at its evaluation; it runs once too, but that
+  is a fact about straight-line top-level code the layout does not yet use (docs/GAPS.md).
 - **`new` and calls through unknown functions** are the most expensive constructs (300 and 230
   nodes): callable checks, the TypeError arm, receiver creation and prototype reads.
 - **The evidence rule of §5 is right but rarely decisive here**: a parameter typed

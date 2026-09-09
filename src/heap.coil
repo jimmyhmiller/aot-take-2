@@ -1,0 +1,613 @@
+;; The static heap image: the realm's initial objects as data in the object file.
+
+;;
+;; A realm begins with objects no statement created: the global object with a property per
+;; var-like global, one function object per hoisted declaration with its `prototype` object, the
+;; intrinsics the program names (`Error`, `TypeError`, ...) with their prototypes and the
+;; properties CreateIntrinsics gives them, and every string literal. Each of those is allocated
+;; exactly once per program run, before the first statement, and its initial contents are
+;; constants or other such objects. Nothing a program can observe distinguishes an object the
+;; entry code allocated and initialized from the same object laid out in a data section, so the
+;; compiler lays them out: this table is that layout, emitted as the `__aot_heap` / `.aot_heap`
+;; section and addressed by `StaticRef` (aot.node.dynamic) exactly as a function's address is.
+;;
+;; Before this, realm creation was ordinary lowered code — a New and its Stores per object, the
+;; JSL property-definition path per property — about 600 nodes in the smallest program and about
+;; 100 per function declaration, optimized and allocated on every compile although the result was
+;; the same bytes every time. V8 builds the same objects in C++ once and ships them as a startup
+;; snapshot that is deserialized and relocated at boot; JavaScriptCore builds its intrinsics
+;; statically from tables. Simple has no heap to initialize; its analogue is that a constant is a
+;; constant, never code that computes it.
+;;
+;; The layout rules are the runtime's and the shape tree's, nothing new: an entry is the runtime's
+;; three header words (payload bytes, collector metadata, hidden-class shape) then its payload,
+;; 8-aligned; an ordinary object's payload is its prototype word and its properties word; a
+;; function's adds the raw code word and the environment word; a backing store's is one word per
+;; field at the offset its shape fixes; a string's is its length then UTF-16 code units. Property
+;; definition on an entry is `shape-transition` on the compiler's own table, so a fast path proved
+;; against a shape id and a runtime lookup over the shape blob name the same word of an image
+;; object as of a heap object.
+;;
+;; Words come in three kinds. A CONST word is bits. A REF word is a NaN-boxed reference to another
+;; entry — its high 16 bits are the tag prefix the caller chose, its low 48 the target entry — and
+;; is written as prefix over the target's section offset, with the word's own offset listed in the
+;; image header so the runtime can add the section's load address once at boot (`rt-statics-boot!`):
+;; linkers relocate plain pointers, not pointers with a tag in their high half. A CODE word is a
+;; function's index, written as zero with an absolute 8-byte relocation against the function's
+;; symbol, which every linker does relocate.
+;;
+;; The runtime treats the image as a permanent, immovable root region: entries are never copied or
+;; freed, every reference word they hold is forwarded at every collection (they are mutable
+;; JavaScript objects and may come to point into the heap), and the post-write barrier records the
+;; kinds stored into them as it does for heap objects. `rt-verify-reference?` accepts an image
+;; payload as live.
+;;
+;; Image layout (little-endian), written by `heap-image-build!`:
+;;   0   "AOTHEAP\0"
+;;   8   u32 version (1), u32 entry count
+;;   16  u64 the boxed global object word before relocation (prefix over its offset), or 0
+;;   24  u32 relocation count, u32 offset of the first entry header
+;;   32  u32 per relocation: the section offset of a REF word
+;;       pad to 8, then the entries end to end
+(module aot.heap)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.str" :use [sb-new sb-push-str! sb-push-i64! sb-str])
+(import "aot.util.panic" :use *)
+(import "aot.shape" :use *)
+
+(const HEAP-WORD-CONST 0)
+
+(const HEAP-WORD-REF 1)
+
+(const HEAP-WORD-CODE 2)
+
+;; The runtime's header before every payload (`RT-HEADER-BYTES`) and the metadata word of an
+;; entry the collector scans (`RT-META-HAS-BOXED`); tests/rt-shapes-test.coil asserts agreement.
+(const HEAP-HEADER-BYTES 24)
+
+(const HEAP-META-HAS-BOXED 1)
+
+(const HEAP-IMAGE-VERSION 1)
+
+(const HEAP-IMAGE-FIXED-BYTES 32)
+
+(const HEAP-PAYLOAD-MASK 0x0000ffffffffffff)
+
+(const HEAP-WORD-BYTES 8)
+
+(defstruct HeapEntry
+  [(shape i64)
+   (string bool)
+   (units (ArrayList i64))  ; a string's UTF-16 code units
+   (words (ArrayList i64))  ; an object's payload words: bits, a REF word, or a CODE word's fidx
+   (kinds (ArrayList i64))
+   (storage i64)])  ; an ordinary object's backing store entry, or -1 while it has none
+
+(defstruct StaticHeap
+  [(entries (ArrayList HeapEntry))
+   (object-prefix i64)  ; the boxed prefix of an ordinary object reference (storage pointers)
+   (global i64)  ; the realm's global object entry, or -1
+   (image (ArrayList u8))
+   (offsets (ArrayList i64))  ; per entry: its payload's section offset, once the image is built
+   (relocs (ArrayList i64))
+   (code-offsets (ArrayList i64))
+   (code-fidxs (ArrayList i64))
+   (image-built bool)
+   (booted bool)])
+
+(defn heap-table [] (-> (ptr StaticHeap))
+  (primitive/alloc-static StaticHeap))
+
+;; Entry identities are compilation-local, like shape ids: a `boot!` empties the image.
+(defn heap-reset! [(object-prefix i64)] (-> i64)
+  (let [t (heap-table)
+        a (alloc/malloc-allocator)]
+    (if (.booted t)
+        (do
+          (let [(mut i) 0]
+            (loop (if (>= (load i) (len (.entries t)))
+                      (break 0)
+                      (let [e (al-elem [HeapEntry] (mut (.entries t)) (load i))
+                            (mut units) (.units e)
+                            (mut words) (.words e)
+                            (mut kinds) (.kinds e)]
+                        (al-free! [i64] (mut units))
+                        (al-free! [i64] (mut words))
+                        (al-free! [i64] (mut kinds))
+                        (set! (mut i) (+ (load i) 1))
+                        (continue)))))
+          (al-clear! [HeapEntry] (mut (.entries t)))
+          (al-clear! [u8] (mut (.image t)))
+          (al-clear! [i64] (mut (.offsets t)))
+          (al-clear! [i64] (mut (.relocs t)))
+          (al-clear! [i64] (mut (.code-offsets t)))
+          (al-clear! [i64] (mut (.code-fidxs t))))
+        (do
+          (set! (.entries t) (al-new [HeapEntry] a))
+          (set! (.image t) (al-new [u8] a))
+          (set! (.offsets t) (al-new [i64] a))
+          (set! (.relocs t) (al-new [i64] a))
+          (set! (.code-offsets t) (al-new [i64] a))
+          (set! (.code-fidxs t) (al-new [i64] a))
+          (set! (.booted t) true)))
+    (set! (.object-prefix t) object-prefix)
+    (set! (.global t) -1)
+    (set! (.image-built t) false)
+    0))
+
+(defn heap--require-booted [] (-> i64)
+  (if (.booted (heap-table))
+      0
+      (panic "aot.heap: the static heap image was not reset by boot!")))
+
+(defn heap-count [] (-> i64)
+  (do (heap--require-booted) (len (.entries (heap-table)))))
+
+(defn heap--entry [(i i64)] (-> (ptr HeapEntry))
+  (do
+    (heap--require-booted)
+    (if (or (< i 0) (>= i (len (.entries (heap-table)))))
+        (panic-i "aot.heap: no such image entry" i)
+        0)
+    (al-elem [HeapEntry] (mut (.entries (heap-table))) i)))
+
+;; Adding an entry invalidates a built image; the object writer builds it once, after parsing.
+(defn heap--push! [(e HeapEntry)] (-> i64)
+  (let [t (heap-table)]
+    (set! (.image-built t) false)
+    (push! [HeapEntry] (mut (.entries t)) e)
+    (- (len (.entries t)) 1)))
+
+(defn heap-entry-shape [(i i64)] (-> i64)
+  (.shape (heap--entry i)))
+
+(defn heap-entry-string? [(i i64)] (-> bool)
+  (.string (heap--entry i)))
+
+(defn heap-entry-storage [(i i64)] (-> i64)
+  (.storage (heap--entry i)))
+
+(defn heap-entry-word-count [(i i64)] (-> i64)
+  (len (.words (heap--entry i))))
+
+(defn heap-entry-word [(i i64) (k i64)] (-> i64)
+  (get (.words (heap--entry i)) k))
+
+(defn heap-entry-word-kind [(i i64) (k i64)] (-> i64)
+  (get (.kinds (heap--entry i)) k))
+
+(defn heap-string-units [(i i64)] (-> (ArrayList i64))
+  (let [e (heap--entry i)]
+    (if (.string e) 0 (panic-i "heap-string-units: entry is not a string" i))
+    (.units e)))
+
+(defn heap--units-eq? [(a (ArrayList i64)) (b (ArrayList i64))] (-> bool)
+  (if (!= (len a) (len b))
+      false
+      (let [(mut i) 0
+            (mut same) true]
+        (loop (if (or (>= (load i) (len a)) (not (load same)))
+                  (break 0)
+                  (do
+                    (if (!= (get a (load i)) (get b (load i)))
+                        (set! (mut same) false)
+                        0)
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        (load same))))
+
+;; A string literal, once per content: equal literals are one entry and one address.
+(defn heap-add-string! [(units (ArrayList i64))] (-> i64)
+  (do
+    (heap--require-booted)
+    (let [t (heap-table)
+          (mut i) 0
+          (mut found) -1]
+      (loop (if (or (>= (load i) (len (.entries t))) (>= (load found) 0))
+                (break 0)
+                (let [e (al-elem [HeapEntry] (mut (.entries t)) (load i))]
+                  (if (and (.string e) (heap--units-eq? (.units e) units))
+                      (set! (mut found) (load i))
+                      0)
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      (if (>= (load found) 0)
+          (load found)
+          (let [a (alloc/malloc-allocator)
+                (mut copy) (al-new [i64] a)]
+            (al-for [u units] (push! [i64] (mut copy) u))
+            (heap--push! (HeapEntry
+                           :shape SHAPE-STRING
+                           :string true
+                           :units (load copy)
+                           :words (al-new [i64] a)
+                           :kinds (al-new [i64] a)
+                           :storage -1)))))))
+
+(defn heap--add-words! [(shape i64)
+                        (words (ArrayList i64))
+                        (kinds (ArrayList i64))] (-> i64)
+  (heap--push! (HeapEntry
+                 :shape shape
+                 :string false
+                 :units (al-new [i64] (alloc/malloc-allocator))
+                 :words words
+                 :kinds kinds
+                 :storage -1)))
+
+;; An ordinary object with no properties yet: a null prototype and a null properties word, the
+;; two words `JsNewObjectRaw` stores.
+(defn heap-add-object! [(null-word i64)] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        (mut words) (al-new [i64] a)
+        (mut kinds) (al-new [i64] a)]
+    (push! [i64] (mut words) null-word)
+    (push! [i64] (mut kinds) HEAP-WORD-CONST)
+    (push! [i64] (mut words) null-word)
+    (push! [i64] (mut kinds) HEAP-WORD-CONST)
+    (heap--add-words! SHAPE-EMPTY (load words) (load kinds))))
+
+;; A function object: an ordinary object's two words, the raw code word of function `fidx` and a
+;; null environment word (docs/DECISIONS.md, function values).
+(defn heap-add-function! [(fidx i64) (null-word i64)] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        (mut words) (al-new [i64] a)
+        (mut kinds) (al-new [i64] a)]
+    (if (< fidx 0)
+        (panic-i "heap-add-function!: negative function index" fidx)
+        0)
+    (push! [i64] (mut words) null-word)
+    (push! [i64] (mut kinds) HEAP-WORD-CONST)
+    (push! [i64] (mut words) null-word)
+    (push! [i64] (mut kinds) HEAP-WORD-CONST)
+    (push! [i64] (mut words) fidx)
+    (push! [i64] (mut kinds) HEAP-WORD-CODE)
+    (push! [i64] (mut words) null-word)
+    (push! [i64] (mut kinds) HEAP-WORD-CONST)
+    (heap--add-words! SHAPE-EMPTY (load words) (load kinds))))
+
+;; A REF word: `prefix` (the boxed tag of the target's representation) over the target entry.
+(defn heap-ref-word [(prefix i64) (entry i64)] (-> i64)
+  (do
+    (heap--entry entry)
+    (if (or (< prefix 0) (> prefix 0xffff))
+        (panic-i "heap-ref-word: prefix is not 16 bits" prefix)
+        0)
+    (| (primitive/ishl prefix 48) entry)))
+
+(defn heap-ref-entry [(word i64)] (-> i64)
+  (& word HEAP-PAYLOAD-MASK))
+
+(defn heap--set-word! [(e (ptr HeapEntry)) (k i64) (word i64) (kind i64)] (-> i64)
+  (do
+    (if (.string e) (panic "aot.heap: a string has no words to set") 0)
+    (if (or (< k 0) (>= k (len (.words e))))
+        (panic-i "aot.heap: word index out of range" k)
+        0)
+    (set! (.image-built (heap-table)) false)
+    (set! (mut (.words e)) k word)
+    (set! (mut (.kinds e)) k kind)
+    0))
+
+;; [[Prototype]] of an object-like entry: `word` is a REF word or the null constant.
+(const HEAP-OFFSET-PROTOTYPE-WORD 0)
+
+(const HEAP-OFFSET-PROPERTIES-WORD 1)
+
+(defn heap-set-prototype! [(entry i64) (word i64) (kind i64)] (-> i64)
+  (heap--set-word! (heap--entry entry) HEAP-OFFSET-PROTOTYPE-WORD word kind))
+
+;; The shape of an object-like entry's own properties: the root while it has no backing store.
+(defn heap-storage-shape [(entry i64)] (-> i64)
+  (let [e (heap--entry entry)]
+    (if (< (.storage e) 0) SHAPE-EMPTY (.shape (heap--entry (.storage e))))))
+
+;; OrdinaryDefineOwnProperty of a data property on an image object, the fresh-object case: the
+;; same `shape-transition` the lowered store path takes, the value at the offset the transition
+;; fixes. A key the object already has changes its word, not its layout. The backing store grows
+;; in place — the image is under construction, so the abandoned intermediate stores a heap object
+;; would leave behind never exist.
+(defn heap-define-own! [(entry i64) (name (slice u8)) (word i64) (kind i64)] (-> i64)
+  (let [t (heap-table)
+        e (heap--entry entry)
+        shape (heap-storage-shape entry)
+        next (shape-transition shape name)]
+    (set! (.image-built t) false)
+    (if (< (.storage e) 0)
+        (let [a (alloc/malloc-allocator)
+              (mut words) (al-new [i64] a)
+              (mut kinds) (al-new [i64] a)]
+          (push! [i64] (mut words) word)
+          (push! [i64] (mut kinds) kind)
+          (let [storage (heap--add-words! next (load words) (load kinds))
+                owner (heap--entry entry)]
+            (set! (.storage owner) storage)
+            (heap--set-word! owner
+                             HEAP-OFFSET-PROPERTIES-WORD
+                             (heap-ref-word (.object-prefix t) storage)
+                             HEAP-WORD-REF)))
+        (let [s (heap--entry (.storage e))]
+          (if (shape-has? shape name)
+              (heap--set-word! s
+                               (/ (shape-offset shape name) HEAP-WORD-BYTES)
+                               word
+                               kind)
+              (do
+                ;; A field's offset is fixed by its introducing edge: the new field is last.
+                (if (!= (shape-offset next name)
+                        (* (len (.words s)) HEAP-WORD-BYTES))
+                    (panic-i "heap-define-own!: the transition's offset is not the next word"
+                             (shape-offset next name))
+                    0)
+                (push! [i64] (mut (.words s)) word)
+                (push! [i64] (mut (.kinds s)) kind)
+                (set! (.shape s) next)
+                0))))))
+
+;; The value word of an own property of an image object, for the parser's own checks and tests.
+(defn heap-own-word [(entry i64) (name (slice u8))] (-> i64)
+  (let [e (heap--entry entry)
+        shape (heap-storage-shape entry)]
+    (if (or (< (.storage e) 0) (not (shape-has? shape name)))
+        (do
+          (panic "heap-own-word: the image object has no such own property")
+          0)
+        (get (.words (heap--entry (.storage e)))
+             (/ (shape-offset shape name) HEAP-WORD-BYTES)))))
+
+(defn heap-set-global! [(entry i64)] (-> i64)
+  (do
+    (heap--entry entry)
+    (set! (.global (heap-table)) entry)
+    (set! (.image-built (heap-table)) false)
+    0))
+
+;; The realm's global object entry, or -1 when no realm has been laid out (function-entry
+;; programs and the JSL library compiled alone).
+(defn heap-global-entry [] (-> i64)
+  (do (heap--require-booted) (.global (heap-table))))
+
+;; ---------------------------------------------------------------------------
+;; The image
+(defn heap-entry-payload-bytes [(i i64)] (-> i64)
+  (let [e (heap--entry i)]
+    (if (.string e)
+        (+ 8 (* 2 (len (.units e))))
+        (* HEAP-WORD-BYTES (len (.words e))))))
+
+(defn heap--align8 [(n i64)] (-> i64)
+  (primitive/iand (+ n 7) -8))
+
+(defn heap-entry-bytes [(i i64)] (-> i64)
+  (+ HEAP-HEADER-BYTES (heap--align8 (heap-entry-payload-bytes i))))
+
+(defn heap-symbol [(i i64)] (-> (slice u8))
+  (let [(mut b) (sb-new (alloc/malloc-allocator))]
+    (heap--entry i)
+    (sb-push-str! (mut b) "$aot$.heap.")
+    (sb-push-i64! (mut b) i)
+    (sb-str (mut b))))
+
+(defn heap--put4! [(out (mut (ArrayList u8))) (v i64)] (-> i64)
+  (let [(mut k) 0]
+    (loop (if (>= (load k) 4)
+              (break 0)
+              (do
+                (push! [u8]
+                       (mut out)
+                       (primitive/cast u8
+                                       (primitive/iand (primitive/ishr v
+                                                                       (* 8
+                                                                          (load k)))
+                                                       0xff)))
+                (set! (mut k) (+ (load k) 1))
+                (continue))))
+    0))
+
+(defn heap--put8! [(out (mut (ArrayList u8))) (v i64)] (-> i64)
+  (let [(mut k) 0]
+    (loop (if (>= (load k) 8)
+              (break 0)
+              (do
+                (push! [u8]
+                       (mut out)
+                       (primitive/cast u8
+                                       (primitive/iand (primitive/ishr v
+                                                                       (* 8
+                                                                          (load k)))
+                                                       0xff)))
+                (set! (mut k) (+ (load k) 1))
+                (continue))))
+    0))
+
+(defn heap--pad8! [(out (mut (ArrayList u8)))] (-> i64)
+  (loop (if (= (primitive/iand (len (load out)) 7) 0)
+            (break 0)
+            (do (push! [u8] (mut out) 0) (continue)))))
+
+(defn heap--count-refs [] (-> i64)
+  (let [t (heap-table)
+        (mut n) 0
+        (mut i) 0]
+    (loop (if (>= (load i) (len (.entries t)))
+              (break 0)
+              (let [e (al-elem [HeapEntry] (mut (.entries t)) (load i))]
+                (al-for [k (.kinds e)]
+                        (if (= k HEAP-WORD-REF) (set! (mut n) (+ (load n) 1)) 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load n)))
+
+;; Lay the image out: offsets, relocation list, code fixups, bytes. Idempotent until an entry
+;; changes.
+(defn heap-image-build! [] (-> i64)
+  (let [t (heap-table)]
+    (heap--require-booted)
+    (if (.image-built t)
+        0
+        (let [(mut out) (al-new [u8] (alloc/malloc-allocator))
+              count (len (.entries t))
+              nrelocs (heap--count-refs)
+              entries-offset
+                (heap--align8 (+ HEAP-IMAGE-FIXED-BYTES (* 4 nrelocs)))
+              (mut off) entries-offset
+              (mut i) 0]
+          (al-clear! [i64] (mut (.offsets t)))
+          (al-clear! [i64] (mut (.relocs t)))
+          (al-clear! [i64] (mut (.code-offsets t)))
+          (al-clear! [i64] (mut (.code-fidxs t)))
+          ;; Every payload offset first: REF words name targets that may follow their holder.
+          (loop (if (>= (load i) count)
+                    (break 0)
+                    (do
+                      (push! [i64]
+                             (mut (.offsets t))
+                             (+ (load off) HEAP-HEADER-BYTES))
+                      (set! (mut off)
+                            (+ (load off) (heap-entry-bytes (load i))))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (set! (mut i) 0)
+          (loop (if (>= (load i) count)
+                    (break 0)
+                    (let [e (heap--entry (load i))
+                          base (get (.offsets t) (load i))
+                          (mut k) 0]
+                      (loop (if (>= (load k) (len (.kinds e)))
+                                (break 0)
+                                (do
+                                  (if (= (get (.kinds e) (load k))
+                                         HEAP-WORD-REF)
+                                      (push! [i64]
+                                             (mut (.relocs t))
+                                             (+ base
+                                                (* HEAP-WORD-BYTES (load k))))
+                                      (if (= (get (.kinds e) (load k))
+                                             HEAP-WORD-CODE)
+                                          (do
+                                            (push! [i64]
+                                                   (mut (.code-offsets t))
+                                                   (+ base
+                                                      (* HEAP-WORD-BYTES
+                                                         (load k))))
+                                            (push! [i64]
+                                                   (mut (.code-fidxs t))
+                                                   (get (.words e) (load k))))
+                                          0))
+                                  (set! (mut k) (+ (load k) 1))
+                                  (continue))))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (if (!= (len (.relocs t)) nrelocs)
+              (panic "heap-image-build!: relocation count disagrees")
+              0)
+          ;; Header.
+          (push! [u8] (mut out) 0x41)
+          (push! [u8] (mut out) 0x4f)
+          (push! [u8] (mut out) 0x54)
+          (push! [u8] (mut out) 0x48)
+          (push! [u8] (mut out) 0x45)
+          (push! [u8] (mut out) 0x41)
+          (push! [u8] (mut out) 0x50)
+          (push! [u8] (mut out) 0)
+          (heap--put4! (mut out) HEAP-IMAGE-VERSION)
+          (heap--put4! (mut out) count)
+          (heap--put8! (mut out)
+                       (if (< (.global t) 0)
+                           0
+                           (| (primitive/ishl (.object-prefix t) 48)
+                              (get (.offsets t) (.global t)))))
+          (heap--put4! (mut out) nrelocs)
+          (heap--put4! (mut out) entries-offset)
+          (al-for [r (.relocs t)] (heap--put4! (mut out) r))
+          (heap--pad8! (mut out))
+          (if (!= (len (load out)) entries-offset)
+              (panic-i "heap-image-build!: header size disagrees"
+                       (len (load out)))
+              0)
+          ;; Entries.
+          (set! (mut i) 0)
+          (loop (if (>= (load i) count)
+                    (break 0)
+                    (let [e (heap--entry (load i))]
+                      (if (!= (len (load out))
+                              (- (get (.offsets t) (load i)) HEAP-HEADER-BYTES))
+                          (panic-i "heap-image-build!: entry offset disagrees"
+                                   (load i))
+                          0)
+                      (heap--put8! (mut out)
+                                   (heap-entry-payload-bytes (load i)))
+                      (heap--put8! (mut out)
+                                   (if (.string e) 0 HEAP-META-HAS-BOXED))
+                      (heap--put8! (mut out) (.shape e))
+                      (if (.string e)
+                          (do
+                            (heap--put8! (mut out) (len (.units e)))
+                            (al-for [u (.units e)]
+                                    (do
+                                      (push! [u8]
+                                             (mut out)
+                                             (primitive/cast u8
+                                                             (primitive/iand u
+                                                                             0xff)))
+                                      (push! [u8]
+                                             (mut out)
+                                             (primitive/cast u8
+                                                             (primitive/iand (primitive/ishr u
+                                                                                             8)
+                                                                             0xff))))))
+                          (let [(mut k) 0]
+                            (loop (if (>= (load k) (len (.words e)))
+                                      (break 0)
+                                      (let [kind (get (.kinds e) (load k))
+                                            word (get (.words e) (load k))]
+                                        (heap--put8! (mut out)
+                                                     (if (= kind HEAP-WORD-REF)
+                                                         (| (primitive/iand word
+                                                                            (primitive/inot HEAP-PAYLOAD-MASK))
+                                                            (get (.offsets t)
+                                                                 (heap-ref-entry word)))
+                                                         (if (= kind
+                                                                HEAP-WORD-CODE)
+                                                             0
+                                                             word)))
+                                        (set! (mut k) (+ (load k) 1))
+                                        (continue))))))
+                      (heap--pad8! (mut out))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (al-free! [u8] (mut (.image t)))
+          (set! (.image t) (load out))
+          (set! (.image-built t) true)
+          0))))
+
+(defn heap--require-image [] (-> i64)
+  (if (.image-built (heap-table))
+      0
+      (panic "aot.heap: the image was not built (heap-image-build!)")))
+
+;; The section bytes; empty when the image holds no entry.
+(defn heap-image-bytes [] (-> (slice u8))
+  (do
+    (heap--require-image)
+    (if (= (heap-count) 0)
+        (al-slice (al-new [u8] (alloc/malloc-allocator)))
+        (al-slice (.image (heap-table))))))
+
+;; An entry's payload offset within the section: the value of its local symbol.
+(defn heap-entry-offset [(i i64)] (-> i64)
+  (do (heap--require-image) (heap--entry i) (get (.offsets (heap-table)) i)))
+
+(defn heap-code-fixup-count [] (-> i64)
+  (do (heap--require-image) (len (.code-offsets (heap-table)))))
+
+(defn heap-code-fixup-offset [(k i64)] (-> i64)
+  (do (heap--require-image) (get (.code-offsets (heap-table)) k)))
+
+(defn heap-code-fixup-fidx [(k i64)] (-> i64)
+  (do (heap--require-image) (get (.code-fidxs (heap-table)) k)))
+
+(defn heap-reloc-count [] (-> i64)
+  (do (heap--require-image) (len (.relocs (heap-table)))))
