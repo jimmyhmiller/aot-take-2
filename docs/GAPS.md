@@ -178,8 +178,9 @@ array destructuring (parse, refuse by name); the remaining callback methods (`so
 `splice`, `fill`, `lastIndexOf`, `flat`, `keys/values/entries` and iteration (`for…of` needs the
 iterator protocol); `Array.from`/`Array.of`; sparse-array semantics beyond holes (no dictionary
 elements: a write at index 2^31 allocates); `length` as a non-writable/accessor target; the
-generic-object forms of the methods (a non-array `this` throws `TypeError` instead of running the
-`[[Get]]`/`[[Set]]`-based algorithm); variadic arguments are taken up to the four ABI slots, and an
+generic-object forms of the mutating methods — push, pop, shift, unshift, reverse, slice, concat,
+join, at (a non-array `this` throws `TypeError` instead of running the `[[Get]]`/`[[Set]]`-based
+algorithm; the callback and search methods are generic, docs/DECISIONS.md); variadic arguments are taken up to the four ABI slots, and an
 omitted argument is indistinguishable from `undefined`, so `Array(undefined)` is `[]` and
 `push(undefined)` pushes nothing; the library iterates by recursion over an index because JSL has
 no loop form (`loop`/`recur` admission is the next JSL feature) — one native frame per element, so

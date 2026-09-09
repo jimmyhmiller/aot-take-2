@@ -145,14 +145,15 @@ aot-take-2/
 │   ├── object-layouts.jsl
 │   └── abstract/ array/ string/ object/ json/ math/ number/ symbol/ compiler/
 │       └── compiler/{add,sub,mul,increment-int-or-identity,logical,…,array,string-methods,
-│           ;          function-methods,object-methods,number-methods,math}.jsl
+│           ;          function-methods,object-methods,number-methods,math,array-generic}.jsl
 │           ; the production index (`compiler/index`): every operation the frontend lowers to,
 │           ; built on demand per compile; array.jsl is the Array intrinsic and its methods,
 │           ; string-methods.jsl String.prototype and String.fromCharCode over primitive strings,
 │           ; function-methods.jsl Function.prototype.call/apply (and the Function constructor's
 │           ; refusal), object-methods.jsl Object's statics and Object.prototype,
 │           ; number-methods.jsl Number.prototype and Boolean.prototype,
-│           ; math.jsl the Math object and isNaN/isFinite/parseInt/parseFloat
+│           ; math.jsl the Math object and isNaN/isFinite/parseInt/parseFloat,
+│           ; array-generic.jsl the array-like arms of the callback and search methods, and `in`
 │       function/ array-buffer/ data-view/ typed-array/
 ├── src/
 │   ├── main.coil            ; CLI driver: compile, emit, run, dump; `AOT_SEED=N` compiles under a test's arena seed

@@ -1,5 +1,28 @@
 # Decisions
 
+## 2026-09-09 — Generic array methods and the `in` operator
+
+The callback and search methods of `Array.prototype` — forEach, map, filter, some, every, find,
+findIndex, reduce, indexOf, includes — threw "called on a non-array" for every receiver that was
+not an array; test262 applies them to array-likes throughout (50 cases of the 1-in-20 campaign),
+and the `in` operator was a refusal.
+
+**Decision.** Each method has two arms. The array receiver keeps the element-store fast path
+(`%ArrayLoad`/`%ArrayHasIndex` over the raw payload). Any other receiver takes the specification's
+own generic algorithm, in `jsl/compiler/array-generic.jsl`: LengthOfArrayLike over the receiver's
+`length` (ToLength: NaN reads as zero, the value clamps to 2^53 − 1), HasProperty per index
+(`JsArrayLikeHas`: an array's element or its chain, a string's code unit, an object's own key or
+its chain, nothing on another primitive), and [[Get]] through the ordinary keyed access — so a
+plain object with `length` and indexed keys, a string, or an `arguments`-shaped object all serve,
+and `null`/`undefined` are the ToObject TypeError. `in` is `JsIn`: a TypeError for a non-object
+right operand, then HasProperty of ToPropertyKey(left), the array index reaching the elements. It
+is a throwing completion in the parser and the may-throw filter, as `instanceof` is. The generic
+arms live in their own unit so the stable function indices of the earlier units stay put
+(tests/jsl-test).
+
+The mutating methods (push, pop, shift, unshift, reverse, slice, concat, join, at) still require
+an array; their generic forms wait on [[Set]] and [[Delete]] over array-likes (docs/GAPS.md).
+
 ## 2026-09-09 — Math and the number globals are image data over a libm-backed runtime table
 
 `Math` is an ordinary object (§21.3) with function-valued properties and eight binary64

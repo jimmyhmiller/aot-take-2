@@ -110,7 +110,22 @@ per-case compile time is what to fix. Never edit `jsl/` or run `coil build` duri
 AOT_T262_SAMPLE=20 AOT_T262_JOBS=8 coil run tools/test262.coil -- run /Users/jimmyhmiller/Documents/Code/open-source/test262 ./build/aot-test262-compiler build/release/aot-runtime.o build/test262-sample-YYYYMMDD
 ```
 
-## Latest measured campaign, 2026-09-09 (sampled, after arrays, strings and callbacks)
+## Latest measured campaign, 2026-09-09 (sampled, after Math and the number globals)
+
+With Function.prototype call/apply, the Object statics and prototype methods, the Number and
+Boolean prototypes, the closed-world image facts (a compile-time increment: 327 files either way)
+and then `Math`, `isNaN`, `isFinite`, `parseInt` and `parseFloat`, the 1-in-20 sample measured
+**340 / 2,680 files passing (12.68%)**: verdict-fail 1,186, verdict-compiler-error 112, no crashes,
+no timeouts. The failures rank themselves as before: 716 undeclared globals (Temporal 100, eval 70,
+ArrayBuffer 58, Symbol 53, Date 50, RegExp 42, JSON 31, Intl 30, Proxy 22, Reflect 22, Set 22, …),
+190 property descriptors (`Object.defineProperty` 127, `getOwnPropertyDescriptor` 26,
+`defineProperties` 12, `Object.create` with descriptors 10, freeze/isExtensible/…), 74 ToObject on a
+primitive (44 of them `new String(…)`), 50 `Array.prototype` methods on array-likes (every, reduce,
+filter, map, indexOf, some, forEach — generic since), 30 reads of properties of `undefined`, 25 the
+`Function` constructor (a permanent refusal), 16 ToPrimitive of an object. Evidence: a scratch
+snapshot's `build/test262-sample-20260909i/results.tsv`.
+
+## Earlier measured campaign, 2026-09-09 (sampled, after arrays, strings and callbacks)
 
 With arrays, the callback methods, `new.target`, StringToNumber, String.prototype and the campaign's
 own fixes (the may-throw filter's `instanceof`, GCM's shared globals, the loop tree's parent rule,
