@@ -113,16 +113,37 @@ name (a runtime refusal in both modes).
 ### 2026-09-08 — Standard globals
 
 `Object`, `String`, `Number`, `Boolean`, `Error`, `TypeError`, `RangeError`, `SyntaxError`,
-`ReferenceError`, `EvalError` and `URIError` exist as intrinsics (docs/DECISIONS.md, standard
-globals) when a program names them. Missing: every other global (`Math`, `JSON`, `Array`,
+`ReferenceError`, `EvalError`, `URIError` and `Array` exist as intrinsics (docs/DECISIONS.md, standard
+globals; arrays) when a program names them. Missing: every other global (`Math`, `JSON`,
 `Function`, `Symbol`, `parseInt`, `isNaN`, …, still refused by name at run time); prototype
-methods (`Object.prototype.toString`/`hasOwnProperty`, `Error.prototype.toString`,
-`String.prototype.*`) — the table has no slot for methods yet; wrapper objects (`new String(x)`,
+methods other than `Array.prototype`'s (`Object.prototype.toString`/`hasOwnProperty`,
+`Error.prototype.toString`, `String.prototype.*`) — the intrinsic table carries methods now, so
+each is a JSL definition away; wrapper objects (`new String(x)`,
 `Object(1)`: `ToObject` refuses by name); zero-argument calls read as `undefined` arguments
 (`String()`, `Number()`); the runtime's TypeError traps are not `TypeError` objects, so
 `assert.throws(TypeError, …)` cannot see them; object literals and `new Object()` do not share one
 `%Object.prototype%` — an ordinary object's [[Prototype]] is null unless set, so
 `Object.prototype.x = 1` is not visible through `{}`.
+
+### 2026-09-09 — Arrays
+
+Array literals (with holes), indexed reads and writes through numbers and numeric strings, `length`
+reads and writes (truncating, extending, `RangeError`), named properties on arrays, `typeof`,
+`instanceof`, `Array.isArray`, `Array(n)`/`Array(a, b)`/`new Array`, `String(array)`, and the
+methods `push`, `pop`, `at`, `indexOf`, `includes`, `join`, `toString`, `reverse`, `shift`,
+`unshift`, `slice`, `concat` execute natively and under collector stress (docs/DECISIONS.md, arrays).
+Missing, and the deviations the ABI forces: spread in literals and calls (`[...a]`, `f(...a)`) and
+array destructuring (parse, refuse by name); every callback method (`forEach`, `map`, `filter`,
+`reduce`, `sort`, `find`, …) — JSL has no primitive to call a JavaScript function value yet;
+`splice`, `fill`, `lastIndexOf`, `flat`, `keys/values/entries` and iteration (`for…of` needs the
+iterator protocol); `Array.from`/`Array.of`; sparse-array semantics beyond holes (no dictionary
+elements: a write at index 2^31 allocates); `length` as a non-writable/accessor target; the
+generic-object forms of the methods (a non-array `this` throws `TypeError` instead of running the
+`[[Get]]`/`[[Set]]`-based algorithm); variadic arguments are taken up to the four ABI slots, and an
+omitted argument is indistinguishable from `undefined`, so `Array(undefined)` is `[]` and
+`push(undefined)` pushes nothing; the library iterates by recursion over an index because JSL has
+no loop form (`loop`/`recur` admission is the next JSL feature); `Array.prototype.toString` on a
+receiver whose `join` is overridden ignores the override.
 
 ### 2026-09-08 — Global object properties
 
@@ -184,8 +205,8 @@ loses its shape and every access through it pays the runtime call; a guarded sma
 (a few shape compares before the call) is not built; the runtime transition lookup is linear over
 all shapes; `o[k]` interns its key at run time against the blob's key table (`aot_rt_intern_key`, minting
 runtime ids for new names; linear search) and takes the named path — a constant string key is
-not yet folded to its compile-time id, and arrays do not exist (an integer key is an ordinary
-property); deletion, accessors, attributes, symbols as keys and dictionary mode do not exist. `tests/bloat-test.coil` holds node-count ceilings that fail on any
+not yet folded to its compile-time id; an array index key takes the element path at run time
+(docs/DECISIONS.md, arrays), any other key is a named property; deletion, accessors, attributes, symbols as keys and dictionary mode do not exist. `tests/bloat-test.coil` holds node-count ceilings that fail on any
 regression of this class; `iter-peeps!` and `iter-run!` panic with a trace of recent rewrites or
 inlined sites instead of spinning; `property-expand-all!` panics if the shape universe grows.
 
@@ -400,8 +421,9 @@ syntax. Phase imports (`import.source`/`import.defer`) and `super` fail closed.
 
 Lowering executes a substitution-free template as its cooked string and object shorthand as the
 named property it desugars to. `this`, `new`, `new.target`, computed access and assignment,
-non-name callees, spread, array literals, optional chains, `import()`, template substitutions
-(ToString), tagged templates, object spread and computed keys refuse by name. The regex pattern
+non-name callees, spread, optional chains, `import()`, template substitutions
+(ToString), tagged templates, object spread and computed keys refuse by name (array literals now
+lower; see the arrays entry). The regex pattern
 grammar is not validated: a syntax-only verdict fails closed whenever a regex literal survives
 every other check, so no pattern early error can be missed silently or falsely reported.
 
@@ -439,8 +461,9 @@ expressions on generic property reads still hit the unproven numeric Unbox refus
 
 Grammar not yet admitted fails closed as a compiler refusal: arrow functions, computed members,
 optional chains, templates, spread, `async`, labels, `for`/`do`/`try`/`throw`/`with`/`class`
-statements, nested/expression functions, `this`/`new`/`super`/`import` primaries, array literals,
-regex literals, object-literal shorthand/methods/computed keys, and `let` as a sloppy identifier.
+statements, nested/expression functions, `this`/`new`/`super`/`import` primaries, regex
+literals, object-literal shorthand/methods/computed keys, and `let` as a sloppy identifier (array
+literals have since been admitted; see the arrays entry).
 
 The native regression for runtime NaN comparisons exposed that AArch64 float `<`/`<=` used the
 integer LT/LE condition codes, which are true for unordered operands. Both CSET and the branch now
@@ -674,7 +697,7 @@ available current contracts; missing documents must not be treated as reviewed e
   memory escape/finality facts and the remaining Load/Store peepholes remain.
 - Hidden-class transitions, inherited alias allocation and stable payload-relative property
   offsets are implemented. Shape-set lattice integration and property nodes remain.
-- Named/keyed property and array access nodes.
+- Named/keyed property access nodes on the dynamic axis (arrays exist: docs/DECISIONS.md, arrays).
 - Closures and captured environments.
 - Exceptional control edges.
 - The Coil generational moving core, nursery promotion, compacting old-generation semispaces,

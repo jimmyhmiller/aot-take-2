@@ -285,6 +285,7 @@ order is chosen so that each step shrinks what the next one has to handle.
 | 5 | Evidence-gated JSL inlining (§5) | Bottom-typed sites are calls; typed fixtures unchanged in node count; bloat ceilings hold | **Landed**, but see §10: it removed little on the harness, because almost every argument carries a partial tag set and the volume is made at lowering, per site |
 | 6 | Word-level GC liveness, once (§6) | Stack-map tests green; encoding phase under 20 ms on the harness | **Landed.** 205 → 31 ms (the remainder is layout and emission) |
 | 7 | Gates (§7) | The listed assertions exist and are red when any of 1–6 is reverted | **Landed in part**: `tests/budget-test.coil` gates CalleeSaves, Casts, rounds, node and block ceilings and a 1 s wall ceiling on a harness realm; per-token and campaign gates remain |
+| 9 | JSL definitions built on demand, and a constant JSL condition lowering one arm (docs/DECISIONS.md, JSL definitions are built on demand) | A definition nothing calls has no graph; a macro's constant key compare builds no If | **Landed 2026-09-09**, with arrays. Harness realm parse arena 7,901 (before arrays) → 6,335 nodes with the array library present; 19 of 64 definitions built; pessimistic pass 14 → 12 ms; budget harness 4,935 → 4,811 machine nodes, 1,087 → 1,060 blocks, 90 → 80 ms. Arrays alone had cost 5,579 nodes and 102 ms until this landed |
 | 8 | The realm's initial heap as data: the static heap image (docs/DECISIONS.md, the realm image) | Realm creation and hoisted function objects are `__aot_heap` entries; no New for them in any graph; GC stress and verify green over image objects | **Landed 2026-09-08.** Smallest realm 611 → 56 nodes after opto; a function declaration 100 → 0; budget harness 5,649 → 4,870 machine nodes, 1,171 → 1,066 blocks. Reordered ahead of 4 on the §10 measurements: cheaper to build, no runtime trade-off, more nodes removed per site |
 
 Milestones 1, 2 and 6 are backend-local and touch no semantics. Milestone 3 changes the frame
@@ -312,7 +313,8 @@ have removed the volume that is not the front end's.
 ## 10. Where the volume actually comes from (measured 2026-09-08)
 
 After milestones 1–3, 5 and 6, the harness graph is still 15k nodes at the end of parsing, before
-any inlining; the JSL library itself is 2.9k of that (lowered whole, every compile). So the per-site
+any inlining; the JSL library itself was 2.9k of that (lowered whole, every compile — it is built on
+demand since row 9 of §8). So the per-site
 cost is made by lowering, not by inlining decisions. One-line programs over the `var x = 1;`
 baseline, nodes added at parse and total after opto (the realm baseline after opto is 612):
 

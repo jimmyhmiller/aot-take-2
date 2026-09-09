@@ -106,6 +106,28 @@
 
 (const RT-OFFSET-OBJECT-PROPERTIES 8)
 
+;; Array exotic objects (docs/DECISIONS.md, arrays; `aot.shape` fixes the same numbers). The
+;; payload begins like an object's, then the boxed elements store and the raw length word. The
+;; store is a heap object of shape RT-SHAPE-ELEMENTS whose payload is one boxed word per slot; a
+;; slot no element was ever defined at holds the hole word, which is neither a value nor a
+;; reference and never leaves the runtime.
+(const RT-OFFSET-ARRAY-ELEMENTS 16)
+
+(const RT-OFFSET-ARRAY-LENGTH 24)
+
+(const RT-ARRAY-PAYLOAD-BYTES 32)
+
+(const RT-SHAPE-ELEMENTS 0x2000000000000001)
+
+(const RT-DYNAMIC-PREFIX-ARRAY 0xfffb)
+
+(const RT-DYNAMIC-HOLE-WORD 0xfffc000000000000)
+
+(const RT-ARRAY-MIN-CAPACITY 4)
+
+;; 2^32 - 2: the largest array index (ECMA-262 §6.1.7).
+(const RT-ARRAY-MAX-INDEX 4294967294)
+
 ;; The static heap image header (aot.heap documents the layout).
 (const RT-IMAGE-VERSION 1)
 
@@ -455,7 +477,8 @@
   (let [prefix (rt-word-prefix word)]
     (or (= prefix RT-DYNAMIC-PREFIX-OBJECT)
         (= prefix RT-DYNAMIC-PREFIX-STRING)
-        (= prefix RT-DYNAMIC-PREFIX-FUNCTION))))
+        (= prefix RT-DYNAMIC-PREFIX-FUNCTION)
+        (= prefix RT-DYNAMIC-PREFIX-ARRAY))))
 
 (defn rt-forward-boxed [(word i64)] (-> i64)
   (if (not (rt-word-object? word))
@@ -2216,6 +2239,238 @@
                    "docs/GAPS.md — builtins")
     0))
 
+;; ---------------------------------------------------------------------------
+;; Array exotic objects: the elements store (docs/DECISIONS.md, arrays)
+;;
+;; Generated code reaches elements only through these entries. An array's `length` is the raw word
+;; at RT-OFFSET-ARRAY-LENGTH; its elements store holds `capacity` slots, `capacity >= length`, and
+;; every slot at or past `length`, and every slot inside it that no element was defined at, is the
+;; hole. Growth reallocates the store (doubling), copies, fills holes and installs the new store
+;; through the barrier; the array itself keeps its identity, as JavaScript requires.
+(defn rt-array-elements [(arr i64)] (-> i64)
+  (let [word (load (primitive/cast (ptr i64) (+ arr RT-OFFSET-ARRAY-ELEMENTS)))]
+    (if (= (rt-word-prefix word) RT-DYNAMIC-PREFIX-OBJECT)
+        (& word RT-DYNAMIC-PAYLOAD-MASK)
+        0)))
+
+(defn rt-array-capacity [(store i64)] (-> i64)
+  (if (= store 0) 0 (/ (rt-payload-bytes store) 8)))
+
+(defn rt-array-length [(arr i64)] (-> i64)
+  (load (primitive/cast (ptr i64) (+ arr RT-OFFSET-ARRAY-LENGTH))))
+
+(defn rt-array-set-length-word! [(arr i64) (n i64)] (-> i64)
+  (do (set! (primitive/cast (ptr i64) (+ arr RT-OFFSET-ARRAY-LENGTH)) n) 0))
+
+(defn rt-elements-fill-holes! [(store i64) (from i64) (to i64)] (-> i64)
+  (let [(mut i) from]
+    (loop (if (>= (load i) to)
+              (break 0)
+              (do
+                (set! (primitive/cast (ptr i64) (+ store (* (load i) 8)))
+                      RT-DYNAMIC-HOLE-WORD)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+;; A store of `capacity` hole slots. `arr-root` (a raw array payload, or null) and `boxed-root`
+;; (a boxed word, or null) are rooted across the allocation and re-read by the caller.
+(defn rt-array-alloc-store [(capacity i64)
+                            (map-id i64)
+                            (caller-sp i64)
+                            (arr-root (ptr i64))
+                            (boxed-root (ptr i64))] (-> i64)
+  (let [store
+          (rt-alloc-rooted (* capacity 8)
+                           RT-SHAPE-ELEMENTS
+                           map-id
+                           caller-sp
+                           arr-root
+                           boxed-root
+                           true)]
+    (rt-elements-fill-holes! store 0 capacity)
+    store))
+
+;; ArrayCreate (ECMA-262 §10.4.2.2): a fresh array of `length` holes whose [[Prototype]] is the
+;; boxed `proto` word. Returns the raw array payload.
+(defn rt-array-new [(length i64) (proto i64) (map-id i64) (caller-sp i64)] (-> i64)
+  (let [proto-root (primitive/alloc-stack i64)
+        store-root (primitive/alloc-stack i64)]
+    (set! proto-root proto)
+    (set! store-root 0)
+    (rt-heap-boot!)
+    (if (or (< length 0) (> length RT-ARRAY-MAX-INDEX))
+        (panic-i "aot_rt_array_new: length is not an array length" length)
+        0)
+    (let [capacity
+            (if (< length RT-ARRAY-MIN-CAPACITY) RT-ARRAY-MIN-CAPACITY length)
+          store
+            (rt-array-alloc-store capacity
+                                  map-id
+                                  caller-sp
+                                  (primitive/cast (ptr i64) 0)
+                                  proto-root)]
+      (set! store-root store)
+      (let [arr
+              (rt-alloc-rooted RT-ARRAY-PAYLOAD-BYTES
+                               SHAPES-ROOT
+                               map-id
+                               caller-sp
+                               store-root
+                               proto-root
+                               true)
+            moved-store (load store-root)
+            moved-proto (load proto-root)
+            elements (rt-box-object moved-store)]
+        (set! (primitive/cast (ptr i64) (+ arr 0)) moved-proto)
+        (aot-rt-write-barrier arr moved-proto RT-BARRIER-BOXED)
+        (set! (primitive/cast (ptr i64) (+ arr RT-OFFSET-OBJECT-PROPERTIES))
+              0x7ffb000000000000)
+        (set! (primitive/cast (ptr i64) (+ arr RT-OFFSET-ARRAY-ELEMENTS))
+              elements)
+        (aot-rt-write-barrier arr elements RT-BARRIER-BOXED)
+        (rt-array-set-length-word! arr length)
+        arr))))
+
+;; HasProperty of an array index on the array itself: inside the length and not a hole.
+(defn rt-array-has [(arr i64) (index i64)] (-> i64)
+  (if (or (< index 0) (>= index (rt-array-length arr)))
+      0
+      (let [store (rt-array-elements arr)]
+        (if (or (= store 0) (>= index (rt-array-capacity store)))
+            0
+            (if (= (load (primitive/cast (ptr i64) (+ store (* index 8))))
+                   RT-DYNAMIC-HOLE-WORD)
+                0
+                1)))))
+
+;; The element at `index`, or undefined for a hole or an index outside the length. (The prototype
+;; chain a hole falls through to is the JSL's business: `JsArrayGetIndex`.)
+(defn rt-array-load [(arr i64) (index i64)] (-> i64)
+  (if (= (rt-array-has arr index) 0)
+      RT-DYNAMIC-UNDEFINED-WORD
+      (load (primitive/cast (ptr i64) (+ (rt-array-elements arr) (* index 8))))))
+
+;; Make room for `needed` slots, keeping the array's identity: a larger store, the live elements
+;; copied, the rest holes, installed through the barrier. Roots `arr` and the boxed `value` the
+;; caller is about to store; both are re-read from the roots afterwards.
+(defn rt-array-grow! [(arr-root (ptr i64))
+                      (value-root (ptr i64))
+                      (needed i64)
+                      (map-id i64)
+                      (caller-sp i64)] (-> i64)
+  (let [old (rt-array-elements (load arr-root))
+        capacity (rt-array-capacity old)]
+    (if (<= needed capacity)
+        0
+        (let [doubled (* 2 capacity)
+              target
+                (if (< doubled needed)
+                    needed
+                    (if (< doubled RT-ARRAY-MIN-CAPACITY)
+                        RT-ARRAY-MIN-CAPACITY
+                        doubled))
+              fresh
+                (rt-array-alloc-store target
+                                      map-id
+                                      caller-sp
+                                      arr-root
+                                      value-root)
+              moved-arr (load arr-root)
+              moved-old (rt-array-elements moved-arr)
+              live (rt-array-length moved-arr)
+              (mut i) 0]
+          (loop (if (or (>= (load i) live)
+                        (>= (load i) (rt-array-capacity moved-old)))
+                    (break 0)
+                    (do
+                      (set! (primitive/cast (ptr i64) (+ fresh (* (load i) 8)))
+                            (load (primitive/cast (ptr i64)
+                                                  (+ moved-old (* (load i) 8)))))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (let [elements (rt-box-object fresh)]
+            (set! (primitive/cast (ptr i64)
+                                  (+ moved-arr RT-OFFSET-ARRAY-ELEMENTS))
+                  elements)
+            (aot-rt-write-barrier moved-arr elements RT-BARRIER-BOXED)
+            0)))))
+
+;; [[Set]] of an array index on the array itself: the element is stored and the length grows to
+;; cover it (ArraySetLength's "index >= length" half). Returns the value.
+(defn rt-array-store [(arr i64)
+                      (index i64)
+                      (value i64)
+                      (map-id i64)
+                      (caller-sp i64)] (-> i64)
+  (let [arr-root (primitive/alloc-stack i64)
+        value-root (primitive/alloc-stack i64)]
+    (set! arr-root arr)
+    (set! value-root value)
+    (rt-heap-boot!)
+    (if (or (< index 0) (> index RT-ARRAY-MAX-INDEX))
+        (panic-i "aot_rt_array_store: index is not an array index" index)
+        0)
+    (rt-array-grow! arr-root value-root (+ index 1) map-id caller-sp)
+    (let [moved-arr (load arr-root)
+          moved-value (load value-root)
+          store (rt-array-elements moved-arr)]
+      (set! (primitive/cast (ptr i64) (+ store (* index 8))) moved-value)
+      (aot-rt-write-barrier store moved-value RT-BARRIER-BOXED)
+      (if (>= index (rt-array-length moved-arr))
+          (rt-array-set-length-word! moved-arr (+ index 1))
+          0)
+      moved-value)))
+
+;; ArraySetLength (ECMA-262 §10.4.2.4) once the new length is a valid array length: a shorter
+;; length drops the elements past it (they become holes so the collector may reclaim them); a
+;; longer one extends with holes, growing the store if it must. Returns the length.
+(defn rt-array-set-length [(arr i64) (length i64) (map-id i64) (caller-sp i64)] (-> i64)
+  (let [arr-root (primitive/alloc-stack i64)
+        none (primitive/alloc-stack i64)]
+    (set! arr-root arr)
+    (set! none 0)
+    (rt-heap-boot!)
+    (if (or (< length 0) (> length (+ RT-ARRAY-MAX-INDEX 1)))
+        (panic-i "aot_rt_array_set_length: not an array length" length)
+        0)
+    (let [current (rt-array-length arr)]
+      (if (< length current)
+          (do
+            (rt-elements-fill-holes! (rt-array-elements arr) length current)
+            (rt-array-set-length-word! arr length)
+            length)
+          (do
+            (rt-array-grow! arr-root none length map-id caller-sp)
+            (rt-array-set-length-word! (load arr-root) length)
+            length)))))
+
+;; The array index a canonical numeric string denotes (ECMA-262 §6.1.7: "0", or a decimal with
+;; no leading zero whose value is at most 2^32 - 2), or -1 for any other string.
+(defn rt-array-index-of-string [(string i64)] (-> i64)
+  (let [n (rt-string-length string)]
+    (if (or (= n 0) (> n 10))
+        -1
+        (let [first (rt-string-code-unit string 0)]
+          (if (and (= first 48) (= n 1))
+              0
+              (if (or (< first 49) (> first 57))
+                  -1
+                  (let [(mut i) 1
+                        (mut value) (- first 48)
+                        (mut ok) true]
+                    (loop (if (or (not (load ok)) (>= (load i) n))
+                              (break 0)
+                              (let [c (rt-string-code-unit string (load i))]
+                                (if (or (< c 48) (> c 57))
+                                    (set! (mut ok) false)
+                                    (set! (mut value)
+                                          (+ (* (load value) 10) (- c 48))))
+                                (set! (mut i) (+ (load i) 1))
+                                (continue))))
+                    (if (and (load ok) (<= (load value) RT-ARRAY-MAX-INDEX))
+                        (load value)
+                        -1))))))))
+
 (defn rt-unimplemented-keyed-access [] (-> i64)
   (do
     (unimplemented "computed property access with a runtime key (`o[k]`, arrays)"
@@ -2267,6 +2522,12 @@
           [rt-prop-get-own :as "aot_rt_prop_get_own"]
           [rt-prop-has-own :as "aot_rt_prop_has_own"]
           [rt-prop-set-own :as "aot_rt_prop_set_own"]
+          [rt-array-new :as "aot_rt_array_new"]
+          [rt-array-load :as "aot_rt_array_load"]
+          [rt-array-has :as "aot_rt_array_has"]
+          [rt-array-store :as "aot_rt_array_store"]
+          [rt-array-set-length :as "aot_rt_array_set_length"]
+          [rt-array-index-of-string :as "aot_rt_array_index_of_string"]
           [rt-unimplemented-to-object :as "aot_rt_unimplemented_to_object"]
           [rt-unimplemented-keyed-access
            :as

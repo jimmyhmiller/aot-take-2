@@ -5550,6 +5550,56 @@
                                       (scope-mem scope))]
         (.value finished)))))
 
+;; ArrayLiteral (ECMA-262 §13.2.4.2): ArrayCreate(0), then each element is CreateDataProperty at the
+;; next index and each elision advances the length; the JSL (`jsl/compiler/array.jsl`) owns every
+;; step. Spread refuses by name until iteration exists.
+(defn lower-array-literal [(elements (ArrayList ArrayElement))] (-> (dyn NodeOps))
+  (let [(mut args) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))]
+    (push! [(dyn NodeOps)] (mut args) (con-int 0))
+    (let [scope (parser-node (.current-scope (parser-state)))
+          created (jsl-lower-macro-values "JsNewArray" (load args) (parser-node (.current-ctrl (parser-state))) (scope-mem scope))
+          (mut array-nid) (n-nid (.value created))
+          (mut index) 0]
+      (al-free! [(dyn NodeOps)] (mut args))
+      (parser-set-current-ctrl! (.ctrl created))
+      (scope-set-mem! scope (.mem created))
+      (al-for [element elements]
+              (do
+                (match element
+                  (ElemHole []
+                            (let [(mut hargs) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))
+                                  scope2 (parser-node (.current-scope (parser-state)))]
+                              (push! [(dyn NodeOps)] (mut hargs) (parser-node (load array-nid)))
+                              (let [r (jsl-lower-macro-values "JsArrayLiteralHole" (load hargs) (parser-node (.current-ctrl (parser-state))) (scope-mem scope2))]
+                                (al-free! [(dyn NodeOps)] (mut hargs))
+                                (parser-set-current-ctrl! (.ctrl r))
+                                (scope-set-mem! scope2 (.mem r))
+                                (set! (mut array-nid) (n-nid (.value r))))))
+                  (ElemExpr [expr]
+                            (let [array (parser-node (load array-nid))]
+                              (n-keep! array)
+                              (let [value (lower-syntax-expr expr)
+                                    (mut eargs) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))
+                                    scope2 (parser-node (.current-scope (parser-state)))]
+                                (n-keep! value)
+                                (push! [(dyn NodeOps)] (mut eargs) array)
+                                (push! [(dyn NodeOps)] (mut eargs) (con-int (load index)))
+                                (push! [(dyn NodeOps)] (mut eargs) value)
+                                (let [r (jsl-lower-macro-values "JsArrayLiteralElement" (load eargs) (parser-node (.current-ctrl (parser-state))) (scope-mem scope2))]
+                                  (al-free! [(dyn NodeOps)] (mut eargs))
+                                  (parser-set-current-ctrl! (.ctrl r))
+                                  (scope-set-mem! scope2 (.mem r))
+                                  (n-unkeep! value)
+                                  (n-unkeep! array)
+                                  (set! (mut array-nid) (n-nid (.value r)))))))
+                  (ElemSpread [expr]
+                              (do
+                                (unimplemented "spread in an array literal (iteration)" "docs/GAPS.md — arrays")
+                                0)))
+                (set! (mut index) (+ (load index) 1))
+                0))
+      (parser-node (load array-nid)))))
+
 ;; Simple parseAddition/parseMultiplication attach the left operand to a new node before parsing
 ;; the right operand. Here JSL builds the operation after both values exist, so keep the left across
 ;; RHS Scope updates that could remove its last environment use; a local handle is insufficient.
@@ -6319,6 +6369,16 @@
                                     (scope-mem scope))
               formal-count (parser-abi-slots)
               (mut i) 0]
+          ;; An intrinsic's body sees exactly the arguments it declares; a longer argument list
+          ;; would be dropped silently, so it refuses by name instead.
+          (if (syntax-intrinsic-fun? target-idx)
+              (let [table (intrinsic-table)
+                    entry (get table (intrinsic-index table (.name target-syntax)))]
+                (if (> (len args) (.arity entry))
+                    (unimplemented "more arguments than the intrinsic admits (the slot ABI carries no argument count)"
+                                   "docs/GAPS.md — intrinsics")
+                    0))
+              0)
           ;; JavaScript evaluates every actual left-to-right. The shared ABI carries `this` and
           ;; the program-wide slot count: extra actuals still run for effects, while omitted
           ;; slots receive the canonical boxed undefined.
@@ -6432,11 +6492,7 @@
               (SxSingleton [name] (lower-singleton name))
               (SxGroup [inner] (lower-syntax-expr inner))
               (SxObject [entries] (lower-object-literal entries))
-              (SxArray [elements]
-                       (do
-                         (unimplemented "array literals"
-                                        "docs/GAPS.md — array allocation")
-                         (unreachable-node)))
+              (SxArray [elements] (lower-array-literal elements))
               (SxMember [owner name optional]
                         (if optional
                             (do
@@ -7619,7 +7675,10 @@
    (builtin (slice u8))
    (arity i64)
    (parent (slice u8))   ; a constructor whose prototype heads this one's prototype chain, or ""
-   (setup i64)])  ; what CreateIntrinsics gives its prototype (`realm-image-build!`)
+   (setup i64)  ; what CreateIntrinsics gives its prototype (`realm-image-build!`)
+   (owner (slice u8))  ; a method: the constructor whose object carries it, or "" for a constructor
+   (prop (slice u8))  ; a method: its property name
+   (target i64)])  ; a method: which of the owner's objects carries it
 
 ;; The prototype needs nothing beyond `constructor`.
 (const INTRINSIC-SETUP-NONE 0)
@@ -7628,19 +7687,59 @@
 ;; chain to the parent's prototype (ECMA-262 §20.5.3, §20.5.6.3).
 (const INTRINSIC-SETUP-ERROR-PROTOTYPE 1)
 
+;; A constructor: a global binding. Its body receives (this, its own function object, args...).
+(const INTRINSIC-TARGET-GLOBAL 0)
+
+;; A method of the owner's `prototype` object. Its body receives (this, args...).
+(const INTRINSIC-TARGET-PROTOTYPE 1)
+
+;; A static method of the owner's own function object. Its body receives (this, args...).
+(const INTRINSIC-TARGET-CONSTRUCTOR 2)
+
+(defn intrinsic-method? [(entry Intrinsic)] (-> bool)
+  (!= (.owner entry) ""))
+
+(defn intrinsic-ctor [(name (slice u8)) (builtin (slice u8)) (arity i64) (parent (slice u8)) (setup i64)] (-> Intrinsic)
+  (Intrinsic :name name :builtin builtin :arity arity :parent parent :setup setup
+             :owner "" :prop "" :target INTRINSIC-TARGET-GLOBAL))
+
+(defn intrinsic-method [(owner (slice u8)) (target i64) (prop (slice u8)) (builtin (slice u8)) (arity i64)] (-> Intrinsic)
+  (let [(mut b) (sb-new (alloc/malloc-allocator))]
+    (sb-push-str! (mut b) owner)
+    (sb-push-str! (mut b) (if (= target INTRINSIC-TARGET-PROTOTYPE) ".prototype." "."))
+    (sb-push-str! (mut b) prop)
+    (Intrinsic :name (sb-str (mut b)) :builtin builtin :arity arity :parent "" :setup INTRINSIC-SETUP-NONE
+               :owner owner :prop prop :target target)))
+
 (defn intrinsic-table [] (-> (ArrayList Intrinsic))
   (let [(mut t) (al-new [Intrinsic] (alloc/malloc-allocator))]
-    (push! [Intrinsic] (mut t) (Intrinsic :name "Object" :builtin "JsIntrinsicObject" :arity 1 :parent "" :setup INTRINSIC-SETUP-NONE))
-    (push! [Intrinsic] (mut t) (Intrinsic :name "String" :builtin "JsIntrinsicString" :arity 1 :parent "" :setup INTRINSIC-SETUP-NONE))
-    (push! [Intrinsic] (mut t) (Intrinsic :name "Number" :builtin "JsIntrinsicNumber" :arity 1 :parent "" :setup INTRINSIC-SETUP-NONE))
-    (push! [Intrinsic] (mut t) (Intrinsic :name "Boolean" :builtin "JsIntrinsicBoolean" :arity 1 :parent "" :setup INTRINSIC-SETUP-NONE))
-    (push! [Intrinsic] (mut t) (Intrinsic :name "Error" :builtin "JsIntrinsicError" :arity 1 :parent "" :setup INTRINSIC-SETUP-ERROR-PROTOTYPE))
-    (push! [Intrinsic] (mut t) (Intrinsic :name "TypeError" :builtin "JsIntrinsicError" :arity 1 :parent "Error" :setup INTRINSIC-SETUP-ERROR-PROTOTYPE))
-    (push! [Intrinsic] (mut t) (Intrinsic :name "RangeError" :builtin "JsIntrinsicError" :arity 1 :parent "Error" :setup INTRINSIC-SETUP-ERROR-PROTOTYPE))
-    (push! [Intrinsic] (mut t) (Intrinsic :name "SyntaxError" :builtin "JsIntrinsicError" :arity 1 :parent "Error" :setup INTRINSIC-SETUP-ERROR-PROTOTYPE))
-    (push! [Intrinsic] (mut t) (Intrinsic :name "ReferenceError" :builtin "JsIntrinsicError" :arity 1 :parent "Error" :setup INTRINSIC-SETUP-ERROR-PROTOTYPE))
-    (push! [Intrinsic] (mut t) (Intrinsic :name "EvalError" :builtin "JsIntrinsicError" :arity 1 :parent "Error" :setup INTRINSIC-SETUP-ERROR-PROTOTYPE))
-    (push! [Intrinsic] (mut t) (Intrinsic :name "URIError" :builtin "JsIntrinsicError" :arity 1 :parent "Error" :setup INTRINSIC-SETUP-ERROR-PROTOTYPE))
+    (push! [Intrinsic] (mut t) (intrinsic-ctor "Object" "JsIntrinsicObject" 1 "" INTRINSIC-SETUP-NONE))
+    (push! [Intrinsic] (mut t) (intrinsic-ctor "String" "JsIntrinsicString" 1 "" INTRINSIC-SETUP-NONE))
+    (push! [Intrinsic] (mut t) (intrinsic-ctor "Number" "JsIntrinsicNumber" 1 "" INTRINSIC-SETUP-NONE))
+    (push! [Intrinsic] (mut t) (intrinsic-ctor "Boolean" "JsIntrinsicBoolean" 1 "" INTRINSIC-SETUP-NONE))
+    (push! [Intrinsic] (mut t) (intrinsic-ctor "Error" "JsIntrinsicError" 1 "" INTRINSIC-SETUP-ERROR-PROTOTYPE))
+    (push! [Intrinsic] (mut t) (intrinsic-ctor "TypeError" "JsIntrinsicError" 1 "Error" INTRINSIC-SETUP-ERROR-PROTOTYPE))
+    (push! [Intrinsic] (mut t) (intrinsic-ctor "RangeError" "JsIntrinsicError" 1 "Error" INTRINSIC-SETUP-ERROR-PROTOTYPE))
+    (push! [Intrinsic] (mut t) (intrinsic-ctor "SyntaxError" "JsIntrinsicError" 1 "Error" INTRINSIC-SETUP-ERROR-PROTOTYPE))
+    (push! [Intrinsic] (mut t) (intrinsic-ctor "ReferenceError" "JsIntrinsicError" 1 "Error" INTRINSIC-SETUP-ERROR-PROTOTYPE))
+    (push! [Intrinsic] (mut t) (intrinsic-ctor "EvalError" "JsIntrinsicError" 1 "Error" INTRINSIC-SETUP-ERROR-PROTOTYPE))
+    (push! [Intrinsic] (mut t) (intrinsic-ctor "URIError" "JsIntrinsicError" 1 "Error" INTRINSIC-SETUP-ERROR-PROTOTYPE))
+    ;; Arrays (docs/DECISIONS.md, arrays; ECMA-262 §23.1). The constructor admits four arguments;
+    ;; a call with more refuses by name (the slot ABI carries no count).
+    (push! [Intrinsic] (mut t) (intrinsic-ctor "Array" "JsIntrinsicArray" 4 "" INTRINSIC-SETUP-NONE))
+    (push! [Intrinsic] (mut t) (intrinsic-method "Array" INTRINSIC-TARGET-CONSTRUCTOR "isArray" "JsArrayIsArray" 1))
+    (push! [Intrinsic] (mut t) (intrinsic-method "Array" INTRINSIC-TARGET-PROTOTYPE "push" "JsArrayPush" 4))
+    (push! [Intrinsic] (mut t) (intrinsic-method "Array" INTRINSIC-TARGET-PROTOTYPE "pop" "JsArrayPop" 0))
+    (push! [Intrinsic] (mut t) (intrinsic-method "Array" INTRINSIC-TARGET-PROTOTYPE "shift" "JsArrayShift" 0))
+    (push! [Intrinsic] (mut t) (intrinsic-method "Array" INTRINSIC-TARGET-PROTOTYPE "unshift" "JsArrayUnshift" 4))
+    (push! [Intrinsic] (mut t) (intrinsic-method "Array" INTRINSIC-TARGET-PROTOTYPE "at" "JsArrayAt" 1))
+    (push! [Intrinsic] (mut t) (intrinsic-method "Array" INTRINSIC-TARGET-PROTOTYPE "indexOf" "JsArrayIndexOf" 1))
+    (push! [Intrinsic] (mut t) (intrinsic-method "Array" INTRINSIC-TARGET-PROTOTYPE "includes" "JsArrayIncludes" 1))
+    (push! [Intrinsic] (mut t) (intrinsic-method "Array" INTRINSIC-TARGET-PROTOTYPE "join" "JsArrayJoin" 1))
+    (push! [Intrinsic] (mut t) (intrinsic-method "Array" INTRINSIC-TARGET-PROTOTYPE "toString" "JsArrayToString" 0))
+    (push! [Intrinsic] (mut t) (intrinsic-method "Array" INTRINSIC-TARGET-PROTOTYPE "reverse" "JsArrayReverse" 0))
+    (push! [Intrinsic] (mut t) (intrinsic-method "Array" INTRINSIC-TARGET-PROTOTYPE "slice" "JsArraySlice" 2))
+    (push! [Intrinsic] (mut t) (intrinsic-method "Array" INTRINSIC-TARGET-PROTOTYPE "concat" "JsArrayConcat" 4))
     (load t)))
 
 (defn intrinsic-index [(table (ArrayList Intrinsic)) (name (slice u8))] (-> i64)
@@ -7682,10 +7781,14 @@
         (set! (.hoisted fp) true)
         (set! (.script fp) -1)
         (set! (.parent fp) -1)
-        ;; (this callee a0 a1 ...): the receiver, the constructor's own function object (its
-        ;; `prototype` is what `new` and a plain call both need), then the arguments.
+        ;; A constructor's body is (this callee a0 a1 ...): the receiver, the constructor's own
+        ;; function object (its `prototype` is what `new` and a plain call both need), then the
+        ;; arguments. A method's is (this a0 a1 ...): it has no global binding to name itself by
+        ;; and no use for its own object.
         (push! [i64] (mut args) (syntax-add-node! (SxThis) 0 0))
-        (push! [i64] (mut args) (syntax-add-node! (SxName :name (.name entry)) 0 0))
+        (if (intrinsic-method? entry)
+            0
+            (push! [i64] (mut args) (syntax-add-node! (SxName :name (.name entry)) 0 0)))
         (loop (if (>= (load i) (.arity entry))
                   (break 0)
                   (let [(mut sb) (sb-new (alloc/malloc-allocator))]
@@ -7701,7 +7804,7 @@
                     (continue))))
         (set! (.expression-body fp)
               (Some (syntax-add-node! (SxIntrinsic :builtin (.builtin entry) :args (load args)) 0 0)))
-        (syntax-global-declare! (.name entry) -1 index)
+        (if (intrinsic-method? entry) 0 (syntax-global-declare! (.name entry) -1 index))
         0)))
 
 ;; Materialize the intrinsics the program names, with their parents. Runs before the Scripts'
@@ -7712,10 +7815,18 @@
     ;; %TypeError.prototype% exists in every realm.
     (syntax-declare-intrinsic! (get table (intrinsic-index table "Error")))
     (syntax-declare-intrinsic! (get table (intrinsic-index table "TypeError")))
+    ;; Arrays: an array literal or the name materializes `Array`, with `Object` (whose prototype
+    ;; heads %Array.prototype%'s chain) and `RangeError` (which an invalid length throws).
+    (if (or (syntax-names-identifier? "Array") (syntax-uses-array-literal?))
+        (do
+          (syntax-declare-intrinsic! (get table (intrinsic-index table "Object")))
+          (syntax-declare-intrinsic! (get table (intrinsic-index table "RangeError")))
+          (syntax-declare-intrinsic! (get table (intrinsic-index table "Array"))))
+        0)
     (loop (if (>= (load i) (len table))
               (break 0)
               (let [entry (get table (load i))]
-                (if (syntax-names-identifier? (.name entry))
+                (if (and (not (intrinsic-method? entry)) (syntax-names-identifier? (.name entry)))
                     (do
                       (if (!= (.parent entry) "")
                           (let [pi (intrinsic-index table (.parent entry))]
@@ -7727,7 +7838,31 @@
                     0)
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
+    ;; Every method of a materialized owner.
+    (set! (mut i) 0)
+    (loop (if (>= (load i) (len table))
+              (break 0)
+              (let [entry (get table (load i))]
+                (if (and (intrinsic-method? entry) (>= (syntax-find-fun (.owner entry)) 0))
+                    (syntax-declare-intrinsic! entry)
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
     0))
+
+;; Does any expression in the realm build an array literal?
+(defn syntax-uses-array-literal? [] (-> bool)
+  (let [(mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) (len (.exprs (parser-state)))) (load found))
+              (break 0)
+              (do
+                (let [x (get (.exprs (parser-state)) (load i))]
+                  (match (.node x)
+                    (SxArray [elements] (set! (mut found) true))
+                    (_ 0)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
 
 ;; The body of an intrinsic: its JSL builtin over the lowered operands.
 (defn lower-intrinsic-call [(builtin (slice u8)) (args (ArrayList i64))] (-> (dyn NodeOps))
@@ -7941,17 +8076,66 @@
                     0)
                 (set! (mut fi) (+ (load fi) 1))
                 (continue))))
-    ;; Intrinsics: into their global slots, then each entry's prototype setup.
+    ;; Intrinsics: constructors into their global slots, methods onto their owner's objects, then
+    ;; each constructor's prototype setup.
     (set! (mut fi) 0)
     (loop (if (>= (load fi) (len (.funs p)))
               (break 0)
               (do
                 (if (syntax-intrinsic-fun? (load fi))
-                    (let [f (syntax-fun-at (load fi))]
-                      (heap-define-own! global (.name f) (heap-ref-word DYNAMIC-PREFIX-FUNCTION (.static-entry f)) HEAP-WORD-REF))
+                    (let [f (syntax-fun-at (load fi))
+                          entry (get table (intrinsic-index table (.name f)))]
+                      (if (intrinsic-method? entry)
+                          0
+                          (heap-define-own! global (.name f) (heap-ref-word DYNAMIC-PREFIX-FUNCTION (.static-entry f)) HEAP-WORD-REF)))
                     0)
                 (set! (mut fi) (+ (load fi) 1))
                 (continue))))
+    (set! (mut fi) 0)
+    (loop (if (>= (load fi) (len (.funs p)))
+              (break 0)
+              (do
+                (if (syntax-intrinsic-fun? (load fi))
+                    (let [f (syntax-fun-at (load fi))
+                          entry (get table (intrinsic-index table (.name f)))]
+                      (if (intrinsic-method? entry)
+                          (let [owner (syntax-fun-at (syntax-find-fun (.owner entry)))
+                                carrier (if (= (.target entry) INTRINSIC-TARGET-PROTOTYPE)
+                                            (realm-image-prototype-of (.static-entry owner))
+                                            (.static-entry owner))]
+                            (heap-define-own! carrier (.prop entry) (heap-ref-word DYNAMIC-PREFIX-FUNCTION (.static-entry f)) HEAP-WORD-REF))
+                          0))
+                    0)
+                (set! (mut fi) (+ (load fi) 1))
+                (continue))))
+    ;; %Array.prototype% for `%ArrayPrototype`; and with `Object` materialized, every intrinsic
+    ;; prototype that heads its own chain continues to %Object.prototype% (ECMA-262 §20.5.3.1,
+    ;; §23.1.3.1: the prototypes of Error and Array are ordinary objects on Object.prototype).
+    (let [object-fun (syntax-find-fun "Object")
+          array-fun (syntax-find-fun "Array")]
+      (if (>= array-fun 0)
+          (let [array-syntax (syntax-fun-at array-fun)]
+            (heap-set-intrinsic! "Array.prototype" (realm-image-prototype-of (.static-entry array-syntax))))
+          0)
+      (if (>= object-fun 0)
+          (let [object-syntax (syntax-fun-at object-fun)
+                object-proto (realm-image-prototype-of (.static-entry object-syntax))]
+            (set! (mut fi) 0)
+            (loop (if (>= (load fi) (len (.funs p)))
+                      (break 0)
+                      (do
+                        (if (and (syntax-intrinsic-fun? (load fi)) (!= (load fi) object-fun))
+                            (let [f (syntax-fun-at (load fi))
+                                  entry (get table (intrinsic-index table (.name f)))]
+                              (if (and (not (intrinsic-method? entry)) (= (.parent entry) ""))
+                                  (heap-set-prototype! (realm-image-prototype-of (.static-entry f))
+                                                       (heap-ref-word DYNAMIC-PREFIX-OBJECT object-proto)
+                                                       HEAP-WORD-REF)
+                                  0))
+                            0)
+                        (set! (mut fi) (+ (load fi) 1))
+                        (continue)))))
+          0))
     (set! (mut fi) 0)
     (loop (if (>= (load fi) (len (.funs p)))
               (break 0)
@@ -8227,6 +8411,10 @@
                       (set! (mut fi) (+ (load fi) 1))
                       (continue)))))
       (parser-install-entry-wrapper! start stop)
+      ;; Every semantic call is installed: lower the bodies of the JSL definitions the program
+      ;; demanded, and of those they demand, before pessimistic Iter sees the graph. A definition
+      ;; nothing reached has no graph (docs/DECISIONS.md, JSL definitions are built on demand).
+      (jsl-define-pending!)
       stop)))
 
 (defn parse-program [(src (slice u8))] (-> (dyn NodeOps))

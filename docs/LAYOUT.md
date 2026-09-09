@@ -144,11 +144,12 @@ aot-take-2/
 │   ├── intrinsics.jsl   ; the global-object surface
 │   ├── object-layouts.jsl
 │   └── abstract/ array/ string/ object/ json/ math/ number/ symbol/ compiler/
-│       └── compiler/{add,sub,mul,increment-int-or-identity,logical}.jsl
-│           ; frontend numeric calls plus a guarded generic/fast-path specialization proof
+│       └── compiler/{add,sub,mul,increment-int-or-identity,logical,…,array}.jsl
+│           ; the production index (`compiler/index`): every operation the frontend lowers to,
+│           ; built on demand per compile; array.jsl is the Array intrinsic and its methods
 │       function/ array-buffer/ data-view/ typed-array/
 ├── src/
-│   ├── main.coil            ; CLI driver: compile, emit, run, dump
+│   ├── main.coil            ; CLI driver: compile, emit, run, dump; `AOT_SEED=N` compiles under a test's arena seed
 │   │
 │   ├── util/
 │   │   ├── ary.coil         ; growable arrays: nodes, ints, bitsets     Ary/AryInt
@@ -175,7 +176,7 @@ aot-take-2/
 │   │   ├── control.coil     ; Start, Stop, Region, Loop, If, Never, XCtrl, Proj, CProj, Multi
 │   │   ├── phi.coil         ; Phi and the region/phi arity invariant
 │   │   ├── constant.coil    ; Constant, FunPtr, ConFldOff, Extern, FRef
-│   │   ├── arith.coil       ; Add, Sub, Mul, Div, Minus, ToFloat, RoundF32 + the int/float modes
+│   │   ├── arith.coil       ; Add, Sub, Mul, Div, Minus, ToFloat, ToInt, RoundF32 + the int/float modes
 │   │   ├── bits.coil        ; And, Or, Xor, Shl, Shr, Sar, Not
 │   │   ├── compare.coil     ; EQ, NE, LT, LE, ULT
 │   │   ├── memory.coil      ; MemOp, Load, Store, New, MemMerge, MemPhi, ReadOnly

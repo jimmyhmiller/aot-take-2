@@ -1,5 +1,101 @@
 # Decisions
 
+## 2026-09-09 — Arrays are exotic objects under their own tag, with an elements store and a length word
+
+An array is a heap object under its own NaN-box prefix (`DYNAMIC-PREFIX-ARRAY`, `TAG-ARRAY` on the
+dynamic tag axis; `TAG-ANY` and the completion universe grew by it), so `typeof`, `Array.isArray`,
+truthiness and identity tests are one prefix test, and every operation that admits "object-like"
+values (`%IsObjectLike`, `%UnboxObjectLike`) takes object, function and array as one three-prefix
+range. The payload is `[prototype, properties, elements, length]`: `prototype` and `properties` are
+the ordinary object words, so named properties on an array (`a.foo = 1`) and the prototype chain
+walk are the object machinery unchanged; `elements` is a boxed reference to a separate store object
+(`SHAPE-ELEMENTS`, scanned by the collector as a run of boxed words; capacity in its header) and
+`length` is a raw word. A missing element is the **hole word** (`DYNAMIC-PREFIX-HOLE`, a prefix no
+JavaScript value has, never boxed into a source value): `HasProperty` on an index is a compare
+against it, and a read through a hole falls to the prototype chain with the index's canonical string
+as the key, as the specification's `[[Get]]` does. The store grows by doubling from a minimum
+capacity of four, in the runtime (`aot_rt_array_store`, `aot_rt_array_set_length`), which owns every
+transition an index write or a `length` write can cause; `length` writes truncate to holes or
+extend with holes and throw `RangeError` for a non-array-length value.
+
+**Why a tag rather than an object with an exotic shape.** The carried library (`jsl/`) was written
+against a value universe in which arrays are their own tag, and the dispatch in every operation
+(`ToString`, `ToPrimitive`, property access, `typeof`) is a tag test. Giving arrays a shape bit
+inside the object family would make every object operation read the header before it can decide,
+and would put the elements store behind the same transition machinery as named properties; the
+tag keeps the fast paths for plain objects untouched and makes an array's own fast path one test.
+The price is one more prefix in the negative quiet-NaN family, which the double test now covers as
+a range (`FUNCTION..HOLE`, four prefixes, one subtract-and-compare).
+
+**Indexes.** A property key that is a canonical array index (an integral number in `[0, 2^32-2]`,
+or the string spelling of one — `aot_rt_array_index_of_string`) takes the element path in
+`GetKeyed`/`SetKeyed`; every other key is a named property on the array object. The syntax `a[i]`
+does not know its key's kind, so the JSL dispatches at run time on the key's tag and value;
+`a.length` is recognised at the site (the key is a constant) and reads the length word directly.
+
+**Methods are intrinsics in the image.** `Array` and its methods (`push`, `pop`, `at`, `indexOf`,
+`includes`, `join`, `toString`, `reverse`, `shift`, `unshift`, `slice`, `concat`, `isArray`) are
+hoisted JSL functions placed on `Array.prototype` (or the constructor) as image objects by
+`realm-image-build!` — the same way the Error constructors and prototypes are — when a program
+names `Array` or uses an array literal (`syntax-uses-array-literal?`). `Array.prototype` chains to
+`Object.prototype` when `Object` is materialized. The library's iteration is recursion over an
+index (JSL has no loop form yet); a method that receives a non-array `this` throws a `TypeError`
+(the generic-object forms of these methods are not written), variadic arguments are taken up to
+the four-slot ABI, `Array(undefined)` builds an empty array and `push(undefined)` pushes nothing,
+because the ABI cannot yet distinguish an omitted argument from `undefined` — each of these is in
+docs/GAPS.md as the deviation it is.
+
+**Compile-time cost.** Every generic dispatch grew an arm, and the whole array library was being
+lowered for every compile; both are addressed by the next entry, and the harness realm compiles
+with fewer nodes than before arrays existed.
+
+## 2026-09-09 — JSL definitions are built on demand, and a constant condition lowers one arm
+
+Loading the JSL index declares every definition (its name, its stable function index) and builds
+none. A definition's Fun and Parms are built the first time something asks for its graph
+(`jsl-graph-of` — the frontend installing a semantic call, or a body calling it), and its body is
+lowered afterwards, in a queue drained when the program's lowering is complete
+(`jsl-define-pending!`, at the end of `parse-program-sources`) and again by `jsl-close-world!`,
+which then drops the unknown-caller hooks and closes the table: a demand after that is an error.
+A definition nothing reached has no graph at all. Function indices are still the index's order,
+reserved at declaration, so relocations and the `fidx` tests are unchanged.
+
+**Why.** Before this every compile lowered, peepholed and swept the whole library — 2.9k parse
+nodes for the harness realm before arrays, 4.8k after — and most of it was dead by the end of the
+first peephole pass. The library will keep growing with every builtin; its cost must be paid by
+the programs that use it. On the harness realm the parse arena fell from 7,901 to 6,335 nodes
+(HEAD before arrays → now, with the array library present), 19 of 64 definitions are built, and
+the pessimistic pass fell from 14 to 12 ms; the budget harness is 4,935 → 4,811 machine nodes and
+1,087 → 1,060 blocks (90 → 80 ms).
+
+**A constant condition lowers one arm.** A JSL `if` whose lowered condition is already a constant
+(an integer constant or a Box of one, decided as `if-compute` decides truthiness) lowers only the
+arm it selects: no If, no dead arm, no Region. This is the macro expander's constant folding, and
+it is what makes site-specialised macros cheap — `JsGetNamed` compares its constant key against
+`"length"`, and `JsDefineOwnNamed` likewise; only the `length` sites pay for the array arm. No
+narrowing Cast is lost, because a tag test folds only when the tested value's type already implies
+the answer. (Simple's parser peepholes every node at creation and so folds `if (true)` the same
+way; JSL's `if` had been building both arms first for the branch-local Casts.)
+
+**Tests keep the eager form.** `jsl-lower-unit!` builds and lowers every definition of one unit;
+`jsl-graph-defined` demands one and drains the queue, for a test or tool that inspects a body.
+
+## 2026-09-09 — A Region's dominator ignores a path whose chain ended in a dead subtree
+
+`region-idom` is Simple's `RegionNode.idom`: the LCA over the live inputs, skipping high ones. Our
+`XCtrl` has no input where Simple's hangs off Start, so when a branch's control is replaced by
+XCtrl the dominator chains under it end at that XCtrl until the subtree is retyped and removed.
+Simple's fold restarts the LCA at the next input when two chains fail to meet; over a Region that
+merges both arms of an If plus such a stale path, that computed the dominator inside one arm, and
+the dominating-test hunt (`if-idealize`) then folded the other arm's repeated test to the wrong
+constant — a one-armed If reached the backend (`arm64-cfg-target: selected CFG target is missing`,
+tests/pipeline-test.coil under seed 41 once the array work changed node order). `region-lca-path`
+keeps the side whose chain reached Start and drops the side that ended elsewhere, in either order
+(tests/control-test.coil, `a_region_dominator_ignores_a_path_whose_chain_ended_in_a_dead_subtree`).
+The cache keyed on the control-edit version is unchanged; a chain that heals does so through an
+edit. `AOT_SEED=N` on the CLI compiles under a test's seed, so a seed-dependent failure reproduces
+from the shell.
+
 ## 2026-09-09 — Exceptions are a sentinel completion, and the type is the may-throw analysis
 
 A function that throws returns the **exception sentinel**: a word under its own NaN-box prefix
