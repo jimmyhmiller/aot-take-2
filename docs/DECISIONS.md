@@ -1,5 +1,31 @@
 # Decisions
 
+## 2026-09-09 — Function objects sit on %Function.prototype%; fresh objects on %Object.prototype%
+
+Every function object — a hoisted declaration's image object, an intrinsic, a function expression
+made at run time — has %Function.prototype% as its [[Prototype]] once the realm materializes
+`Function` (the program names it, or names `call` or `apply`), and every fresh ordinary object — a
+literal, a function's `prototype` object, `Object.create(null)` aside — has %Object.prototype% once
+the realm materializes `Object`. Until then those words are null, as before: the chain is what the
+program can observe, and a program that names no method of either prototype observes nothing.
+`Function.prototype.call` and `apply` are JSL over `%CallFunction`; the `Function` constructor
+itself is a hard refusal (`%TrapDynamicCode`): it compiles source text at run time, and this
+compiler is ahead-of-time by design.
+
+The intrinsic prototypes are named uniformly: `(%IntrinsicPrototype "Name.prototype")` is the image
+object of any materialized constructor's prototype, or null (it replaces the per-name
+`%ArrayPrototype`/`%StringPrototype`); the realm registers every materialized constructor's
+prototype under that name. A number or boolean receiver resolves its properties on
+%Number.prototype% or %Boolean.prototype% the same way a string does on %String.prototype%
+(docs/DECISIONS.md, strings), so `(5).toString(16)` and `true.valueOf()` work without wrapper
+objects. `Object.keys` is the one new runtime capability (`%ObjectKeys`): the shape tree's edges
+from the root to the object's shape name its own keys in insertion order, and the runtime builds
+the array of their names.
+
+The image builder now rejects a cyclic prototype chain at compile time: the first version of this
+change made `Object.prototype` its own prototype, and every program that walked a chain overflowed
+its stack. A structural invariant of the image is checked where the image is built.
+
 ## 2026-09-09 — Strings have no wrapper objects; their properties resolve on %String.prototype%
 
 A property read on a primitive string is `length` for that key and otherwise a lookup on

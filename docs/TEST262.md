@@ -110,6 +110,21 @@ per-case compile time is what to fix. Never edit `jsl/` or run `coil build` duri
 AOT_T262_SAMPLE=20 AOT_T262_JOBS=8 coil run tools/test262.coil -- run /Users/jimmyhmiller/Documents/Code/open-source/test262 ./build/aot-test262-compiler build/release/aot-runtime.o build/test262-sample-YYYYMMDD
 ```
 
+## Latest measured campaign, 2026-09-09 (sampled, after arrays, strings and callbacks)
+
+With arrays, the callback methods, `new.target`, StringToNumber, String.prototype and the campaign's
+own fixes (the may-throw filter's `instanceof`, GCM's shared globals, the loop tree's parent rule,
+the allocator's deleted edges), the 1-in-20 sample measured **305 / 2,680 files passing (11.38%)**:
+verdict-pass 580, verdict-fail 1,256, verdict-unsupported 3,190, verdict-compiler-error 112, no
+crashes, no timeouts (the run deadline now absorbs a fresh binary's first launch). Uncaught
+exceptions report their value, so the failures rank themselves: 742 undeclared globals (Temporal,
+eval, ArrayBuffer, Date, Symbol, Function, RegExp, JSON, Math, …), 177 `Object.defineProperty` /
+`getOwnPropertyDescriptor` / `create` / `defineProperties` not a function, 74 ToObject on a
+primitive (`Number.prototype`, `Boolean.prototype`, wrapper objects), 26 `Function.prototype.call`
+on an intrinsic method, 16 ToPrimitive of an object. Evidence: a scratch snapshot's
+`build/test262-sample-20260909d/results.tsv`; the earlier same-day run before the callback work
+measured 289.
+
 ## Latest measured campaign, 2026-09-08 (sampled, after the compile-time architecture)
 
 With static string literals, all-caller-save frames, direct split insertion and the other

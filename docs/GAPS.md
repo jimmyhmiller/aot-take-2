@@ -125,6 +125,24 @@ each is a JSL definition away; wrapper objects (`new String(x)`,
 `%Object.prototype%` — an ordinary object's [[Prototype]] is null unless set, so
 `Object.prototype.x = 1` is not visible through `{}`.
 
+### 2026-09-09 — Function objects, Object and the primitive prototypes
+
+`Function.prototype.call`/`apply` (apply over an array, up to four elements), `Object.create`
+(without a properties object), `Object.getPrototypeOf`, `Object.keys` (own keys in insertion order;
+an array's indices first), `Object.prototype.hasOwnProperty`/`toString`/`valueOf`/`isPrototypeOf`/
+`propertyIsEnumerable`, `Number.prototype.toString([radix])`/`valueOf` and
+`Boolean.prototype.toString`/`valueOf` execute (docs/DECISIONS.md, function objects). Missing:
+`Function.prototype.bind` (a bound function is a closure), `Function.prototype.toString`, `name`
+and `length` on functions, `arguments`; property descriptors — `Object.defineProperty`,
+`defineProperties`, `getOwnPropertyDescriptor(s)`, `getOwnPropertyNames`, `freeze`/`seal`/
+`preventExtensions` and their `is*` queries — since properties have no attributes yet (the
+campaign's largest remaining bucket, 177 sampled cases); `Object.assign`, `entries`, `values`,
+`fromEntries`, `setPrototypeOf`; `Object.prototype.__proto__` and `toLocaleString`;
+`Symbol.toStringTag` in `Object.prototype.toString`; wrapper objects (`new Number(1)`,
+`Object(1)`); `Number.prototype.toFixed`/`toPrecision`/`toExponential`/`toLocaleString`;
+`Number.isInteger` and the other Number statics; `Object.prototype.valueOf` on a primitive returns
+the primitive (no wrapper).
+
 ### 2026-09-09 — Strings
 
 A primitive string's properties resolve on %String.prototype% (docs/DECISIONS.md, strings): `length`,
