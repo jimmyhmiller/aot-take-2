@@ -1,5 +1,19 @@
 # Decisions
 
+## 2026-09-09 — A loop's parent is the innermost enclosing region any branch proposes
+
+Simple's loop-tree walk (`_bltWalk`) attaches an inner loop to an outer tree at every branch whose
+arms reach two different loop trees, writing the parent each time; the branch post-visited last
+decides, and in Simple's language that is the loop's own exit test. Our lowering puts a loop's exit
+decision below the JSL dispatch diamonds of its condition and below exception checks, so several
+branches inside a loop pair it with different enclosing regions — the enclosing loop at the real
+exit, the function root at an exception arm — and the arbitrary last one parented an inner loop to
+the root, which then absorbed the outer loop's head and left the outer loop's blocks out of the
+layout (`enc-layout-order-blocks!: loop tree omitted block`; the test262 campaign's
+`decodeURI` tests). Every region a branch proposes contains the inner loop, so the correct parent
+is the innermost of them: `looptree-attach-parent!` keeps the proposal whose head has the larger
+preorder number. Recorded as a divergence in `looptree.coil`'s header.
+
 ## 2026-09-09 — `new.target` is an argument slot
 
 Every JavaScript frame receives `new.target` as its second argument, after `this`: the shared ABI
