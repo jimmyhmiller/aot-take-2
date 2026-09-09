@@ -36,6 +36,7 @@
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
 (import "coil.arraylist" :use *)
+(import "coil.str" :use [sb-new sb-push-str! sb-push-i64! sb-str])
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
 (import "aot.node.constant" :use *)
@@ -48,6 +49,8 @@
 (import "aot.node.jsops" :use *)
 (import "aot.type.type" :use *)
 (import "aot.shape" :use *)
+(import "aot.heap" :use *)
+(import "aot.facts" :use *)
 
 (const PROP-LOAD 0)
 
@@ -164,6 +167,8 @@
                 (let [ctrl (n-in! d PROP-CTRL)
                       object (n-in! d PROP-OBJECT)
                       key (.key p)]
+                  (if (and (facts-ready?) (and (= (n-op object) OP-STATICREF) (!= (staticref-rep object) REP-STRING)))
+                      (prop-image-resolve! d ctrl mem object key)
                   (match (prop-static-storage mem object)
                     (PropUnknown [] (None [(dyn NodeOps)]))
                     (PropNoStorage []
@@ -186,7 +191,72 @@
                                                                                 (con-int (shape-offset-key shape key))
                                                                                 (shape-alias-key shape key)
                                                                                 (ty-dyn TAG-ANY))
-                                                                     (dyn-undefined-make))))))))))))))
+                                                                     (dyn-undefined-make)))))))))))))))
+
+;; The owner is an image object (docs/COMPILE-TIME.md §8 row 10; aot.node.imagefacts). Its
+;; properties are constants of the compilation unless the closed-world facts say the program may
+;; have stored the key:
+;;
+;;   key in the image shape, never stored      HAS is true; LOAD is the image word itself
+;;   key in the image shape, possibly stored   HAS is still true (nothing deletes a property);
+;;                                             LOAD reads the word at the key's fixed offset
+;;                                             through the properties word, no dispatch — a
+;;                                             transition keeps every offset it inherits, so the
+;;                                             offset the image shape fixes holds at run time
+;;   key absent, never stored                  HAS is false; LOAD is undefined
+;;   key absent, possibly stored               unknown: the generic dispatch, as before
+;;
+;; A store of a key in the image shape is the same fixed-offset write; a store of any other key
+;; stays generic, because it may transition the shape at run time. The global object is an image
+;; object like any other, so a Script's global variable reads and writes are these accesses
+;; (`lower-global-load`, `lower-global-store!`): a never-assigned global folds to its image word, an
+;; assigned one is one load and one store at a fixed offset, and a property another alias of the
+;; global object adds at run time (`globalThis.k = v`, a sloppy `this`) transitions the shape
+;; without disturbing either, since transitions keep offsets.
+(defn prop-image-resolve! [(d (dyn NodeOps))
+                           (ctrl (dyn NodeOps))
+                           (mem (dyn NodeOps))
+                           (object (dyn NodeOps))
+                           (key i64)] (-> (Option (dyn NodeOps)))
+  (let [p (prop-access-node d)
+        entry (staticref-entry object)
+        storage (heap-entry-storage entry)
+        shape (heap-storage-shape entry)
+        present (shape-has-key? shape key)
+        written (facts-written? entry key)]
+    (if (= (.kind p) PROP-STORE)
+        (if present
+            ;; The key's offset is fixed by the image shape and kept by every transition, so the
+            ;; store is the field's word through the properties word, as a heap object's is once
+            ;; its shape is known. A key the shape lacks transitions at run time: generic.
+            (let [word (load-make ctrl mem object (con-int OFFSET-OBJECT-PROPERTIES)
+                                  ALIAS-OBJECT-PROPERTIES (ty-dyn TAG-OBJECT))
+                  store-ptr (unbox-make word REP-OBJECT)
+                  stored (property-store-in-shape ctrl mem store-ptr shape key (n-in! d PROP-VALUE))]
+              (prop-access-resolve! d ctrl (.mem stored) (.value stored)))
+            (None [(dyn NodeOps)]))
+        (if (= (.kind p) PROP-HAS)
+            (if present
+                (prop-access-resolve! d ctrl mem (con-int 1))
+                (if written (None [(dyn NodeOps)]) (prop-access-resolve! d ctrl mem (con-int 0))))
+            (if present
+                (if written
+                    ;; The properties word of an image object with a backing store is always an
+                    ;; object: a store only grows or replaces the store, never removes it.
+                    (let [word (load-make ctrl mem object (con-int OFFSET-OBJECT-PROPERTIES)
+                                          ALIAS-OBJECT-PROPERTIES (ty-dyn TAG-OBJECT))
+                          store-ptr (unbox-make word REP-OBJECT)]
+                      (prop-access-resolve! d ctrl mem
+                                            (load-make ctrl mem store-ptr
+                                                       (con-int (shape-offset-key shape key))
+                                                       (shape-alias-key shape key)
+                                                       (ty-dyn TAG-ANY))))
+                    (let [k (/ (shape-offset-key shape key) HEAP-WORD-BYTES)]
+                      (match (image-word-node (heap-entry-word storage k) (heap-entry-word-kind storage k))
+                        (Some [value] (prop-access-resolve! d ctrl mem value))
+                        ;; A word this graph has no constant form of yet keeps the generic read.
+                        (None [] (None [(dyn NodeOps)])))))
+                (if written (None [(dyn NodeOps)]) (prop-access-resolve! d ctrl mem (dyn-undefined-make))))))))
 
 (defn prop-access-resolve! [(d (dyn NodeOps)) (ctrl (dyn NodeOps)) (mem (dyn NodeOps)) (value (dyn NodeOps))] (-> (Option (dyn NodeOps)))
   (let [p (prop-access-node d)]
@@ -208,7 +278,12 @@
 (impl NodeOps PropAccessNode
   (hdr [(self (ptr PropAccessNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
   (label [(self (ptr PropAccessNode))] (-> (slice u8))
-         (if (= (.kind self) PROP-LOAD) "PropLoad" (if (= (.kind self) PROP-HAS) "PropHas" "PropStore")))
+         (let [(mut b) (sb-new (alloc/malloc-allocator))]
+           (sb-push-str! (mut b) (if (= (.kind self) PROP-LOAD) "PropLoad" (if (= (.kind self) PROP-HAS) "PropHas" "PropStore")))
+           (sb-push-str! (mut b) "[")
+           (sb-push-str! (mut b) (shape-key-name (.key self)))
+           (sb-push-str! (mut b) "]")
+           (sb-str (mut b))))
   (is-const? [(self (ptr PropAccessNode))] (-> bool) false)
   (no-const-fold? [(self (ptr PropAccessNode))] (-> bool) true)
   (is-pinned? [(self (ptr PropAccessNode))] (-> bool) true)
@@ -506,80 +581,6 @@
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
     (property-access-result value ctrl merged)))
-
-;; An owner whose backing store is statically fixed to exactly one hidden class — the realm's
-;; global object after instantiation — needs no dispatch over the shape universe. The two guards
-;; stay (a backing store is present, its shape is the fixed one) so this path remains a
-;; specialization of the generic one and never asserts an unproven representation; but the arms
-;; the compiler proved impossible trap at run time instead of quietly yielding `undefined` or
-;; dropping a store. `value` None is a load; Some is a store of that value.
-(defn property-shaped-named [(ctrl (dyn NodeOps))
-                             (mem (dyn NodeOps))
-                             (object (dyn NodeOps))
-                             (shape i64)
-                             (key i64)
-                             (value (Option (dyn NodeOps)))] (-> PropertyAccessResult)
-  (do
-    (if (or (<= key 0) (> key (shape-key-count)))
-        (panic-i "property-shaped-named: invalid property key" key)
-        0)
-    (if (not (shape-has-key? shape key))
-        (panic-i "property-shaped-named: the fixed shape does not carry the key" key)
-        0)
-    (let [storage-word
-            (load-make ctrl mem object (con-int OFFSET-OBJECT-PROPERTIES) ALIAS-OBJECT-PROPERTIES (ty-dyn TAG-ANY))
-          is-storage (typetest-make storage-word TAG-OBJECT)
-          storage-if (if-make ctrl is-storage)
-          storage-arms (if-arms! storage-if)
-          storage-cast (cast-make (arms-true storage-arms) storage-word (ty-dyn TAG-OBJECT))
-          storage (unbox-make storage-cast REP-OBJECT)
-          shape-value (load-make (arms-true storage-arms) mem storage (con-int -8) ALIAS-OBJECT-SHAPE (ty-int-bot))
-          shape-if (if-make (arms-true storage-arms) (eq-make shape-value (con-int shape)))
-          shape-arms (if-arms! shape-if)
-          region (region-make)
-          load? (match value (Some [_] false) (None [] true))
-          phi (phi-make region (ty-dyn TAG-ANY) "property.shaped")
-          memphi (memphi-make region 1 TY-BOT "property.shaped.mem")
-          no-storage-trap (jsop-make (arms-false storage-arms) mem JS-TRAP-INVARIANT)
-          wrong-shape-trap (jsop-make (arms-false shape-arms) mem JS-TRAP-INVARIANT)]
-      (region-add-path! region (arms-false storage-arms))
-      (phi-add-value! phi (dyn-undefined-make))
-      (memphi-add-state! memphi (proj-make no-storage-trap 1 "property.shaped.trap.mem"))
-      (region-add-path! region (arms-false shape-arms))
-      (phi-add-value! phi (dyn-undefined-make))
-      (memphi-add-state! memphi (proj-make wrong-shape-trap 1 "property.shaped.trap.mem"))
-      (match value
-        (None []
-              (do
-                (region-add-path! region (arms-true shape-arms))
-                (phi-add-value! phi (load-make (arms-true shape-arms)
-                                               mem
-                                               storage
-                                               (con-int (shape-offset-key shape key))
-                                               (shape-alias-key shape key)
-                                               (ty-dyn TAG-ANY)))
-                (memphi-add-state! memphi mem)))
-        (Some [v]
-              (let [stored (property-store-in-shape (arms-true shape-arms) mem storage shape key v)]
-                (region-add-path! region (.ctrl stored))
-                (phi-add-value! phi v)
-                (memphi-add-state! memphi (.mem stored)))))
-      (property-access-result (if load? phi (match value (Some [v] v) (None [] phi))) region memphi))))
-
-(defn property-load-shaped-named [(ctrl (dyn NodeOps))
-                                  (mem (dyn NodeOps))
-                                  (object (dyn NodeOps))
-                                  (shape i64)
-                                  (key i64)] (-> PropertyAccessResult)
-  (property-shaped-named ctrl mem object shape key (None [(dyn NodeOps)])))
-
-(defn property-store-shaped-named [(ctrl (dyn NodeOps))
-                                   (mem (dyn NodeOps))
-                                   (object (dyn NodeOps))
-                                   (shape i64)
-                                   (key i64)
-                                   (value (dyn NodeOps))] (-> PropertyAccessResult)
-  (property-shaped-named ctrl mem object shape key (Some value)))
 
 (defn property-load-own-named [(ctrl (dyn NodeOps))
                                (mem (dyn NodeOps))

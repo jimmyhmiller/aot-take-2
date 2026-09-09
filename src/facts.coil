@@ -1,0 +1,203 @@
+;; Closed-world facts about the image objects: what the program can do to each of them.
+
+;;
+;; The realm's initial objects are data in the static heap image (`aot.heap`). Their properties are
+;; therefore constants of the compilation — until the program stores into them. A read of an image
+;; object's property folds when the compiler knows that no store in the whole program can have
+;; written that key of that object (docs/COMPILE-TIME.md §8 row 10, docs/DECISIONS.md, image
+;; object property reads fold under closed-world facts). This module holds those facts; the pass
+;; that establishes them is `aot.node.imagefacts`, which walks every graph once the world is closed.
+;;
+;; The facts, per image entry X and property key K:
+;;
+;;   escaped(X)      a reference to X reached a position the analysis does not follow — a call
+;;                   argument, a return value, a stored value, a thrown value. From there X can be
+;;                   the owner of any store whose owner the analysis could not name.
+;;   written(X, K)   some store whose owner the analysis named as X writes K; or X escaped and some
+;;                   store of K has an owner the analysis could not name; or X was the named target
+;;                   of a store whose key is a runtime value.
+;;   prototypes-written   some store writes an object's [[Prototype]] word after allocation.
+;;
+;; A key interned after the facts were computed cannot have been stored by the analysed program —
+;; every store in the program named an already-interned key — so it reads as unwritten. An image
+;; entry added after the facts were computed is a wiring error: the image is complete when the
+;; world closes, and a query about such an entry panics rather than guessing.
+;;
+;; Simple has no analogue: its heap begins empty and every object is a `new` the graph can see.
+;; JavaScript starts with a populated realm, and this is the closed-world answer to "may that
+;; populated object have changed?" — the same question Simple's Load-after-Store idealization
+;; answers for a fresh allocation, asked of an allocation that predates the program.
+(module aot.facts)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+
+(defstruct ImageFacts
+  [(ready bool)
+   (heap-count i64)  ; image entries the analysis saw
+   (key-count i64)  ; property keys interned when the analysis ran
+   (escaped (ArrayList bool))  ; per entry
+   (any-key (ArrayList bool))  ; per entry: the named target of a store whose key is a runtime value
+   (written (ArrayList bool))  ; entry * (key-count + 1) + key
+   (unknown-owner-key (ArrayList bool))  ; per key: stored to an owner the analysis could not name
+   (unknown-owner-any bool)  ; a store of a runtime key to an owner the analysis could not name
+   (prototypes-written bool)
+   (booted bool)])
+
+(defn facts-table [] (-> (ptr ImageFacts))
+  (primitive/alloc-static ImageFacts))
+
+;; Facts are compilation-local: a new realm starts with none.
+(defn facts-reset! [] (-> i64)
+  (let [t (facts-table)]
+    (set! (.ready t) false)
+    (set! (.booted t) false)
+    (set! (.heap-count t) 0)
+    (set! (.key-count t) 0)
+    (set! (.unknown-owner-any t) false)
+    (set! (.prototypes-written t) false)
+    0))
+
+(defn facts--fill! [(l (mut (ArrayList bool))) (n i64)] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) n)
+              (break 0)
+              (do
+                (push! [bool] (mut l) false)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+;; Begin recording over `heap-count` image entries and `key-count` property keys.
+(defn facts-begin! [(heap-count i64) (key-count i64)] (-> i64)
+  (let [t (facts-table)
+        a (alloc/malloc-allocator)]
+    (if (.ready t)
+        (panic "facts-begin!: the image facts were already computed for this realm")
+        0)
+    (set! (.heap-count t) heap-count)
+    (set! (.key-count t) key-count)
+    (set! (.escaped t) (al-new [bool] a))
+    (set! (.any-key t) (al-new [bool] a))
+    (set! (.written t) (al-new [bool] a))
+    (set! (.unknown-owner-key t) (al-new [bool] a))
+    (facts--fill! (mut (.escaped t)) heap-count)
+    (facts--fill! (mut (.any-key t)) heap-count)
+    (facts--fill! (mut (.written t)) (* heap-count (+ key-count 1)))
+    (facts--fill! (mut (.unknown-owner-key t)) (+ key-count 1))
+    (set! (.unknown-owner-any t) false)
+    (set! (.prototypes-written t) false)
+    (set! (.booted t) true)
+    0))
+
+(defn facts-finish! [] (-> i64)
+  (let [t (facts-table)]
+    (if (not (.booted t))
+        (panic "facts-finish!: facts-begin! was never called")
+        0)
+    (set! (.ready t) true)
+    0))
+
+(defn facts-ready? [] (-> bool)
+  (.ready (facts-table)))
+
+(defn facts--require-entry [(entry i64)] (-> i64)
+  (let [t (facts-table)]
+    (if (not (.booted t)) (panic "aot.facts: no facts are being recorded") 0)
+    (if (or (< entry 0) (>= entry (.heap-count t)))
+        (panic-i "aot.facts: an image entry the closed-world analysis never saw"
+                 entry)
+        0)))
+
+(defn facts--require-key [(key i64)] (-> i64)
+  (if (<= key 0) (panic-i "aot.facts: invalid property key" key) 0))
+
+;; Each marker answers whether it changed anything, so the analysis can run to a fixpoint.
+(defn facts-mark-escaped! [(entry i64)] (-> bool)
+  (let [t (facts-table)]
+    (facts--require-entry entry)
+    (if (get (.escaped t) entry)
+        false
+        (do (set! (mut (.escaped t)) entry true) true))))
+
+(defn facts-mark-written! [(entry i64) (key i64)] (-> bool)
+  (let [t (facts-table)]
+    (facts--require-entry entry)
+    (facts--require-key key)
+    (if (> key (.key-count t))
+        (panic-i "facts-mark-written!: a key interned after the analysis began"
+                 key)
+        0)
+    (let [i (+ (* entry (+ (.key-count t) 1)) key)]
+      (if (get (.written t) i)
+          false
+          (do (set! (mut (.written t)) i true) true)))))
+
+(defn facts-mark-any-key! [(entry i64)] (-> bool)
+  (let [t (facts-table)]
+    (facts--require-entry entry)
+    (if (get (.any-key t) entry)
+        false
+        (do (set! (mut (.any-key t)) entry true) true))))
+
+(defn facts-mark-unknown-owner-key! [(key i64)] (-> bool)
+  (let [t (facts-table)]
+    (facts--require-key key)
+    (if (> key (.key-count t))
+        (panic-i "facts-mark-unknown-owner-key!: a key interned after the analysis began"
+                 key)
+        0)
+    (if (get (.unknown-owner-key t) key)
+        false
+        (do (set! (mut (.unknown-owner-key t)) key true) true))))
+
+(defn facts-mark-unknown-owner-any! [] (-> bool)
+  (let [t (facts-table)]
+    (if (.unknown-owner-any t)
+        false
+        (do (set! (.unknown-owner-any t) true) true))))
+
+(defn facts-mark-prototypes-written! [] (-> bool)
+  (let [t (facts-table)]
+    (if (.prototypes-written t)
+        false
+        (do (set! (.prototypes-written t) true) true))))
+
+(defn facts-escaped? [(entry i64)] (-> bool)
+  (do
+    (facts--require-entry entry)
+    (get (.escaped (facts-table)) entry)))
+
+(defn facts-escaped-count [] (-> i64)
+  (let [t (facts-table)
+        (mut i) 0
+        (mut n) 0]
+    (loop (if (>= (load i) (.heap-count t))
+              (break (load n))
+              (do
+                (if (get (.escaped t) (load i)) (set! (mut n) (+ (load n) 1)) 0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+;; May the program have stored `key` on image entry `entry`?
+;; Was image entry `entry` the named target of a store whose key is a runtime value?
+(defn facts-any-key? [(entry i64)] (-> bool)
+  (do
+    (facts--require-entry entry)
+    (get (.any-key (facts-table)) entry)))
+
+;; A key interned after the analysis was never named by a store, but a store of a runtime key
+;; covers it like every other key.
+(defn facts-written? [(entry i64) (key i64)] (-> bool)
+  (let [t (facts-table)]
+    (facts--require-entry entry)
+    (facts--require-key key)
+    (or (get (.any-key t) entry)
+        (and (get (.escaped t) entry) (.unknown-owner-any t))
+        (if (> key (.key-count t))
+            false
+            (or (get (.written t) (+ (* entry (+ (.key-count t) 1)) key))
+                (and (get (.escaped t) entry) (get (.unknown-owner-key t) key)))))))
+
+(defn facts-prototypes-written? [] (-> bool)
+  (.prototypes-written (facts-table)))

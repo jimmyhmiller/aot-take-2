@@ -176,7 +176,10 @@ Allocation is iterative graph coloring, not a one-pass greedy assignment:
 2. Build live ranges while intersecting every def/use allowed mask.
 3. Pre-split a range whose allowed mask becomes empty, then restart the round.
 4. Build liveness and the interference graph together. A singleton fixed register denies that
-   color from neighbors instead of creating a dense row of interference edges.
+   color from neighbors instead of creating a dense row of interference edges. An input without a
+   register mask — a GCM anti-dependence edge, a memory or control operand — is not a use: it
+   neither keeps the value live nor constrains it (Simple's BuildLRG: "use_mask is also null for
+   anti-dep").
 5. Detect self-conflicting ranges, especially Phi cycles, and split them. Loop Phis receive the
    cold-edge split before a hot-edge split.
 6. Coalesce noninterfering copies without violating masks.

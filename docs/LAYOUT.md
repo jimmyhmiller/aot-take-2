@@ -172,6 +172,7 @@ aot-take-2/
 │   │
 │   ├── shape.coil           ; ✦ the shape transition tree; alias classes at the introducing edge
 │   ├── heap.coil            ; ✦ the static heap image: the realm's initial objects and string literals as data (`__aot_heap`)
+│   ├── facts.coil           ; ✦ closed-world facts about image objects: escaped, written (entry, key), prototype writes
 │   │
 │   ├── node/
 │   │   ├── node.coil        ; NodeHdr, NodeOps, edges, peephole/peepholeOpt, GVN, deps,
@@ -189,6 +190,7 @@ aot-take-2/
 │   │   ├── scope.coil       ; ScopeNode + Var — the parser's SSA helper
 │   │   ├── dynamic.coil     ; ✦ Box, Unbox, TypeTest, Cast — the guard mechanism
 │   │   ├── property.coil    ; ✦ PropAccess node (load/has/store), its fold and late expansion
+│   │   ├── imagefacts.coil  ; ✦ the closed-world image analysis that fills aot.facts, once the world closes; `AOT_FACTS_TRACE=1` narrates escapes and stores
 │   │   ├── jsops.coil       ; ✦ string, symbol and number primitives the JSL layer bottoms out on
 │   │   ├── closure.coil     ; ✦ closure creation and captured-environment access
 │   │   ├── exception.coil   ; ✦ Throw and the exceptional control edge
@@ -258,6 +260,7 @@ aot-take-2/
 │   ├── encode-test.coil  compunit-test.coil  verify-test.coil  text-test.coil
 │   ├── lex-test.coil  parse-test.coil  regex-test.coil  tstype-test.coil  jsl-test.coil
 │   ├── number-test.coil             ; StringToNumber grammar and the Number word (aot.rt.number)
+│   ├── imagefacts-test.coil         ; the closed-world image facts: named, parameter and runtime-key stores
 │   ├── test262-test.coil            ; metadata, runner policy and accounting regressions
 │   ├── harness.coil                 ; source in → linked binary out → node's answer beside it
 │   ├── bloat-test.coil              ; graph-size budgets: node-count ceilings after optimization

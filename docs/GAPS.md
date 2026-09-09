@@ -179,16 +179,29 @@ generic-object forms of the methods (a non-array `this` throws `TypeError` inste
 `[[Get]]`/`[[Set]]`-based algorithm); variadic arguments are taken up to the four ABI slots, and an
 omitted argument is indistinguishable from `undefined`, so `Array(undefined)` is `[]` and
 `push(undefined)` pushes nothing; the library iterates by recursion over an index because JSL has
-no loop form (`loop`/`recur` admission is the next JSL feature); `Array.prototype.toString` on a
-receiver whose `join` is overridden ignores the override.
+no loop form (`loop`/`recur` admission is the next JSL feature) — one native frame per element, so
+`concat` or `slice` of a large array runs deep (500 elements is 500 frames of 80 bytes; a hundred
+thousand would exhaust the stack); `Array.prototype.toString` on a receiver whose `join` is
+overridden ignores the override.
 
-### 2026-09-08 — Global object properties
+### 2026-09-08, amended 2026-09-09 — Global object properties
 
-`this.name = v` in a Script's own code declares the global `name` (the global object's fixed shape
-carries it, so the property and the binding are one word). Missing: properties created through
-any other alias of the global object (`globalThis`, a variable holding it, a function's sloppy
-`this`) — such a store transitions the global object at run time and the fixed-shape reads then
-trap the invariant; `delete` of a global; the global object's own prototype chain.
+`this.name = v` in a Script's own code declares the global `name` (the global object's image shape
+carries it, so the property and the binding are one word). A property created through any other
+alias of the global object (`globalThis`, a variable holding it, a function's sloppy `this`)
+transitions the global object at run time and every access keeps working: a Script's global
+accesses are image-object property accesses at fixed offsets (docs/DECISIONS.md, image object
+property reads fold under closed-world facts). Missing: `delete` of a global; the global object's
+own prototype chain.
+
+### 2026-09-09 — The image analysis is closed over the call graph but not over the runtime
+
+`aot.node.imagefacts` follows values through Parms, Returns and the finite target sets of value
+calls; a call whose pointer type names no finite set, a value stored into any object or array, a
+thrown value and a runtime primitive's operand are escapes. An escaped object counts every key an
+unnamed-owner store writes as written, so `this.k = v` in a function whose `this` may be an
+escaped image object keeps `x.k` generic on primitive receivers. `delete` and `Object.defineProperty`
+must register with the analysis when they land (each is a refusal today).
 
 ### 2026-09-08 — finally
 

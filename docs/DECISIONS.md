@@ -1,5 +1,65 @@
 # Decisions
 
+## 2026-09-09 — Image object property reads fold under closed-world facts
+
+The realm's initial objects are image data (the realm image, below), so their properties are
+constants of the compilation until the program stores into them. Every named read on a receiver
+that may be a primitive had grown a lookup arm on %String.prototype%, %Number.prototype% and
+%Boolean.prototype% — each a runtime shape-tree dispatch — and the budget harness went from 4,811
+to 7,349 machine nodes (docs/COMPILE-TIME.md §8 rows 9–10) for reads whose answer the image
+already held.
+
+**Decision.** Once the world is closed — every source function lowered and every JSL definition
+they demand built — one pass over every graph (`aot.node.imagefacts`) establishes, per image
+object X and key K, whether the program can have stored K on X, and records it in `aot.facts`. A
+value's abstract state is the set of image entries it may denote plus TOP; stores name their
+owners through that state; a value that reaches a position the transfer does not follow (a stored
+value, an array element, a runtime primitive's operand, the entry wrapper's return) escapes, and an
+escaped object counts every key some unnamed-owner store writes as written. The call graph is
+closed and finite, so values flow through it rather than escaping at it: a Parm is the union of
+its callers' arguments, a Call the pessimistic pass has not linked yet is simulated over the finite
+set its pointer type names (the edges SCCP adds in Opto), and a call's value is the union of its
+targets' Returns. The pass is monotone over a finite abstraction and runs to a fixpoint.
+
+With the facts in, a `PropAccess` whose owner is a `StaticRef` folds in its idealize: a key in the
+image shape that the program never stores is its image word (a method is its function object; a
+global function declaration is its object); a key in the shape that may be stored is one load at
+the key's fixed offset through the properties word (every transition keeps the offsets it
+inherits, so the offset the image fixes holds at run time), and a store of such a key is the
+matching fixed-offset store; a key absent from the shape that nothing can store is `undefined`
+(and `HasOwnProperty` is false); an absent key that may be stored keeps the generic dispatch. A
+[[Prototype]] Load from a `StaticRef` folds to the image word while no store writes a prototype
+word after allocation (`Object.create` initializes a fresh object; nothing today writes an
+existing one). The global object is an image object like any other, so a Script's global variable
+reads and writes are these accesses (`lower-global-load`, `lower-global-store!`), and the earlier
+fixed-shape path with its trapping arms (`property-shaped-named`) is gone: a property another alias
+of the global object adds at run time (`globalThis.k = v`, a function's sloppy `this`) transitions
+the shape without disturbing any access, where before it made every global read trap.
+
+**Why this is sound under optimization.** Inlining replaces a Parm with the argument the analysis
+already flowed into it, and replaces a call's result with the Return value the analysis already
+flowed out of it; folds replace nodes with constants the analysis accounted for. What would
+invalidate the facts is a graph the pass never saw, so `jsl-build-graph!` refuses to build a JSL
+definition after the facts are computed, and a query about an image entry added after them
+panics. `delete` and `Object.defineProperty` are refusals today; when they land they are stores in
+this pass's sense and must mark what they touch.
+
+**Effect.** The budget harness (docs/COMPILE-TIME.md §7): 7,349 → 2,957 machine nodes, 1,611 →
+517 blocks, 138 → about 105 ms. `Test262Error`, `assert` and the intrinsic constructors are
+constants at every use; `x` after `var x = 1` is one load; `(255).toString(16)` is a direct call of
+the image method.
+
+**Found on the way.** Three latent backend faults that the new graph shapes exposed, each fixed at
+its cause. The runtime's frame walk panicked as "cyclic" when the call depth exceeded the number of
+stack-map records — a heuristic, not an invariant; a 500-deep JSL array copy tripped it once the
+folds removed enough call sites. The walk now checks the real invariant, that each frame's parent
+stack pointer is strictly above it. The AArch64 indirect-call encoder took its target from the
+node's last input, but GCM appends anti-dependence edges as further inputs; the target is the last
+operand the selector masked. And the allocator treated every input with a live range as a register
+use, so a Load kept alive only by the Store it must precede stretched across every call between
+them with no use the splitter could split before, and never coloured; an input without a register
+mask is an ordering edge, not a use (Simple's BuildLRG: "use_mask is also null for anti-dep").
+
 ## 2026-09-09 — Function objects sit on %Function.prototype%; fresh objects on %Object.prototype%
 
 Every function object — a hoisted declaration's image object, an intrinsic, a function expression
