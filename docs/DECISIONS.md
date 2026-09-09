@@ -1,5 +1,50 @@
 # Decisions
 
+## 2026-09-09 — Exceptions are a sentinel completion, and the type is the may-throw analysis
+
+A function that throws returns the **exception sentinel**: a word under its own NaN-box prefix
+(`DYNAMIC-PREFIX-EXCEPTION`, `TAG-EXCEPTION` on the dynamic tag axis) that no JavaScript value
+ever is, with the thrown value left in the runtime's pending word. Every function's return type is
+a *completion*, `dyn` widened by the exception tag (`TAG-COMPLETION`, the axis's full universe;
+`TAG-ANY` remains "every JavaScript value" and is what a parameter admits). A caller tests the
+result with one `TypeTest` for the tag (`lower-exception-check!`): the exceptional arm takes the
+pending value to the enclosing try (the catch, or the finally as a throw completion), or completes
+with the sentinel itself; the normal arm continues with the result narrowed by a Cast to a value.
+The pending word's flag is gone — the sentinel is the flag — and the entry wrapper tests each
+Script root's completion (and a function-entry program's `main`) before running the next, reporting
+an uncaught exception through the runtime.
+
+**Why a lattice tag rather than a magic constant.** SCCP does the may-throw analysis. A callee whose
+Return type excludes the tag folds every check at its callers; a callee that may throw keeps them.
+Nothing is loaded from memory, so the check sits on no memory edge and blocks no load or store
+folding. And a value that may carry the tag is visibly not a JavaScript value: the parser narrows
+every checked result, the type of the return Phi is declared a completion, and the JSL checker
+enforces the discipline the pending word never demanded — a definition whose body may complete with
+the sentinel must declare `:throws true` (inferred and refused like `:transitioning`), a `:throws`
+definition's result may only be looked at by `%IsException` before use, and `(if (%IsException x)
+x …)` narrows it in the else branch as every tag predicate does. `%SetPendingException` stores the
+value and yields the sentinel; `JsThrowTypeError` returns it; `JsGetNamed`, `JsDefineOwnNamed`,
+`JsGetKeyed`, `JsSetKeyed`, `JsInstanceof`, `JsOrdinaryCreateFromConstructor` and the Error and
+Object intrinsics are `:throws`, and each use of one of their results in the library tests it.
+
+**The syntactic filter stays as an optimization, guarded.** Building the test at every direct
+call and letting SCCP fold it cost a third more optimizer time on the harness (the folds happen
+late, after the callee's return type descends). The closed-world syntactic fixpoint over throwing
+constructs (`syntax-compute-may-throw!`) therefore still decides which direct calls get a test
+built; a call the filter clears has its result narrowed by a Cast instead. The filter is an
+under-approximation only if it misses a throwing construct, and that is now a hard error: a body
+whose lowering emits a propagation path while the filter cleared it panics naming the function
+(`parser-note-propagation!`). The old filter had missed `instanceof` and the strict write to a
+restricted global, which let a pending flag survive silently; both are in the walk now.
+
+**Precedent.** HotSpot's Catch projection and V8's IfException give a throwing call two control
+successors and unwind by tables; SpiderMonkey's VM calls return a sentinel the caller tests; Swift
+tests an error register after every throwing call. This is the sentinel form of the same graph
+shape; it can become table-driven unwinding later without changing the IR, because stack maps are
+already keyed by return address. Supersedes "Exceptions are a pending word and ordinary control
+flow" (2026-09-08) and the per-call check of "The language's TypeErrors are TypeError objects";
+`finally`'s completion record and the Scope-merging jump to a catch target stand.
+
 ## 2026-09-08 — The realm's initial heap is data: the static heap image
 
 A realm begins with objects no statement made: the global object with one property per var-like
@@ -86,13 +131,12 @@ known divergence listed in docs/GAPS.md, not a silent one.
    survives only for what the map records) and "Moving-root stack boundaries extend the allocator
    convergence budget" (2026-09-02): the budget returns to Simple's seven rounds.
 2. **A throwing call has an exceptional control projection.** The callee stores the thrown value
-   in the pending word and returns the exception sentinel, a reserved boxed word; CallEnd compares
-   the returned word and takes the exceptional CProj; a function without a handler returns the
-   sentinel. No load, compare, If and block per call site. The graph shape is HotSpot's Catch
-   projection and V8's IfException; the mechanism is SpiderMonkey's VM-call sentinel and can
-   become table unwinding without changing the graph. Supersedes the per-call check in
-   "Exceptions are a pending word and ordinary control flow" (2026-09-08); the pending word,
-   `finally`'s completion record and the Scope-merging jump to a catch target stand.
+   in the pending word and returns the exception sentinel, a reserved boxed word; the caller tests
+   the returned word's tag and takes the exceptional arm; a function without a handler returns the
+   sentinel. No load per call site. The graph shape is HotSpot's Catch projection and V8's
+   IfException; the mechanism is SpiderMonkey's VM-call sentinel and can become table unwinding
+   without changing the graph. Landed 2026-09-09 as "Exceptions are a sentinel completion": the
+   sentinel is a lattice tag, so SCCP is the may-throw analysis.
 3. **A JSL definition inlines only on evidence.** The candidate inlines when some argument type
    is strictly sharper than its formal or the body is tiny; otherwise it defers with dependencies
    on its arguments and, if nothing sharpens, stays a call to the shared out-of-line builtin the
@@ -204,6 +248,8 @@ level holds another binding of that name, and binding first filled the wrong one
 inner finally reached the outer catch as `undefined`).
 
 ## 2026-09-08 — The language's TypeErrors are TypeError objects
+
+*The pending check described here became the sentinel test of "Exceptions are a sentinel completion" (2026-09-09); the TypeError objects and their sites stand.*
 
 A JSL builtin throws by `%SetPendingException`: the pending word of the runtime heap record takes
 the value and the flag, exactly as a source `throw` outside a `try` does, and the builtin yields a
@@ -359,7 +405,7 @@ type still compiles; only the missing conversion refuses, and only when actually
 
 ## 2026-09-08 — Exceptions are a pending word and ordinary control flow
 
-*Superseded in part by "The compile-time architecture" (2026-09-08): the per-call load-and-branch check becomes an exceptional CallEnd projection over a sentinel return; the pending word and the jump-to-catch stand.*
+*Superseded by "Exceptions are a sentinel completion" (2026-09-09): the flag and the per-call load-and-branch are gone; a throwing function returns the exception sentinel and the caller tests its type. The pending word (value only), the jump-to-catch and the finally completion record stand.*
 
 Simple has no exceptions. Ours are a value in the runtime heap record — `RtHeap.pending-exception`,
 a boxed word the collector forwards, reached through `HeapState` on its own alias — plus control

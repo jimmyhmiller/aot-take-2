@@ -284,6 +284,7 @@
    (continue-scope (Option i64))
    (continue-count i64)
    (kind i64)
+   (completions i64)  ; a finally target: the completion kinds recorded into it, as bits
    (labels (ArrayList (slice u8)))])
 
 ;; A function header. The record is reserved when its keyword is seen so nested functions can
@@ -314,7 +315,7 @@
    (fidx i64)
    (fun-nid i64)
    (script i64)  ; the realm Script this function belongs to (its position in `scripts`)
-   (may-throw bool)  ; can a call to this function leave an exception pending? (closed-world fixpoint)
+   (may-throw bool)  ; can a call to this function complete with the exception sentinel? (syntactic fixpoint)
    (static-entry i64)])  ; a hoisted declaration's function object in the static heap image, or -1
 
 ;; A var-like global: a top-level `var` or function declaration of some Script of the realm. The
@@ -376,7 +377,8 @@
    (current-script i64)  ; the Script whose source is being parsed, or -1
    (scripts (ArrayList i64))  ; each Script's root function record, in evaluation order
    (globals (ArrayList GlobalBinding))
-   (global-shape i64)  ; the global object's one hidden class: every global added in table order
+   (global-shape i64)
+   (propagates bool)  ; the function being lowered emitted a path that returns the exception sentinel  ; the global object's one hidden class: every global added in table order
    (booted bool)])
 
 (defn parser-state [] (-> (ptr ParserState))
@@ -5024,7 +5026,8 @@
     (al-for [f (.funs (parser-state))]
             (let [fun f]
               (if (> (len (.params fun)) (load slots)) (set! (mut slots) (len (.params fun))) 0)))
-    (push! [i64] (mut members) (ty-dyn TAG-ANY))
+    ;; A function returns a completion: its value, or the exception sentinel when it throws.
+    (push! [i64] (mut members) (ty-dyn TAG-COMPLETION))
     (let [(mut i) 0]
       (loop (if (> (load i) (load slots))
                 (break 0)
@@ -5340,10 +5343,7 @@
           (al-free! [(dyn NodeOps)] (mut args))
           (parser-set-current-ctrl! (.ctrl loaded))
           (scope-set-mem! scope (.mem loaded))
-          (n-keep! (.value loaded))
-          (lower-nullish-base-check! (parser-node (.owner-nid ref)))
-          (n-unkeep! (.value loaded))
-          (.value loaded)))
+          (lower-completion! (.value loaded))))
       (lower-name (.name ref))))
 
 ;; PutValue against the live post-RHS Scope. Non-strict PutValue to the three non-writable
@@ -5366,7 +5366,7 @@
             (al-free! [(dyn NodeOps)] (mut args))
             (parser-set-current-ctrl! (.ctrl stored))
             (scope-set-mem! scope (.mem stored))
-            (lower-nullish-base-check! (parser-node (.owner-nid ref)))
+            (lower-completion! (.value stored))
             0))
         (if (.bound ref)
             (scope-update! scope (.name ref) value)
@@ -5374,8 +5374,7 @@
                 ;; `undefined = 1`: silently ignored in sloppy code; a TypeError in strict code
                 ;; (the runtime's TypeError trap until exception objects exist).
                 (if (syntax-fun-strict (.current-fun (parser-state)))
-                    (do (lower-throw-type-error! "Cannot assign to read only property")
-                        (lower-pending-check!))
+                    (lower-throw-type-error! "Cannot assign to read only property")
                     0)
                 ;; Var-like globals are properties of the realm's global object; an undeclared
                 ;; name would create one at run time and refuses until that is implemented.
@@ -5562,15 +5561,11 @@
       (let [right (lower-syntax-expr right-id)
             result (lower-js-binary left right name)]
         (n-unkeep! left)
-        ;; `instanceof` throws a TypeError for a non-callable right operand; when its type does not
-        ;; prove a function, the operator is followed by the pending check that unwinds.
-        (if (and (= name "JsInstanceof")
-                 (match (ty-kind (n-ty right))
-                   (TDyn [tags high] (or high (!= tags TAG-FUNCTION)))
-                   (_ true)))
-            (do (n-keep! result) (lower-pending-check!) (n-unkeep! result) 0)
-            0)
-        result))))
+        ;; `instanceof` throws a TypeError for a non-callable right operand: its result is a
+        ;; completion (nothing to test when the operand's type proved a function).
+        (if (= name "JsInstanceof")
+            (lower-completion! result)
+            result)))))
 
 (defn lower-conditional [(condition-id i64) (yes-id i64) (no-id i64)] (-> (dyn NodeOps))
   (let [condition (lower-js-truthy (lower-syntax-expr condition-id))
@@ -5684,7 +5679,8 @@
 ;; ABI or hands the value to the runtime's abrupt-completion entry (a TypeError once exceptions
 ;; exist). Both arms merge as an ordinary Scope diamond.
 ;; ---------------------------------------------------------------------------
-;; Exceptions: a pending word and ordinary control flow (docs/DECISIONS.md, exceptions)
+;; Exceptions: a sentinel completion and ordinary control flow (docs/DECISIONS.md, exceptions are
+;; a sentinel completion)
 
 ;; The innermost catch target, or -1 when a throw leaves the function.
 (defn parser-find-catch [] (-> i64)
@@ -5723,6 +5719,7 @@
     (if (>= index 0)
         (let [scope (parser-node (.current-scope (parser-state)))]
           (n-keep! value)
+          (parser-note-completion! index COMPLETION-RETURN)
           (scope-update! scope FINALLY-KIND-VAR (con-int COMPLETION-RETURN))
           (scope-update! scope FINALLY-VALUE-VAR value)
           (lower-jump-to-target! index (None [(dyn NodeOps)]))
@@ -5730,18 +5727,33 @@
           0)
         (parser-record-return! value))))
 
-;; A thrown value leaving the current point: to the nearest catch, or pending and out.
+;; A thrown value leaving the current point (docs/DECISIONS.md, exceptions are a sentinel
+;; completion): to the nearest try as a Scope jump (its catch, or its finally as a throw
+;; completion); with no try around it, into the pending word, and the function completes with the
+;; exception sentinel, which every caller tests.
 (defn lower-throw-value! [(value (dyn NodeOps))] (-> i64)
-  (let [index (parser-find-catch)]
+  (let [catch-index (parser-find-catch)
+        finally-index (parser-find-finally)]
     (n-keep! value)
-    (if (>= index 0)
-        (lower-jump-to-catch! index value)
-        (do
-          (lower-pending-store! RT-HEAP-OFFSET-EXCEPTION-VALUE ALIAS-EXCEPTION-VALUE value)
-          (lower-pending-store! RT-HEAP-OFFSET-EXCEPTION-FLAG ALIAS-EXCEPTION-FLAG (con-int 1))
-          (lower-return-completion! (dyn-undefined-make))))
+    (if (>= catch-index 0)
+        (lower-jump-to-catch! catch-index value)
+        (if (>= finally-index 0)
+            (let [scope (parser-node (.current-scope (parser-state)))]
+              (parser-note-completion! finally-index COMPLETION-THROW)
+              (scope-update! scope FINALLY-KIND-VAR (con-int COMPLETION-THROW))
+              (scope-update! scope FINALLY-VALUE-VAR value)
+              (lower-jump-to-target! finally-index (None [(dyn NodeOps)])))
+            (do
+              (lower-pending-store! value)
+              (parser-note-propagation!)
+              (parser-record-return! (dyn-exception-make)))))
     (n-unkeep! value)
     0))
+
+;; The function being lowered can complete with the sentinel. The syntactic filter must have said
+;; so, or a direct caller was built without its test (`syntax-fun-may-throw?`).
+(defn parser-note-propagation! [] (-> i64)
+  (do (set! (.propagates (parser-state)) true) 0))
 
 ;; Take the Scope-merging jump a `break` takes to target `index`, binding the synthetic exception
 ;; variable first when a value is carried.
@@ -5764,12 +5776,12 @@
       (set! (.count meta) (+ (.count meta) 1)))
     0))
 
-;; Store into one of the pending-exception fields of the runtime heap record.
-(defn lower-pending-store! [(offset i64) (alias i64) (value (dyn NodeOps))] (-> i64)
+;; The pending word of the runtime heap record: the thrown value while a throw unwinds.
+(defn lower-pending-store! [(value (dyn NodeOps))] (-> i64)
   (let [p (parser-state)
         scope (parser-node (.current-scope p))
         mem (scope-mem scope)
-        stored (store-make (parser-node (.current-ctrl p)) mem (heapstate-make) (con-int offset) value alias (ty-dyn TAG-ANY))
+        stored (store-make (parser-node (.current-ctrl p)) mem (heapstate-make) (con-int RT-HEAP-OFFSET-EXCEPTION-VALUE) value ALIAS-EXCEPTION-VALUE (ty-dyn TAG-ANY))
         merged (memmerge-make)]
     (memmerge-set-alias! merged ALIAS-BULK (mem-effective mem ALIAS-BULK))
     (if (= (n-op mem) OP-MEMMERGE)
@@ -5778,19 +5790,19 @@
                     (break 0)
                     (do
                       (match (n-in mem (load a))
-                        (Some [slice] (if (= (load a) alias) 0 (memmerge-set-alias! merged (load a) slice)))
+                        (Some [slice] (if (= (load a) ALIAS-EXCEPTION-VALUE) 0 (memmerge-set-alias! merged (load a) slice)))
                         (None [] 0))
                       (set! (mut a) (+ (load a) 1))
                       (continue)))))
         0)
-    (memmerge-set-alias! merged alias stored)
+    (memmerge-set-alias! merged ALIAS-EXCEPTION-VALUE stored)
     (scope-set-mem! scope merged)
     0))
 
-(defn lower-pending-load [(offset i64) (alias i64) (declared i64)] (-> (dyn NodeOps))
+(defn lower-pending-load [] (-> (dyn NodeOps))
   (let [p (parser-state)
         scope (parser-node (.current-scope p))]
-    (load-make (parser-node (.current-ctrl p)) (scope-mem scope) (heapstate-make) (con-int offset) alias declared)))
+    (load-make (parser-node (.current-ctrl p)) (scope-mem scope) (heapstate-make) (con-int RT-HEAP-OFFSET-EXCEPTION-VALUE) ALIAS-EXCEPTION-VALUE (ty-dyn TAG-ANY))))
 
 ;; `throw v`: inside a try, a jump to its catch; otherwise set the pending word and leave the
 ;; function with undefined.
@@ -5799,33 +5811,47 @@
     (lower-throw-value! (lower-syntax-expr value-id))
     1))
 
-;; After a source call: if the callee left an exception pending, take it to the enclosing catch
-;; (clearing the flag) or propagate by returning. An ordinary Scope diamond; the taken arm ends
-;; dead, so the merge keeps only the normal continuation.
-(defn lower-pending-check! [] (-> i64)
+;; After a call or operation whose result may be the exception sentinel: one TypeTest on the
+;; result. On the exceptional arm the thrown value leaves the pending word (cleared) for the
+;; enclosing try, or the function completes with the sentinel itself; the normal arm continues
+;; with the result narrowed to a JavaScript value. The arm ends dead, so the merge keeps only the
+;; normal continuation. Where the result's type already excludes the sentinel there is nothing to
+;; test, and every call and throwing operation is asked: SCCP is the may-throw analysis. (A
+;; syntactic may-throw fixpoint used to decide which calls were asked; it missed operators that
+;; throw, and a missed site let the sentinel escape as a value. Nothing decides but the type.)
+(defn lower-exception-check! [(value (dyn NodeOps))] (-> (dyn NodeOps))
   (let [p (parser-state)
-        flag (lower-pending-load RT-HEAP-OFFSET-EXCEPTION-FLAG ALIAS-EXCEPTION-FLAG (ty-int-bot))
-        iff (if-make (parser-node (.current-ctrl p)) (ne-make flag (con-int 0)))
-        arms (if-arms! iff)
-        normal (parser-node (.current-scope p))
-        unwinding (scope-dup normal false)]
-    (set! (.current-scope p) (n-nid unwinding))
-    (scope-set-ctrl! unwinding (arms-true arms))
-    (set! (.current-ctrl p) (n-nid (arms-true arms)))
-    (let [index (parser-find-catch)]
-      (if (>= index 0)
-          (let [thrown (lower-pending-load RT-HEAP-OFFSET-EXCEPTION-VALUE ALIAS-EXCEPTION-VALUE (ty-dyn TAG-ANY))]
-            (n-keep! thrown)
-            (lower-pending-store! RT-HEAP-OFFSET-EXCEPTION-FLAG ALIAS-EXCEPTION-FLAG (con-int 0))
-            (lower-jump-to-catch! index thrown)
-            (n-unkeep! thrown))
-          (lower-return-completion! (dyn-undefined-make))))
-    (let [taken (parser-node (.current-scope p))]
-      (scope-set-ctrl! normal (arms-false arms))
-      (let [merged (scope-merge! normal taken)]
-        (set! (.current-scope p) (n-nid merged))
-        (set! (.current-ctrl p) (n-nid (scope-ctrl merged)))
-        0))))
+        t (n-ty value)
+        tags (match (ty-kind t) (TDyn [bits high] (if high TAG-COMPLETION bits)) (_ TAG-COMPLETION))]
+    (if (= (primitive/iand tags TAG-EXCEPTION) 0)
+        value
+        (let [iff (if-make (parser-node (.current-ctrl p)) (typetest-make value TAG-EXCEPTION))
+              arms (if-arms! iff)
+              normal (parser-node (.current-scope p))
+              unwinding (scope-dup normal false)]
+          (n-keep! value)
+          (set! (.current-scope p) (n-nid unwinding))
+          (scope-set-ctrl! unwinding (arms-true arms))
+          (set! (.current-ctrl p) (n-nid (arms-true arms)))
+          (if (or (>= (parser-find-catch) 0) (>= (parser-find-finally) 0))
+              (let [thrown (lower-pending-load)]
+                (n-keep! thrown)
+                (lower-pending-store! (con-int 0))
+                (lower-throw-value! thrown)
+                (n-unkeep! thrown))
+              (do
+                (parser-note-propagation!)
+                (parser-record-return! (dyn-exception-make))))
+          (let [taken (parser-node (.current-scope p))
+                narrowed (cast-make (arms-false arms) value (ty-dyn (primitive/iand tags (primitive/ixor TAG-COMPLETION TAG-EXCEPTION))))]
+            (n-keep! narrowed)
+            (scope-set-ctrl! normal (arms-false arms))
+            (let [merged (scope-merge! normal taken)]
+              (set! (.current-scope p) (n-nid merged))
+              (set! (.current-ctrl p) (n-nid (scope-ctrl merged)))
+              (n-unkeep! narrowed)
+              (n-unkeep! value)
+              narrowed))))))
 
 ;; `try { body } catch (e) { handler } finally { tail }`. The catch target is a Scope with the
 ;; synthetic exception variable; every throw and unwinding call in the body merges into it. The
@@ -5908,7 +5934,7 @@
                   ;; throws (kind 2). The block runs once over the merge, then the completion resumes.
                   (parser-use-scope! (scope-merge! normal (parser-node (.scope fin-target))))
                   (lower-syntax-statement tail)
-                  (lower-finally-dispatch!)
+                  (lower-finally-dispatch! fin-target)
                   0))
           (None [] 0))
         (scope-pop! (parser-node (.current-scope p)))
@@ -5922,6 +5948,7 @@
     (parser-use-scope! arrivals)
     (let [thrown (match (scope-lookup arrivals EXCEPTION-VAR) (Some [v] v) (None [] (unreachable-node)))]
       (n-keep! thrown)
+      (parser-note-completion! index COMPLETION-THROW)
       (scope-update! arrivals FINALLY-KIND-VAR (con-int COMPLETION-THROW))
       (scope-update! arrivals FINALLY-VALUE-VAR thrown)
       (lower-jump-to-target! index (None [(dyn NodeOps)]))
@@ -5930,10 +5957,22 @@
 
 ;; After the finally block: resume the recorded completion. Each arm is a Scope diamond whose taken
 ;; side ends dead (a return or a throw severs control), so the merge keeps only the normal path.
-(defn lower-finally-dispatch! [] (-> i64)
+;; Only the kinds some path recorded into this target get an arm: a block nothing throws into has
+;; no throw arm, so it emits no propagation path (and the may-throw filter's guard stays honest).
+(defn lower-finally-dispatch! [(target JumpTarget)] (-> i64)
   (do
-    (lower-completion-arm! COMPLETION-RETURN)
-    (lower-completion-arm! COMPLETION-THROW)
+    (if (!= (primitive/iand (.completions target) (primitive/ishl 1 COMPLETION-RETURN)) 0)
+        (lower-completion-arm! COMPLETION-RETURN)
+        0)
+    (if (!= (primitive/iand (.completions target) (primitive/ishl 1 COMPLETION-THROW)) 0)
+        (lower-completion-arm! COMPLETION-THROW)
+        0)
+    0))
+
+;; A completion of `kind` is recorded into the finally target `index`.
+(defn parser-note-completion! [(index i64) (kind i64)] (-> i64)
+  (let [meta (al-elem [JumpTarget] (mut (.jump-targets (parser-state))) index)]
+    (set! (.completions meta) (primitive/ior (.completions meta) (primitive/ishl 1 kind)))
     0))
 
 (defn lower-completion-arm! [(kind i64)] (-> i64)
@@ -6000,22 +6039,22 @@
           (n-keep! value)
           (parser-set-current-ctrl! (cproj-make end RETURN-CTRL "value-call.ctrl"))
           (scope-set-mem! scope (proj-make end RETURN-MEM "value-call.mem"))
-          (let [called-scope (parser-node (.current-scope (parser-state)))]
+          ;; The callee's completion: an exception it did not catch unwinds here.
+          (let [checked (lower-exception-check! value)
+                called-scope (parser-node (.current-scope (parser-state)))]
+            (n-keep! checked)
             (set! (.current-scope (parser-state)) (n-nid false-scope))
             (parser-set-current-ctrl! (guard-false g))
-            ;; Not callable: a TypeError object goes pending; the check after the merge unwinds
-            ;; this arm and any exception the callee left alike.
+            ;; Not callable: a TypeError, which unwinds this arm.
             (lower-throw-type-error! "value is not a function")
             (let [merged (scope-merge! called-scope (parser-node (.current-scope (parser-state))))
                   region (scope-ctrl merged)
                   phi (phi-make region (ty-dyn TAG-ANY) "value-call")]
-              (phi-add-value! phi value)
+              (phi-add-value! phi checked)
               (phi-add-value! phi (dyn-undefined-make))
               (set! (.current-scope (parser-state)) (n-nid merged))
               (set! (.current-ctrl (parser-state)) (n-nid region))
-              (n-keep! phi)
-              (lower-pending-check!)
-              (n-unkeep! phi)
+              (n-unkeep! checked)
               (n-unkeep! value)
               (al-for [v (load actuals)] (n-unkeep! v))
               (n-unkeep! receiver)
@@ -6023,17 +6062,14 @@
               (al-free! [(dyn NodeOps)] (mut actuals))
               phi)))))))
 
-;; A property access on undefined or null is a TypeError raised inside JsGetNamed; when the base's
-;; type admits either, the access is followed by a pending check so the function unwinds at once.
-(defn lower-nullish-base-check! [(base (dyn NodeOps))] (-> i64)
-  (let [t (n-ty base)
-        may-be-nullish (match (ty-kind t)
-                         (TDyn [tags high] (and (not high) (!= (primitive/iand tags (primitive/ior TAG-UNDEFINED TAG-NULL)) 0)))
-                         (_ true))]
-    (if may-be-nullish (lower-pending-check!) 0)))
+;; The completion of a JSL operation that may throw (a property access on undefined or null is a
+;; TypeError raised inside JsGetNamed): tested for the sentinel, which is nothing when the operand
+;; types already folded the throwing arm away.
+(defn lower-completion! [(result (dyn NodeOps))] (-> (dyn NodeOps))
+  (lower-exception-check! result))
 
-;; The language raising a TypeError at a source site: JsThrowTypeError with the message, then the
-;; pending check that unwinds.
+;; The language raising a TypeError at a source site: JsThrowTypeError with the message returns
+;; the sentinel, and the check unwinds it at once.
 (defn lower-throw-type-error! [(message (slice u8))] (-> i64)
   (let [(mut values) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))
         text (lower-ascii-string message)]
@@ -6045,10 +6081,9 @@
       (al-free! [(dyn NodeOps)] (mut values))
       (parser-set-current-ctrl! (.ctrl r))
       (scope-set-mem! scope (.mem r))
+      (lower-exception-check! (.value r))
       0)))
 
-;; A string constant at the current point, built directly: lowering never adds syntax nodes (the
-;; syntax tables may be reallocated under callers holding elements).
 (defn lower-ascii-string [(text (slice u8))] (-> (dyn NodeOps))
   (let [(mut units) (al-new [i64] (alloc/malloc-allocator)) (mut i) 0]
     (loop (if (>= (load i) (len text))
@@ -6112,11 +6147,9 @@
         (n-unkeep! k)
         (parser-set-current-ctrl! (.ctrl r))
         (scope-set-mem! scope (.mem r))
-        (n-keep! (.value r))
-        (lower-nullish-base-check! owner)
-        (n-unkeep! (.value r))
-        (n-unkeep! owner)
-        (.value r)))))
+        (let [checked (lower-completion! (.value r))]
+          (n-unkeep! owner)
+          checked)))))
 
 (defn lower-keyed-call [(owner-id i64) (key-id i64) (args (ArrayList i64))] (-> (dyn NodeOps))
   (let [owner (lower-syntax-expr owner-id)]
@@ -6132,10 +6165,8 @@
         (n-unkeep! k)
         (parser-set-current-ctrl! (.ctrl r))
         (scope-set-mem! scope (.mem r))
-        (n-keep! (.value r))
-        (lower-nullish-base-check! owner)
-        (n-unkeep! (.value r))
-        (let [answer (lower-value-call-with-receiver (.value r) owner args)]
+        (let [checked (lower-completion! (.value r))
+              answer (lower-value-call-with-receiver checked owner args)]
           (n-unkeep! owner)
           answer)))))
 
@@ -6153,12 +6184,14 @@
         (al-free! [(dyn NodeOps)] (mut pargs))
         (parser-set-current-ctrl! (.ctrl proto))
         (scope-set-mem! scope (.mem proto))
-        (n-keep! (.value proto))
+        ;; `F.prototype` on a non-object F is the TypeError; its completion unwinds here.
+        (let [proto-value (lower-completion! (.value proto))]
+        (n-keep! proto-value)
         (let [raw (lower-jsl-nullary "JsNewObjectRaw")]
           (n-keep! raw)
           (let [(mut sargs) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))]
             (push! [(dyn NodeOps)] (mut sargs) raw)
-            (push! [(dyn NodeOps)] (mut sargs) (.value proto))
+            (push! [(dyn NodeOps)] (mut sargs) proto-value)
             (let [linked (jsl-lower-macro-values "JsSetObjectLiteralPrototype" (load sargs) (parser-node (.current-ctrl (parser-state))) (scope-mem scope))]
               (al-free! [(dyn NodeOps)] (mut sargs))
               (parser-set-current-ctrl! (.ctrl linked))
@@ -6177,9 +6210,9 @@
                     (n-unkeep! returned)
                     (n-unkeep! created)
                     (n-unkeep! raw)
-                    (n-unkeep! (.value proto))
+                    (n-unkeep! proto-value)
                     (n-unkeep! callee)
-                    (.value result)))))))))))
+                    (.value result))))))))))))
 
 ;; `o.m(args)`: the owner is evaluated once and is both the property base and the receiver.
 (defn lower-member-call [(owner-id i64) (name (slice u8)) (args (ArrayList i64))] (-> (dyn NodeOps))
@@ -6196,10 +6229,8 @@
         (al-free! [(dyn NodeOps)] (mut margs))
         (parser-set-current-ctrl! (.ctrl loaded))
         (scope-set-mem! scope (.mem loaded))
-        (n-keep! (.value loaded))
-        (lower-nullish-base-check! owner)
-        (n-unkeep! (.value loaded))
-        (let [answer (lower-value-call-with-receiver (.value loaded) owner args)]
+        (let [checked (lower-completion! (.value loaded))
+              answer (lower-value-call-with-receiver checked owner args)]
           (n-unkeep! owner)
           answer)))))
 
@@ -6264,10 +6295,7 @@
       (al-free! [(dyn NodeOps)] (mut args))
       (parser-set-current-ctrl! (.ctrl lowered))
       (scope-set-mem! scope (.mem lowered))
-      (n-keep! (.value lowered))
-      (lower-nullish-base-check! owner)
-      (n-unkeep! (.value lowered))
-      (.value lowered))))
+      (lower-completion! (.value lowered)))))
 
 (defn lower-named-call [(name (slice u8)) (args (ArrayList i64))] (-> (dyn NodeOps))
   (let [bound (or (>= (scope-find (parser-node (.current-scope (parser-state))) name) 0)
@@ -6323,10 +6351,12 @@
             (scope-set-mem! (parser-node (.current-scope (parser-state)))
                             (proj-make end RETURN-MEM "call.mem"))
             (let [value (proj-make end RETURN-VALUE "call.value")]
+              ;; The callee's completion: tested when the filter says the callee may throw; else
+              ;; the filter's proof narrows the result to a value (the Cast folds once SCCP
+              ;; sharpens the callee's return type).
               (if (syntax-fun-may-throw? target-idx)
-                  (do (n-keep! value) (lower-pending-check!) (n-unkeep! value) 0)
-                  0)
-              value))))))
+                  (lower-exception-check! value)
+                  (cast-make (parser-node (.current-ctrl (parser-state))) value (ty-dyn TAG-ANY)))))))))
 
 ;; Final Simple parseAsgn recursively parses the RHS, updates the lexical Scope and returns the
 ;; assigned value. opAssign keeps the old value across RHS parsing, then computes and updates.
@@ -6596,6 +6626,7 @@
     (al-clear! [(slice u8)] (mut (.pending-labels p)))
     (set! (.scope (mut target)) (n-nid exit))
     (set! (.kind (mut target)) kind)
+    (set! (.completions (mut target)) 0)
     (set! (.continue-scope (mut target)) (None [i64]))
     (set! (.labels (mut target)) (load labels))
     (n-keep! exit)
@@ -6709,7 +6740,8 @@
                                  (Some fun))
                     (let [region (region-make)
                           memphi (memphi-make region ALIAS-BULK TY-BOT "$return.mem")
-                          valuephi (phi-make region (ty-dyn TAG-ANY) "$return.value")
+                          ;; A function returns a completion: a value, or the exception sentinel.
+                          valuephi (phi-make region (ty-dyn TAG-COMPLETION) "$return.value")
                           (mut i) 0]
                       (loop (if (>= (load i) count)
                                 (break 0)
@@ -7179,29 +7211,26 @@
                     (call-set-fptr! c (funptr-make target (.fidx syntax)))
                     (let [end (callend-make c)]
                       (callend-set-never-inline! end)
-                      (set! (mut ctrl-nid) (n-nid (cproj-make end RETURN-CTRL "entry.ctrl")))
-                      (set! (mut mem-nid) (n-nid (proj-make end RETURN-MEM "entry.mem")))
-                      (set! (mut value-nid) (n-nid (proj-make end RETURN-VALUE "entry.value"))))))
-          ;; A throw that no Script caught is pending here; report it through the runtime, which
-          ;; exits. The arms merge so the wrapper keeps one Return.
-          (if (.script-mode p)
-              (let [ctrl (parser-node (load ctrl-nid))
-                    mem (parser-node (load mem-nid))
-                    flag (load-make ctrl mem (heapstate-make) (con-int RT-HEAP-OFFSET-EXCEPTION-FLAG) ALIAS-EXCEPTION-FLAG (ty-int-bot))
-                    iff (if-make ctrl (ne-make flag (con-int 0)))
-                    arms (if-arms! iff)
-                    thrown (load-make (arms-true arms) mem (heapstate-make) (con-int RT-HEAP-OFFSET-EXCEPTION-VALUE) ALIAS-EXCEPTION-VALUE (ty-dyn TAG-ANY))
-                    report (jsop-make (arms-true arms) mem JS-UNCAUGHT)
-                    region (region-make)
-                    memphi (memphi-make region 1 TY-BOT "entry.uncaught.mem")]
-                (jsop-add-arg! report thrown)
-                (region-add-path! region (arms-true arms))
-                (memphi-add-state! memphi (proj-make report 1 "entry.uncaught.mem"))
-                (region-add-path! region (arms-false arms))
-                (memphi-add-state! memphi mem)
-                (set! (mut ctrl-nid) (n-nid region))
-                (set! (mut mem-nid) (n-nid memphi)))
-              0)
+                      ;; An exception the root did not catch comes back as the sentinel: report
+                      ;; it through the runtime, which exits, before any later Script runs. The
+                      ;; arms merge so the wrapper keeps one Return.
+                      (let [ctrl (cproj-make end RETURN-CTRL "entry.ctrl")
+                            mem (proj-make end RETURN-MEM "entry.mem")
+                            value (proj-make end RETURN-VALUE "entry.value")
+                            iff (if-make ctrl (typetest-make value TAG-EXCEPTION))
+                            arms (if-arms! iff)
+                            thrown (load-make (arms-true arms) mem (heapstate-make) (con-int RT-HEAP-OFFSET-EXCEPTION-VALUE) ALIAS-EXCEPTION-VALUE (ty-dyn TAG-ANY))
+                            report (jsop-make (arms-true arms) mem JS-UNCAUGHT)
+                            region (region-make)
+                            memphi (memphi-make region 1 TY-BOT "entry.uncaught.mem")]
+                        (jsop-add-arg! report thrown)
+                        (region-add-path! region (arms-true arms))
+                        (memphi-add-state! memphi (proj-make report 1 "entry.uncaught.mem"))
+                        (region-add-path! region (arms-false arms))
+                        (memphi-add-state! memphi mem)
+                        (set! (mut ctrl-nid) (n-nid region))
+                        (set! (mut mem-nid) (n-nid memphi))
+                        (set! (mut value-nid) (n-nid value))))))
           (let [ret (return-make (parser-node (load ctrl-nid))
                                  (Some (parser-node (load mem-nid)))
                                  (parser-node (load value-nid))
@@ -7322,7 +7351,6 @@
                   (set! (mut si) (+ (load si) 1))
                   (continue)))))
     (if script-mode (do (syntax-declare-intrinsics!) (syntax-collect-globals!)) 0)
-    (syntax-compute-may-throw!)
     (syntax-settle-strictness!)
     (syntax-check-cover-initializers!)
     (al-for [f (.funs (parser-state))]
@@ -7342,17 +7370,27 @@
     ;; Strict code runs (docs/DECISIONS.md, strict code runs): its early errors are checked above,
     ;; a strict function's receiver is taken as it is (`lower-this`), and a strict write to a
     ;; non-writable global is a TypeError (`lower-ref-put!`).
-    (syntax-check-strict-functions!)))
+    (syntax-check-strict-functions!)
+    (syntax-compute-may-throw!)))
 
 ;; ---------------------------------------------------------------------------
-;; Which functions can leave an exception pending
+;; Which functions can complete with the exception sentinel
 ;;
-;; A call site checks the pending word only when its callee may throw. That is a closed-world
-;; fixpoint over the syntax: a function throws directly when a `throw`, or a call whose target the
-;; syntax cannot name (a value, a member, a constructor, a reassigned global), sits outside every
-;; try-with-catch in its body; it throws indirectly when a directly named callee may throw. The
-;; approximation is conservative: shadowing a hoisted name with a local binding still counts as a
+;; The truth is the type: a callee's return type carries TAG-EXCEPTION exactly when a throw path
+;; reaches its Return, and `lower-exception-check!` folds to nothing where the type excludes it.
+;; This syntactic fixpoint is an optimization over that truth: a direct call to a function it
+;; proves cannot throw gets no test built at all (the result is narrowed by a Cast instead), which
+;; keeps the parse volume and the optimizer's work proportional to the calls that can throw. A
+;; function throws directly when a `throw`, a call whose target the syntax cannot name (a value, a
+;; member, a constructor, a reassigned global), a property access (a TypeError on undefined or
+;; null), an `instanceof` (a TypeError on a non-callable right operand) or a strict write to a
+;; restricted global sits outside every try-with-catch in its body; it throws indirectly when a
+;; directly named callee may throw. Shadowing a hoisted name with a local binding still counts as a
 ;; call to the hoisted function.
+;;
+;; The filter can only under-approximate by missing a throwing construct, and that is caught: a
+;; body whose lowering emits a propagation path (`parser-note-propagation!`) while the filter said
+;; it cannot throw is a hard error naming the function, never a silent miscompile.
 
 (defn syntax-fun-may-throw? [(i i64)] (-> bool)
   (let [f (syntax-fun-at i)] (.may-throw f)))
@@ -7377,6 +7415,16 @@
       ;; A property access on undefined or null is a TypeError.
       (SxMember [owner name optional] (if protected 0 (set! direct true)))
       (SxIndex [owner key optional] (if protected 0 (set! direct true)))
+      ;; `instanceof` with a non-callable right operand is a TypeError.
+      (SxBinary [op left right] (if (and (not protected) (= op "instanceof")) (set! direct true) 0))
+      ;; A strict write to `undefined`, `NaN` or `Infinity` is a TypeError; sloppy code ignores it,
+      ;; but the filter does not know the function's strictness here and stays conservative.
+      (SxAssign [target value]
+                (if protected
+                    0
+                    (match (syntax-node (syntax-ungroup-id target))
+                      (SxName [name] (if (syntax-restricted-global? name) (set! direct true) 0))
+                      (_ 0))))
       (_ 0))
     (let [(mut kids) (al-new [i64] (alloc/malloc-allocator))]
       (syntax-expr-children! id (mut kids))
@@ -8084,6 +8132,7 @@
                           (unimplemented "destructuring parameters" "docs/GAPS.md — destructuring")
                           0)
                       (set! (.current-fun (parser-state)) (load fi))
+                      (set! (.propagates (parser-state)) false)
                       (set! (.current-ctrl (parser-state)) (n-nid fun))
                       (set! (.current-scope (parser-state)) (n-nid scope))
                       (n-add-def! scope (Some fun))
@@ -8147,6 +8196,14 @@
                         ;; JavaScript functions return undefined when control reaches the closing brace.
                         (if (= terminated 0)
                             (parser-record-return! (dyn-undefined-make))
+                            0)
+                        ;; The filter's soundness check: a propagation path in a body it cleared.
+                        (if (and (.propagates (parser-state)) (not (.may-throw f)))
+                            (do
+                              (p--str "\naot: parser: the may-throw filter cleared a function whose lowering propagates an exception: ")
+                              (p--str (.name f))
+                              (p--str "\n")
+                              (panic "parser: syntactic may-throw filter is unsound for a construct in this function (add it to syntax-throw-walk-expr!)"))
                             0)
                         (let [ret (parser-build-return! fun)]
                           (fun-set-ret! fun ret)

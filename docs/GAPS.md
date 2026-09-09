@@ -141,12 +141,13 @@ pending completion is handled by the same mechanism but has no test yet.
 
 ### 2026-09-08 — Exceptions
 
-`throw` and `try`/`catch` execute (docs/DECISIONS.md, exceptions): a throw inside a try is a jump
-to its catch carrying the value in a synthetic Scope variable; a throw leaving a function sets the
-pending flag and value in the runtime heap record and returns undefined; every source call site
-checks the flag afterwards and either jumps to its enclosing catch (clearing the flag) or
-propagates by returning; the entry wrapper reports a pending exception after the last Script
-through `aot_rt_uncaught` with status 3. `finally` runs on normal completions; an abrupt
+`throw` and `try`/`catch` execute (docs/DECISIONS.md, exceptions are a sentinel completion): a
+throw inside a try is a jump to its catch carrying the value in a synthetic Scope variable; a throw
+leaving a function stores the value in the runtime's pending word and returns the exception
+sentinel; a call site whose callee may throw tests the result's tag and either takes the pending
+value to its enclosing try (clearing the word) or completes with the sentinel; the entry wrapper
+tests each Script root's completion (and `main`'s, in a function-entry program) and reports an
+uncaught exception through `aot_rt_uncaught` with status 3 before any later Script runs. `finally` runs on normal completions; an abrupt
 completion crossing a `finally` (a return, or a throw with no catch) refuses by name, as does a
 destructuring catch parameter. Runtime refusals (non-callable calls, the unimplemented
 conversions) are still hard errors rather than TypeError completions, and the uncaught report

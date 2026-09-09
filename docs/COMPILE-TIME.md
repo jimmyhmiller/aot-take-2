@@ -115,6 +115,18 @@ CallEnd compares the returned word with the sentinel and takes the exceptional e
 with no handler for that edge returns the sentinel itself; a `try` binds the pending word on the
 edge and clears it. The pending word's flag field goes away; the sentinel is the flag.
 
+**Landed 2026-09-09** (docs/DECISIONS.md, exceptions are a sentinel completion), in the refined
+form below: the exceptional edge is the If on a `TypeTest` of the call's value projection for
+`TAG-EXCEPTION`, folded by SCCP wherever the callee's return type excludes the tag. On the harness
+the optimized graph lost 71 Loads and 73 compares and gained 50 TypeTests; the graph is smaller and
+carries no memory dependence for exceptions. Building the test at every direct call and leaving
+the folding to SCCP cost a third more optimizer time (the folds happen after the callee's return
+type descends), so the syntactic may-throw filter stays as an optimization with a soundness guard;
+with it the harness realm in test262 order compiles faster (opto 169 → 135 ms) while the reverse
+order compiles slower (134 → 174 ms), a swing the optimizer already had with program order. The
+"−265 blocks, −1,300 nodes" estimate in §8 was wrong: the pending check's block was already
+folded into the call's block by the branch layout.
+
 **What Simple does.** Nothing; Simple has no exceptions.
 
 **What the engines do.** HotSpot's Call is a multi-node with a Catch projection; V8's throwing
@@ -269,7 +281,7 @@ order is chosen so that each step shrinks what the next one has to handle.
 | 1 | Splits enter the block order; no per-round reschedule (§6) | Allocator tests green; `sched-run!` called once per compile | **Landed 2026-09-08.** |
 | 2 | Cast is a zero-byte node erased after scheduling (§6) | Zero bytes and zero moves from Cast; execution suite green | **Landed.** |
 | 3 | All-caller-save frames (§3) | CalleeSave only in the entry wrapper; managed-root splitters and `root-restricted` deleted; GC stress and verify green | **Landed.** 18 CalleeSaves, 5 rounds (target ≤ 3 still open), regalloc 526 → 59 ms |
-| 4 | Exceptional CallEnd projection (§4) | Every pending-check lowering path deleted; `assert.throws`, `finally` and nested-catch tests green | −265 blocks, −1,300 nodes |
+| 4 | Exceptional CallEnd projection (§4) | Every pending-check lowering path deleted; `assert.throws`, `finally` and nested-catch tests green | **Landed 2026-09-09** as the sentinel completion. Optimized harness graph 7,573 → 7,444 nodes, −71 Loads, −73 compares; harness realm in test262 order (sta.js, assert.js, test): opto 169 → 135 ms, user 0.32 → 0.28 s (the reverse file order goes 134 → 174 ms: the optimizer's time swings with program order either way); the pending flag, its alias and its runtime root are gone, and the JSL checker enforces `:throws` |
 | 5 | Evidence-gated JSL inlining (§5) | Bottom-typed sites are calls; typed fixtures unchanged in node count; bloat ceilings hold | **Landed**, but see §10: it removed little on the harness, because almost every argument carries a partial tag set and the volume is made at lowering, per site |
 | 6 | Word-level GC liveness, once (§6) | Stack-map tests green; encoding phase under 20 ms on the harness | **Landed.** 205 → 31 ms (the remainder is layout and emission) |
 | 7 | Gates (§7) | The listed assertions exist and are red when any of 1–6 is reverted | **Landed in part**: `tests/budget-test.coil` gates CalleeSaves, Casts, rounds, node and block ceilings and a 1 s wall ceiling on a harness realm; per-token and campaign gates remain |
