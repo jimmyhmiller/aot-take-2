@@ -58,6 +58,29 @@
 
 (const PROP-STORE 2)
 
+;; The own property's attributes (SHAPE-ATTR-* bits), -1 absent on an extensible object, -2 absent
+;; on a non-extensible one: the one question JSL's [[Get]] and [[Set]] ask before a load or store,
+;; folding to a constant wherever the shape is known (aot.node.property, docs/DECISIONS.md, property
+;; attributes live in the shape tree).
+(const PROP-ATTRS 3)
+
+;; The first prototype (the receiver excluded) with an own `key`, or null: the one question the
+;; chain walk of [[Get]] and [[Set]] asks. It folds when the receiver's prototype chain is image
+;; data — a literal's %Object.prototype%, an image object's chain — under the closed-world facts.
+(const PROP-HOLDER 4)
+
+;; Ordinary [[Get]] of a data property, own or inherited: the value, undefined past the chain's end,
+;; or the exception sentinel for an accessor found (whose pair the JSL slow path then reads). One
+;; access, so a site whose owner and chain are known folds to a load or a constant, and one whose
+;; owner is unknown is one runtime call (JS-PROP-GET), never a chain of runtime questions.
+(const PROP-GET 5)
+
+;; The fast cases of OrdinarySet with the object as receiver: an own writable data property takes
+;; the value, an absent key is added when the object is extensible and no prototype holds the key
+;; as an accessor or read-only property. The value, or the exception sentinel when the slow path
+;; must decide (JS-PROP-SET when nothing is known).
+(const PROP-SET 6)
+
 (const PROP-CTRL 0)
 
 (const PROP-MEM 1)
@@ -77,6 +100,7 @@
   [(hdr NodeHdr)
    (key i64)
    (kind i64)
+   (attrs i64)  ; a store: the attributes a new key takes (SHAPE-ATTRS-DEFAULT for an assignment)
    (res-mem i64)  ; once resolved: the memory the mem projection forwards to
    (res-value i64)])  ; once resolved: the value the value projection forwards to
 
@@ -95,6 +119,8 @@
 (defn prop-access-key [(n (dyn NodeOps))] (-> i64) (.key (prop-access-node n)))
 
 (defn prop-access-kind [(n (dyn NodeOps))] (-> i64) (.kind (prop-access-node n)))
+
+(defn prop-access-attrs [(n (dyn NodeOps))] (-> i64) (.attrs (prop-access-node n)))
 
 ;; The properties-word Store that governs `object` in memory state `mem`, or None. Simple's
 ;; Load-after-Store bypass applied to the properties word: a Store into a provably different
@@ -128,6 +154,48 @@
                             (do (set! (mut walking) false) (continue))))))))
     (load found)))
 
+;; The [[Prototype]] word a fresh object was given, as the Store's value: `prop-owner-store` over
+;; the prototype alias. None when the memory state does not show it.
+(defn prop-owner-prototype [(mem (dyn NodeOps)) (object (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [(mut state) (mem-effective mem ALIAS-OBJECT-PROTOTYPE)
+        (mut found) (None [(dyn NodeOps)])
+        (mut walking) true]
+    (loop (if (not (load walking))
+              (break 0)
+              (let [cur (load state)]
+                (if (= (n-op cur) OP-STORE)
+                    (if (!= (mem-alias-of-node cur) ALIAS-OBJECT-PROTOTYPE)
+                        (do (set! (mut state) (n-in! cur MEM-STATE)) (continue))
+                        (if (n-same? (n-in! cur MEM-PTR) object)
+                            (do (set! (mut found) (Some (n-in! cur STORE-VAL))) (set! (mut walking) false) (continue))
+                            (if (mem-provably-distinct? (n-in! cur MEM-PTR) object)
+                                (do (set! (mut state) (n-in! cur MEM-STATE)) (continue))
+                                (do (set! (mut walking) false) (continue)))))
+                    (if (= (n-op cur) OP-MEMMERGE)
+                        (do (set! (mut state) (memmerge-alias cur ALIAS-OBJECT-PROTOTYPE)) (continue))
+                        (if (and (= (n-op cur) OP-PROJ)
+                                 (and (= (proj-idx cur) 1) (= (n-op (n-in! cur 0)) OP-NEW)))
+                            (do (set! (mut state) (new-memory (n-in! cur 0))) (continue))
+                            (do (set! (mut walking) false) (continue))))))))
+    (load found)))
+
+;; The holder of `key` for a fresh object whose prototype word the memory state shows: null when the
+;; word is null, the image chain from a boxed StaticRef, unknown otherwise.
+(defn prop-fresh-holder [(mem (dyn NodeOps)) (object (dyn NodeOps)) (key i64)] (-> (Option (dyn NodeOps)))
+  (match (prop-owner-prototype mem object)
+    (None [] (None [(dyn NodeOps)]))
+    (Some [v]
+          (if (= (n-ty v) (ty-dyn TAG-NULL))
+              (Some (dyn-null-make))
+              (if (and (= (n-op v) OP-BOX) (= (n-op (n-in! v 1)) OP-STATICREF))
+                  (let [entry (staticref-entry (n-in! v 1))]
+                    (if (heap-entry-string? entry)
+                        (None [(dyn NodeOps)])
+                        (prop-image-holder (heap-ref-word (staticref-rep-prefix (staticref-rep (n-in! v 1))) entry)
+                                           HEAP-WORD-REF
+                                           key)))
+                  (None [(dyn NodeOps)]))))))
+
 ;; The owner's properties word must be a Store to this very object of either the null word (no
 ;; backing store yet) or a boxed fresh allocation whose hidden class New declares.
 (defn prop-static-storage [(mem (dyn NodeOps)) (object (dyn NodeOps))] (-> PropStatic)
@@ -145,7 +213,124 @@
                         (PropUnknown)))))))))
 
 (defn prop-access-result-ty [(kind i64) (value-ty i64)] (-> i64)
-  (if (= kind PROP-HAS) (ty-bool) (if (= kind PROP-STORE) value-ty (ty-dyn TAG-ANY))))
+  (if (= kind PROP-HAS)
+      (ty-bool)
+      (if (= kind PROP-ATTRS)
+          (prop-attrs-ty)
+          (if (= kind PROP-HOLDER)
+              (ty-dyn (+ TAG-NULL (+ TAG-OBJECT (+ TAG-FUNCTION TAG-ARRAY))))
+              (if (= kind PROP-GET)
+                  (prop-get-ty)
+                  (if (= kind PROP-SET)
+                      ;; The value on success, the sentinel when the slow path decides.
+                      (if (and (ty-dyn? value-ty) (not (ty-dyn-high? value-ty)))
+                          (ty-dyn (| (ty-dyn-tags value-ty) TAG-EXCEPTION))
+                          value-ty)
+                      (if (= kind PROP-STORE) value-ty (ty-dyn TAG-ANY))))))))
+
+;; The word an image entry's own `key` reads as, when the closed-world facts fix it: the image word
+;; of a never-stored key, a fixed-offset load of a possibly stored writable data key, undefined for
+;; a never-stored absent key; None when the program may have changed it. An accessor's word is its
+;; pair for a LOAD and the exception sentinel — the slow path's signal — for a GET.
+(defn prop-image-read [(ctrl (dyn NodeOps))
+                       (mem (dyn NodeOps))
+                       (object (dyn NodeOps))
+                       (entry i64)
+                       (key i64)
+                       (get? bool)] (-> (Option (dyn NodeOps)))
+  (let [storage (heap-entry-storage entry)
+        shape (heap-storage-shape entry)
+        present (shape-has-key? shape key)
+        written (facts-written? entry key)
+        attrs-unknown (and written (facts-descriptors?))
+        accessor (and present (!= (& (shape-key-attrs shape key) SHAPE-ATTR-ACCESSOR) 0))
+        data-writable (and present
+                           (and (not accessor)
+                                (!= (& (shape-key-attrs shape key) SHAPE-ATTR-WRITABLE) 0)))]
+    (if present
+        (if (and accessor (and get? (not attrs-unknown)))
+            (Some (dyn-exception-make))
+            (if written
+                (if (or attrs-unknown (not data-writable))
+                    (None [(dyn NodeOps)])
+                    ;; The properties word of an image object with a backing store is always an
+                    ;; object: a store only grows or replaces the store, never removes it.
+                    (let [word (load-make ctrl mem object (con-int OFFSET-OBJECT-PROPERTIES)
+                                          ALIAS-OBJECT-PROPERTIES (ty-dyn TAG-OBJECT))
+                          store-ptr (unbox-make word REP-OBJECT)]
+                      (Some (load-make ctrl mem store-ptr
+                                       (con-int (shape-offset-key shape key))
+                                       (shape-alias-key shape key)
+                                       (ty-dyn TAG-ANY)))))
+                (let [k (/ (shape-offset-key shape key) HEAP-WORD-BYTES)]
+                  ;; A word this graph has no constant form of yet keeps the generic read.
+                  (image-word-node (heap-entry-word storage k) (heap-entry-word-kind storage k)))))
+        (if written (None [(dyn NodeOps)]) (Some (dyn-undefined-make))))))
+
+;; [[Get]] continued at a folded holder (`prop-image-holder`, `prop-fresh-holder`): undefined at
+;; null, the holder's own word when it is an image reference the facts fix.
+(defn prop-holder-read [(ctrl (dyn NodeOps))
+                        (mem (dyn NodeOps))
+                        (holder (dyn NodeOps))
+                        (key i64)] (-> (Option (dyn NodeOps)))
+  (if (= (n-ty holder) (ty-dyn TAG-NULL))
+      (Some (dyn-undefined-make))
+      (if (and (= (n-op holder) OP-BOX) (= (n-op (n-in! holder 1)) OP-STATICREF))
+          (prop-image-read ctrl mem (n-in! holder 1) (staticref-entry (n-in! holder 1)) key true)
+          (None [(dyn NodeOps)]))))
+
+;; May OrdinarySet add `key` to a receiver whose chain's holder this is? Some true at null or an
+;; inherited writable data property (shadowed), Some false at an inherited accessor or read-only
+;; property (the slow path's), None when the facts do not fix the holder's attributes.
+(defn prop-holder-set-ok [(holder (dyn NodeOps)) (key i64)] (-> (Option bool))
+  (if (= (n-ty holder) (ty-dyn TAG-NULL))
+      (Some true)
+      (if (and (= (n-op holder) OP-BOX) (= (n-op (n-in! holder 1)) OP-STATICREF))
+          (let [entry (staticref-entry (n-in! holder 1))
+                shape (heap-storage-shape entry)
+                attrs (shape-key-attrs shape key)]
+            (if (and (facts-written? entry key) (facts-descriptors?))
+                (None [bool])
+                (Some (= (& attrs (| SHAPE-ATTR-ACCESSOR SHAPE-ATTR-WRITABLE)) SHAPE-ATTR-WRITABLE))))
+          (None [bool]))))
+
+;; A folded holder that decided nothing is a node nothing uses.
+(defn prop-holder-drop! [(holder (dyn NodeOps))] (-> i64)
+  (if (n-unused? holder) (n-kill! holder) 0))
+
+;; The holder of `key` along the image chain that starts at the prototype word (`word`, `kind`) of
+;; some object: the boxed image reference of the first entry whose shape carries the key; null at
+;; the chain's end; None when a runtime store may have added the key to an entry that lacks it, or
+;; prototype words may have changed.
+(defn prop-image-holder [(word i64) (kind i64) (key i64)] (-> (Option (dyn NodeOps)))
+  (if (facts-prototypes-written?)
+      (None [(dyn NodeOps)])
+      (let [(mut w) word
+            (mut k) kind
+            (mut answer) (None [(dyn NodeOps)])
+            (mut walking) true]
+        (loop (if (not (load walking))
+                  (break 0)
+                  (let [entry (image-word-object-entry (load w) (load k))]
+                    (if (< entry 0)
+                        ;; The chain ends: the word is null (or not an object reference).
+                        (do (set! (mut answer) (Some (dyn-null-make))) (set! (mut walking) false) (continue))
+                        (let [shape (heap-storage-shape entry)]
+                          (if (shape-has-key? shape key)
+                              (do (set! (mut answer) (image-word-node (load w) (load k))) (set! (mut walking) false) (continue))
+                              (if (facts-written? entry key)
+                                  (do (set! (mut walking) false) (continue))
+                                  (do
+                                    (set! (mut w) (heap-entry-word entry HEAP-OFFSET-PROTOTYPE-WORD))
+                                    (set! (mut k) (heap-entry-word-kind entry HEAP-OFFSET-PROTOTYPE-WORD))
+                                    (continue)))))))))
+        (load answer))))
+
+;; The attributes a fresh-object shape answers for `key`: the field's bits, or -1/-2 by extensibility.
+(defn prop-shape-attrs [(shape i64) (key i64)] (-> i64)
+  (if (shape-has-key? shape key)
+      (shape-key-attrs shape key)
+      (if (shape-extensible? shape) -1 -2)))
 
 (defn prop-access-compute [(d (dyn NodeOps))] (-> i64)
   (let [p (prop-access-node d)]
@@ -210,25 +395,97 @@
                     (PropUnknown [] (None [(dyn NodeOps)]))
                     (PropNoStorage []
                                    (if (= (.kind p) PROP-STORE)
-                                       (let [stored (property-store-known-owner ctrl mem object key (n-in! d PROP-VALUE))]
+                                       (let [stored (property-store-known-owner ctrl mem object key (n-in! d PROP-VALUE) (.attrs p))]
                                          (prop-access-resolve! d ctrl (.mem stored) (.value stored)))
-                                       (prop-access-resolve! d ctrl mem
-                                                             (if (= (.kind p) PROP-HAS) (con-int 0) (dyn-undefined-make)))))
+                                       (if (= (.kind p) PROP-GET)
+                                           (prop-get-chain! d ctrl mem object key)
+                                       (if (= (.kind p) PROP-SET)
+                                           (prop-set-absent! d ctrl mem object key)
+                                       (if (= (.kind p) PROP-HOLDER)
+                                           (match (prop-fresh-holder mem object key)
+                                             (Some [holder] (prop-access-resolve! d ctrl mem holder))
+                                             (None [] (None [(dyn NodeOps)])))
+                                           (prop-access-resolve! d ctrl mem
+                                                                 (if (= (.kind p) PROP-HAS)
+                                                                     (con-int 0)
+                                                                     (if (= (.kind p) PROP-ATTRS)
+                                                                         (con-int -1)
+                                                                         (dyn-undefined-make)))))))))
                     (PropStorage [storage-nid shape]
                                  (let [storage (match (arena-node storage-nid) (Some [n] n) (None [] (unreachable-node)))
                                        present (shape-has-key? shape key)]
                                    (if (= (.kind p) PROP-STORE)
-                                       (let [stored (property-store-known-owner ctrl mem object key (n-in! d PROP-VALUE))]
+                                       (let [stored (property-store-known-owner ctrl mem object key (n-in! d PROP-VALUE) (.attrs p))]
                                          (prop-access-resolve! d ctrl (.mem stored) (.value stored)))
+                                       (if (= (.kind p) PROP-GET)
+                                           (if present
+                                               (if (!= (& (shape-key-attrs shape key) SHAPE-ATTR-ACCESSOR) 0)
+                                                   (prop-access-resolve! d ctrl mem (dyn-exception-make))
+                                                   (prop-access-resolve! d ctrl mem
+                                                                         (load-make ctrl mem storage
+                                                                                    (con-int (shape-offset-key shape key))
+                                                                                    (shape-alias-key shape key)
+                                                                                    (ty-dyn TAG-ANY))))
+                                               (prop-get-chain! d ctrl mem object key))
+                                       (if (= (.kind p) PROP-SET)
+                                           (if present
+                                               (if (= (& (shape-key-attrs shape key) (| SHAPE-ATTR-ACCESSOR SHAPE-ATTR-WRITABLE))
+                                                      SHAPE-ATTR-WRITABLE)
+                                                   (let [stored (property-store-known-owner ctrl mem object key (n-in! d PROP-VALUE) SHAPE-ATTRS-DEFAULT)]
+                                                     (prop-access-resolve! d ctrl (.mem stored) (.value stored)))
+                                                   (prop-access-resolve! d ctrl mem (dyn-exception-make)))
+                                               (if (shape-extensible? shape)
+                                                   (prop-set-absent! d ctrl mem object key)
+                                                   (prop-access-resolve! d ctrl mem (dyn-exception-make))))
                                        (if (= (.kind p) PROP-HAS)
                                            (prop-access-resolve! d ctrl mem (con-int (if present 1 0)))
-                                           (prop-access-resolve! d ctrl mem
-                                                                 (if present
-                                                                     (load-make ctrl mem storage
-                                                                                (con-int (shape-offset-key shape key))
-                                                                                (shape-alias-key shape key)
-                                                                                (ty-dyn TAG-ANY))
-                                                                     (dyn-undefined-make))))))))))))))))
+                                           (if (= (.kind p) PROP-ATTRS)
+                                               (prop-access-resolve! d ctrl mem (con-int (prop-shape-attrs shape key)))
+                                           (if (= (.kind p) PROP-HOLDER)
+                                               (match (prop-fresh-holder mem object key)
+                                                 (Some [holder] (prop-access-resolve! d ctrl mem holder))
+                                                 (None [] (None [(dyn NodeOps)])))
+                                               (prop-access-resolve! d ctrl mem
+                                                                     (if present
+                                                                         (load-make ctrl mem storage
+                                                                                    (con-int (shape-offset-key shape key))
+                                                                                    (shape-alias-key shape key)
+                                                                                    (ty-dyn TAG-ANY))
+                                                                         (dyn-undefined-make))))))))))))))))))))
+
+;; [[Get]] of a key a fresh object lacks: its chain's holder, when the memory state shows the
+;; prototype word, decides — undefined at null, the image word at an image holder.
+(defn prop-get-chain! [(d (dyn NodeOps))
+                       (ctrl (dyn NodeOps))
+                       (mem (dyn NodeOps))
+                       (object (dyn NodeOps))
+                       (key i64)] (-> (Option (dyn NodeOps)))
+  (match (prop-fresh-holder mem object key)
+    (None [] (None [(dyn NodeOps)]))
+    (Some [holder]
+          (match (prop-holder-read ctrl mem holder key)
+            (Some [value] (do (prop-holder-drop! holder) (prop-access-resolve! d ctrl mem value)))
+            (None [] (do (prop-holder-drop! holder) (None [(dyn NodeOps)])))))))
+
+;; OrdinarySet of a key a fresh, extensible object lacks: added by the static transition when the
+;; chain's holder allows it, the sentinel when the holder is an accessor or read-only property.
+(defn prop-set-absent! [(d (dyn NodeOps))
+                        (ctrl (dyn NodeOps))
+                        (mem (dyn NodeOps))
+                        (object (dyn NodeOps))
+                        (key i64)] (-> (Option (dyn NodeOps)))
+  (match (prop-fresh-holder mem object key)
+    (None [] (None [(dyn NodeOps)]))
+    (Some [holder]
+          (let [ok (prop-holder-set-ok holder key)]
+            (prop-holder-drop! holder)
+            (match ok
+              (None [] (None [(dyn NodeOps)]))
+              (Some [allowed]
+                    (if allowed
+                        (let [stored (property-store-known-owner ctrl mem object key (n-in! d PROP-VALUE) SHAPE-ATTRS-DEFAULT)]
+                          (prop-access-resolve! d ctrl (.mem stored) (.value stored)))
+                        (prop-access-resolve! d ctrl mem (dyn-exception-make)))))))))
 
 ;; The owner is an image object (docs/COMPILE-TIME.md §8 row 10; aot.node.imagefacts). Its
 ;; properties are constants of the compilation unless the closed-world facts say the program may
@@ -242,6 +499,10 @@
 ;;                                             offset the image shape fixes holds at run time
 ;;   key absent, never stored                  HAS is false; LOAD is undefined
 ;;   key absent, possibly stored               unknown: the generic dispatch, as before
+;;
+;; ATTRS answers from the image shape the same way. Once the program defines property attributes
+;; anywhere (`facts-descriptors?`), a possibly stored key may also have changed kind or attributes,
+;; so its read, store and attribute question stay generic; only never-stored keys still fold.
 ;;
 ;; A store of a key in the image shape is the same fixed-offset write; a store of any other key
 ;; stays generic, because it may transition the shape at run time. The global object is an image
@@ -260,9 +521,66 @@
         storage (heap-entry-storage entry)
         shape (heap-storage-shape entry)
         present (shape-has-key? shape key)
-        written (facts-written? entry key)]
-    (if (= (.kind p) PROP-STORE)
+        written (facts-written? entry key)
+        ;; Attributes the program may have changed: a stored key once descriptors exist anywhere.
+        attrs-unknown (and written (facts-descriptors?))
+        data-writable (and present
+                           (and (= (& (shape-key-attrs shape key) SHAPE-ATTR-ACCESSOR) 0)
+                                (!= (& (shape-key-attrs shape key) SHAPE-ATTR-WRITABLE) 0)))]
+    (if (= (.kind p) PROP-HOLDER)
+        (match (prop-image-holder (heap-entry-word entry HEAP-OFFSET-PROTOTYPE-WORD)
+                                  (heap-entry-word-kind entry HEAP-OFFSET-PROTOTYPE-WORD)
+                                  key)
+          (Some [holder] (prop-access-resolve! d ctrl mem holder))
+          (None [] (None [(dyn NodeOps)])))
+    (if (= (.kind p) PROP-GET)
+        (if (or present written)
+            (match (prop-image-read ctrl mem object entry key true)
+              (Some [value] (prop-access-resolve! d ctrl mem value))
+              (None [] (None [(dyn NodeOps)])))
+            (match (prop-image-holder (heap-entry-word entry HEAP-OFFSET-PROTOTYPE-WORD)
+                                      (heap-entry-word-kind entry HEAP-OFFSET-PROTOTYPE-WORD)
+                                      key)
+              (None [] (None [(dyn NodeOps)]))
+              (Some [holder]
+                    (match (prop-holder-read ctrl mem holder key)
+                      (Some [value] (do (prop-holder-drop! holder) (prop-access-resolve! d ctrl mem value)))
+                      (None [] (do (prop-holder-drop! holder) (None [(dyn NodeOps)])))))))
+    (if (= (.kind p) PROP-SET)
         (if present
+            (if attrs-unknown
+                (None [(dyn NodeOps)])
+                (if data-writable
+                    (let [word (load-make ctrl mem object (con-int OFFSET-OBJECT-PROPERTIES)
+                                          ALIAS-OBJECT-PROPERTIES (ty-dyn TAG-OBJECT))
+                          store-ptr (unbox-make word REP-OBJECT)
+                          stored (property-store-in-shape ctrl mem store-ptr shape key (n-in! d PROP-VALUE))]
+                      (prop-access-resolve! d ctrl (.mem stored) (.value stored)))
+                    (prop-access-resolve! d ctrl mem (dyn-exception-make))))
+            (if written
+                (None [(dyn NodeOps)])
+                (if (not (shape-extensible? shape))
+                    (prop-access-resolve! d ctrl mem (dyn-exception-make))
+                    ;; Adding a key to an image object transitions its shape at run time: generic,
+                    ;; unless the chain already refuses.
+                    (match (prop-image-holder (heap-entry-word entry HEAP-OFFSET-PROTOTYPE-WORD)
+                                              (heap-entry-word-kind entry HEAP-OFFSET-PROTOTYPE-WORD)
+                                              key)
+                      (None [] (None [(dyn NodeOps)]))
+                      (Some [holder]
+                            (let [ok (prop-holder-set-ok holder key)]
+                              (prop-holder-drop! holder)
+                              (match ok
+                                (Some [allowed] (if allowed (None [(dyn NodeOps)]) (prop-access-resolve! d ctrl mem (dyn-exception-make))))
+                                (None [] (None [(dyn NodeOps)])))))))))
+    (if (= (.kind p) PROP-ATTRS)
+        (if attrs-unknown
+            (None [(dyn NodeOps)])
+            (if (or present (not written))
+                (prop-access-resolve! d ctrl mem (con-int (prop-shape-attrs shape key)))
+                (None [(dyn NodeOps)])))
+    (if (= (.kind p) PROP-STORE)
+        (if (and present (and data-writable (not attrs-unknown)))
             ;; The key's offset is fixed by the image shape and kept by every transition, so the
             ;; store is the field's word through the properties word, as a heap object's is once
             ;; its shape is known. A key the shape lacks transitions at run time: generic.
@@ -276,25 +594,10 @@
             (if present
                 (prop-access-resolve! d ctrl mem (con-int 1))
                 (if written (None [(dyn NodeOps)]) (prop-access-resolve! d ctrl mem (con-int 0))))
-            (if present
-                (if written
-                    ;; The properties word of an image object with a backing store is always an
-                    ;; object: a store only grows or replaces the store, never removes it.
-                    (let [word (load-make ctrl mem object (con-int OFFSET-OBJECT-PROPERTIES)
-                                          ALIAS-OBJECT-PROPERTIES (ty-dyn TAG-OBJECT))
-                          store-ptr (unbox-make word REP-OBJECT)]
-                      (prop-access-resolve! d ctrl mem
-                                            (load-make ctrl mem store-ptr
-                                                       (con-int (shape-offset-key shape key))
-                                                       (shape-alias-key shape key)
-                                                       (ty-dyn TAG-ANY))))
-                    (let [k (/ (shape-offset-key shape key) HEAP-WORD-BYTES)]
-                      (match (image-word-node (heap-entry-word storage k) (heap-entry-word-kind storage k))
-                        (Some [value] (prop-access-resolve! d ctrl mem value))
-                        ;; A word this graph has no constant form of yet keeps the generic read.
-                        (None [] (None [(dyn NodeOps)])))))
-                (if written (None [(dyn NodeOps)]) (prop-access-resolve! d ctrl mem (dyn-undefined-make))))))))
-
+            ;; An accessor's word is its pair, which JSL reads through the attributes.
+            (match (prop-image-read ctrl mem object entry key false)
+              (Some [value] (prop-access-resolve! d ctrl mem value))
+              (None [] (None [(dyn NodeOps)])))))))))))
 (defn prop-access-resolve! [(d (dyn NodeOps)) (ctrl (dyn NodeOps)) (mem (dyn NodeOps)) (value (dyn NodeOps))] (-> (Option (dyn NodeOps)))
   (let [p (prop-access-node d)]
     (set! (.res-mem p) (n-nid mem))
@@ -316,7 +619,17 @@
   (hdr [(self (ptr PropAccessNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
   (label [(self (ptr PropAccessNode))] (-> (slice u8))
          (let [(mut b) (sb-new (alloc/malloc-allocator))]
-           (sb-push-str! (mut b) (if (= (.kind self) PROP-LOAD) "PropLoad" (if (= (.kind self) PROP-HAS) "PropHas" "PropStore")))
+           (sb-push-str! (mut b) (if (= (.kind self) PROP-LOAD)
+                                     "PropLoad"
+                                     (if (= (.kind self) PROP-HAS)
+                                         "PropHas"
+                                         (if (= (.kind self) PROP-ATTRS)
+                                             "PropAttrs"
+                                             (if (= (.kind self) PROP-HOLDER)
+                                                 "PropHolder"
+                                                 (if (= (.kind self) PROP-GET)
+                                                     "PropGet"
+                                                     (if (= (.kind self) PROP-SET) "PropSet" "PropStore")))))))
            (sb-push-str! (mut b) "[")
            (sb-push-str! (mut b) (shape-key-name (.key self)))
            (sb-push-str! (mut b) "]")
@@ -368,15 +681,16 @@
         0)
     (set! (.key p) key)
     (set! (.kind p) kind)
+    (set! (.attrs p) SHAPE-ATTRS-DEFAULT)
     (set! (.res-mem p) 0)
     (set! (.res-value p) 0)
-    (n-init! d (if (= kind PROP-STORE) OP-PROPSTORE OP-PROPLOAD))
+    (n-init! d (if (or (= kind PROP-STORE) (= kind PROP-SET)) OP-PROPSTORE OP-PROPLOAD))
     (n-add-def! d (Some ctrl))
     (n-add-def! d (Some mem))
     (n-add-def! d (Some object))
     (match value
       (Some [v] (n-add-def! d (Some v)))
-      (None [] (if (= kind PROP-STORE) (panic "prop-access-make: a store needs a value") 0)))
+      (None [] (if (or (= kind PROP-STORE) (= kind PROP-SET)) (panic "prop-access-make: a store needs a value") 0)))
     (n-set-ty! d (compute p))
     d))
 
@@ -387,7 +701,19 @@
                         (value (Option (dyn NodeOps)))
                         (key i64)
                         (kind i64)] (-> PropertyAccessResult)
+  (prop-access-emit-attrs ctrl mem object value key kind SHAPE-ATTRS-DEFAULT))
+
+;; A store that defines a new key with these attributes (CreateDataProperty with a descriptor, the
+;; image builder's `prototype`): the same node, the transition it takes carries the attributes.
+(defn prop-access-emit-attrs [(ctrl (dyn NodeOps))
+                              (mem (dyn NodeOps))
+                              (object (dyn NodeOps))
+                              (value (Option (dyn NodeOps)))
+                              (key i64)
+                              (kind i64)
+                              (attrs i64)] (-> PropertyAccessResult)
   (let [d (prop-access-make ctrl mem object value key kind)]
+    (set! (.attrs (prop-access-node d)) attrs)
     (property-access-result (proj-make d PROP-RESULT-VALUE "prop.value")
                             (cproj-make d PROP-RESULT-CTRL "prop.ctrl")
                             (proj-make d PROP-RESULT-MEM "prop.mem"))))
@@ -413,8 +739,18 @@
                                         object (n-in! n PROP-OBJECT)
                                         access
                                           (if (= (.kind p) PROP-STORE)
-                                              (property-store-generic-owner ctrl mem object (.key p) (n-in! n PROP-VALUE))
-                                              (property-own-named ctrl mem object (.key p) (= (.kind p) PROP-LOAD)))]
+                                              (if (= (.attrs p) SHAPE-ATTRS-DEFAULT)
+                                                  (property-store-generic-owner ctrl mem object (.key p) (n-in! n PROP-VALUE))
+                                                  (property-store-generic-owner-attrs ctrl mem object (con-int (.key p)) (n-in! n PROP-VALUE) (.attrs p)))
+                                              (if (= (.kind p) PROP-ATTRS)
+                                                  (property-attrs-own-named ctrl mem object (.key p))
+                                                  (if (= (.kind p) PROP-HOLDER)
+                                                      (property-holder-named ctrl mem object (.key p))
+                                                      (if (= (.kind p) PROP-GET)
+                                                          (property-generic-access ctrl mem object (con-int (.key p)) (None [(dyn NodeOps)]) JS-PROP-GET)
+                                                          (if (= (.kind p) PROP-SET)
+                                                              (property-set-generic ctrl mem object (con-int (.key p)) (n-in! n PROP-VALUE))
+                                                              (property-own-named ctrl mem object (.key p) (= (.kind p) PROP-LOAD)))))))]
                                     (set! (mut expanded) (+ (load expanded) 1))
                                     (set! (.res-mem p) (n-nid (.mem access)))
                                     (set! (.res-value p) (n-nid (.value access)))
@@ -576,6 +912,72 @@
                             ctrl
                             (proj-make op 1 "property.generic.mem"))))
 
+;; The runtime's OrdinarySet fast path (`rt-prop-set`): its answer is the value or the sentinel, so
+;; unlike a store the graph uses the call's result.
+(defn property-set-generic [(ctrl (dyn NodeOps))
+                            (mem (dyn NodeOps))
+                            (object (dyn NodeOps))
+                            (key (dyn NodeOps))
+                            (value (dyn NodeOps))] (-> PropertyAccessResult)
+  (let [op (jsop-make ctrl mem JS-PROP-SET)]
+    (jsop-add-arg! op object)
+    (jsop-add-arg! op key)
+    (jsop-add-arg! op value)
+    (property-access-result (proj-make op 2 "property.generic.value")
+                            ctrl
+                            (proj-make op 1 "property.generic.mem"))))
+
+;; The runtime's attribute question (`rt-prop-attributes`) over a constant or a runtime key.
+(defn property-attrs-own-named [(ctrl (dyn NodeOps))
+                                (mem (dyn NodeOps))
+                                (object (dyn NodeOps))
+                                (key i64)] (-> PropertyAccessResult)
+  (do
+    (if (or (<= key 0) (> key (shape-key-count)))
+        (panic-i "property-attrs-own-named: invalid property key" key)
+        0)
+    (property-generic-access ctrl mem object (con-int key) (None [(dyn NodeOps)]) JS-PROP-ATTRIBUTES)))
+
+;; The runtime's chain walk (`rt-prop-chain-holder`) over a constant or a runtime key.
+(defn property-holder-named [(ctrl (dyn NodeOps))
+                             (mem (dyn NodeOps))
+                             (object (dyn NodeOps))
+                             (key i64)] (-> PropertyAccessResult)
+  (do
+    (if (or (<= key 0) (> key (shape-key-count)))
+        (panic-i "property-holder-named: invalid property key" key)
+        0)
+    (property-generic-access ctrl mem object (con-int key) (None [(dyn NodeOps)]) JS-PROP-CHAIN-HOLDER)))
+
+(defn property-holder-keyed [(ctrl (dyn NodeOps))
+                             (mem (dyn NodeOps))
+                             (object (dyn NodeOps))
+                             (key (dyn NodeOps))] (-> PropertyAccessResult)
+  (property-generic-access ctrl mem object key (None [(dyn NodeOps)]) JS-PROP-CHAIN-HOLDER))
+
+(defn property-attrs-own-keyed [(ctrl (dyn NodeOps))
+                                (mem (dyn NodeOps))
+                                (object (dyn NodeOps))
+                                (key (dyn NodeOps))] (-> PropertyAccessResult)
+  (property-generic-access ctrl mem object key (None [(dyn NodeOps)]) JS-PROP-ATTRIBUTES))
+
+;; A definition with attributes that no static shape absorbed: the runtime's ValidateAndApply
+;; (`rt-prop-define`) with every descriptor field named. The value is the value stored.
+;; The runtime's store whose added key takes `attrs` (`rt-prop-set-own-attrs`): the same contract
+;; as the default store — a present writable data property takes the value and keeps its attributes.
+(defn property-store-generic-owner-attrs [(ctrl (dyn NodeOps))
+                                          (mem (dyn NodeOps))
+                                          (object (dyn NodeOps))
+                                          (key (dyn NodeOps))
+                                          (value (dyn NodeOps))
+                                          (attrs i64)] (-> PropertyAccessResult)
+  (let [op (jsop-make ctrl mem JS-PROP-SET-OWN-ATTRS)]
+    (jsop-add-arg! op object)
+    (jsop-add-arg! op key)
+    (jsop-add-arg! op value)
+    (jsop-add-arg! op (con-int attrs))
+    (property-access-result value ctrl (proj-make op 1 "property.generic.mem"))))
+
 (defn property-own-named [(ctrl (dyn NodeOps))
                           (mem (dyn NodeOps))
                           (object (dyn NodeOps))
@@ -667,21 +1069,29 @@
         0)
     (property-generic-access ctrl mem object (con-int key) (Some value) JS-PROP-SET-OWN)))
 
+;; A store whose owner's backing store is statically visible, with the attributes a new key takes.
+;; A present key is written in place when it is a writable data property with the same attributes
+;; (JSL asks the attributes before storing, so this is the case an assignment reaches); a new key
+;; transitions the shape with the attributes when the shape is extensible. Anything else — a
+;; non-extensible shape, an attribute change — is the runtime's define.
 (defn property-store-known-owner [(ctrl (dyn NodeOps))
                                   (mem (dyn NodeOps))
                                   (object (dyn NodeOps))
                                   (key i64)
-                                  (value (dyn NodeOps))] (-> PropertyAccessResult)
+                                  (value (dyn NodeOps))
+                                  (attrs i64)] (-> PropertyAccessResult)
   (do
     (if (or (<= key 0) (> key (shape-key-count)))
         (panic-i "property-store-known-owner: invalid property key" key)
         0)
     (match (prop-owner-store mem object)
-      (None [] (property-store-generic-owner ctrl mem object key value))
+      (None [] (if (= attrs SHAPE-ATTRS-DEFAULT)
+                   (property-store-generic-owner ctrl mem object key value)
+                   (property-store-generic-owner-attrs ctrl mem object (con-int key) value attrs)))
       (Some [owner-state]
           (let [storage-word (n-in! owner-state STORE-VAL)]
             (if (= (n-ty storage-word) (ty-dyn TAG-NULL))
-                (let [shape (shape-transition SHAPE-EMPTY (shape-key-name key))
+                (let [shape (shape-transition-attrs SHAPE-EMPTY (shape-key-name key) attrs)
                       (mut values) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))]
                   (push! [(dyn NodeOps)] (mut values) value)
                   (let [storage (property-storage-new ctrl mem shape (load values))
@@ -697,8 +1107,19 @@
                           (do
                             (panic "property-store-known-owner: storage shape is not statically known")
                             (property-access-result (unreachable-node) ctrl mem))
-                          (let [shape (new-shape (n-in! storage 0))]
-                            (if (shape-has-key? shape key)
+                          (let [shape (new-shape (n-in! storage 0))
+                                present (shape-has-key? shape key)
+                                ;; The store contract: a present writable data property takes the
+                                ;; value and keeps its attributes; `attrs` is for an added key.
+                                in-place (and present
+                                              (and (= (& (shape-key-attrs shape key) SHAPE-ATTR-ACCESSOR) 0)
+                                                   (!= (& (shape-key-attrs shape key) SHAPE-ATTR-WRITABLE) 0)))]
+                            (if (or (and present (not in-place))
+                                    (and (not present) (not (shape-extensible? shape))))
+                                (if (= attrs SHAPE-ATTRS-DEFAULT)
+                                    (property-store-generic-owner ctrl mem object key value)
+                                    (property-store-generic-owner-attrs ctrl mem object (con-int key) value attrs))
+                            (if in-place
                                 (let [alias (shape-alias-key shape key)
                                       stored
                                         (store-make ctrl
@@ -729,7 +1150,7 @@
                                               (continue))))
                                   (property-access-result value ctrl merged))
                                 (let [next-shape
-                                        (shape-transition shape (shape-key-name key))
+                                        (shape-transition-attrs shape (shape-key-name key) attrs)
                                       fields (shape-field-count shape)
                                       (mut values)
                                         (al-new [(dyn NodeOps)] (alloc/malloc-allocator))
@@ -760,7 +1181,7 @@
                                                                     object
                                                                     next-shape
                                                                     next-storage)]
-                                    (property-access-result value ctrl installed))))))))))))))
+                                    (property-access-result value ctrl installed)))))))))))))))
 
 (defn propload-named-make [(ctrl (dyn NodeOps))
                            (mem (dyn NodeOps))

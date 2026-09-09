@@ -1,5 +1,79 @@
 # Decisions
 
+## 2026-09-09 — Property attributes live in the shape tree; accessors are pairs
+
+The object model had one kind of property: a writable, enumerable, configurable data slot.
+`Object.defineProperty`, `getOwnPropertyDescriptor`, `defineProperties`, `Object.create` with
+descriptors, `freeze`, `seal`, `preventExtensions` and their tests were 190 cases of the 1-in-20
+campaign, and 114 of them define accessors.
+
+**Decision.** Attributes are part of the shape edge that introduces a field (`aot.shape`,
+`aot.rt.shapes`): the transition map is canonical on (parent, key, attributes), so two objects whose
+same key differs in writability have different shape ids, and a fast path proved against a shape
+knows its field is a writable data property with no check — V8's descriptor arrays reached the same
+conclusion. Changing an existing property's attributes rebuilds the chain with the new edge
+(`shape-reshape-attrs`): the layout, and therefore every offset, is unchanged, only the backing
+store's shape word moves. [[PreventExtensions]] is a marker edge (key zero, offset -1) that adds no
+field and sets a flag every descendant inherits; freeze and seal reshape every field and then close
+the object. An accessor property's word is its *pair*, an ordinary object with `get` and `set`,
+flagged by the ACCESSOR attribute; there is no new heap kind and the collector traces it like any
+object. The `__aot_shapes` blob is version 2, six words per row.
+
+**[[Get]] and [[Set]] are one access each.** The first version asked the questions one at a time —
+own attributes, then the chain's holder, then the holder's attributes, then the load — and inlined
+the accessor and failure arms at every site. Each unfolded site became four runtime calls, the
+getter/setter call sites made every function in the realm reachable, and the budget harness went
+from 3,015 to 15,960 machine nodes. So the JSL asks one question: `%PropGetNamed` is ordinary
+[[Get]] of a data property, own or inherited (`PropAccess` kind GET), and `%PropSetNamed` is
+OrdinarySet's fast cases with the object as receiver (kind SET) — an own writable data property
+takes the value, an absent key is added when the object is extensible and no prototype holds it as
+an accessor or read-only property. Each folds where the owner's shape and prototype chain are known
+(a literal under construction, an image object and its image chain under the closed-world facts):
+a data property's read is one load, or the image word itself; an assignment is one store or one
+static transition. Where nothing is known each is one runtime call (`rt-prop-get`, `rt-prop-set`),
+never a chain of runtime questions. Both answer the exception sentinel when the slow path must
+decide — an accessor found, a read-only property, a non-extensible object — and only then does the
+JSL walk the chain explicitly (`%PropAttrsOwn`, `%PropChainHolder`), call the getter or setter on
+the original receiver, or fail: a failed [[Set]] is a TypeError in strict code and nothing
+otherwise, so the parser passes each assignment site's strictness to the JSL (`JsDefineOwnNamed`,
+`JsSetKeyed`). The slow path never stores: every case the fast access refused is a call or a
+failure. The runtime's `%PropDefine` is ValidateAndApplyPropertyDescriptor over a mask of the
+descriptor fields named. `Object.keys` and `propertyIsEnumerable` honour the enumerable bit, so
+built-in methods, `Math`'s constants and the intrinsics' global bindings are no longer enumerable,
+as CreateIntrinsics makes them.
+
+**The store contract.** Every `PropAccess` store — `%PropStoreOwnNamed`, `%PropStoreOwnNamedAttrs`,
+the SET access — writes the value of a present writable data property and leaves its attributes;
+the attributes it carries are those an *added* key takes (the default, or a function's `prototype`,
+a class's methods). The runtime's `rt-prop-set-own` and `rt-prop-set-own-attrs` keep the same
+contract, so a fold and the generic path agree. The first version required the store's attributes
+to equal the key's before folding in place, which made every write to a `var` global (attributes
+`writable, enumerable`) generic.
+
+**Types carry the facts.** In a program that defines no descriptor (`facts-descriptors?`), the
+attribute word is typed `int[-2..7]` and a [[Get]] result excludes the exception sentinel, at the
+access and at the primitive it expands to alike (`prop-attrs-ty`, `prop-get-ty`, aot.node.jsops).
+The accessor test is `attrs < 8` and the sentinel test a TypeTest, so both fold away and with them
+the getter and setter call sites that would make every function reachable. The realm image
+defines no accessor; `heap-define-own-attrs!` refuses one, since these types assume it.
+
+**Facts and optimization alternate.** The optimistic pass folds under the facts and leaves a
+smaller graph: the accessor arm that was live only because no attribute type had folded yet is
+gone, and with it the setter call that made every assigned object escape. The pipeline rescans
+that graph and optimizes again until a rescan marks nothing new, at most three rounds
+(`pipeline-opto-under-facts!`; two in practice). Every earlier fold stays justified: it was proved
+on facts about a program the round only rewrote equivalently.
+
+**Consequences for the folds.** A stored key of an image object may have changed attributes only
+if the program defines attributes somewhere (`facts-descriptors?`, set by the analysis when any
+define, integrity or preventExtensions primitive exists); while it does not, the fixed-offset
+access of a stored key still folds, and once it does, only never-stored keys fold. The static store
+paths transition with the attributes they are given and go generic on a non-extensible shape. The
+budget harness: 3,015 machine nodes before descriptors, 2,914 after (docs/COMPILE-TIME.md).
+
+**Not yet.** Accessor syntax in object literals (`{get x() {}}`), `defineProperty` of an array index
+or `length`, `delete`, `Object.getOwnPropertyNames` and `Reflect` (docs/GAPS.md).
+
 ## 2026-09-09 — Generic array methods and the `in` operator
 
 The callback and search methods of `Array.prototype` — forEach, map, filter, some, every, find,

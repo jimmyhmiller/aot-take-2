@@ -198,14 +198,33 @@ accesses are image-object property accesses at fixed offsets (docs/DECISIONS.md,
 property reads fold under closed-world facts). Missing: `delete` of a global; the global object's
 own prototype chain.
 
+### 2026-09-09 — Property descriptors
+
+Data and accessor descriptors, `defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`,
+`Object.create` with descriptors, `freeze`, `seal`, `preventExtensions`, `isFrozen`, `isSealed` and
+`isExtensible` work over ordinary objects (docs/DECISIONS.md, property attributes live in the
+shape tree). Missing: accessor syntax in object literals and classes (`{get x() {}}` refuses as
+"object methods and accessors"); `defineProperty` of an array element or `length`, and of a
+string's or function's exotic properties (`name`, `length`); `delete`; `Object.getOwnPropertyNames`,
+`Object.getOwnPropertyDescriptors`, `Object.entries`/`values`, `Reflect`; a `Symbol` key. An
+assignment to a primitive base throws in strict code but the sloppy-mode wrapper-object semantics
+(a property created on a temporary wrapper) are not observable either way.
+
 ### 2026-09-09 — The image analysis is closed over the call graph but not over the runtime
 
 `aot.node.imagefacts` follows values through Parms, Returns and the finite target sets of value
 calls; a call whose pointer type names no finite set, a value stored into any object or array, a
 thrown value and a runtime primitive's operand are escapes. An escaped object counts every key an
 unnamed-owner store writes as written, so `this.k = v` in a function whose `this` may be an
-escaped image object keeps `x.k` generic on primitive receivers. `delete` and `Object.defineProperty`
-must register with the analysis when they land (each is a refusal today).
+escaped image object keeps `x.k` generic on primitive receivers. A define, freeze, seal or
+preventExtensions is a store in the analysis's sense and sets `facts-descriptors?`, after which a
+stored key's attributes are unknown, every attribute word is typed `int[-2..15]` and every [[Get]]
+may answer the accessor sentinel, so the getter and setter call sites stay live and make every
+function reachable: a program that names `Object.defineProperty` anywhere pays for accessors at
+every unfolded site. A per-key or per-object accessor fact would narrow that; `delete` must register
+the same way when it lands. The facts are rescanned after the optimistic pass folds under them
+(`pipeline-opto-under-facts!`, at most three rounds), so a fold that depends on a call the first
+round removes lands in the second.
 
 ### 2026-09-08 — finally
 

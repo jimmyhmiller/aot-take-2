@@ -10,24 +10,25 @@
       (%PropHasOwnNamed (%UnboxObjectLike object) key)
       (%Eq 0 1)))
 
-; Ordinary [[Get]] for the represented data-property object model. The representation primitive
-; exposes only the already-proven object's [[Prototype]] slot; own-property choice, chain traversal,
-; and the undefined result at null are JavaScript semantics and therefore remain here in JSL.
-(builtin JsGetNamedObject :transitioning true :params [(object dyn) (key int)] :ret dyn
-  (if (JsHasOwnNamed object key)
-      (JsGetOwnNamed object key)
-      (let [(prototype (%GetObjectPrototype (%UnboxObjectLike object)))]
-        (if (%IsNull prototype)
-            (%Undefined)
-            (JsGetNamedObject prototype key)))))
+;; The chain question of [[Get]] and [[Set]] is one primitive: the first prototype (the receiver
+;; excluded) with an own `key`, or null (`%PropChainHolder`, aot.rt.rt's chain walk). It folds to
+;; an image reference or to null wherever the receiver's chain is image data (docs/DECISIONS.md,
+;; property attributes live in the shape tree), which is every literal's and every image object's.
+;; [[Get]] from the holder found on the chain: its own data word, or its accessor's getter called on
+;; the original receiver.
+(builtin JsGetFromHolder :transitioning true :noinline true :throws true :params [(holder dyn) (key int) (receiver dyn)] :ret dyn
+  (let [(attrs (%PropAttrsOwn (%UnboxObjectLike holder) key))]
+    (if (%Lt attrs 8)
+        (%PropLoadOwnNamed (%UnboxObjectLike holder) key)
+        (JsCallGetter (%PropLoadOwnNamed (%UnboxObjectLike holder) key) receiver))))
 
 ;; The own-property step is peeled out of the chain walk so a receiver whose backing store the
 ;; compiler can see folds to a single Load at the site; only the prototype chain is a call.
-(macro JsGetNamedPrototypeChain :transitioning true :params [(object dyn) (key int)] :ret dyn
-  (let [(prototype (%GetObjectPrototype (%UnboxObjectLike object)))]
-    (if (%IsNull prototype)
+(macro JsGetNamedPrototypeChain :transitioning true :throws true :params [(object dyn) (key int)] :ret dyn
+  (let [(holder (%PropChainHolder (%UnboxObjectLike object) key))]
+    (if (%IsNull holder)
         (%Undefined)
-        (JsGetNamedObject prototype key))))
+        (JsGetFromHolder holder key object))))
 
 ;; [[Get]] on a primitive base: a string's `length`; undefined and null are a TypeError (the result
 ;; is then the exception sentinel, which the caller tests when the base may be either); other
@@ -63,30 +64,119 @@
                           (let [(proto (%IntrinsicPrototype "Number.prototype"))]
                             (if (%IsNull proto) (%Undefined) (JsGetNamedOwnOrChain proto key))))))))))
 
-;; Own step then the chain, over a proven object-like base.
-(macro JsGetNamedOwnOrChain :transitioning true :params [(object dyn) (key int)] :ret dyn
-  (if (JsHasOwnNamed object key)
-      (JsGetOwnNamed object key)
-      (JsGetNamedPrototypeChain object key)))
+;; Own step then the chain, over a proven object-like base, as one access (`%PropGetNamed`): it
+;; folds to a load or a constant wherever the owner's shape and chain are known (docs/DECISIONS.md,
+;; property attributes live in the shape tree) and is one runtime lookup otherwise. An accessor
+;; found anywhere answers the exception sentinel, and only then does the slow path find the pair and
+;; call its getter with the original receiver; the sentinel test folds away in a program that can
+;; define no accessor.
+(macro JsGetNamedOwnOrChain :transitioning true :throws true :params [(object dyn) (key int)] :ret dyn
+  (let [(v (%PropGetNamed (%UnboxObjectLike object) key))]
+    (if (%IsException v)
+        (JsGetViaAccessor object key)
+        v)))
 
-;; A store on undefined or null is a TypeError; a store on another primitive is silently dropped
-;; (sloppy mode; strict mode's TypeError waits for the wrapper objects). An array's `length` write
-;; is ArraySetLength (docs/DECISIONS.md, arrays).
+;; [[Get]] whose property is an accessor somewhere on the chain: the own attributes, else the
+;; holder's, name the pair.
+(builtin JsGetViaAccessor :transitioning true :noinline true :throws true :params [(object dyn) (key int)] :ret dyn
+  (let [(attrs (%PropAttrsOwn (%UnboxObjectLike object) key))]
+    (if (%Lt attrs 0)
+        (let [(holder (%PropChainHolder (%UnboxObjectLike object) key))]
+          (if (%IsNull holder)
+              (%Undefined)
+              (JsGetFromHolder holder key object)))
+        (if (%Lt attrs 8)
+            (%PropLoadOwnNamed (%UnboxObjectLike object) key)
+            (JsCallGetter (%PropLoadOwnNamed (%UnboxObjectLike object) key) object)))))
+
+;; [[Get]] through an accessor pair: `get` called on the receiver; undefined when there is none.
+(builtin JsCallGetter :transitioning true :noinline true :throws true :params [(pair dyn) (receiver dyn)] :ret dyn
+  (let [(getter (JsGetOwnNamed pair (%PropertyKey "get")))]
+    (if (%IsFunction getter)
+        (%CallFunction getter receiver)
+        (%Undefined))))
+
+;; [[Set]] through an accessor pair: `set` called on the receiver with the value; a missing setter
+;; is the failed assignment (a TypeError in strict code, nothing otherwise).
+(builtin JsCallSetter :transitioning true :noinline true :throws true
+  :params [(pair dyn) (receiver dyn) (value dyn) (strict int)] :ret dyn
+  (let [(setter (JsGetOwnNamed pair (%PropertyKey "set")))]
+    (if (%IsFunction setter)
+        (let [(r (%CallFunction setter receiver value))]
+          (if (%IsException r) r value))
+        (if (%Eq strict 1)
+            (JsThrowTypeError (%Box "Cannot set property which has only a getter"))
+            value))))
+
+;; Assignment `object[key] = value` (PutValue → [[Set]], ECMA-262 §10.1.9): a store on undefined or
+;; null is a TypeError; a store on another primitive is dropped, a TypeError in strict code (§7.3.4
+;; without wrapper objects: docs/GAPS.md). An array's `length` write is ArraySetLength
+;; (docs/DECISIONS.md, arrays). `strict` is the site's strictness: a failed [[Set]] throws there.
 (macro JsDefineOwnNamed :transitioning true :throws true
-  :params [(object dyn) (key int) (value dyn)] :ret dyn
+  :params [(object dyn) (key int) (value dyn) (strict int)] :ret dyn
   (if (%IsObjectLike object)
       (if (%Eq key (%PropertyKey "length"))
           (if (%IsArray object)
               (JsArraySetLength object value)
-              (let [(stored (%PropStoreOwnNamed (%UnboxObjectLike object) key value))]
-                object))
-          (let [(stored (%PropStoreOwnNamed (%UnboxObjectLike object) key value))]
-            object))
+              (JsSetNamedObject object key value strict))
+          (JsSetNamedObject object key value strict))
       (if (%IsUndefined object)
           (JsThrowTypeError (%Box "Cannot set properties of undefined"))
           (if (%IsNull object)
               (JsThrowTypeError (%Box "Cannot set properties of null"))
-              object))))
+              (if (%Eq strict 1)
+                  (JsThrowTypeError (%Box "Cannot create property on a primitive value"))
+                  value)))))
+
+;; OrdinarySet (§10.1.9.2) on a proven object, the receiver being the object itself, as one
+;; access (`%PropSetNamed`): an own writable data property takes the value, an absent key is added
+;; when the object is extensible and no prototype holds an accessor or a read-only property. Both
+;; fold wherever the shape and the chain are known, so a store to a literal's field or a fresh
+;; property is one store; otherwise it is one runtime call. Every other case — an accessor, a
+;; read-only property, a non-extensible object — answers the sentinel and is the builtin below.
+(macro JsSetNamedObject :transitioning true :throws true
+  :params [(object dyn) (key int) (value dyn) (strict int)] :ret dyn
+  (let [(v (%PropSetNamed (%UnboxObjectLike object) key value))]
+    (if (%IsException v)
+        (JsSetSlow object (%PropAttrsOwn (%UnboxObjectLike object) key) key value strict)
+        value)))
+
+;; The rest of OrdinarySet, reached only when the fast access answered the sentinel — so every case
+;; here is one the fast path refused, and none stores a data value: an own accessor calls its
+;; setter; an own data property is read-only; an absent key finds on the chain an accessor (its
+;; setter is called, a non-extensible receiver notwithstanding, §10.1.9.2 step 2.c) or a read-only
+;; property, or finds nothing or a writable data property on a receiver that is not extensible. A
+;; failure is a TypeError in strict code and nothing otherwise.
+(builtin JsSetSlow :transitioning true :noinline true :throws true
+  :params [(object dyn) (attrs int) (key int) (value dyn) (strict int)] :ret dyn
+  (if (%Lt attrs 0)
+      (let [(holder (%PropChainHolder (%UnboxObjectLike object) key))]
+        (if (%IsNull holder)
+            (JsSetFail value strict (%Box "Cannot add property, object is not extensible"))
+            (let [(hattrs (%PropAttrsOwn (%UnboxObjectLike holder) key))]
+              (if (%Lt hattrs 8)
+                  (if (%Eq (%And hattrs 1) 1)
+                      (JsSetFail value strict (%Box "Cannot add property, object is not extensible"))
+                      (JsSetFail value strict (%Box "Cannot assign to read only property")))
+                  (JsCallSetter (%PropLoadOwnNamed (%UnboxObjectLike holder) key) object value strict)))))
+      (if (%Lt attrs 8)
+          (JsSetFail value strict (%Box "Cannot assign to read only property"))
+          (JsCallSetter (%PropLoadOwnNamed (%UnboxObjectLike object) key) object value strict))))
+
+;; A failed [[Set]]: PutValue throws in strict code (§6.2.5.6 step 5.d) and completes normally
+;; with the assigned value otherwise.
+(builtin JsSetFail :transitioning true :noinline true :throws true
+  :params [(value dyn) (strict int) (message dyn)] :ret dyn
+  (if (%Eq strict 1)
+      (JsThrowTypeError message)
+      value))
+
+;; CreateDataProperty with attributes on a proven raw object: the image builder's `prototype`,
+;; a class's methods.
+(macro JsCreateDataPropertyAttrs :transitioning true
+  :params [(object obj) (key int) (value dyn) (attrs int)] :ret obj
+  (let [(stored (%PropStoreOwnNamedAttrs object key value attrs))]
+    object))
 
 ; Object-literal PropertyDefinition evaluates against a freshly allocated, proven raw object.
 ; Keeping this distinct from the JavaScript-visible guarded Set path preserves precise memory

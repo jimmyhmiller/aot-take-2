@@ -172,7 +172,7 @@ aot-take-2/
 │   │   ├── fun.coil         ; funptr, tuple, RPC
 │   │   └── dyn.coil         ; ✦ the dynamic tag axis, shape sets, the JS string type
 │   │
-│   ├── shape.coil           ; ✦ the shape transition tree; alias classes at the introducing edge
+│   ├── shape.coil           ; ✦ the shape transition tree; alias classes and property attributes at the introducing edge; extensibility as a marker edge
 │   ├── heap.coil            ; ✦ the static heap image: the realm's initial objects and string literals as data (`__aot_heap`)
 │   ├── facts.coil           ; ✦ closed-world facts about image objects: escaped, written (entry, key), prototype writes
 │   │
