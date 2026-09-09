@@ -39,11 +39,11 @@ fixes recorded in §6.
 | Cast moves | 612 | 0 | 0 |
 | Split copies | 578 | 1,615 (every value that crosses a call now takes a slot) | |
 | Allocation rounds | 8 | 5 | ≤ 3 |
-| Register allocation | 526 ms | 59 ms | |
-| Stack maps and encoding | 205 ms | 31 ms | |
-| Global code motion | 179 ms | 16 ms | |
-| Optimizer (iter + opto) | 400 ms | 185 ms | |
-| User time | 1.30 s | 0.31 s | < 0.1 s |
+| Register allocation | 526 ms | 50 ms | |
+| Stack maps and encoding | 205 ms | 27 ms | |
+| Global code motion | 179 ms | 8 ms | |
+| Optimizer (iter + opto) | 400 ms | 170 ms | |
+| User time | 1.30 s | 0.28 s | < 0.1 s |
 
 The volume rows are unchanged because they are the front end's (§4, §5); the time rows are what
 the backend corrections bought.
@@ -225,6 +225,10 @@ Measured and fixed while landing the above (each was a constant factor Simple do
   read accessors of the arena do not re-check boot; env flags are read once.
 - The allocator's per-block live set and the block schedules are per-block lists, not hash maps
   or one flat array shifted on every insertion.
+- The owning Fun of a control node is a memoized dominator walk (`cfg-owner-fun`), shared by the
+  self-recursion check, GCM's global splitting and frame finalization; the version guarding the idom
+  and owner caches bumps only on control-edge edits (a merge's paths, any node's input 0), not on
+  data-input rewires, and a kill is tolerated by a liveness check instead of a bump.
 - Three splitter rules Simple does not need under kill-all: a union's representative definition
   prefers a fixed-register endpoint (Simple's `LRG.union`), a rematerializable constant is never
   cloned into a Phi arm whose range lives on the stack, and a range emptied by a kill with no fixed

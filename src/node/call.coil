@@ -1473,6 +1473,9 @@
         n (ty-sig-nargs sig)
         (mut i) 0
         (mut evidence) false]
+    ;; The tiny-body test first, then the arguments in order, depending on each one that is not
+    ;; yet sharper than its formal. Measured on the harness realm: this order reaches the inline
+    ;; fixpoint fastest (the retries it registers sharpen sites earlier than the alternatives).
     (if (and (= (call-nargs c) n) (<= (fun-live-body-size fun) INLINE-TINY-SIZE))
         (set! (mut evidence) true)
         0)
@@ -1561,83 +1564,6 @@
 ;; FunPtr can be visible one turn before its Call has become a Fun input. Inspecting the Fun's sparse
 ;; FunPtr outputs closes that ordering window without scanning the arena or inventing a second call
 ;; graph. Once linked, the first loop remains the authoritative Simple path.
-;; Arena-indexed marks for the control-ownership walk, process-wide scratch grown to the arena once
-;; and cleared through the ids a walk set; a fresh arena-sized map per walk, per candidate check,
-;; was the largest single cost of a compile.
-(defstruct ControlOwnedScratch
-  [(seen (ArrayList bool)) (touched (ArrayList i64)) (booted bool)])
-
-(defn control-owned-scratch [] (-> (ptr ControlOwnedScratch))
-  (primitive/alloc-static ControlOwnedScratch))
-
-(defn fun--control-owned? [(f (dyn NodeOps)) (start (dyn NodeOps))] (-> bool)
-  (let [a (alloc/malloc-allocator)
-        s (control-owned-scratch)
-        limit (+ (arena-node-count) 1)
-        (mut work) (al-new [(dyn NodeOps)] a)
-        (mut yes) false]
-    (if (.booted s)
-        0
-        (do
-          (set! (.seen s) (al-new [bool] a))
-          (set! (.touched s) (al-new [i64] a))
-          (set! (.booted s) true)
-          0))
-    (do
-      (loop (if (>= (len (.seen s)) limit)
-                (break 0)
-                (do (push! [bool] (mut (.seen s)) false) (continue))))
-      (push! [(dyn NodeOps)] (mut work) start)
-      (loop (if (or (= (len (load work)) 0) (load yes))
-                (break 0)
-                (match (pop! (mut work))
-                  (None [] (break 0))
-                  (Some [n]
-                        (let [id (n-nid n)]
-                          (if (or (<= id 0) (>= id limit) (get (.seen s) id))
-                              0
-                              (do
-                                (set! (mut (.seen s)) id true)
-                                (push! [i64] (mut (.touched s)) id)
-                                (if (n-same? n f)
-                                    (set! (mut yes) true)
-                                    (if (= (n-op n) OP-FUN)
-                                        0
-                                        ;; This is control ownership, not arbitrary graph reachability.
-                                        ;; Simple's recursion guard walks the caller's dominators. A
-                                        ;; CallEnd also references its callee Return; following that
-                                        ;; edge misclassifies two sequential calls as self-recursion.
-                                        ;; Before dominators settle, visit all Region predecessors but
-                                        ;; only input zero of other control nodes (CallEnd -> Call).
-                                        (let [merge
-                                                (or (= (n-op n) OP-REGION)
-                                                    (= (n-op n) OP-LOOP))
-                                              limit
-                                                (if merge
-                                                    (n-nins n)
-                                                    (if (> (n-nins n) 0) 1 0))
-                                              (mut input) (if merge 1 0)]
-                                          (loop (if (>= (load input) limit)
-                                                    (break 0)
-                                                    (do
-                                                      (match (n-in n
-                                                                   (load input))
-                                                        (Some [def]
-                                                              (push! [(dyn NodeOps)]
-                                                                     (mut work)
-                                                                     def))
-                                                        (None [] 0))
-                                                      (set! (mut input)
-                                                            (+ (load input) 1))
-                                                      (continue)))))))))
-                          (continue))))))
-      (al-free! [(dyn NodeOps)] (mut work))
-      (al-for [id (.touched s)] (set! (mut (.seen s)) id false))
-      (al-clear! [i64] (mut (.touched s)))
-      (load yes))))
-
-;; Memoized per inlining epoch (see `fun-size-epoch`): every deferred candidate asks each round, and
-;; the answer only changes when the graph does.
 (defn fun-self-recursive? [(f (dyn NodeOps))] (-> bool)
   (let [p (primitive/cast (ptr FunNode) (hdr f))
         epoch (+ (load (fun-size-epoch)) 1)]
@@ -1683,10 +1609,9 @@
                                           (match (n-out fp (load oi))
                                             (Some [use_]
                                                   (if (= (n-op use_) OP-CALL)
-                                                      (if (fun--control-owned? f
-                                                                               (call-ctrl use_))
-                                                          (set! (mut yes) true)
-                                                          0)
+                                                      (match (cfg-owner-fun (call-ctrl use_) (primitive/fnptr-of call--fun-op?))
+                                                        (Some [owner] (if (n-same? owner f) (set! (mut yes) true) 0))
+                                                        (None [] 0))
                                                       0))
                                             (None [] 0))
                                           (set! (mut oi) (+ (load oi) 1))
@@ -1697,25 +1622,14 @@
                 (continue))))
     (load yes)))
 
-;; Is `ce` inside `f`'s body? Walks the dominator chain up looking for the Fun.
+;; Is `ce` inside `f`'s body? The owning Fun of its control (memoized dominator walk).
+(defn call--fun-op? [(n (dyn NodeOps))] (-> bool)
+  (= (n-op n) OP-FUN))
+
 (defn fun--reaches? [(f (dyn NodeOps)) (ce (dyn NodeOps))] (-> bool)
-  (let [(mut cur) (Some ce)
-        (mut yes) false
-        (mut guard) 0]
-    (loop (if (> (load guard) 100000)
-              (do
-                (broken "fun--reaches?: dominator walk did not converge")
-                (break 0))
-              (match (load cur)
-                (None [] (break 0))
-                (Some [n]
-                      (if (n-same? n f)
-                          (do (set! (mut yes) true) (break 0))
-                          (do
-                            (set! (mut cur) (cfg-idom-of n))
-                            (set! (mut guard) (+ (load guard) 1))
-                            (continue)))))))
-    (load yes)))
+  (match (cfg-owner-fun ce (primitive/fnptr-of call--fun-op?))
+    (Some [owner] (n-same? owner f))
+    (None [] false)))
 
 ;; Does every argument's type `isa` its formal? Depends on any that does not yet, so the candidate is
 ;; retried when it sharpens.

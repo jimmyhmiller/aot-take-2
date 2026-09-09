@@ -107,7 +107,16 @@ per-case compile time is what to fix. Never edit `jsl/` or run `coil build` duri
 AOT_T262_SAMPLE=20 AOT_T262_JOBS=8 coil run tools/test262.coil -- run /Users/jimmyhmiller/Documents/Code/open-source/test262 ./build/aot-test262-compiler build/release/aot-runtime.o build/test262-sample-YYYYMMDD
 ```
 
-## Latest measured campaign, 2026-09-08 (sampled)
+## Latest measured campaign, 2026-09-08 (sampled, after the compile-time architecture)
+
+With static string literals, all-caller-save frames, direct split insertion and the other
+corrections of docs/COMPILE-TIME.md, the same 1-in-20 sample (2,680 files, 8 workers) ran in
+**4m13s** (from 8m50s) and measured **262 / 2,680 files passing (9.77%)**: verdict-pass 498,
+verdict-fail 1,025, verdict-unsupported 3,498, verdict-compiler-error 113, verdict-timeout 4. The
+four timeouts are run-stage (each case compiles in under 50 ms standalone and linked; the executable
+exceeds the 2 s run deadline), so they are runtime hangs to investigate, not compile time.
+
+## Earlier measured campaign, 2026-09-08 (sampled)
 
 After strict mode, intrinsics, keyed access, TypeError objects and `finally`, a 1-in-20 sample
 (2,680 files, 8 workers, 8m50s) measured **259 / 2,680 files passing (9.66%)**, up from 7.88% on
