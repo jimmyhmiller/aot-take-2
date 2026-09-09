@@ -113,9 +113,12 @@ name (a runtime refusal in both modes).
 ### 2026-09-08 — Standard globals
 
 `Object`, `String`, `Number`, `Boolean`, `Error`, `TypeError`, `RangeError`, `SyntaxError`,
-`ReferenceError`, `EvalError`, `URIError` and `Array` exist as intrinsics (docs/DECISIONS.md, standard
-globals; arrays) when a program names them. Missing: every other global (`Math`, `JSON`,
-`Function`, `Symbol`, `parseInt`, `isNaN`, …, still refused by name at run time); prototype
+`ReferenceError`, `EvalError`, `URIError`, `Array`, `Math`, `isNaN`, `isFinite`, `parseInt` and
+`parseFloat` exist as intrinsics (docs/DECISIONS.md, standard globals; arrays; Math and the number
+globals) when a program names them. `Math.max`, `Math.min` and `Math.hypot` see four arguments at
+most and read an `undefined` argument as absent (`Math.max(1, undefined)` is 1, not NaN); every
+built-in function carries a `prototype` object it should not (§10.2.4). Missing: every other global
+(`JSON`, `Symbol`, `Date`, `RegExp`, `Reflect`, …, still refused by name at run time); prototype
 methods other than `Array.prototype`'s (`Object.prototype.toString`/`hasOwnProperty`,
 `Error.prototype.toString`, `String.prototype.*`) — the intrinsic table carries methods now, so
 each is a JSL definition away; wrapper objects (`new String(x)`,
@@ -241,7 +244,7 @@ every tag either to a conversion or to a named runtime refusal (`aot_rt_unimplem
 for objects, `..._to_string` for concatenation with a non-string, `..._string_to_number`, a
 TypeError for Symbol), so programs whose operands the compiler cannot type still compile and only
 the unimplemented conversion refuses when actually reached. ToPrimitive, ToString of numbers and
-ToPrimitive is the conversion still to write (StringToNumber runs in the runtime through `%StringToNumber`, `aot.rt.number`; `parseInt`/`parseFloat` do not exist yet).
+ToPrimitive is the conversion still to write (StringToNumber, parseInt and parseFloat run in the runtime through `%StringToNumber`, `%ParseInt` and `%ParseFloat`, `aot.rt.number`).
 
 ### 2026-09-08 — Property access as a node, the runtime shape tree, and the graph-size budgets
 

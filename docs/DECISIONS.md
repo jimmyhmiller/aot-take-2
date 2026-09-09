@@ -1,5 +1,42 @@
 # Decisions
 
+## 2026-09-09 — Math and the number globals are image data over a libm-backed runtime table
+
+`Math` is an ordinary object (§21.3) with function-valued properties and eight binary64
+constants; `isNaN`, `isFinite`, `parseInt` and `parseFloat` are plain global functions (§19.2).
+The 1-in-20 campaign refused 28 cases by the name `Math` and 16 by the names of the four
+functions.
+
+**Decision.** The intrinsic table gains a *namespace* kind (`intrinsic-namespace`): an object of
+the realm image on %Object.prototype%, bound as a global, carrying the methods the table lists for
+it under `INTRINSIC-TARGET-NAMESPACE` — each a hoisted JSL builtin compiled into the program when
+the program names it as a member, exactly as a prototype method is. Its value properties are
+image words (`realm-image-math-constants!`), so `Math.PI` folds to a constant under the
+closed-world facts, and `image-word-node` now knows a binary64 word (any prefix outside the tag
+range, the canonical NaN included). The four functions are constructor-shaped intrinsics whose
+bodies throw a TypeError when constructed.
+
+The functions themselves are one runtime table, not one primitive each: `%MathUnary op x` and
+`%MathBinary op x y` (`JS-MATH-UNARY`, `JS-MATH-BINARY`) take an operation code and Number
+words and return a Number word; `aot.rt.number` maps the code to the libm function through Coil
+`extern` declarations (`sqrt`, `sin`, …, `hypot`), and writes out the cases where the
+specification departs from C: `Math.round` rounds ties toward +∞ and keeps -0 for −0.5 ≤ x < 0
+(C `round` rounds away from zero); `Number::exponentiate` makes any NaN exponent NaN and ±1 to ±∞
+NaN (C `pow` gives 1). `Math.random` draws 53 bits from `arc4random`. `abs`, `sign`, `max` and
+`min` are JSL arithmetic, with the +0/-0 order told apart by a division. `parseInt` and
+`parseFloat` are their own grammars in `aot.rt.number` over code units (`%ParseInt`, `%ParseFloat`):
+the longest digit run below the radix and the longest StrDecimalLiteral prefix, with the radix-10
+value handed to `strtod` for correct rounding. The per-function primitive ids the table had
+reserved (`JS-SQRT` … `JS-ROUND`) are gone: a primitive is a machine or runtime *capability*, and
+the capability here is "call the libm table".
+
+**What the four ABI slots cost.** `Math.max`, `Math.min` and `Math.hypot` see at most four
+arguments, and an argument that arrived as `undefined` is indistinguishable from an absent one,
+so `Math.max(1, undefined)` is 1 where the specification says NaN (docs/GAPS.md, standard
+globals). Every builtin function in the image, these included, carries a `prototype` object it
+should not have (§10.2.4 gives none to built-in functions); the layout treats every hoisted
+function alike.
+
 ## 2026-09-09 — Image object property reads fold under closed-world facts
 
 The realm's initial objects are image data (the realm image, below), so their properties are

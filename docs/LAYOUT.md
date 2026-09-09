@@ -145,13 +145,14 @@ aot-take-2/
 │   ├── object-layouts.jsl
 │   └── abstract/ array/ string/ object/ json/ math/ number/ symbol/ compiler/
 │       └── compiler/{add,sub,mul,increment-int-or-identity,logical,…,array,string-methods,
-│           ;          function-methods,object-methods,number-methods}.jsl
+│           ;          function-methods,object-methods,number-methods,math}.jsl
 │           ; the production index (`compiler/index`): every operation the frontend lowers to,
 │           ; built on demand per compile; array.jsl is the Array intrinsic and its methods,
 │           ; string-methods.jsl String.prototype and String.fromCharCode over primitive strings,
 │           ; function-methods.jsl Function.prototype.call/apply (and the Function constructor's
 │           ; refusal), object-methods.jsl Object's statics and Object.prototype,
-│           ; number-methods.jsl Number.prototype and Boolean.prototype
+│           ; number-methods.jsl Number.prototype and Boolean.prototype,
+│           ; math.jsl the Math object and isNaN/isFinite/parseInt/parseFloat
 │       function/ array-buffer/ data-view/ typed-array/
 ├── src/
 │   ├── main.coil            ; CLI driver: compile, emit, run, dump; `AOT_SEED=N` compiles under a test's arena seed
@@ -235,7 +236,7 @@ aot-take-2/
 │   │   └── decls.coil       ; (intrinsic …), (internal-slot …), (slot-list …)
 │   │
 │   ├── rt/                  ; the runtime, in Coil, built as its own object (Coil.toml `runtime`)
-│   │   ├── number.coil      ; Number conversions shared by compiler and runtime: exact radix integers, `strtod` decimals, StringToNumber, the NaN-box word
+│   │   ├── number.coil      ; Number conversions shared by compiler and runtime: exact radix integers, `strtod` decimals, StringToNumber, parseInt/parseFloat, the NaN-box word; the libm-backed Math table
 │   │   ├── abi.coil         ; RtHeap layout + folded field offsets shared with the encoders
 │   │   ├── shapes.coil      ; the runtime shape tree: static `__aot_shapes` blob + runtime transitions
 │   │   └── rt.coil          ; allocation, generational collector, the static heap image as a root region, strings, generic property access, throw entry points
