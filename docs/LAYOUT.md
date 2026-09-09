@@ -134,6 +134,7 @@ aot-take-2/
 │   ├── DESIGN.md        ; the pipeline, the lattice, memory, the GC contract, the backend
 │   ├── DECISIONS.md     ; law: load-bearing choices with their reasoning
 │   ├── BACKEND.md       ; backend consumer assumptions and their ideal-graph producers
+│   ├── COMPILE-TIME.md  ; what a compile may cost: graph shape, frame model, budgets, the road
 │   ├── GAPS.md          ; complete inventory of absent and partial implementation
 │   ├── TEST262.md       ; pinned conformance campaign, denominator and runner contract
 │   ├── JSL.md           ; the runtime-library language

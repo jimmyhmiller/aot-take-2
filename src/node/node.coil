@@ -215,11 +215,16 @@
 ;; The runtime heap-state record's address: a host pointer the process entry pins in a register.
 (const OP-HEAPSTATE 114)
 
+;; A string literal as immutable data in the object file (aot.node.dynamic).
+(const OP-STRCONST 115)
+
 ;; -- selected machine graph --
 ;; Machine families retain their ideal opcode as payload.  These coarse tags make it impossible to
 ;; mistake a selected node for an ideal node while walking the post-selection graph.
 (const OP-MACH-SCALAR 200)
+
 (const OP-MACH-MEM 201)
+
 (const OP-MACH-CFG 202)
 
 (const OP-MACH-CALL 203)
@@ -246,6 +251,10 @@
    (deps (ArrayList (Option (dyn NodeOps))))  ; far-field peephole dependents
    (idepth i64)  ; cached dominator-tree depth; valid only at `idepth-ver`
    (idepth-ver i64)
+   ;; A Region's cached immediate dominator (0 = none); valid only at `idom-ver`, the control
+   ;; edit version. See the control-version section.
+   (idom-nid i64)
+   (idom-ver i64)
    ;; Backend CFG metadata. `ltree-head` names the innermost containing loop head; the loop head's
    ;; own header stores its enclosing loop in `ltree-parent`. Start is the root loop head.
    (ltree-head i64)
@@ -326,8 +335,12 @@
    (work WorkList)
    (inline-work WorkList)  ; Simple's second worklist, of CallEnd nodes
    (deferred (ArrayList i64))  ; candidates that answered DEFER, retried after any inline fires
+   ;; Every (dep, watcher) pair currently in some node's `deps`, so adding one is a lookup and not
+   ;; a scan of the dep's lists: a Fun watched by hundreds of CallEnds made that scan half of Opto.
+   (dep-pairs (HashMap i64 bool))
    (mid-assert bool)  ; true while an expensive assert is running: no side effects allowed
-   (ctrl-version i64)  ; bumped by any control mutation; invalidates every derived table at once
+   (ctrl-version i64)  ; bumped at inlining and phase boundaries; guards the idepth cache
+   (cfg-edit-version i64)  ; bumped by every control-node edge edit; guards the region idom cache
    (next-fidx i64)  ; compilation-local function identity; inline clones reserve from this space
    (function-nids (ArrayList i64))  ; fidx -> owner nid; metadata, not a liveness edge
    (source-lo i64)  ; active parser range inherited by newly constructed nodes
@@ -343,14 +356,16 @@
         0
         (let [a (alloc/malloc-allocator)]
           (set! (.nodes t) (al-new [(Option (dyn NodeOps))] a))
-          (set! (.gvn-index t) (hm-new-scalar [i64 i64] a))
+          (set! (.gvn-index t) (hm-new [i64 i64] a (i64-keyops)))
           (set! (.gvn-next t) (al-new [i64] a))
           (set! (.work t) (wl-new 1))
           (set! (.inline-work t) (wl-new 1))
           (set! (.deferred t) (al-new [i64] a))
+          (set! (.dep-pairs t) (hm-new [i64 bool] a (i64-keyops)))
           (set! (.next-nid t) 1)
           (set! (.mid-assert t) false)
           (set! (.ctrl-version t) 1)
+          (set! (.cfg-edit-version t) 1)
           (set! (.next-fidx t) 0)
           (set! (.function-nids t) (al-new [i64] a))
           (set! (.source-lo t) -1)
@@ -372,11 +387,14 @@
     (let [t (arena)
           a (alloc/malloc-allocator)]
       (set! (.nodes t) (al-new [(Option (dyn NodeOps))] a))
-      (set! (.gvn-index t) (hm-new-scalar [i64 i64] a))
+      (set! (.gvn-index t) (hm-new [i64 i64] a (i64-keyops)))
       (set! (.gvn-next t) (al-new [i64] a))
       (set! (.work t) (wl-new seed))
       (set! (.inline-work t) (wl-new seed))
       (set! (.deferred t) (al-new [i64] a))
+      (set! (.dep-pairs t) (hm-new [i64 bool] a (i64-keyops)))
+      (set! (.ctrl-version t) 1)
+      (set! (.cfg-edit-version t) 1)
       (set! (.next-nid t) 1)
       (set! (.next-fidx t) 0)
       (set! (.function-nids t) (al-new [i64] a))
@@ -411,13 +429,16 @@
 (defn arena-register-function! [(fidx i64) (fun (dyn NodeOps))] (-> i64)
   (do
     (reserve-fidx! fidx)
-    (if (!= (n-op fun) OP-FUN) (panic "arena-register-function!: owner is not a Fun") 0)
+    (if (!= (n-op fun) OP-FUN)
+        (panic "arena-register-function!: owner is not a Fun")
+        0)
     (loop (if (> (len (.function-nids (arena))) fidx)
               (break 0)
               (do (push! [i64] (mut (.function-nids (arena))) 0) (continue))))
     (let [prior (get (.function-nids (arena)) fidx)]
       (if (and (!= prior 0) (!= prior (n-nid fun)))
-          (panic-i "arena-register-function!: conflicting owner for function index" fidx)
+          (panic-i "arena-register-function!: conflicting owner for function index"
+                   fidx)
           (set! (mut (.function-nids (arena))) fidx (n-nid fun))))))
 
 (defn arena-function [(fidx i64)] (-> (Option (dyn NodeOps)))
@@ -427,13 +448,13 @@
         (None [(dyn NodeOps)])
         (arena-node (get (.function-nids (arena)) fidx)))))
 
+;; Read accessors do not boot: an unbooted arena has no nodes, count zero, and version zero.
 (defn arena-node-count [] (-> i64)
-  (do (arena-boot!) (- (.next-nid (arena)) 1)))
+  (let [t (arena)] (if (.booted t) (- (.next-nid t) 1) 0)))
 
 ;; The node with this nid, or None if it was never made.
 (defn arena-node [(id i64)] (-> (Option (dyn NodeOps)))
   (do
-    (arena-boot!)
     (if (or (<= id 0) (>= id (len (.nodes (arena)))))
         (None)
         (get (.nodes (arena)) id))))
@@ -629,7 +650,8 @@
                       (break 0)
                       (do
                         (match (n-out n (load oi))
-                          (Some [use_] (do (println "  used by: {s}" (n-text use_)) 0))
+                          (Some [use_]
+                                (do (println "  used by: {s}" (n-text use_)) 0))
                           (None [] 0))
                         (set! (mut oi) (+ (load oi) 1))
                         (continue)))))
@@ -683,12 +705,17 @@
                       (break 0)
                       (do
                         (match (n-in n (load i))
-                          (Some [v] (do (sb-push-str! (mut b) " #") (sb-push-i64! (mut b) (.nid (hdr v)))))
+                          (Some [v]
+                                (do
+                                  (sb-push-str! (mut b) " #")
+                                  (sb-push-i64! (mut b) (.nid (hdr v)))))
                           (None [] (sb-push-str! (mut b) " _")))
                         (set! (mut i) (+ (load i) 1))
                         (continue)))))
           (if (!= (n-block-nid n) 0)
-              (do (sb-push-str! (mut b) " @") (sb-push-i64! (mut b) (n-block-nid n)))
+              (do
+                (sb-push-str! (mut b) " @")
+                (sb-push-i64! (mut b) (n-block-nid n)))
               0)
           ;; After allocation: the assigned location as a raw machine-neutral number. Numbers past
           ;; the target's register file are stack slots.
@@ -726,7 +753,10 @@
                   (match (n-in n (load i))
                     (Some [v]
                           (do
-                            (p--str "\n  in") (p--int (load i)) (p--str ": ") (p--str (n-text v))
+                            (p--str "\n  in")
+                            (p--int (load i))
+                            (p--str ": ")
+                            (p--str (n-text v))
                             ;; A memory merge's slices are what a memory node really reads.
                             (if (= (n-op v) OP-MEMMERGE)
                                 (let [(mut j) 1]
@@ -734,7 +764,12 @@
                                             (break 0)
                                             (do
                                               (match (n-in v (load j))
-                                                (Some [s] (do (p--str "\n      slice ") (p--int (load j)) (p--str ": ") (p--str (n-text s))))
+                                                (Some [s]
+                                                      (do
+                                                        (p--str "\n      slice ")
+                                                        (p--int (load j))
+                                                        (p--str ": ")
+                                                        (p--str (n-text s))))
                                                 (None [] 0))
                                               (set! (mut j) (+ (load j) 1))
                                               (continue)))))
@@ -764,7 +799,8 @@
         (do
           (if (and (!= old TY-INVALID) (not (ty-isa? t old)))
               (let [(mut b) (sb-new (alloc/malloc-allocator))]
-                (sb-push-str! (mut b) "n-set-ty!: monotonicity violated: new type ")
+                (sb-push-str! (mut b)
+                              "n-set-ty!: monotonicity violated: new type ")
                 (ty-text-into! (mut b) t)
                 (sb-push-str! (mut b) " is not at least as specific as old ")
                 (ty-text-into! (mut b) old)
@@ -772,8 +808,9 @@
               0)
           ;; `AOT_TRACE_TOP=1`: narrate a Store or Load whose type rises to TOP — the transient
           ;; that later monotonicity violations fall from.
-          (if (and (ty-high? t) (or (= (n-op n) OP-STORE) (= (n-op n) OP-LOAD))
-                   (!= (primitive/cast i64 (os/getenv c"AOT_TRACE_TOP")) 0))
+          (if (and (ty-high? t)
+                   (or (= (n-op n) OP-STORE) (= (n-op n) OP-LOAD))
+                   (trace-top?))
               (let [(mut i) 0]
                 (p--str "\ntrace-top: ")
                 (p--str (n-text n))
@@ -781,7 +818,12 @@
                           (break 0)
                           (do
                             (match (n-in n (load i))
-                              (Some [v] (do (p--str "\n    in") (p--int (load i)) (p--str ": ") (p--str (n-text v))))
+                              (Some [v]
+                                    (do
+                                      (p--str "\n    in")
+                                      (p--int (load i))
+                                      (p--str ": ")
+                                      (p--str (n-text v))))
                               (None [] 0))
                             (set! (mut i) (+ (load i) 1))
                             (continue))))
@@ -799,8 +841,12 @@
     (if (and (!= t TY-INVALID)
              (ty-high? t)
              (or (= (n-op n) OP-STORE) (= (n-op n) OP-LOAD))
-             (!= (primitive/cast i64 (os/getenv c"AOT_TRACE_TOP")) 0))
-        (do (p--str "\ntrace-top (forced): ") (p--str (n-text n)) (p--str "\n") 0)
+             (trace-top?))
+        (do
+          (p--str "\ntrace-top (forced): ")
+          (p--str (n-text n))
+          (p--str "\n")
+          0)
         0)
     (set! (.ty (hdr n)) t)
     0))
@@ -822,7 +868,9 @@
               (do
                 (set! (mut h)
                       (^ (^ (* (load h) 31) (primitive/ishl (load h) 7))
-                         (match (n-in n (load i)) (Some [v] (n-nid v)) (None [] 0))))
+                         (match (n-in n (load i))
+                           (Some [v] (n-nid v))
+                           (None [] 0))))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
     (let [x (^ (load h) (hash-extra n))]
@@ -846,7 +894,8 @@
             (loop (if (or (>= (load i) cnt) (not (load same)))
                       (break 0)
                       (do
-                        (if (not (edge-same? (n-in a (load i)) (n-in b (load i))))
+                        (if (not (edge-same? (n-in a (load i))
+                                             (n-in b (load i))))
                             (set! (mut same) false)
                             0)
                         (set! (mut i) (+ (load i) 1))
@@ -881,7 +930,8 @@
   (do
     (arena-boot!)
     (let [h (n-gvn-hash n)
-          (mut cur) (match (get (.gvn-index (arena)) h) (Some [v] v) (None [] 0))
+          (mut cur)
+            (match (get (.gvn-index (arena)) h) (Some [v] v) (None [] 0))
           (mut found) (None [(dyn NodeOps)])]
       (loop (if (= (load cur) 0)
                 (break 0)
@@ -924,8 +974,13 @@
                 (loop (if (= (load prev) 0)
                           (break 0)
                           (if (= (arena--gvn-next (load prev)) id)
-                              (do (arena--set-gvn-next! (load prev) (arena--gvn-next id)) (break 0))
-                              (do (set! (mut prev) (arena--gvn-next (load prev))) (continue)))))
+                              (do
+                                (arena--set-gvn-next! (load prev)
+                                                      (arena--gvn-next id))
+                                (break 0))
+                              (do
+                                (set! (mut prev) (arena--gvn-next (load prev)))
+                                (continue)))))
                 0))
           (arena--set-gvn-next! id 0)
           (set! (.hash (hdr n)) 0)
@@ -939,19 +994,44 @@
 ;;
 ;; Only registers a dependency at least one step away: an immediate input or output is already
 ;; re-queued by ordinary edge bookkeeping, so recording it as well is pure overhead.
+;; `AOT_TRACE_TOP=1`, read once.
+(defstruct TraceTopFlag [(state i64)])
+
+(defn trace-top? [] (-> bool)
+  (let [f (primitive/alloc-static TraceTopFlag)]
+    (if (= (.state f) 0)
+        (set! (.state f) (if (!= (primitive/cast i64 (os/getenv c"AOT_TRACE_TOP")) 0) 1 2))
+        0)
+    (= (.state f) 1)))
+
+;; The key of a (dep, watcher) pair in the arena's dependency set. The pair is packed into one word
+;; and then mixed by a bijection (odd multiply, xor-shift): the set hashes integer keys by value, and
+;; unmixed packed keys share their low bits whenever they share a watcher, which put every pair a
+;; watcher registers into one probe chain.
+(defn n-dep-key [(dep (dyn NodeOps)) (watcher (dyn NodeOps))] (-> i64)
+  (let [packed (+ (primitive/ishl (n-nid dep) 32) (n-nid watcher))
+        m (primitive/imul packed -7046029254386353131)]
+    (primitive/ixor m (primitive/iand (primitive/ishr m 31) 0x1ffffffff))))
+
 (defn n-add-dep! [(dep (dyn NodeOps)) (watcher (dyn NodeOps))] (-> i64)
   (if (.mid-assert (arena))
       ;; An expensive assert re-runs peepholes and must have no side effects.
       0
-      (if (n-has? (.deps (hdr dep)) watcher)
-          0
-          (if (n-has? (.outs (hdr dep)) watcher)
-              0
-              (if (n-has? (.ins (hdr dep)) watcher)
-                  0  ; immediate neighbour: ordinary bookkeeping already covers it
-                  (do
-                    (push! [(Option (dyn NodeOps))] (mut (.deps (hdr dep))) (Some watcher))
-                    0))))))
+      (let [key (n-dep-key dep watcher)]
+        ;; Simple skips both immediate neighbours, whose ordinary edges already requeue the
+        ;; watcher: the watched node as an input of the watcher, and the watcher as an input of the
+        ;; watched node. Both are input scans, bounded by arity; the pair set makes the duplicate
+        ;; check constant instead of a scan of the dependency list.
+        (if (or (hm-contains? (.dep-pairs (arena)) key)
+                (n-has? (.ins (hdr watcher)) dep)
+                (n-has? (.ins (hdr dep)) watcher))
+            0
+            (do
+              (set! (mut (.dep-pairs (arena))) key true)
+              (push! [(Option (dyn NodeOps))]
+                     (mut (.deps (hdr dep)))
+                     (Some watcher))
+              0)))))
 
 ;; Simple's `addDepForwards`: unlike `n-add-dep!`, retain a dependency even when the watched node
 ;; is an immediate INPUT of the watcher. Forward dataflow rules use this when ordinary output
@@ -960,11 +1040,16 @@
 (defn n-add-dep-forwards! [(dep (dyn NodeOps)) (watcher (dyn NodeOps))] (-> i64)
   (if (.mid-assert (arena))
       0
-      (if (or (n-has? (.deps (hdr dep)) watcher) (n-has? (.outs (hdr dep)) watcher))
-          0
-          (do
-            (push! [(Option (dyn NodeOps))] (mut (.deps (hdr dep))) (Some watcher))
-            0))))
+      (let [key (n-dep-key dep watcher)]
+        (if (or (hm-contains? (.dep-pairs (arena)) key)
+                (n-has? (.ins (hdr watcher)) dep))
+            0
+            (do
+              (set! (mut (.dep-pairs (arena))) key true)
+              (push! [(Option (dyn NodeOps))]
+                     (mut (.deps (hdr dep)))
+                     (Some watcher))
+              0)))))
 
 (defn n-has? [(l (ArrayList (Option (dyn NodeOps)))) (n (dyn NodeOps))] (-> bool)
   (let [cnt (len l)
@@ -987,7 +1072,14 @@
     (loop (if (>= (load i) cnt)
               (break 0)
               (do
-                (match (get (.deps (hdr n)) (load i)) (Some [v] (code-add! v)) (None [] 0))
+                (match (get (.deps (hdr n)) (load i))
+                  (Some [v]
+                        (do
+                          (hm-remove! [i64 bool]
+                                      (mut (.dep-pairs (arena)))
+                                      (n-dep-key n v))
+                          (code-add! v)))
+                  (None [] 0))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
     (al-clear! [(Option (dyn NodeOps))] (mut (.deps (hdr n))))
@@ -1017,14 +1109,18 @@
                   (Some [v]
                         (if (n-same? v use_)
                             (do
-                              (al-del-at! [(Option (dyn NodeOps))] (mut outs_) (load i))
+                              (al-del-at! [(Option (dyn NodeOps))]
+                                          (mut outs_)
+                                          (load i))
                               (set! (mut done) true)
                               0)
                             0))
                   (None [] 0))
                 (if (load done) 0 (set! (mut i) (+ (load i) 1)))
                 (continue))))
-    (if (load done) 0 (broken "n-del-use!: def-use edge missing for a use-def edge"))
+    (if (load done)
+        0
+        (broken "n-del-use!: def-use edge missing for a use-def edge"))
     (= (len (load outs_)) 0)))
 
 ;; Remove one bogus `keep` edge. Returns true if the outputs are now empty.
@@ -1040,18 +1136,23 @@
                   (Some [_] 0)
                   (None []
                         (do
-                          (al-del-at! [(Option (dyn NodeOps))] (mut outs_) (load i))
+                          (al-del-at! [(Option (dyn NodeOps))]
+                                      (mut outs_)
+                                      (load i))
                           (set! (mut done) true)
                           0)))
                 (if (load done) 0 (set! (mut i) (+ (load i) 1)))
                 (continue))))
-    (if (load done) 0 (broken "n-del-keep!: unkeep on a node that was not kept"))
+    (if (load done)
+        0
+        (broken "n-del-keep!: unkeep on a node that was not kept"))
     (= (len (load outs_)) 0)))
 
 ;; Append an input edge.
 (defn n-add-def! [(n (dyn NodeOps)) (d (Option (dyn NodeOps)))] (-> i64)
   (do
     (n-unlock! n)
+    (n-cfg-edited! n)
     (push! [(Option (dyn NodeOps))] (mut (.ins (hdr n))) d)
     (match d
       (Some [v] (do (n-add-use! v n) (n-source-merge! n v) 0))
@@ -1072,6 +1173,7 @@
             (if (edge-same? old d)
                 0
                 (do
+                  (n-cfg-edited! n)
                   (match d (Some [v] (n-add-use! v n)) (None [] 0))
                   (set! (mut ins_) i d)
                   (match old
@@ -1144,6 +1246,7 @@
 (defn n-del-def! [(n (dyn NodeOps)) (i i64)] (-> i64)
   (do
     (n-unlock! n)
+    (n-cfg-edited! n)
     (let [ins_ (field (hdr n) ins)
           old (get (load ins_) i)]
       (al-remove-at! [(Option (dyn NodeOps))] (mut ins_) i)
@@ -1194,6 +1297,7 @@
       (broken "n-kill!: killing a node that still has uses")
       (do
         (n-unlock! n)
+        (n-cfg-edited! n)
         (n-move-deps-to-worklist! n)
         (set! (.ty (hdr n)) TY-INVALID)  ; flag as dead
         (loop (if (= (n-nins n) 0)
@@ -1220,6 +1324,7 @@
         (Some [ctrl]
               (do
                 (n-unlock! n)
+                (n-cfg-edited! n)
                 (n-del-use-ordered! ctrl n)
                 (code-add! ctrl)
                 (set! (mut (.ins (hdr n))) 0 (None [(dyn NodeOps)]))
@@ -1238,7 +1343,9 @@
                   (Some [v]
                         (if (n-same? v use_)
                             (do
-                              (al-remove-at! [(Option (dyn NodeOps))] (mut outs_) (load i))
+                              (al-remove-at! [(Option (dyn NodeOps))]
+                                             (mut outs_)
+                                             (load i))
                               (set! (mut found) true)
                               0)
                             0))
@@ -1280,7 +1387,9 @@
 ;; Point ONE input of `u` that names `old` at `new_`.  The output list has one entry per use, so
 ;; `n-subsume!` calls this once per popped edge; replacing every duplicate at once would make the
 ;; next recorded edge fail its invariant check.
-(defn n-replace-input! [(u (dyn NodeOps)) (old (dyn NodeOps)) (new_ (dyn NodeOps))] (-> i64)
+(defn n-replace-input! [(u (dyn NodeOps))
+                        (old (dyn NodeOps))
+                        (new_ (dyn NodeOps))] (-> i64)
   (let [ins_ (field (hdr u) ins)
         cnt (len (load ins_))
         (mut i) 0
@@ -1291,12 +1400,17 @@
                 (match (get (load ins_) (load i))
                   (Some [v]
                         (if (n-same? v old)
-                            (do (set! (mut ins_) (load i) (Some new_)) (set! (mut hit) true) 0)
+                            (do
+                              (set! (mut ins_) (load i) (Some new_))
+                              (set! (mut hit) true)
+                              0)
                             0))
                   (None [] 0))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
-    (if (load hit) 0 (broken "n-replace-input!: user did not name the node it was an output of"))))
+    (if (load hit)
+        0
+        (broken "n-replace-input!: user did not name the node it was an output of"))))
 
 ;; ---------------------------------------------------------------------------
 ;; Node construction
@@ -1327,6 +1441,8 @@
     (set! (.deps h) (al-new [(Option (dyn NodeOps))] a))
     (set! (.idepth h) 0)
     (set! (.idepth-ver h) 0)
+    (set! (.idom-nid h) 0)
+    (set! (.idom-ver h) 0)
     (set! (.ltree-head h) 0)
     (set! (.ltree-parent h) 0)
     (set! (.ltree-depth h) 0)
@@ -1376,7 +1492,8 @@
   (let [old (n-ty n)
         now (compute n)]
     (n-set-ty! n now)
-    (if (and (and (not (is-const? n)) (not (no-const-fold? n))) (ty-high-or-const? now))
+    (if (and (and (not (is-const? n)) (not (no-const-fold? n)))
+             (ty-high-or-const? now))
         ;; Replace with a Constant. The Constant is peepholed, then this node is dead-code
         ;; eliminated against it.
         (Some (n-dead-code-elim! n (n-peephole! (n-make-constant now))))
@@ -1449,7 +1566,8 @@
               (break 0)
               (do
                 (match (n-in n (load i))
-                  (Some [v] (if (ty-constant? (n-ty v)) 0 (set! (mut all) false)))
+                  (Some [v]
+                        (if (ty-constant? (n-ty v)) 0 (set! (mut all) false)))
                   (None [] (do (set! (mut all) false) 0)))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
@@ -1474,20 +1592,104 @@
 ;; ---------------------------------------------------------------------------
 ;; The control-version counter, and the idepth cache it guards
 ;;
-;; Simple's `validIDepth` / `invalidateIDepthCaches`. Dominator depths are derived from the control
-;; subgraph, so ANY control mutation invalidates all of them at once. Simple bumps a global counter
-;; rather than tracking which nodes went stale — inlining in particular "blows all cache idepth
-;; fields past the inline point", and finding them individually is not worth it.
+;; Simple's `validIDepth` / `invalidateIDepthCaches`. Depths are computed lazily on first request
+;; and are valid through ordinary construction and peepholes: a new control node starts uncomputed,
+;; a Region's depth is one past its deepest input, and folding control away only shortens chains,
+;; which keeps every cached depth strictly decreasing along its dominator chain — all the parallel
+;; LCA walk needs. Simple bumps the version in exactly one place: inlining, which "blows all cache
+;; idepth fields past the inline point". We bump there (both inlining paths) and once at every phase
+;; boundary, after a bulk edit such as unlinking or selection is known to have finished.
 ;;
-;; A stale dominator does not crash. It schedules a node outside its own dominance region, which is
-;; a miscompile. So the cache is checked against the version on every read.
+;; Bumping on every control constructor or path edit is not more correct, only slower: during
+;; opto it emptied the cache many times per peephole round, and every dominator query recomputed
+;; whole chains (measured as most of opto's time on the test262 harness).
 (defn cfg-version [] (-> i64)
-  (do (arena-boot!) (.ctrl-version (arena))))
+  (.ctrl-version (arena)))
 
 (defn invalidate-cfg! [] (-> i64)
   (do
     (arena-boot!)
     (set! (.ctrl-version (arena)) (+ (.ctrl-version (arena)) 1))
+    (set! (.cfg-edit-version (arena)) (+ (.cfg-edit-version (arena)) 1))
+    0))
+
+;; ## The region idom cache and its own, finer version
+;;
+;; Simple does not cache a Region's idom: the LCA of its inputs is recomputed on every request,
+;; "linear in the size of the program". Our graphs are deeper (every JSL abstract operation is
+;; inlined control), and the two hot walks that ask for it — IfNode's dominating-test hunt and the
+;; enclosing-Fun search — ask for every Region on a chain, each of which re-walks the chains of its
+;; inputs, so one request was quadratic in the chain depth and opto spent most of its time there.
+;;
+;; A cached idom is a POINTER, so unlike a depth it cannot survive a control edit anywhere above:
+;; a rewired chain changes the LCA while the Region's own inputs are untouched. The cache is
+;; therefore guarded by `cfg-edit-version`, bumped by every edge edit or kill of a control node
+;; (`n-cfg-edited!`, asked through a hook the control module installs at boot, since node.coil
+;; cannot name control opcodes). Data-node edits, the overwhelming majority, leave it alone, so the
+;; cache survives across the many peepholes between two control changes.
+(defstruct CfgEditHook [(f (fnptr c [(ref (dyn NodeOps))] bool)) (set bool)])
+
+(defn cfg-edit-hook [] (-> (ptr CfgEditHook))
+  (primitive/alloc-static CfgEditHook))
+
+(defn set-cfg-edit-hook! [(f (fnptr c [(ref (dyn NodeOps))] bool))] (-> i64)
+  (do (set! (.f (cfg-edit-hook)) f) (set! (.set (cfg-edit-hook)) true) 0))
+
+(defn cfg-edit-version [] (-> i64)
+  (do (arena-boot!) (.cfg-edit-version (arena))))
+
+;; Whether an opcode is control, memoized per opcode: the hook's answer is a function of the
+;; opcode alone (a machine kind has one coarse opcode per node struct), and this is asked on every
+;; edge edit.
+(defstruct CfgOpMemo [(table (ArrayList i64)) (booted bool)])  ; per op: 0 unknown, 1 control, 2 not
+
+(defn cfg-op-memo [] (-> (ptr CfgOpMemo))
+  (let [t (primitive/alloc-static CfgOpMemo)]
+    (if (.booted t)
+        t
+        (do
+          (set! (.table t) (al-new [i64] (alloc/malloc-allocator)))
+          (loop (if (>= (len (.table t)) 512) (break 0) (do (push! [i64] (mut (.table t)) 0) (continue))))
+          (set! (.booted t) true)
+          t))))
+
+(defn n-cfg-op? [(n (dyn NodeOps))] (-> bool)
+  (let [op (n-op n)
+        memo (cfg-op-memo)]
+    (if (or (< op 0) (>= op 512))
+        (primitive/call-ptr (.f (cfg-edit-hook)) n)
+        (let [known (get (.table memo) op)]
+          (if (= known 0)
+              (let [answer (primitive/call-ptr (.f (cfg-edit-hook)) n)]
+                (set! (mut (.table memo)) op (if answer 1 2))
+                answer)
+              (= known 1))))))
+
+;; An edge of `n` is about to change (or `n` is dying). Control nodes bump the edit version.
+(defn n-cfg-edited! [(n (dyn NodeOps))] (-> i64)
+  (if (and (.set (cfg-edit-hook)) (n-cfg-op? n))
+      (do (set! (.cfg-edit-version (arena)) (+ (.cfg-edit-version (arena)) 1)) 0)
+      0))
+
+(defn n-idom-cache-valid? [(n (dyn NodeOps))] (-> bool)
+  (= (.idom-ver (hdr n)) (cfg-edit-version)))
+
+;; The cached idom; None when the cache says there is none. A dead cached node is a wiring bug
+;; (every kill bumps the version) and is reported rather than returned.
+(defn n-idom-cached [(n (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [id (.idom-nid (hdr n))]
+    (if (= id 0)
+        (None [(dyn NodeOps)])
+        (match (arena-node id)
+          (Some [d] (if (n-dead? d)
+                        (do (n-panic! "n-idom-cached: cached dominator is dead" n) (None [(dyn NodeOps)]))
+                        (Some d)))
+          (None [] (do (n-panic! "n-idom-cached: cached dominator was collected" n) (None [(dyn NodeOps)])))))))
+
+(defn n-set-idom-cache! [(n (dyn NodeOps)) (idom (Option (dyn NodeOps)))] (-> i64)
+  (do
+    (set! (.idom-nid (hdr n)) (match idom (Some [d] (n-nid d)) (None [] 0)))
+    (set! (.idom-ver (hdr n)) (cfg-edit-version))
     0))
 
 (defn n-idepth-valid? [(n (dyn NodeOps))] (-> bool)
@@ -1543,7 +1745,8 @@
 ;; Walk the connected graph in Simple's order: node, inputs, outputs. Cycles and duplicate edges
 ;; are visited once by nid. Return the first node accepted by `pred`, or None after full traversal.
 ;; The visited state is per call, so nested and consecutive walks cannot leak marks into each other.
-(defn n-walk-find [(root (dyn NodeOps)) (pred (fnptr c [(ref (dyn NodeOps))] bool))] (-> (Option (dyn NodeOps)))
+(defn n-walk-find [(root (dyn NodeOps))
+                   (pred (fnptr c [(ref (dyn NodeOps))] bool))] (-> (Option (dyn NodeOps)))
   (let [a (alloc/malloc-allocator)
         cnt (arena-node-count)
         (mut seen) (al-new [bool] a)
@@ -1578,7 +1781,8 @@
   (let [cnt (if inputs (n-nins n) (n-nouts n))
         (mut i) 0
         (mut answer) (None [(dyn NodeOps)])]
-    (loop (if (or (>= (load i) cnt) (match (load answer) (Some [_] true) (None [] false)))
+    (loop (if (or (>= (load i) cnt)
+                  (match (load answer) (Some [_] true) (None [] false)))
               (break 0)
               (do
                 (let [edge (if inputs (n-in n (load i)) (n-out n (load i)))]

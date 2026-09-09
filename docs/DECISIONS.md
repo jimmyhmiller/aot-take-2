@@ -1,5 +1,91 @@
 # Decisions
 
+## 2026-09-08 — The compile-time architecture: frames, exceptions, inlining evidence, and budgets
+
+Compiling the test262 harness realm (212 lines) produced 11,200 machine nodes, 3,246 blocks, eight
+allocation rounds and 1.3 s, after a session of pass-level fixes. docs/COMPILE-TIME.md holds the
+measurements, the precedent survey and the road; the four decisions are recorded here as law. Each
+supersedes an earlier entry where noted; until its milestone lands, the code it describes is a
+known divergence listed in docs/GAPS.md, not a silent one.
+
+1. **JavaScript frames preserve no registers.** Every Call, New, JSOP and Safepoint kills every
+   allocatable register for every live-range kind; a value live across one reaches a stack slot
+   through Simple's ordinary empty-mask splitting, and stack maps record slots only. CalleeSave
+   nodes exist in the process-entry wrapper alone. This is the HotSpot, V8, SpiderMonkey, Go and
+   OCaml model; Simple keeps AAPCS callee-saves only because it has no collector. Supersedes
+   "Managed-root split boundaries apply only to ranges a safepoint restricted" (2026-09-07),
+   "Boxed non-references get spill homes but are not roots" (2026-09-02, the kind distinction
+   survives only for what the map records) and "Moving-root stack boundaries extend the allocator
+   convergence budget" (2026-09-02): the budget returns to Simple's seven rounds.
+2. **A throwing call has an exceptional control projection.** The callee stores the thrown value
+   in the pending word and returns the exception sentinel, a reserved boxed word; CallEnd compares
+   the returned word and takes the exceptional CProj; a function without a handler returns the
+   sentinel. No load, compare, If and block per call site. The graph shape is HotSpot's Catch
+   projection and V8's IfException; the mechanism is SpiderMonkey's VM-call sentinel and can
+   become table unwinding without changing the graph. Supersedes the per-call check in
+   "Exceptions are a pending word and ordinary control flow" (2026-09-08); the pending word,
+   `finally`'s completion record and the Scope-merging jump to a catch target stand.
+3. **A JSL definition inlines only on evidence.** The candidate inlines when some argument type
+   is strictly sharper than its formal or the body is tiny; otherwise it defers with dependencies
+   on its arguments and, if nothing sharpens, stays a call to the shared out-of-line builtin the
+   runtime object carries. Source functions keep Simple's size rule. JSL is Torque-shaped and
+   Torque builtins are out of line; the engines inline only what feedback selects, and our
+   feedback is the SCCP type. Refines the inlining paragraph of docs/FRONTEND.md: Simple's rule
+   is complete for a language with no generic operations, and JSL bodies are generic by
+   construction.
+4. **Budgets are gates.** Machine nodes per source token, blocks per statement, Cast machine
+   nodes, CalleeSave count and allocation rounds are asserted by tests on the harness realm and
+   the fixture corpus; wall time has a coarse ceiling. Deterministic metrics gate and noisy ones
+   alert, as V8, LLVM and Rust track compile time.
+
+Three backend items are recorded with them because they are Simple's algorithm done Simple's way,
+not policy: a Cast is Simple's zero-byte `GuardMach` for scheduling and is erased once the block
+order is fixed (its two-address form multiplied splits in our guard-dense graphs), a split copy is inserted into
+its block's order rather than re-running the list scheduler over the program after every round,
+and the stack-map liveness is one word-level gen/kill fixpoint.
+
+## 2026-09-08 — String literals are static data, and the compiler's own hot paths are measured, not guessed
+
+A string literal was a `New` plus one `Store` per two code units, made at every evaluation of the
+literal: on the test262 harness realm that was 2,142 Store nodes, a fifth of the graph, and the
+allocator, scheduler and stack maps all paid for them. A literal's units never change, so it is a
+constant address: `StrConst` (aot.node.dynamic) is a node with no inputs and no memory effect,
+GVN'd by content, typed as the raw string payload pointer, selected exactly like `FunPtr` (ADRP and
+ADD against a local symbol) and laid out by `code-string-table-bytes` in a `__aot_strings` /
+`.aot_strings` data section with the runtime's three header words (payload bytes, metadata 0,
+`SHAPE-STRING`) before each payload. The runtime accepts such a payload as a valid reference that
+is never moved or scanned (`rt-static-string?`); `Load` folds a literal's length to its unit count.
+Simple's analogue is a constant, not an allocation, and that is what this is.
+
+Three defects were found and fixed by measuring where compile time went (`AOT_TIME=1`, which now
+also reports startup and the export phase, and a symbolized build sampled with `sample`):
+
+- The object writer resolved every relocation by scanning all definitions, all string names (each
+  freshly spelled) and all earlier fixups; export was quadratic in the relocation count and cost
+  more than the whole optimizer. `obj-symbols-build!` now resolves every fixup once through hash
+  lookups, in the fixed symbol order (definitions, string literals, then undefined targets in first
+  appearance order), and both writers read the answers.
+- A Region's immediate dominator was recomputed on every request, and every request from
+  IfNode's dominating-test hunt asked for every Region on the chain, each of which re-walked its
+  inputs' chains: quadratic in chain depth, most of opto's time. Simple recomputes it too, but
+  Simple's chains are short. A Region now caches its idom under `cfg-edit-version`, bumped by every
+  edge edit or kill of a control node through a hook the control module installs at boot; data-node
+  edits leave it alone. The depth cache's own version is bumped where Simple bumps it, at inlining
+  (both paths) and once per phase boundary, no longer at every control constructor and path edit,
+  which had emptied it many times per peephole round: depths are lazily computed and stay
+  consistent along every chain through ordinary construction and folding.
+- The register class masks and the split mask were rebuilt as fresh bitsets on every allocator
+  query. Masks are immutable, so each is now one shared instance.
+
+Two bugs surfaced with the new allocation shape. The dependency pair-set was not cleared by
+`arena-reset!`, so a second compile in one process silently skipped dependencies and tripped
+monotonicity; every arena-owned table is reset there now. And the double `TypeTest` encoding wrote
+its result register mid-sequence and then re-read its source: when a dying input shared the result
+register, a function value classified as a double. Rule, recorded in the encoder: a multi-
+instruction form reads its source registers before it writes its destination, always, because the
+allocator may legally give a dying input and the result the same register. The encode test pins the
+shared-register case.
+
 ## 2026-09-08 — Campaigns are sharded and sampled; `this.x` at Script level is a global
 
 The test262 runner forks `AOT_T262_JOBS` workers over the file list (round-robin by eligible file
@@ -205,6 +291,8 @@ type still compiles; only the missing conversion refuses, and only when actually
 
 ## 2026-09-08 — Exceptions are a pending word and ordinary control flow
 
+*Superseded in part by "The compile-time architecture" (2026-09-08): the per-call load-and-branch check becomes an exceptional CallEnd projection over a sentinel return; the pending word and the jump-to-catch stand.*
+
 Simple has no exceptions. Ours are a value in the runtime heap record — `RtHeap.pending-exception`,
 a boxed word the collector forwards, reached through `HeapState` on its own alias — plus control
 flow the optimizer already understands. A `throw` inside a `try` is a jump to the catch target,
@@ -320,6 +408,8 @@ keeps no graph input, since GCM would otherwise be asked to place it below a blo
 dominate its uses.
 
 ## 2026-09-07 — Managed-root split boundaries apply only to ranges a safepoint restricted
+
+*Superseded in part by "The compile-time architecture" (2026-09-08): frames preserve no registers, so a safepoint kills every register and the managed-root splitters are removed.*
 
 A boxed value live across a Call, New, JSOP or Safepoint is restricted to the collector's root
 homes, and a later register-only consumer needs a reload boundary; splitting the definition side
@@ -638,6 +728,8 @@ The convergence cap and register constraints remain unchanged.
 
 ## 2026-09-02 — Boxed non-references get spill homes but are not roots
 
+*Superseded in part by "The compile-time architecture" (2026-09-08): every kind takes a slot across a safepoint; the kind distinction remains only for what the stack map records.*
+
 NaN-boxing makes null, undefined, booleans and compact integers machine words with the same storage
 width as boxed object references. Values live across collecting calls need addressable spill homes
 for allocator convergence, but a word whose lattice tag excludes string, symbol, object and
@@ -649,6 +741,8 @@ unions retain the conservative boxed-root kind. This distinction is derived from
 tag lattice rather than from individual opcode names.
 
 ## 2026-09-02 — Moving-root stack boundaries extend the allocator convergence budget
+
+*Superseded in part by "The compile-time architecture" (2026-09-08): the budget returns to Simple's seven rounds.*
 
 Final Simple caps iterative graph-coloring allocation at eight rounds for its scalar language.
 This compiler's moving-GC divergence gives every live root two additional fixed stack boundaries:

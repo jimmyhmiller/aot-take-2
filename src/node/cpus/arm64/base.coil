@@ -17,6 +17,7 @@
 (import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
 (import "coil.arraylist" :use *)
 (import "aot.util.panic" :use *)
+(import "aot.util.ary" :use [al-remove-at!])
 (import "aot.node.node" :use *)
 (import "aot.node.dynamic" :use *)
 (import "aot.codegen.machine" :use *)
@@ -99,15 +100,31 @@
    (clone-cheap bool)
    (symbol (slice u8))])  ; the defined function a FUNPTR form addresses
 
+;; The three class masks are constants. Masks are immutable once built, so one instance of each
+;; is shared: the allocator asks for an operand's class mask on every interference-graph visit,
+;; and building a fresh bitset per query was a large share of allocation time.
+(defstruct Arm64ClassMasks [(gpr (ptr RegMask)) (fpr (ptr RegMask)) (flags (ptr RegMask)) (built bool)])
+
+(defn arm64-class-masks [] (-> (ptr Arm64ClassMasks))
+  (let [t (primitive/alloc-static Arm64ClassMasks)]
+    (if (.built t)
+        t
+        (do
+          (set! (.gpr t) (mask-pin (mask-or (mask-range ARM64-X0 ARM64-X17) (mask-range ARM64-X19 27))))
+          (set! (.fpr t) (mask-pin (mask-range ARM64-D0 ARM64-D31)))
+          (set! (.flags t) (mask-pin (mask-of ARM64-FLAGS)))
+          (set! (.built t) true)
+          t))))
+
 (defn arm64-class-mask [(class i64)] (-> (Option (ptr RegMask)))
   (if (= class ARM64-CLASS-NONE)
       (None [(ptr RegMask)])
       (Some (if (= class ARM64-CLASS-GPR)
-                (mask-or (mask-range ARM64-X0 ARM64-X17) (mask-range ARM64-X19 27))
+                (.gpr (arm64-class-masks))
                 (if (= class ARM64-CLASS-FPR)
-                    (mask-range ARM64-D0 ARM64-D31)
+                    (.fpr (arm64-class-masks))
                     (if (= class ARM64-CLASS-FLAGS)
-                        (mask-of ARM64-FLAGS)
+                        (.flags (arm64-class-masks))
                         (do (panic-i "arm64-class-mask: unknown register class" class)
                             (mask-empty))))))))
 
@@ -172,6 +189,15 @@
 (defn arm64-scalar-set-symbol! [(n (dyn NodeOps)) (symbol (slice u8))] (-> i64)
   (do (set! (.symbol (arm64-scalar-node n)) symbol) 0))
 
+;; Drop input `i` of a freshly selected node (raw input slots, no def-use edges yet). The immediate
+;; forms drop the constant operand by its index, not "the last input": a scheduling-only edge
+;; appended after the operands (tests do this; GCM's anti-dependences come later) must not be the
+;; one removed, or the constant keeps a live range and a `mov` nothing reads.
+(defn arm64-scalar-drop-input! [(n (dyn NodeOps)) (i i64)] (-> i64)
+  (if (or (< i 0) (>= (n-nins n) (+ i 1)))
+      (do (al-remove-at! [(Option (dyn NodeOps))] (mut (.ins (hdr n))) i) 0)
+      (broken "arm64-scalar-drop-input!: input index outside the selected node")))
+
 (defn arm64-scalar-drop-last-input! [(n (dyn NodeOps))] (-> i64)
   (if (= (n-nins n) 0)
       (broken "arm64-scalar-drop-last-input!: selected node has no input")
@@ -204,7 +230,7 @@
 
 (defn arm64-scalar-op-name [(p (ptr Arm64ScalarNode))] (-> (slice u8))
   (let [op (.ideal-op p)]
-    (case op OP-CON "mov" OP-FUNPTR "adrp" OP-ADD
+    (case op OP-CON "mov" OP-FUNPTR "adrp" OP-STRCONST "adrp" OP-ADD
           (if (= (.form p) ARM64-FORM-IMM12) "addi" "add") OP-SUB
           (if (= (.form p) ARM64-FORM-IMM12) "subi" "sub") OP-MUL
           "mul" OP-DIV
@@ -441,21 +467,24 @@
                       rd (arm64-enc-gpr encoder d)]
                   ;; Every positive prefix from INT through OBJECT is reserved. Unsigned
                   ;; subtraction turns the inclusive range test into `(prefix-0x7ff9) <= 6`.
+                  ;;
+                  ;; Xn is read exactly once, before Xd is written: the allocator may give a
+                  ;; dying input and the result the same register, so the prefix lives in X16 for
+                  ;; the whole sequence and X17 holds every immediate and the range difference.
                   (enc-add4! encoder (arm64-enc-r2 0xd370fc00 16 rn))
                   (enc-add4! encoder
                              (| 0xd2800000
                                 (| (primitive/ishl DYNAMIC-PREFIX-INT 5) 17)))
-                  (enc-add4! encoder (arm64-enc-r3 0xcb000000 16 16 17))
+                  (enc-add4! encoder (arm64-enc-r3 0xcb000000 17 16 17))
                   (enc-add4! encoder
                              (| 0xf100001f
                                 (| (primitive/ishl
                                      (- DYNAMIC-PREFIX-OBJECT DYNAMIC-PREFIX-INT)
                                      10)
-                                   (primitive/ishl 16 5))))
+                                   (primitive/ishl 17 5))))
                   ;; CSET Xd,LS: prefix lies in the reserved positive range.
                   (enc-add4! encoder (| 0x9a9f87e0 rd))
-                  ;; Function uses the distinct negative quiet-NaN prefix.
-                  (enc-add4! encoder (arm64-enc-r2 0xd370fc00 16 rn))
+                  ;; Function uses the distinct negative quiet-NaN prefix; X16 still holds the prefix.
                   (enc-add4! encoder
                              (| 0xd2800000
                                 (| (primitive/ishl DYNAMIC-PREFIX-FUNCTION 5) 17)))
@@ -466,14 +495,9 @@
                   (enc-add4! encoder (| 0xf100001f (primitive/ishl rd 5)))
                   (enc-add4! encoder (| 0x9a9f17e0 rd)))
             (if (= form ARM64-FORM-CAST)
-                ;; Runtime Cast is an identity, but its machine node retains the true-edge control
-                ;; dependency. A real move keeps correctness even when allocation does not coalesce.
-                (enc-add4! encoder
-                           (| 0xaa0003e0
-                              (| (primitive/ishl
-                                   (arm64-enc-gpr encoder (n-in! d 1))
-                                   16)
-                                 (arm64-enc-gpr encoder d))))
+                ;; Zero bytes (Simple's GuardMach), and erased after local scheduling; size zero
+                ;; keeps this branch from ever being reached.
+                (panic "arm64 encoding: a Cast has no bytes")
             (if (= form ARM64-FORM-CMP-BOXED-INT)
                 ;; ANDS XZR,Xn,#0x0000ffffffffffff tests the signed-int payload while ignoring the
                 ;; nonzero NaN-box tag. The immediate is N=1, immr=0, imms=47.

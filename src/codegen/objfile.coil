@@ -9,13 +9,23 @@
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.str" :use [str-keyops str-keyops-borrowed])
 (import "coil.fs" :as fs)
 (import "coil.slice" :use [slice-new])
 (import "coil.subprocess" :as subprocess)
 (import "aot.util.panic" :use *)
 (import "aot.codegen.encoding" :use *)
 (import "aot.codegen.gcmeta" :use *)
-(import "aot.shape" :use [shape-table-bytes])
+(import "aot.shape" :use [shape-table-bytes SHAPE-STRING])
+(import "aot.codegen.codegen"
+        :use
+        [code-string-count
+         code-string-units
+         code-string-symbol
+         code-string-index-of-symbol
+         code-string-offset
+         code-string-table-bytes])
 
 (const MACHO-SEGMENT-SIZE 152)
 
@@ -48,7 +58,9 @@
 
 (defn obj-put-name16! [(out (mut (ArrayList u8))) (name (slice u8))] (-> i64)
   (let [(mut i) 0]
-    (if (> (len name) 16) (panic "obj-put-name16!: Mach-O name exceeds 16 bytes") 0)
+    (if (> (len name) 16)
+        (panic "obj-put-name16!: Mach-O name exceeds 16 bytes")
+        0)
     (loop (if (>= (load i) 16)
               (break 0)
               (do
@@ -61,7 +73,9 @@
 
 (defn obj-pad-to! [(out (mut (ArrayList u8))) (offset i64)] (-> i64)
   (do
-    (if (> (len (load out)) offset) (panic-i "obj-pad-to!: offset already passed" offset) 0)
+    (if (> (len (load out)) offset)
+        (panic-i "obj-pad-to!: offset already passed" offset)
+        0)
     (loop (if (>= (len (load out)) offset)
               (break 0)
               (do (obj-put1! (mut out) 0) (continue))))))
@@ -73,7 +87,9 @@
           0x3d000000
           (if (= kind ENC-FIXUP-A64-PAGEOFF12)
               0x4c000000
-              (do (panic-i "macho-relocation-bits: unsupported fixup kind" kind) 0)))))
+              (do
+                (panic-i "macho-relocation-bits: unsupported fixup kind" kind)
+                0)))))
 
 (defn elf-relocation-type [(kind i64)] (-> i64)
   ;; R_AARCH64_CALL26, R_AARCH64_ADR_PREL_PG_HI21, R_AARCH64_ADD_ABS_LO12_NC.
@@ -83,74 +99,125 @@
           275
           (if (= kind ENC-FIXUP-A64-PAGEOFF12)
               277
-              (do (panic-i "elf-relocation-type: unsupported fixup kind" kind) 0)))))
+              (do
+                (panic-i "elf-relocation-type: unsupported fixup kind" kind)
+                0)))))
 
+;; ---------------------------------------------------------------------------
+;; The object's symbol table, resolved once per write.
+;;
+;; Symbol numbering: text definitions first (their encoder order), then the string literals
+;; (`__aot_strings`, table order), then every undefined target once, in first-appearance order.
+;; Every fixup is resolved to its symbol index exactly once here, through hash lookups; the writers
+;; then read the answers. Resolving per relocation by scanning definitions, strings and earlier
+;; fixups made object writing quadratic in the relocation count.
+;;
 ;; A nonnegative fidx is the closed-world identity and must never fall back to spelling: after a
 ;; graph-copy or lifecycle bug, name fallback can bind a call to a different definition and turn
-;; corrupted metadata into a silent miscompile. Only explicit externs (fidx -1) resolve by symbol.
-(defn macho-definition-for-fixup [(fixup i64)] (-> i64)
-  (let [fidx (enc-symbol-fixup-fidx fixup)
-        name (enc-symbol-fixup-name fixup)
-        (mut i) 0
-        (mut answer) -1]
-    (loop (if (or (>= (load i) (enc-definition-count)) (>= (load answer) 0))
-              (break (load answer))
-              (do
-                (if (if (>= fidx 0)
-                        (= (enc-definition-fidx (load i)) fidx)
-                        (= (enc-definition-name (load i)) name))
-                    (set! (mut answer) (load i))
-                    0)
-                (set! (mut i) (+ (load i) 1))
-                (continue))))))
+;; corrupted metadata into a silent miscompile. A fidx with no definition in this object names a
+;; function compiled elsewhere (the runtime's JSL) and is undefined here by its symbol name; only
+;; explicit externs (fidx -1) resolve a definition by symbol.
+(defstruct ObjSymbols
+  [(booted bool)
+   (fixup-symbol (ArrayList i64))  ; per fixup: its symbol index
+   (undefined-names (ArrayList (slice u8)))])  ; deduplicated, first appearance first
 
-(defn macho-prior-undefined-fixup [(fixup i64)] (-> i64)
-  (let [name (enc-symbol-fixup-name fixup)
-        (mut i) 0
-        (mut answer) -1]
-    (loop (if (or (>= (load i) fixup) (>= (load answer) 0))
-              (break (load answer))
-              (do
-                (if (and (< (macho-definition-for-fixup (load i)) 0)
-                         (= (enc-symbol-fixup-name (load i)) name))
-                    (set! (mut answer) (load i))
-                    0)
-                (set! (mut i) (+ (load i) 1))
-                (continue))))))
+(defn obj-symbols [] (-> (ptr ObjSymbols))
+  (let [t (primitive/alloc-static ObjSymbols)]
+    (if (.booted t)
+        t
+        (let [a (alloc/malloc-allocator)]
+          (set! (.fixup-symbol t) (al-new [i64] a))
+          (set! (.undefined-names t) (al-new [(slice u8)] a))
+          (set! (.booted t) true)
+          t))))
 
-(defn macho-undefined-ordinal [(fixup i64)] (-> i64)
-  (let [(mut i) 0
-        (mut ordinal) 0]
-    (loop (if (>= (load i) fixup)
-              (break (load ordinal))
+(defn obj-symbols-build! [] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        t (obj-symbols)
+        ndefs (enc-definition-count)
+        nstrings (code-string-count)
+        (mut def-by-fidx) (hm-new [i64 i64] a (i64-keyops))
+        (mut def-by-name) (hm-new [(slice u8) i64] a (str-keyops-borrowed))
+        (mut string-by-name) (hm-new [(slice u8) i64] a (str-keyops))
+        (mut undefined-by-name)
+          (hm-new [(slice u8) i64] a (str-keyops-borrowed))
+        (mut i) 0]
+    (al-clear! [i64] (mut (.fixup-symbol t)))
+    (al-clear! [(slice u8)] (mut (.undefined-names t)))
+    (loop (if (>= (load i) ndefs)
+              (break 0)
               (do
-                (if (and (< (macho-definition-for-fixup (load i)) 0)
-                         (< (macho-prior-undefined-fixup (load i)) 0))
-                    (set! (mut ordinal) (+ (load ordinal) 1))
+                (if (>= (enc-definition-fidx (load i)) 0)
+                    (do
+                      (set! (mut def-by-fidx)
+                            (enc-definition-fidx (load i))
+                            (load i))
+                      0)
                     0)
+                (set! (mut def-by-name) (enc-definition-name (load i)) (load i))
                 (set! (mut i) (+ (load i) 1))
-                (continue))))))
+                (continue))))
+    (set! (mut i) 0)
+    (loop (if (>= (load i) nstrings)
+              (break 0)
+              (do
+                (set! (mut string-by-name)
+                      (code-string-symbol (load i))
+                      (load i))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (set! (mut i) 0)
+    (loop (if (>= (load i) (enc-symbol-fixup-count))
+              (break 0)
+              (let [fidx (enc-symbol-fixup-fidx (load i))
+                    name (enc-symbol-fixup-name (load i))
+                    defined
+                      (if (>= fidx 0)
+                          (match (get (load def-by-fidx) fidx)
+                            (Some [d] d)
+                            (None [] -1))
+                          (match (get (load def-by-name) name)
+                            (Some [d] d)
+                            (None [] -1)))
+                    string-index
+                      (if (>= fidx 0)
+                          -1
+                          (match (get (load string-by-name) name)
+                            (Some [k] k)
+                            (None [] -1)))
+                    symbol
+                      (if (>= defined 0)
+                          defined
+                          (if (>= string-index 0)
+                              (+ ndefs string-index)
+                              (+ ndefs
+                                 (+ nstrings
+                                    (match (get (load undefined-by-name) name)
+                                      (Some [k] k)
+                                      (None []
+                                            (let [k (len (.undefined-names t))]
+                                              (push! [(slice u8)]
+                                                     (mut (.undefined-names t))
+                                                     name)
+                                              (set! (mut undefined-by-name)
+                                                    name
+                                                    k)
+                                              k)))))))]
+                (push! [i64] (mut (.fixup-symbol t)) symbol)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))
 
+;; The Mach-O symbol index a fixup relocates against.
 (defn macho-symbol-index-for-fixup [(fixup i64)] (-> i64)
-  (let [defined (macho-definition-for-fixup fixup)]
-    (if (>= defined 0)
-        defined
-        (let [prior (macho-prior-undefined-fixup fixup)]
-          (+ (enc-definition-count)
-             (macho-undefined-ordinal (if (>= prior 0) prior fixup)))))))
+  (get (.fixup-symbol (obj-symbols)) fixup))
 
 (defn macho-undefined-count [] (-> i64)
-  (let [(mut i) 0
-        (mut count) 0]
-    (loop (if (>= (load i) (enc-symbol-fixup-count))
-              (break (load count))
-              (do
-                (if (and (< (macho-definition-for-fixup (load i)) 0)
-                         (< (macho-prior-undefined-fixup (load i)) 0))
-                    (set! (mut count) (+ (load count) 1))
-                    0)
-                (set! (mut i) (+ (load i) 1))
-                (continue))))))
+  (len (.undefined-names (obj-symbols))))
+
+(defn macho-undefined-name [(k i64)] (-> (slice u8))
+  (get (.undefined-names (obj-symbols)) k))
 
 (defn macho-put-str! [(strtab (mut (ArrayList u8))) (name (slice u8))] (-> i64)
   (let [offset (len (load strtab))]
@@ -160,10 +227,12 @@
     offset))
 
 (defn macho-bytes [] (-> (slice u8))
+  (obj-symbols-build!)
   (let [a (alloc/malloc-allocator)
         (mut out) (al-new [u8] a)
         (mut strtab) (al-new [u8] a)
         (mut def-strx) (al-new [i64] a)
+        (mut string-strx) (al-new [i64] a)
         (mut undef-strx) (al-new [i64] a)
         stackmaps (gc-stackmap-bytes)
         stackmap-size (len stackmaps)
@@ -173,18 +242,34 @@
         shapes (shape-table-bytes)
         shapes-size (len shapes)
         has-shapes (> shapes-size 0)
-        nsects (+ 1 (+ (if has-stackmaps 1 0) (if has-shapes 1 0)))
+        ;; String literals: the runtime reads them as immortal string payloads (aot.node.dynamic,
+        ;; StrConst); each is a local symbol in this section.
+        strings (code-string-table-bytes SHAPE-STRING)
+        strings-size (len strings)
+        has-strings (> strings-size 0)
+        nstrings (code-string-count)
+        nsects
+          (+ 1
+             (+ (if has-stackmaps 1 0)
+                (+ (if has-shapes 1 0) (if has-strings 1 0))))
+        strings-sect (+ 1 (+ (if has-stackmaps 1 0) (+ (if has-shapes 1 0) 1)))
         segment-size (+ 72 (* 80 nsects))
-        data-offset (+ 32 (+ segment-size (+ MACHO-SYMTAB-SIZE MACHO-BUILD-VERSION-SIZE)))
+        data-offset
+          (+ 32 (+ segment-size (+ MACHO-SYMTAB-SIZE MACHO-BUILD-VERSION-SIZE)))
         text-size (enc-byte-count)
         nreloc (enc-symbol-fixup-count)
         ndefs (enc-definition-count)
         nundef (macho-undefined-count)
-        nsyms (+ ndefs nundef)
+        nsyms (+ ndefs (+ nstrings nundef))
         stackmap-offset (obj-align-up (+ data-offset text-size) 8)
-        stackmap-end (if has-stackmaps (+ stackmap-offset stackmap-size) (+ data-offset text-size))
+        stackmap-end
+          (if has-stackmaps
+              (+ stackmap-offset stackmap-size)
+              (+ data-offset text-size))
         shapes-offset (obj-align-up stackmap-end 8)
-        data-end (if has-shapes (+ shapes-offset shapes-size) stackmap-end)
+        shapes-end (if has-shapes (+ shapes-offset shapes-size) stackmap-end)
+        strings-offset (obj-align-up shapes-end 8)
+        data-end (if has-strings (+ strings-offset strings-size) shapes-end)
         reloff (obj-align-up data-end 4)
         symoff (+ reloff (* nreloc 8))
         stroff (+ symoff (* nsyms 16))
@@ -195,19 +280,28 @@
               (do
                 (push! [i64]
                        (mut def-strx)
-                       (macho-put-str! (mut strtab) (enc-definition-name (load i))))
+                       (macho-put-str! (mut strtab)
+                                       (enc-definition-name (load i))))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
+    (let [(mut si) 0]
+      (loop (if (>= (load si) nstrings)
+                (break 0)
+                (do
+                  (push! [i64]
+                         (mut string-strx)
+                         (macho-put-str! (mut strtab)
+                                         (code-string-symbol (load si))))
+                  (set! (mut si) (+ (load si) 1))
+                  (continue)))))
     (set! (mut i) 0)
-    (loop (if (>= (load i) (enc-symbol-fixup-count))
+    (loop (if (>= (load i) nundef)
               (break 0)
               (do
-                (if (and (< (macho-definition-for-fixup (load i)) 0)
-                         (< (macho-prior-undefined-fixup (load i)) 0))
-                    (push! [i64]
-                           (mut undef-strx)
-                           (macho-put-str! (mut strtab) (enc-symbol-fixup-name (load i))))
-                    0)
+                (push! [i64]
+                       (mut undef-strx)
+                       (macho-put-str! (mut strtab)
+                                       (macho-undefined-name (load i))))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
 
@@ -274,6 +368,21 @@
           (obj-put4! (mut out) 0)
           (obj-put4! (mut out) 0))
         0)
+    (if has-strings
+        (do
+          (obj-put-name16! (mut out) "__aot_strings")
+          (obj-put-name16! (mut out) "__DATA")
+          (obj-put8! (mut out) (- strings-offset data-offset))
+          (obj-put8! (mut out) strings-size)
+          (obj-put4! (mut out) strings-offset)
+          (obj-put4! (mut out) 3)
+          (obj-put4! (mut out) 0)
+          (obj-put4! (mut out) 0)
+          (obj-put4! (mut out) 0)
+          (obj-put4! (mut out) 0)
+          (obj-put4! (mut out) 0)
+          (obj-put4! (mut out) 0))
+        0)
     (obj-put4! (mut out) 2)
     (obj-put4! (mut out) MACHO-SYMTAB-SIZE)
     (obj-put4! (mut out) symoff)
@@ -293,10 +402,19 @@
 
     (obj-put-slice! (mut out) (enc-bytes))
     (if has-stackmaps
-        (do (obj-pad-to! (mut out) stackmap-offset) (obj-put-slice! (mut out) stackmaps))
+        (do
+          (obj-pad-to! (mut out) stackmap-offset)
+          (obj-put-slice! (mut out) stackmaps))
         0)
     (if has-shapes
-        (do (obj-pad-to! (mut out) shapes-offset) (obj-put-slice! (mut out) shapes))
+        (do
+          (obj-pad-to! (mut out) shapes-offset)
+          (obj-put-slice! (mut out) shapes))
+        0)
+    (if has-strings
+        (do
+          (obj-pad-to! (mut out) strings-offset)
+          (obj-put-slice! (mut out) strings))
         0)
     (obj-pad-to! (mut out) reloff)
     (set! (mut i) 0)
@@ -324,23 +442,31 @@
                 (obj-put8! (mut out) (enc-definition-offset (load i)))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
+    ;; String literals: local symbols in the strings section, at each payload.
     (set! (mut i) 0)
-    (let [(mut ui) 0]
-      (loop (if (>= (load i) (enc-symbol-fixup-count))
-                (break 0)
-                (do
-                  (if (and (< (macho-definition-for-fixup (load i)) 0)
-                           (< (macho-prior-undefined-fixup (load i)) 0))
-                      (do
-                        (obj-put4! (mut out) (get (load undef-strx) (load ui)))
-                        (obj-put1! (mut out) 1)
-                        (obj-put1! (mut out) 0)
-                        (obj-put2! (mut out) 0)
-                        (obj-put8! (mut out) 0)
-                        (set! (mut ui) (+ (load ui) 1)))
-                      0)
-                  (set! (mut i) (+ (load i) 1))
-                  (continue)))))
+    (loop (if (>= (load i) nstrings)
+              (break 0)
+              (do
+                (obj-put4! (mut out) (get (load string-strx) (load i)))
+                (obj-put1! (mut out) 0x0e)
+                (obj-put1! (mut out) strings-sect)
+                (obj-put2! (mut out) 0)
+                (obj-put8! (mut out)
+                           (+ (- strings-offset data-offset)
+                              (code-string-offset (load i))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (set! (mut i) 0)
+    (loop (if (>= (load i) nundef)
+              (break 0)
+              (do
+                (obj-put4! (mut out) (get (load undef-strx) (load i)))
+                (obj-put1! (mut out) 1)
+                (obj-put1! (mut out) 0)
+                (obj-put2! (mut out) 0)
+                (obj-put8! (mut out) 0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
     (obj-put-slice! (mut out) (al-slice (load strtab)))
     (al-slice (load out))))
 
@@ -386,11 +512,13 @@
     0))
 
 (defn elf-bytes [] (-> (slice u8))
+  (obj-symbols-build!)
   (let [a (alloc/malloc-allocator)
         (mut out) (al-new [u8] a)
         (mut strtab) (al-new [u8] a)
         (mut shstr) (al-new [u8] a)
         (mut def-strx) (al-new [i64] a)
+        (mut string-strx) (al-new [i64] a)
         (mut undef-strx) (al-new [i64] a)
         stackmaps (gc-stackmap-bytes)
         stackmap-size (len stackmaps)
@@ -398,12 +526,20 @@
         shapes (shape-table-bytes)
         shapes-size (len shapes)
         has-shapes (> shapes-size 0)
-        extra-sections (+ (if has-stackmaps 1 0) (if has-shapes 1 0))
+        strings (code-string-table-bytes SHAPE-STRING)
+        strings-size (len strings)
+        has-strings (> strings-size 0)
+        nstrings (code-string-count)
+        extra-sections
+          (+ (if has-stackmaps 1 0)
+             (+ (if has-shapes 1 0) (if has-strings 1 0)))
+        ;; .text 1, .rela.text 2, .symtab 3, .strtab 4, then the data sections in order.
+        strings-shndx (+ 5 (+ (if has-stackmaps 1 0) (if has-shapes 1 0)))
         text-size (enc-byte-count)
         nreloc (enc-symbol-fixup-count)
         ndefs (enc-definition-count)
         nundef (macho-undefined-count)
-        nsyms (+ 2 (+ ndefs nundef))
+        nsyms (+ 2 (+ ndefs (+ nstrings nundef)))
         text-off 64
         rela-off (obj-align-up (+ text-off text-size) 8)
         rela-size (* nreloc 24)
@@ -417,19 +553,28 @@
               (do
                 (push! [i64]
                        (mut def-strx)
-                       (elf-put-str! (mut strtab) (enc-definition-name (load i))))
+                       (elf-put-str! (mut strtab)
+                                     (enc-definition-name (load i))))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
+    (let [(mut si) 0]
+      (loop (if (>= (load si) nstrings)
+                (break 0)
+                (do
+                  (push! [i64]
+                         (mut string-strx)
+                         (elf-put-str! (mut strtab)
+                                       (code-string-symbol (load si))))
+                  (set! (mut si) (+ (load si) 1))
+                  (continue)))))
     (set! (mut i) 0)
-    (loop (if (>= (load i) (enc-symbol-fixup-count))
+    (loop (if (>= (load i) nundef)
               (break 0)
               (do
-                (if (and (< (macho-definition-for-fixup (load i)) 0)
-                         (< (macho-prior-undefined-fixup (load i)) 0))
-                    (push! [i64]
-                           (mut undef-strx)
-                           (elf-put-str! (mut strtab) (enc-symbol-fixup-name (load i))))
-                    0)
+                (push! [i64]
+                       (mut undef-strx)
+                       (elf-put-str! (mut strtab)
+                                     (macho-undefined-name (load i))))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
     (obj-put1! (mut shstr) 0)
@@ -437,8 +582,11 @@
           rela-name (elf-put-str! (mut shstr) ".rela.text")
           sym-name (elf-put-str! (mut shstr) ".symtab")
           str-name (elf-put-str! (mut shstr) ".strtab")
-          stackmap-name (if has-stackmaps (elf-put-str! (mut shstr) ".aot_stackmaps") 0)
+          stackmap-name
+            (if has-stackmaps (elf-put-str! (mut shstr) ".aot_stackmaps") 0)
           shapes-name (if has-shapes (elf-put-str! (mut shstr) ".aot_shapes") 0)
+          strings-name
+            (if has-strings (elf-put-str! (mut shstr) ".aot_strings") 0)
           shstr-name (elf-put-str! (mut shstr) ".shstrtab")
           stackmap-off (obj-align-up (+ str-off (len (load strtab))) 8)
           stackmap-end
@@ -446,7 +594,9 @@
                 (+ stackmap-off stackmap-size)
                 (+ str-off (len (load strtab))))
           shapes-off (obj-align-up stackmap-end 8)
-          shstr-off (if has-shapes (+ shapes-off shapes-size) stackmap-end)
+          shapes-end (if has-shapes (+ shapes-off shapes-size) stackmap-end)
+          strings-off (obj-align-up shapes-end 8)
+          shstr-off (if has-strings (+ strings-off strings-size) shapes-end)
           shoff (obj-align-up (+ shstr-off (len (load shstr))) 8)]
       ;; ELF64 header, little-endian, ET_REL, EM_AARCH64.
       (obj-put1! (mut out) 0x7f)
@@ -482,7 +632,8 @@
                 (do
                   (obj-put8! (mut out) (enc-symbol-fixup-offset (load i)))
                   (obj-put8! (mut out)
-                             (| (primitive/ishl (elf-symbol-index-for-fixup (load i)) 32)
+                             (| (primitive/ishl (elf-symbol-index-for-fixup (load i))
+                                                32)
                                 (elf-relocation-type (enc-symbol-fixup-kind (load i)))))
                   (obj-put8! (mut out) 0)
                   (set! (mut i) (+ (load i) 1))
@@ -511,36 +662,71 @@
                   (obj-put8! (mut out) (enc-definition-size (load i)))
                   (set! (mut i) (+ (load i) 1))
                   (continue))))
+      ;; String literals: local object symbols in .aot_strings at each payload.
       (set! (mut i) 0)
-      (let [(mut ui) 0]
-        (loop (if (>= (load i) (enc-symbol-fixup-count))
-                  (break 0)
-                  (do
-                    (if (and (< (macho-definition-for-fixup (load i)) 0)
-                             (< (macho-prior-undefined-fixup (load i)) 0))
-                        (do
-                          (obj-put4! (mut out) (get (load undef-strx) (load ui)))
-                          (obj-put1! (mut out) 0x10)
-                          (obj-put1! (mut out) 0)
-                          (obj-put2! (mut out) 0)
-                          (obj-put8! (mut out) 0)
-                          (obj-put8! (mut out) 0)
-                          (set! (mut ui) (+ (load ui) 1)))
-                        0)
-                    (set! (mut i) (+ (load i) 1))
-                    (continue)))))
+      (loop (if (>= (load i) nstrings)
+                (break 0)
+                (do
+                  (obj-put4! (mut out) (get (load string-strx) (load i)))
+                  (obj-put1! (mut out) 0x01)
+                  (obj-put1! (mut out) 0)
+                  (obj-put2! (mut out) strings-shndx)
+                  (obj-put8! (mut out) (code-string-offset (load i)))
+                  (obj-put8! (mut out)
+                             (+ 8 (* 2 (len (code-string-units (load i))))))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      (set! (mut i) 0)
+      (loop (if (>= (load i) nundef)
+                (break 0)
+                (do
+                  (obj-put4! (mut out) (get (load undef-strx) (load i)))
+                  (obj-put1! (mut out) 0x10)
+                  (obj-put1! (mut out) 0)
+                  (obj-put2! (mut out) 0)
+                  (obj-put8! (mut out) 0)
+                  (obj-put8! (mut out) 0)
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
       (obj-put-slice! (mut out) (al-slice (load strtab)))
       (if has-stackmaps
-          (do (obj-pad-to! (mut out) stackmap-off) (obj-put-slice! (mut out) stackmaps))
+          (do
+            (obj-pad-to! (mut out) stackmap-off)
+            (obj-put-slice! (mut out) stackmaps))
           0)
       (if has-shapes
-          (do (obj-pad-to! (mut out) shapes-off) (obj-put-slice! (mut out) shapes))
+          (do
+            (obj-pad-to! (mut out) shapes-off)
+            (obj-put-slice! (mut out) shapes))
+          0)
+      (if has-strings
+          (do
+            (obj-pad-to! (mut out) strings-off)
+            (obj-put-slice! (mut out) strings))
           0)
       (obj-put-slice! (mut out) (al-slice (load shstr)))
       (obj-pad-to! (mut out) shoff)
       (elf-put-section-header! (mut out) 0 0 0 0 0 0 0 0 0)
-      (elf-put-section-header! (mut out) text-name 1 6 text-off text-size 0 0 4 0)
-      (elf-put-section-header! (mut out) rela-name 4 0 rela-off rela-size 3 1 8 24)
+      (elf-put-section-header! (mut out)
+                               text-name
+                               1
+                               6
+                               text-off
+                               text-size
+                               0
+                               0
+                               4
+                               0)
+      (elf-put-section-header! (mut out)
+                               rela-name
+                               4
+                               0
+                               rela-off
+                               rela-size
+                               3
+                               1
+                               8
+                               24)
       (elf-put-section-header! (mut out) sym-name 2 0 sym-off sym-size 4 2 8 24)
       (elf-put-section-header! (mut out)
                                str-name
@@ -565,7 +751,28 @@
                                    0)
           0)
       (if has-shapes
-          (elf-put-section-header! (mut out) shapes-name 1 2 shapes-off shapes-size 0 0 8 0)
+          (elf-put-section-header! (mut out)
+                                   shapes-name
+                                   1
+                                   2
+                                   shapes-off
+                                   shapes-size
+                                   0
+                                   0
+                                   8
+                                   0)
+          0)
+      (if has-strings
+          (elf-put-section-header! (mut out)
+                                   strings-name
+                                   1
+                                   3
+                                   strings-off
+                                   strings-size
+                                   0
+                                   0
+                                   8
+                                   0)
           0)
       (elf-put-section-header! (mut out)
                                shstr-name

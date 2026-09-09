@@ -6,10 +6,17 @@
 ;; spill slots. Final Simple's fixed 128 bits are explicitly a capacity compromise. arm64 consumes
 ;; locations 0..64 before stack slot zero, so copying that limit would leave only 63 stack slots.
 ;;
-;; A mask is therefore an immutable dynamically-sized bitset plus `stack-tail`. Explicit words can
-;; name any fixed location. `stack-tail` means every location at or above `stack-base` is allowed,
-;; faithfully representing the conceptually infinite spill mask. Operations allocate fresh masks,
-;; so machine-node constraints and LRG intersections never share mutable storage.
+;; A mask is therefore an immutable bitset plus `stack-tail`. Explicit words can name any fixed
+;; location. `stack-tail` means every location at or above `stack-base` is allowed, faithfully
+;; representing the conceptually infinite spill mask. Operations produce fresh masks, so
+;; machine-node constraints and LRG intersections never share mutable storage.
+;;
+;; Representation, chosen by measurement: the first two words (locations 0..127, every register and
+;; the first spill slots) live inline, and words beyond them are an ArrayList created only when
+;; such a location is named explicitly (a deep spill slot as a singleton); Simple's two `long`s are
+;; the same shape. Masks are bump-allocated from chunks the compiler resets once per compile
+;; (`mask-arena-reset!`): the allocator asks for a mask operation at every live range it visits at
+;; every kill, and a malloc per operation was a large share of allocation time.
 (module aot.codegen.regmask)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
@@ -17,67 +24,149 @@
 (import "aot.util.panic" :use *)
 
 (const MASK-WORD-BITS 64)
+(const MASK-INLINE-WORDS 2)
+(const MASK-CHUNK 4096)
 
-(defstruct RegMask [(stack-tail i64) (stack-base i64) (words (ArrayList i64))])
+(defstruct RegMask
+  [(stack-tail i64)
+   (stack-base i64)
+   (w0 i64)
+   (w1 i64)
+   (more (ArrayList i64))  ; words 2.., present only when an explicit location >= 128 was named
+   (has-more bool)])
 
+;; The bump arena: stable chunks, reused across compiles.
+(defstruct MaskArena
+  [(chunks (ArrayList (ptr RegMask)))
+   (chunk i64)  ; index of the chunk being filled
+   (used i64)  ; masks handed out of that chunk
+   (booted bool)])
+
+(defn mask-arena [] (-> (ptr MaskArena))
+  (let [t (primitive/alloc-static MaskArena)]
+    (if (.booted t)
+        t
+        (do
+          (set! (.chunks t) (al-new [(ptr RegMask)] (alloc/malloc-allocator)))
+          (set! (.chunk t) 0)
+          (set! (.used t) 0)
+          (set! (.booted t) true)
+          t))))
+
+;; Start a compile: every mask made before this is dead. Chunks are kept and refilled.
+(defn mask-arena-reset! [] (-> i64)
+  (let [t (mask-arena)]
+    (set! (.chunk t) 0)
+    (set! (.used t) 0)
+    0))
+
+(defn mask--alloc [] (-> (ptr RegMask))
+  (let [t (mask-arena)]
+    (if (>= (.used t) MASK-CHUNK)
+        (do (set! (.chunk t) (+ (.chunk t) 1)) (set! (.used t) 0))
+        0)
+    (if (>= (.chunk t) (len (.chunks t)))
+        (push! [(ptr RegMask)]
+               (mut (.chunks t))
+               (match (alloc/alloc [RegMask] (alloc/malloc-allocator) MASK-CHUNK)
+                 (Some [chunk] (alloc/alloc-slice-data [RegMask] chunk))
+                 (None [] (do (alloc/oom-at c"mask--alloc: chunk" (* MASK-CHUNK 64)) (primitive/cast (ptr RegMask) 0)))))
+        0)
+    (let [p (primitive/index (get (.chunks t) (.chunk t)) (.used t))]
+      (set! (.used t) (+ (.used t) 1))
+      p)))
+
+;; The tail rendered as one word: every bit at or above `base` within word `word`.
+(defn mask--tail-word [(stack-tail i64) (base i64) (word i64)] (-> i64)
+  (if (= stack-tail 0)
+      0
+      (let [word-lo (* word MASK-WORD-BITS)]
+        (if (>= word-lo base)
+            -1
+            (if (<= (+ word-lo MASK-WORD-BITS) base)
+                0
+                (primitive/ishl -1 (- base word-lo)))))))
+
+;; Stored words are authoritative (they carry the tail's bits where the tail covers them, and may
+;; punch holes in it); the tail alone answers for words beyond the stored ones.
 (defn mask-new [(stack-tail i64) (stack-base i64)] (-> (ptr RegMask))
-  (let [a (alloc/malloc-allocator)
-        p (alloc/unwrap-ptr [RegMask] (alloc/create [RegMask] a))]
-    (set! (.words p) (al-new [i64] a))
+  (let [p (mask--alloc)]
     (set! (.stack-tail p) stack-tail)
     (set! (.stack-base p) stack-base)
+    (set! (.w0 p) (mask--tail-word stack-tail stack-base 0))
+    (set! (.w1 p) (mask--tail-word stack-tail stack-base 1))
+    (set! (.has-more p) false)
     p))
 
 (defn mask-empty [] (-> (ptr RegMask))
   (mask-new 0 0))
 
+;; A permanent copy outside the arena, for the few masks a target caches across compiles (its
+;; register classes, its kill set). Everything else dies at `mask-arena-reset!`.
+(defn mask-pin [(m (ptr RegMask))] (-> (ptr RegMask))
+  (let [a (alloc/malloc-allocator)
+        p (alloc/unwrap-ptr [RegMask] (alloc/create [RegMask] a))]
+    (set! (.stack-tail p) (.stack-tail m))
+    (set! (.stack-base p) (.stack-base m))
+    (set! (.w0 p) (.w0 m))
+    (set! (.w1 p) (.w1 m))
+    (set! (.has-more p) (.has-more m))
+    (if (.has-more m)
+        (do
+          (set! (.more p) (al-new [i64] a))
+          (al-for [w (.more m)] (push! [i64] (mut (.more p)) w)))
+        0)
+    p))
+
+;; Explicit words present (inline plus any deep words).
+(defn mask-nwords [(m (ptr RegMask))] (-> i64)
+  (if (.has-more m) (+ MASK-INLINE-WORDS (len (.more m))) MASK-INLINE-WORDS))
+
+(defn mask--explicit-word [(m (ptr RegMask)) (word i64)] (-> i64)
+  (if (= word 0)
+      (.w0 m)
+      (if (= word 1)
+          (.w1 m)
+          (get (.more m) (- word MASK-INLINE-WORDS)))))
+
+;; Word `word` of the mask: a stored word as it is, the tail beyond the stored words.
 (defn mask-word [(m (ptr RegMask)) (word i64)] (-> i64)
   (if (< word 0)
       0
-      (if (< word (len (.words m)))
-          (get (.words m) word)
-          (if (= (.stack-tail m) 0)
-              0
-              (let [word-lo (* word MASK-WORD-BITS)
-                    base (.stack-base m)]
-                (if (>= word-lo base)
-                    -1
-                    (if (<= (+ word-lo MASK-WORD-BITS) base)
-                        0
-                        (let [(mut bit) 0
-                              (mut bits) 0]
-                          (loop (if (>= (load bit) MASK-WORD-BITS)
-                                    (break (load bits))
-                                    (do
-                                      (if (>= (+ word-lo (load bit)) base)
-                                          (set! (mut bits)
-                                                (| (load bits) (primitive/ishl 1 (load bit))))
-                                          0)
-                                      (set! (mut bit) (+ (load bit) 1))
-                                      (continue))))))))))))
+      (if (< word (mask-nwords m))
+          (mask--explicit-word m word)
+          (mask--tail-word (.stack-tail m) (.stack-base m) word))))
 
-(defn mask--ensure-word! [(m (ptr RegMask)) (word i64)] (-> i64)
-  (loop (if (> (len (.words m)) word)
-            (break 0)
-            (let [next (len (.words m))
-                  value (mask-word m next)]
-              (do (push! [i64] (mut (.words m)) value) (continue))))))
+;; Store word `word`; deep words created on the way are the tail's rendering, so they stay exact.
+(defn mask--set-word! [(m (ptr RegMask)) (word i64) (value i64)] (-> i64)
+  (if (= word 0)
+      (do (set! (.w0 m) value) 0)
+      (if (= word 1)
+          (do (set! (.w1 m) value) 0)
+          (do
+            (if (not (.has-more m))
+                (do (set! (.more m) (al-new [i64] (alloc/malloc-allocator))) (set! (.has-more m) true))
+                0)
+            (loop (if (> (len (.more m)) (- word MASK-INLINE-WORDS))
+                      (break 0)
+                      (do (push! [i64]
+                             (mut (.more m))
+                             (mask--tail-word (.stack-tail m) (.stack-base m) (+ MASK-INLINE-WORDS (len (.more m)))))
+                          (continue))))
+            (set! (mut (.more m)) (- word MASK-INLINE-WORDS) value)
+            0))))
 
 (defn mask-stack [(stack-base i64)] (-> (ptr RegMask))
   (if (< stack-base 0)
       (do (panic-i "mask-stack: negative stack base" stack-base) (mask-empty))
-      (let [a (alloc/malloc-allocator)
-            m (alloc/unwrap-ptr [RegMask] (alloc/create [RegMask] a))]
-        (set! (.stack-tail m) 1)
-        (set! (.stack-base m) stack-base)
-        (set! (.words m) (al-new [i64] a))
-        m)))
+      (mask-new 1 stack-base)))
 
 (defn mask--set-explicit! [(m (ptr RegMask)) (reg i64)] (-> i64)
   (let [word (/ reg MASK-WORD-BITS)
         bit (% reg MASK-WORD-BITS)]
-    (mask--ensure-word! m word)
-    (set! (mut (.words m)) word (| (get (.words m) word) (primitive/ishl 1 bit)))))
+    ;; `mask-word`, not the raw stored word: a deep word may not exist yet, and a new stored word
+    ;; must carry the tail's bits it now speaks for.
+    (mask--set-word! m word (| (mask-word m word) (primitive/ishl 1 bit)))))
 
 (defn mask-of [(reg i64)] (-> (ptr RegMask))
   (if (< reg 0)
@@ -104,8 +193,8 @@
       false
       (let [word (/ reg MASK-WORD-BITS)
             bit (% reg MASK-WORD-BITS)]
-        (if (< word (len (.words m)))
-            (!= (& (get (.words m) word) (primitive/ishl 1 bit)) 0)
+        (if (< word (mask-nwords m))
+            (!= (& (mask--explicit-word m word) (primitive/ishl 1 bit)) 0)
             (and (!= (.stack-tail m) 0) (>= reg (.stack-base m)))))))
 
 ;; op: 0 intersection, 1 union, 2 subtraction.
@@ -127,7 +216,7 @@
                       (.stack-base a)))
               0)
         out (mask-new (if tail 1 0) base)
-        explicit-words (if (> (len (.words a)) (len (.words b))) (len (.words a)) (len (.words b)))
+        explicit-words (if (> (mask-nwords a) (mask-nwords b)) (mask-nwords a) (mask-nwords b))
         a-bound (if (!= (.stack-tail a) 0) (+ (/ (.stack-base a) MASK-WORD-BITS) 1) 0)
         b-bound (if (!= (.stack-tail b) 0) (+ (/ (.stack-base b) MASK-WORD-BITS) 1) 0)
         words
@@ -140,7 +229,12 @@
               (let [aw (mask-word a (load i))
                     bw (mask-word b (load i))
                     word (if (= op 0) (& aw bw) (if (= op 1) (| aw bw) (& aw (^ bw -1))))]
-                (push! [i64] (mut (.words out)) word)
+                ;; Every computed word is stored: a stored word is authoritative and may punch a
+                ;; hole in the tail; a deep word equal to the tail's own rendering is left implied.
+                (if (or (< (load i) MASK-INLINE-WORDS)
+                        (!= word (mask--tail-word (if tail 1 0) base (load i))))
+                    (mask--set-word! out (load i) word)
+                    0)
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
     out))
@@ -155,7 +249,7 @@
   (mask--binary a b 2))
 
 (defn mask-overlap? [(a (ptr RegMask)) (b (ptr RegMask))] (-> bool)
-  (let [words (if (> (len (.words a)) (len (.words b))) (len (.words a)) (len (.words b)))
+  (let [words (if (> (mask-nwords a) (mask-nwords b)) (mask-nwords a) (mask-nwords b))
         (mut i) 0
         (mut yes) false]
     (loop (if (or (>= (load i) words) (load yes))
@@ -173,10 +267,10 @@
       false
       (let [(mut i) 0
             (mut empty) true]
-        (loop (if (or (>= (load i) (len (.words m))) (not (load empty)))
+        (loop (if (or (>= (load i) (mask-nwords m)) (not (load empty)))
                   (break 0)
                   (do
-                    (if (!= (get (.words m) (load i)) 0) (set! (mut empty) false) 0)
+                    (if (!= (mask--explicit-word m (load i)) 0) (set! (mut empty) false) 0)
                     (set! (mut i) (+ (load i) 1))
                     (continue))))
         (load empty))))
@@ -187,10 +281,10 @@
       -1
       (let [(mut i) 0
             (mut count) 0]
-        (loop (if (>= (load i) (len (.words m)))
+        (loop (if (>= (load i) (mask-nwords m))
                   (break 0)
                   (do
-                    (set! (mut count) (+ (load count) (primitive/popcount (get (.words m) (load i)))))
+                    (set! (mut count) (+ (load count) (primitive/popcount (mask--explicit-word m (load i)))))
                     (set! (mut i) (+ (load i) 1))
                     (continue))))
         (load count))))
@@ -200,9 +294,9 @@
 
 (defn mask-first [(m (ptr RegMask))] (-> i64)
   (let [(mut i) 0]
-    (loop (if (>= (load i) (len (.words m)))
+    (loop (if (>= (load i) (mask-nwords m))
               (break (if (!= (.stack-tail m) 0) (.stack-base m) -1))
-              (let [word (get (.words m) (load i))]
+              (let [word (mask--explicit-word m (load i))]
                 (if (!= word 0)
                     (break (+ (* (load i) MASK-WORD-BITS) (primitive/ctz word)))
                     (do (set! (mut i) (+ (load i) 1)) (continue))))))))
@@ -211,7 +305,7 @@
   (if (or (!= (.stack-tail a) (.stack-tail b))
           (and (!= (.stack-tail a) 0) (!= (.stack-base a) (.stack-base b))))
       false
-      (let [words (if (> (len (.words a)) (len (.words b))) (len (.words a)) (len (.words b)))
+      (let [words (if (> (mask-nwords a) (mask-nwords b)) (mask-nwords a) (mask-nwords b))
             (mut i) 0
             (mut same) true]
         (loop (if (or (>= (load i) words) (not (load same)))

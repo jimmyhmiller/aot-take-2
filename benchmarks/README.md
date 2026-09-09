@@ -10,10 +10,10 @@ three warmups produced:
 
 | Runtime | Mean | Standard deviation | Range |
 | --- | ---: | ---: | ---: |
-| aot-take-2 | 893.0 ms | 1.9 ms | 890.6–897.3 ms |
-| Node | 975.7 ms | 21.0 ms | 932.2–1025.6 ms |
+| aot-take-2 | 902.1 ms | 8.1 ms | 885.9–912.5 ms |
+| Node | 979.5 ms | 35.3 ms | 919.6–1034.9 ms |
 
-The generated AArch64 executable was **1.09 ± 0.02 times faster** in this whole-process benchmark.
+The generated AArch64 executable was **1.09 ± 0.04 times faster** in this whole-process benchmark.
 This is one small recursive numeric workload, not a general JavaScript performance claim.
 
 ## Managed binary trees
@@ -28,10 +28,10 @@ On the same machine and Node 26.5.0, 15 measured whole-process runs after three 
 
 | Runtime | Mean | Standard deviation | Range |
 | --- | ---: | ---: | ---: |
-| aot-take-2 | 251.6 ms | 3.6 ms | 247.5–259.4 ms |
-| Node | 116.3 ms | 4.1 ms | 112.4–130.0 ms |
+| aot-take-2 | 127.1 ms | 3.2 ms | 122.8–132.7 ms |
+| Node | 118.5 ms | 2.8 ms | 110.8–122.2 ms |
 
-Node was **2.16 ± 0.08 times faster**. Unlike the Fibonacci workload, this comparison exercises
+Node was **1.07 ± 0.04 times faster**. Unlike the Fibonacci workload, this comparison exercises
 managed object allocation, recursive traversal, repeated default-policy collections, and a root
 retained across the full temporary-tree workload.
 
@@ -46,10 +46,10 @@ Ten measured whole-process runs after one external warmup produced:
 
 | Runtime | Mean | Standard deviation | Range |
 | --- | ---: | ---: | ---: |
-| aot-take-2 | 1.690 s | 0.003 s | 1.686–1.695 s |
-| Node | 1.784 s | 0.075 s | 1.728–1.908 s |
+| aot-take-2 | 1.698 s | 0.012 s | 1.679–1.710 s |
+| Node | 1.752 s | 0.050 s | 1.710–1.836 s |
 
-The generated executable was **1.06 ± 0.04 times faster**. This comparison is dominated by
+The generated executable was **1.03 ± 0.03 times faster**. This comparison is dominated by
 warmed recursive execution, but it still times the whole process and the shared warmup; it is not
 an isolated in-process timing region.
 
@@ -58,11 +58,11 @@ Reproduce it from the repository root:
 ```sh
 coil build --release
 build/release/aot compile benchmarks/fib-aot.ts /tmp/aot-take-2-fib.o
-cc /tmp/aot-take-2-fib.o -o /tmp/aot-take-2-fib
+cc /tmp/aot-take-2-fib.o build/release/aot-runtime.o -o /tmp/aot-take-2-fib
 hyperfine --warmup 3 --runs 15 /tmp/aot-take-2-fib 'node benchmarks/fib-node.js'
 
 build/release/aot compile benchmarks/fib-warm-aot.ts /tmp/aot-take-2-fib-warm.o
-cc /tmp/aot-take-2-fib-warm.o -o /tmp/aot-take-2-fib-warm
+cc /tmp/aot-take-2-fib-warm.o build/release/aot-runtime.o -o /tmp/aot-take-2-fib-warm
 hyperfine --warmup 1 --runs 10 /tmp/aot-take-2-fib-warm 'node benchmarks/fib-warm-node.js'
 
 unset AOT_RT_HEAP_BYTES

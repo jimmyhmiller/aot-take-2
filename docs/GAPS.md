@@ -540,9 +540,9 @@ BigInt and HTMLDDA production remain absent.
 
 Unresolved names require a complete global environment. The compiler refuses this path by name,
 including parenthesized references, instead of treating unimplemented globals such as JSON as
-absent. Declared uninitialized names take the existing TDZ refusal. Result strings use managed
-literal allocation and the JSL function declares that effect; a constant-string pool remains
-required to remove repeated allocation. The regression reuses its compiled binary under GC stress.
+absent. Declared uninitialized names take the existing TDZ refusal. Result strings are static data
+(`StrConst` in the `__aot_strings` section; docs/DECISIONS.md, string literals are static data),
+so `typeof` no longer allocates. The regression reuses its compiled binary under GC stress.
 
 ### 2026-09-06 — Lexical instantiation and initializer-free let
 

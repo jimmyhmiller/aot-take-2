@@ -170,7 +170,9 @@ that same contract, including cold-backedge deferral for loop Phis.
 
 Allocation is iterative graph coloring, not a one-pass greedy assignment:
 
-1. Insert CalleeSave nodes and cache machine register constraints.
+1. Insert CalleeSave nodes for the process-entry wrapper only (a JavaScript frame preserves no
+   register: every Call, New, JSOP and Safepoint kills them all; docs/DECISIONS.md, the
+   compile-time architecture) and cache machine register constraints.
 2. Build live ranges while intersecting every def/use allowed mask.
 3. Pre-split a range whose allowed mask becomes empty, then restart the round.
 4. Build liveness and the interference graph together. A singleton fixed register denies that
@@ -180,24 +182,26 @@ Allocation is iterative graph coloring, not a one-pass greedy assignment:
 6. Coalesce noninterfering copies without violating masks.
 7. Simplify trivially colorable ranges first using Simple's fixed/ordinary/Split reverse-color
    priority, then optimistic ranges; assign colors in reverse with biased Split-chain choices.
-8. Split every failed range deterministically and retry, with the documented sixteen-round hard
-   limit required by explicit moving-root boundaries.
+8. Split every failed range deterministically and retry, within Simple's eight-round hard limit.
+   A split copy is inserted into its block's order directly (`code-schedule-insert-*`), as Simple's
+   `insertBefore`/`insertAfter` do; the list scheduler runs once, before allocation.
 9. Number spill slots after physical registers so split copies use one location namespace.
 10. Remove no-op copies after coloring and finalize frame size, callee saves, and stack arguments.
 
 Our extension carries a liveness kind on every live range: scalar, raw managed reference, boxed
-word that may contain a reference, or boxed word proven not to contain one. Both boxed families can
-receive addressable spill homes across calls, but only reference-bearing kinds enter relocation
-maps. Coalescing and splitting preserve the conservative join of this evidence.
+word that may contain a reference, or boxed word proven not to contain one. Every kind reaches a
+stack slot across a call through ordinary empty-mask splitting; only reference-bearing kinds enter
+relocation maps. Coalescing and splitting preserve the conservative join of this evidence. A
+rematerializable constant is never cloned into a Phi arm whose range lives on the stack (it would
+make the range register-only again); it is copied into the slot by a Split.
 
 Current producer: `regmask.coil` represents arbitrary fixed locations plus the infinite spill tail
-and is covered beyond location 512. `regalloc.coil` builds and unions LRGs, carries conservative GC
+and is covered beyond location 512; masks are bump-allocated from per-compile chunks with the
+first 128 locations inline, and the few masks a target keeps across compiles are pinned copies. `regalloc.coil` builds and unions LRGs, carries conservative GC
 kinds, builds the IFG backwards over the durable schedule, applies fixed constraints and call kills,
 coalesces, colours, inserts fixed-use and pressure splits, retries, removes no-op copies, inserts the
-AAPCS64 callee-save ranges and finalizes stack frames. A live range restricted to root homes by a
-safepoint is flagged `root-restricted`, and only such ranges take the managed-root split
-boundaries; every live range with a register use must have a machine definition, checked after
-BuildLRG. Safepoint relocation nodes, typed stack maps,
+AAPCS64 callee-save ranges for the entry wrapper and finalizes stack frames. Every live range with a
+register use must have a machine definition, checked after BuildLRG. Safepoint relocation nodes, typed stack maps,
 and aligned object sections are implemented as described below.
 Direct regression coverage proves conservative copy coalescing unions a legal Split/source pair,
 while interference and fixed masks prevent illegal unions.
@@ -212,8 +216,10 @@ Encoding is layout-sensitive and iterative. It must:
 - emit exact bytes only after allocation and frame layout are final;
 - record internal branches, external symbols, literals, and compilation-unit references as typed
   relocations;
-- emit stack maps keyed by final return-PC/safepoint offsets, and the static shape table
-  (`__aot_shapes`, `shape-table-bytes`) the runtime boots its transition tree from;
+- emit stack maps keyed by final return-PC/safepoint offsets, the static shape table
+  (`__aot_shapes`, `shape-table-bytes`) the runtime boots its transition tree from, and the string
+  literal table (`__aot_strings`, `code-string-table-bytes`: header words then payload per literal,
+  each a local symbol the `StrConst` ADRP/ADD pair relocates against);
 - write a valid arm64 Mach-O object first, then add ELF and x86-64 without changing the generic
   machine contract;
 - link with `cc` only as a linker and execute without any authored C shim.
@@ -232,8 +238,9 @@ splicing; exact-byte tests cover both branch polarities, the neither-successor-a
 B19 boundary, conditional relaxation and far B26/BL26 routes.
 The arm64 machine families emit
 scalar, memory, copy/spill, branch, call, frame and return instructions. `objfile.coil` writes
-independently validated arm64 Mach-O and ELF64 relocatable objects with definitions, undefined
-targets and branch relocations; its typed subprocess path links Mach-O with `cc` as a linker and
+independently validated arm64 Mach-O and ELF64 relocatable objects with definitions, string
+literal symbols, undefined targets and branch/page relocations, resolving every fixup once through
+`obj-symbols-build!` (docs/DECISIONS.md, string literals are static data); its typed subprocess path links Mach-O with `cc` as a linker and
 executes a selected `main` returning 42.
 
 `gcmeta.coil` computes its own liveness over the final allocated graph (one backward dataflow over
