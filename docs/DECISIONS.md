@@ -1,5 +1,52 @@
 # Decisions
 
+## 2026-09-09 — `new.target` is an argument slot
+
+Every JavaScript frame receives `new.target` as its second argument, after `this`: the shared ABI
+is `[ret this new.target slot…]`. A call passes `undefined`; `new F(…)` passes `F` (lower-new);
+`%CallFunction` from a JSL body passes `undefined`; the entry wrapper passes `undefined` to each
+Script root. `new.target` in a source function reads that Parm (`lower-new-target`).
+
+**Why a slot rather than the receiver.** The intrinsic constructors had told a call from a
+construct by comparing `this` with the global object — true only for a sloppy-mode plain call.
+In strict code a plain call's `this` is `undefined`, so `String(1)`, `Error('x')` and every other
+intrinsic called as a function in strict code took the construct path (a wrapper object, or an
+own property defined on `undefined`); `f.call(obj)` would have taken it too. The specification
+distinguishes the two by NewTarget, and engines pass it in a register (V8's `new.target` register;
+SpiderMonkey's `newTarget` argument). Passing it is one more word per call; the intrinsic
+constructors' bodies are `(this new.target callee args…)` and `JsCalledAsFunction` is
+`(%IsUndefined newtarget)`. The slot also makes `new.target` in source functions the language
+feature it is, instead of a refusal (arrows still wait for closures, as `this` does).
+
+## 2026-09-09 — JSL calls JavaScript through `%CallFunction`
+
+A JSL body may call a JavaScript function value: `(%CallFunction callee this arg...)`, up to four
+arguments. The checker requires the callee proven a function (a `%IsFunction` test narrows it), the
+operands to be values, and types the result as a completion — the callee's value or the exception
+sentinel — so the definition is `:throws` and tests the result with `%IsException` before using it;
+the form is transitioning. It lowers to exactly the frontend's value call (`lower-value-call-with-
+receiver`): the code word loaded from the function object is the Call's target, the Call carries
+`this` and the program's argument slots (missing ones `undefined`; an argument past the slot count
+is unobservable without `arguments` and is not passed), and the CallEnd's projections continue the
+body. The frontend settles the value-call ABI — the slot count and the function-pointer set every
+code word may hold — before any body is lowered (`jsl-set-value-call-abi!`, then
+`jsl-define-pending!`), which is another reason bodies are lowered after the program.
+
+This is what `Array.prototype.forEach/map/filter/some/every/find/findIndex/reduce` are built
+from, in JSL, with the specification's order of HasProperty, Get and Call per index. It is a
+primitive because a call into JavaScript is a machine capability the graph cannot express
+otherwise — the same test that admits `%StringConcat` and refuses `Array.prototype.map`.
+
+**Two backend consequences surfaced by the first campaign over it.** First, a folded `if` can
+let a `Box` of a Start-pinned constant be shared, and GCM's break-up of shared globals (Simple's
+`breakUpGlobalConstantSingle`) recursively splits such a dependent and then assumes it owned; when
+the dependent stays at Start (one of its users is a Start-level instruction), moving the constant
+into its one function put that user outside its dominance. A dependent that remains at Start now
+keeps the constant at Start — a divergence from Simple's code, recorded in `gcm.coil`. Second, the
+syntactic may-throw filter compared `instanceof` by its source spelling where the syntax records
+the operator by its JSL entry point, so a function whose only throw was an `instanceof` was
+cleared and the soundness check fired on it; the filter now names `JsInstanceof`.
+
 ## 2026-09-09 — Arrays are exotic objects under their own tag, with an elements store and a length word
 
 An array is a heap object under its own NaN-box prefix (`DYNAMIC-PREFIX-ARRAY`, `TAG-ARRAY` on the

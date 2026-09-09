@@ -61,7 +61,7 @@ Function expressions, arrow functions, nested and block-level function declarati
 Annex B `if`-arm and labelled forms), immediately invoked functions, a declaration read as a value
 and a call through a binding all lower and execute natively. A function value is a heap object
 under the FUNCTION prefix whose payload is prototype, properties, raw code word and boxed
-environment; every source function shares the `[ret this slot…]` ABI with the program-wide formal
+environment; every source function shares the `[ret this new.target slot…]` ABI with the program-wide formal
 count; a value call loads the code word, guards `%IsFunction` and traps to
 `aot_rt_throw_type_error` otherwise (docs/DECISIONS.md, function values). Remaining in this
 subsystem: captured variables (a reference to an enclosing function's binding refuses by name),
@@ -131,10 +131,13 @@ Array literals (with holes), indexed reads and writes through numbers and numeri
 reads and writes (truncating, extending, `RangeError`), named properties on arrays, `typeof`,
 `instanceof`, `Array.isArray`, `Array(n)`/`Array(a, b)`/`new Array`, `String(array)`, and the
 methods `push`, `pop`, `at`, `indexOf`, `includes`, `join`, `toString`, `reverse`, `shift`,
-`unshift`, `slice`, `concat` execute natively and under collector stress (docs/DECISIONS.md, arrays).
+`unshift`, `slice`, `concat`, and the callback methods `forEach`, `map`, `filter`, `some`,
+`every`, `find`, `findIndex`, `reduce` (docs/DECISIONS.md, JSL calls JavaScript) execute natively
+and under collector stress (docs/DECISIONS.md, arrays).
 Missing, and the deviations the ABI forces: spread in literals and calls (`[...a]`, `f(...a)`) and
-array destructuring (parse, refuse by name); every callback method (`forEach`, `map`, `filter`,
-`reduce`, `sort`, `find`, …) — JSL has no primitive to call a JavaScript function value yet;
+array destructuring (parse, refuse by name); the remaining callback methods (`sort`, `reduceRight`,
+`findLast`, `findLastIndex`, `flatMap`) and `reduce` with an explicit `undefined` initial value
+(taken as absent: the ABI cannot tell them apart);
 `splice`, `fill`, `lastIndexOf`, `flat`, `keys/values/entries` and iteration (`for…of` needs the
 iterator protocol); `Array.from`/`Array.of`; sparse-array semantics beyond holes (no dictionary
 elements: a write at index 2^31 allocates); `length` as a non-writable/accessor target; the
@@ -211,7 +214,8 @@ regression of this class; `iter-peeps!` and `iter-run!` panic with a trace of re
 inlined sites instead of spinning; `property-expand-all!` panics if the shape universe grows.
 
 Constructors and chains: `new` on a non-callable takes the value call's TypeError trap; class
-constructors, `new.target`, bound functions and `Symbol.hasInstance` are unimplemented;
+constructors, bound functions and `Symbol.hasInstance` are unimplemented (`new.target` is an
+argument slot and executes in non-arrow functions: docs/DECISIONS.md, new.target);
 `instanceof` on a non-callable right operand traps as a TypeError. A function DECLARATION nested
 in a function is instantiated at every evaluation of its name, not once per FunctionDeclaration-
 Instantiation, so `inner === inner` and `inner.prototype` identity are wrong there (top-level
@@ -420,8 +424,8 @@ chains, CoverInitializedName outside a pattern, private names in object literals
 syntax. Phase imports (`import.source`/`import.defer`) and `super` fail closed.
 
 Lowering executes a substitution-free template as its cooked string and object shorthand as the
-named property it desugars to. `this`, `new`, `new.target`, computed access and assignment,
-non-name callees, spread, optional chains, `import()`, template substitutions
+named property it desugars to. `this`, `new`, `new.target`, computed access and assignment and
+non-name callees execute; spread, optional chains, `import()`, template substitutions
 (ToString), tagged templates, object spread and computed keys refuse by name (array literals now
 lower; see the arrays entry). The regex pattern
 grammar is not validated: a syntax-only verdict fails closed whenever a regex literal survives

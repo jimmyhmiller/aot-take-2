@@ -210,10 +210,11 @@ parse, pass early-error validation, and refuse lowering by their JSL name. Prima
 grammar is complete, destructuring patterns included (binding and assignment forms parse and
 validate; lowering refuses them by name): `this`, `new`, computed members and general callees
 execute (an undeclared global compiles and refuses at run time);
-`new.target`, `super`, spread, optional chains, `import()`, templates, regex
+`super`, spread, optional chains, `import()`, templates, regex
 literals, function expressions, arrows, methods and accessors, generators, async functions and
 classes parse, and the forms without runtime support refuse by name at lowering; array literals
-lower (docs/DECISIONS.md, arrays).
+lower (docs/DECISIONS.md, arrays) and `new.target` reads its argument slot (docs/DECISIONS.md,
+new.target is an argument slot).
 Statement branches duplicate and merge ScopeNode directly, so reassigned bindings acquire Phis
 only when the arm values differ. Final Simple's pruned return-Scope protocol is represented by a
 function-local accumulator of control, memory, and value: bare returns and live fallthrough add
