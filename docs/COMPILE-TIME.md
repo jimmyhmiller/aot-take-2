@@ -124,6 +124,18 @@ The mechanism behind the edge is the sentinel test now, one compare of a value a
 register; it can become table-driven unwinding later without changing the graph, because stack
 maps are already keyed by return PC.
 
+**Mechanism, refined after measurement.** The sentinel is best expressed as a *tag* in the dynamic
+lattice, `TAG-EXCEPTION`, with its own reserved NaN-box prefix: then the exceptional test is the
+existing `TypeTest(value, TAG-EXCEPTION)` on the call's value projection (a prefix compare, no
+load), a Return on a throw path returns the sentinel constant typed `dyn{exception}`, and SCCP does
+the may-throw analysis for free: a callee whose return type excludes the tag folds every check at
+its callers, and a value that may carry the tag is visibly not a JavaScript value wherever it flows.
+That last point is the discipline the pending word never demanded: today a JSL body that calls a
+throwing builtin computes on with `undefined` until the enclosing source function's check; with a
+sentinel every JSL call site of a may-throw definition needs its own check, and the JSL checker
+must infer and enforce a `:throws` property the way it enforces `:transitioning`. The pending word
+keeps the thrown value; its flag field disappears.
+
 **Consequences in the tree.**
 
 - `call.coil`: CallEnd produces control at two projection indices. The verifier requires both
@@ -249,9 +261,9 @@ order is chosen so that each step shrinks what the next one has to handle.
 | 2 | Cast is a zero-byte node erased after scheduling (§6) | Zero bytes and zero moves from Cast; execution suite green | **Landed.** |
 | 3 | All-caller-save frames (§3) | CalleeSave only in the entry wrapper; managed-root splitters and `root-restricted` deleted; GC stress and verify green | **Landed.** 18 CalleeSaves, 5 rounds (target ≤ 3 still open), regalloc 526 → 59 ms |
 | 4 | Exceptional CallEnd projection (§4) | Every pending-check lowering path deleted; `assert.throws`, `finally` and nested-catch tests green | −265 blocks, −1,300 nodes |
-| 5 | Evidence-gated JSL inlining (§5) | Bottom-typed sites are calls; typed fixtures unchanged in node count; bloat ceilings hold | blocks 3,246 → under 500 |
+| 5 | Evidence-gated JSL inlining (§5) | Bottom-typed sites are calls; typed fixtures unchanged in node count; bloat ceilings hold | **Landed**, but see §10: it removed little on the harness, because almost every argument carries a partial tag set and the volume is made at lowering, per site |
 | 6 | Word-level GC liveness, once (§6) | Stack-map tests green; encoding phase under 20 ms on the harness | **Landed.** 205 → 31 ms (the remainder is layout and emission) |
-| 7 | Gates (§7) | The listed assertions exist and are red when any of 1–6 is reverted | |
+| 7 | Gates (§7) | The listed assertions exist and are red when any of 1–6 is reverted | **Landed in part**: `tests/budget-test.coil` gates CalleeSaves, Casts, rounds, node and block ceilings and a 1 s wall ceiling on a harness realm; per-token and campaign gates remain |
 
 Milestones 1, 2 and 6 are backend-local and touch no semantics. Milestone 3 changes the frame
 contract and is the one with runtime exposure; it lands with the GC stress suite. Milestone 4
@@ -272,3 +284,43 @@ have removed the volume that is not the front end's.
 | Exceptions | none | Catch projection, unwind tables | IfSuccess/IfException, handler table | Unwind for JS, sentinel for VM calls | Swift: error register tested per call; JSC: pending field loaded per call |
 | Allocator | Briggs-Chaitin-Click graph colouring with splitting | Same design | Linear scan | Linear scan | GCC IRA, B3 IRC: colouring |
 | Rounds | ≤ 7, no reschedule | | | | |
+
+---
+
+## 10. Where the volume actually comes from (measured 2026-09-08)
+
+After milestones 1–3, 5 and 6, the harness graph is still 15k nodes at the end of parsing, before
+any inlining; the JSL library itself is 2.9k of that (lowered whole, every compile). So the per-site
+cost is made by lowering, not by inlining decisions. One-line programs over the `var x = 1;`
+baseline, nodes added at parse and total after opto (the realm baseline after opto is 612):
+
+| Construct | Parse nodes added | After opto, over the realm |
+|---|---|---|
+| `typeof a` (a unknown) | 151 | 55 |
+| `a === b` (unknown) | 158 | 70 |
+| `a + b`, `a < b`, `if (a)` (unknown) | 158–163 | 54–55 |
+| `o.x` read (unknown o) | 307 | 114 |
+| `o.x = 2` (unknown o) | 244 | 77 |
+| `f()` (a declared empty function) | 146 | 54 |
+| `g(1)` (g an unknown function) | 285 | 229 |
+| `new F(1)` | 427 | 298 |
+| `try { throw 1 } catch (e) {}` | 159 | 54 |
+| string literal | 0 | 0 |
+
+What this says:
+
+- **Every call costs about 50 nodes after optimization**, and the harness has 465 of them. The
+  post-call pending-exception check, the boxing of arguments and result, and the call's
+  projections are the bulk. Milestone 4 (the exceptional projection) is the direct answer to the
+  first of those.
+- **A function declaration costs about 100 nodes** at parse: the function object, its `prototype`
+  object, and their property storage, each a New with stores. The prototype object could be made
+  lazily (V8 does), and intrinsic prototypes as static data would remove the 600-node realm setup
+  every compile pays.
+- **`new` and calls through unknown functions** are the most expensive constructs (300 and 230
+  nodes): callable checks, the TypeError arm, receiver creation and prototype reads.
+- **The evidence rule of §5 is right but rarely decisive here**: a parameter typed
+  `dyn{undefined,double,string,function}` is sharper than `dyn` and inlining does fold a test or
+  two. Making the rule stricter (a single tag, or a constant) would turn those sites into calls
+  and shrink the graph further; that is a knob to revisit with the campaign's numbers.
+

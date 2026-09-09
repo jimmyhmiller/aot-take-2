@@ -252,6 +252,7 @@ aot-take-2/
 │   ├── test262-test.coil            ; metadata, runner policy and accounting regressions
 │   ├── harness.coil                 ; source in → linked binary out → node's answer beside it
 │   ├── bloat-test.coil              ; graph-size budgets: node-count ceilings after optimization
+│   ├── budget-test.coil             ; compile-time budgets as gates: rounds, shape, wall time (docs/COMPILE-TIME.md §7)
 │   ├── execution-test.coil          ; cases that must RUN, not merely compile
 │   └── differential-test.coil       ; compiled output vs. a JavaScript engine
 ├── benchmarks/              ; JavaScript/TypeScript input fixtures for native comparisons
