@@ -1,5 +1,37 @@
 # Decisions
 
+## 2026-09-09 — Strings have no wrapper objects; their properties resolve on %String.prototype%
+
+A property read on a primitive string is `length` for that key and otherwise a lookup on
+%String.prototype% (`JsGetNamed`'s string arm through `%StringPrototype`), and `s[i]` is the
+code unit at an array index (`JsStringIndexGet`). This is GetV without the wrapper: ToObject
+would make a String object whose [[Prototype]] is that very object, and the only difference a
+program could observe — identity of the wrapper — has no consumer here until wrapper objects
+exist (docs/GAPS.md, strings). The methods on the prototype (`jsl/compiler/string-methods.jsl`)
+receive the primitive as `this` and throw a TypeError for any other receiver.
+
+The prototype is an image object like Array's, registered as the well-known intrinsic
+`String.prototype` when `String` is materialized, and `String` is materialized when the program
+names it or names one of its methods as a member — the closed-world property names decide, as for
+the other intrinsics. A computed key that spells a method name only at run time (`s['charAt']`)
+finds nothing unless the program also names it somewhere; that is the approximation every by-name
+intrinsic already makes (`this['Error']`), and materializing the prototype for every computed
+access would compile the whole String library into most programs.
+
+**Methods materialize one by one.** An intrinsic's method is a hoisted function compiled into
+the program and a property of an image object, so only the methods the program names as a member
+somewhere exist (`syntax-names-member?`); `toString` alone, which almost every program names,
+brings one small method, not the library. This is the same closed-world rule that decides which
+intrinsics exist, with the same approximation: a method reached only through a computed key the
+program never spells is absent, and so is enumeration of a prototype's methods (docs/GAPS.md).
+Compiling every method of a materialized owner had put the whole String library into the harness
+realm (8,297 machine nodes against the 8,000 budget) because the harness names `toString`.
+
+Two new runtime capabilities carry the methods: `%Substring` (a fresh string over a clamped
+range) and `%StringFromCharCode` (a one-unit string); indexOf and friends are JSL recursion over
+`%StringCharCode`. `toUpperCase`/`toLowerCase` are not written: a correct implementation needs the
+Unicode case tables, and an ASCII-only one would be wrong on the first non-ASCII input.
+
 ## 2026-09-09 — A loop's parent is the innermost enclosing region any branch proposes
 
 Simple's loop-tree walk (`_bltWalk`) attaches an inner loop to an outer tree at every branch whose

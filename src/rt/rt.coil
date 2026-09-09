@@ -27,6 +27,7 @@
 (import "aot.util.panic" :use *)
 (import "aot.rt.abi" :use *)
 (import "aot.rt.shapes" :use *)
+(import "aot.rt.number" :use *)
 
 ;; Darwin publishes the main executable header and libSystem's section lookup routine. This keeps
 ;; stack-map discovery inside Coil while avoiding an unresolved generated-data symbol in the
@@ -1569,6 +1570,46 @@
                       (continue)))))
         result))))
 
+;; A fresh string of `length` code units, zero-filled, with `root` (a raw string payload the caller
+;; still needs) kept alive and re-read across any collection the allocation triggers.
+(defn rt-alloc-string [(length i64) (shape i64) (map-id i64) (caller-sp i64) (root (ptr i64))] (-> i64)
+  (do
+    (if (> length (/ (- RT-MAX-PAYLOAD-BYTES 8) 2))
+        (alloc/oom-at c"aot_rt_alloc_string: string is too large" length)
+        0)
+    (let [result (rt-alloc-rooted (+ 8 (* length 2)) shape map-id caller-sp root (primitive/cast (ptr i64) 0) false)]
+      (set! (primitive/cast (ptr i64) result) length)
+      result)))
+
+;; The runtime capability behind `%Substring`: the code units of [start, end), which the caller
+;; has already clamped into the string.
+(defn rt-substring [(string i64) (start i64) (end i64) (shape i64) (map-id i64) (caller-sp i64)] (-> i64)
+  (let [root (primitive/alloc-stack i64)]
+    (set! root string)
+    (rt-heap-boot!)
+    (if (or (< start 0) (> start end) (> end (rt-string-length string)))
+        (panic-i "aot_rt_substring: bounds outside the string" end)
+        0)
+    (let [length (- end start)
+          result (rt-alloc-string length shape map-id caller-sp root)
+          (mut i) 0]
+      (loop (if (>= (load i) length)
+                (break 0)
+                (do
+                  (rt-string-set-code-unit! result (load i) (rt-string-code-unit (load root) (+ start (load i))))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      result)))
+
+;; The runtime capability behind `%StringFromCharCode`: a one-unit string of the code unit.
+(defn rt-string-from-code [(unit i64) (shape i64) (map-id i64) (caller-sp i64)] (-> i64)
+  (let [none (primitive/alloc-stack i64)]
+    (set! none 0)
+    (rt-heap-boot!)
+    (let [result (rt-alloc-string 1 shape map-id caller-sp none)]
+      (rt-string-set-code-unit! result 0 (& unit 0xffff))
+      result)))
+
 (defn rt-collect [(map-id i64) (caller-sp i64)] (-> i64)
   (rt-collect-linked! map-id caller-sp))
 
@@ -2352,12 +2393,6 @@
                    "docs/GAPS.md — conversions")
     0))
 
-(defn rt-unimplemented-string-to-number [] (-> i64)
-  (do
-    (unimplemented "StringToNumber of a runtime string"
-                   "docs/GAPS.md — conversions")
-    0))
-
 (defn rt-unimplemented-to-object [] (-> i64)
   (do
     (unimplemented "ToObject on a primitive (wrapper objects: `new String(x)`, `Object(1)`)"
@@ -2571,6 +2606,43 @@
 
 ;; The array index a canonical numeric string denotes (ECMA-262 §6.1.7: "0", or a decimal with
 ;; no leading zero whose value is at most 2^32 - 2), or -1 for any other string.
+;; The runtime capability behind `%StringToNumber` (ECMA-262 §7.1.4.1.1): StrWhiteSpace trimmed
+;; from both ends of the UTF-16 spelling, the ASCII remainder parsed by `aot.rt.number`, and the
+;; Number returned as its boxed word. A non-ASCII character surviving the trim is outside every
+;; numeric production, so the result is NaN without a copy.
+(defn rt-str-whitespace? [(unit i64)] (-> bool)
+  (or (= unit 9) (= unit 10) (= unit 11) (= unit 12) (= unit 13) (= unit 32)
+      (= unit 0xa0) (= unit 0x1680)
+      (and (>= unit 0x2000) (<= unit 0x200a))
+      (= unit 0x2028) (= unit 0x2029) (= unit 0x202f) (= unit 0x205f)
+      (= unit 0x3000) (= unit 0xfeff)))
+
+(defn rt-string-to-number [(string i64)] (-> i64)
+  (let [n (rt-string-length string)
+        (mut lo) 0
+        (mut hi) n]
+    (loop (if (and (< (load lo) (load hi)) (rt-str-whitespace? (rt-string-code-unit string (load lo))))
+              (do (set! (mut lo) (+ (load lo) 1)) (continue))
+              (break 0)))
+    (loop (if (and (< (load lo) (load hi)) (rt-str-whitespace? (rt-string-code-unit string (- (load hi) 1))))
+              (do (set! (mut hi) (- (load hi) 1)) (continue))
+              (break 0)))
+    (let [a (alloc/malloc-allocator)
+          (mut bytes) (al-new [u8] a)
+          (mut i) (load lo)
+          (mut ascii) true]
+      (loop (if (or (not (load ascii)) (>= (load i) (load hi)))
+                (break 0)
+                (let [unit (rt-string-code-unit string (load i))]
+                  (if (> unit 127)
+                      (set! (mut ascii) false)
+                      (push! [u8] (mut bytes) (primitive/cast u8 unit)))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      (let [value (if (load ascii) (number-string-to-number (al-slice (load bytes))) (number-nan))]
+        (al-free! [u8] (mut bytes))
+        (number-word value)))))
+
 (defn rt-array-index-of-string [(string i64)] (-> i64)
   (let [n (rt-string-length string)]
     (if (or (= n 0) (> n 10))
@@ -2629,6 +2701,8 @@
           [rt-string-eq :as "aot_rt_string_eq"]
           [rt-string-compare :as "aot_rt_string_compare"]
           [rt-string-concat :as "aot_rt_string_concat"]
+          [rt-substring :as "aot_rt_substring"]
+          [rt-string-from-code :as "aot_rt_string_from_code"]
           [aot-rt-write-barrier :as "aot_rt_write_barrier"]
           [rt-throw :as "aot_rt_throw"]
           [rt-throw-type-error :as "aot_rt_throw_type_error"]
@@ -2637,9 +2711,7 @@
            :as
            "aot_rt_unimplemented_to_primitive"]
           [rt-unimplemented-to-string :as "aot_rt_unimplemented_to_string"]
-          [rt-unimplemented-string-to-number
-           :as
-           "aot_rt_unimplemented_string_to_number"]
+          [rt-string-to-number :as "aot_rt_string_to_number"]
           [rt-unimplemented-no-realm :as "aot_rt_unimplemented_no_realm"]
           [rt-uncaught :as "aot_rt_uncaught"]
           [rt-number-to-string :as "aot_rt_number_to_string"]

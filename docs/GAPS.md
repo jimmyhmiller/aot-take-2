@@ -125,6 +125,22 @@ each is a JSL definition away; wrapper objects (`new String(x)`,
 `%Object.prototype%` — an ordinary object's [[Prototype]] is null unless set, so
 `Object.prototype.x = 1` is not visible through `{}`.
 
+### 2026-09-09 — Strings
+
+A primitive string's properties resolve on %String.prototype% (docs/DECISIONS.md, strings): `length`,
+`s[i]`, `charAt`, `charCodeAt`, `at`, `indexOf`, `lastIndexOf`, `includes`, `startsWith`,
+`endsWith`, `slice`, `substring`, `concat`, `trim`, `trimStart`, `trimEnd`, `repeat`,
+`toString`, `valueOf`, `split` (string separators), `padStart`, `padEnd` and
+`String.fromCharCode` execute. Missing: wrapper objects (`new String("x")`, `Object("x")`:
+`ToObject` still refuses by name), `toUpperCase`/`toLowerCase` (Unicode case tables),
+`codePointAt`/`fromCodePoint`/`normalize`, `replace`/`replaceAll`/`match`/`search` (regular
+expressions), `localeCompare`, `substr`, the Symbol.split/RegExp separator forms of `split`,
+`includes`/`startsWith`/`endsWith` rejecting a RegExp argument, a method reached only through a
+computed key the program never spells as a member (`s['charAt']`, `a['push']`: intrinsic methods
+materialize by member name, for every intrinsic, so enumerating a prototype's methods sees only the
+named ones), and the ABI deviations shared with arrays: `concat`/`fromCharCode` stop at the first undefined argument, an explicit `undefined`
+position or fill reads as absent, and at most four variadic arguments arrive.
+
 ### 2026-09-09 — Arrays
 
 Array literals (with holes), indexed reads and writes through numbers and numeric strings, `length`
@@ -194,7 +210,7 @@ every tag either to a conversion or to a named runtime refusal (`aot_rt_unimplem
 for objects, `..._to_string` for concatenation with a non-string, `..._string_to_number`, a
 TypeError for Symbol), so programs whose operands the compiler cannot type still compile and only
 the unimplemented conversion refuses when actually reached. ToPrimitive, ToString of numbers and
-StringToNumber are the conversions still to write.
+ToPrimitive is the conversion still to write (StringToNumber runs in the runtime through `%StringToNumber`, `aot.rt.number`; `parseInt`/`parseFloat` do not exist yet).
 
 ### 2026-09-08 — Property access as a node, the runtime shape tree, and the graph-size budgets
 
@@ -205,7 +221,10 @@ one runtime operation over the shape tree (docs/DECISIONS.md, generic property a
 enumeration of shapes. The static shape table travels in the `__aot_shapes` section; the runtime
 extends it. Remaining: the dynamic axis does not carry a struct, so a value that crosses a Box
 loses its shape and every access through it pays the runtime call; a guarded small-set fast path
-(a few shape compares before the call) is not built; the runtime transition lookup is linear over
+(a few shape compares before the call) is not built; a property read on an image object (an
+intrinsic prototype through `JsGetNamed`'s string and array arms, a hoisted function's
+`prototype`) is not folded even though the image shape is known at compile time
+(docs/COMPILE-TIME.md §8 row 10); the runtime transition lookup is linear over
 all shapes; `o[k]` interns its key at run time against the blob's key table (`aot_rt_intern_key`, minting
 runtime ids for new names; linear search) and takes the named path — a constant string key is
 not yet folded to its compile-time id; an array index key takes the element path at run time

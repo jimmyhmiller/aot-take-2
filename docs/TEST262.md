@@ -100,7 +100,10 @@ merges into `results.tsv` and `summary.txt`). `AOT_T262_SAMPLE=N` runs every N-t
 quick campaign over 1/20 of the suite takes about nine minutes on eight workers and its pass rate
 is over the sampled files (the summary records `jobs=` and `sample=`). Artifacts are
 `case-<file-index>-<variant>`. Stage deadlines: compile `AOT_T262_COMPILE_SECONDS` (default 30),
-link 10 s, run 2 s; a compile past its deadline is a `timeout` verdict, so when timeouts appear the
+link `AOT_T262_LINK_SECONDS` (default 30), run `AOT_T262_RUN_SECONDS` (default 15; a freshly linked
+executable's first launch waits about 2.5 s on macOS while the host validates the new binary — the
+old 2 s run deadline turned every such case into a timeout once that validation slowed on
+2026-09-09); a compile past its deadline is a `timeout` verdict, so when timeouts appear the
 per-case compile time is what to fix. Never edit `jsl/` or run `coil build` during a campaign.
 
 ```

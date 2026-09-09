@@ -144,9 +144,10 @@ aot-take-2/
 │   ├── intrinsics.jsl   ; the global-object surface
 │   ├── object-layouts.jsl
 │   └── abstract/ array/ string/ object/ json/ math/ number/ symbol/ compiler/
-│       └── compiler/{add,sub,mul,increment-int-or-identity,logical,…,array}.jsl
+│       └── compiler/{add,sub,mul,increment-int-or-identity,logical,…,array,string-methods}.jsl
 │           ; the production index (`compiler/index`): every operation the frontend lowers to,
-│           ; built on demand per compile; array.jsl is the Array intrinsic and its methods
+│           ; built on demand per compile; array.jsl is the Array intrinsic and its methods,
+│           ; string-methods.jsl String.prototype and String.fromCharCode over primitive strings
 │       function/ array-buffer/ data-view/ typed-array/
 ├── src/
 │   ├── main.coil            ; CLI driver: compile, emit, run, dump; `AOT_SEED=N` compiles under a test's arena seed
@@ -228,6 +229,7 @@ aot-take-2/
 │   │   └── decls.coil       ; (intrinsic …), (internal-slot …), (slot-list …)
 │   │
 │   ├── rt/                  ; the runtime, in Coil, built as its own object (Coil.toml `runtime`)
+│   │   ├── number.coil      ; Number conversions shared by compiler and runtime: exact radix integers, `strtod` decimals, StringToNumber, the NaN-box word
 │   │   ├── abi.coil         ; RtHeap layout + folded field offsets shared with the encoders
 │   │   ├── shapes.coil      ; the runtime shape tree: static `__aot_shapes` blob + runtime transitions
 │   │   └── rt.coil          ; allocation, generational collector, the static heap image as a root region, strings, generic property access, throw entry points
@@ -251,6 +253,7 @@ aot-take-2/
 │   ├── opto-test.coil  gcm-test.coil  sched-test.coil  regalloc-test.coil
 │   ├── encode-test.coil  compunit-test.coil  verify-test.coil  text-test.coil
 │   ├── lex-test.coil  parse-test.coil  regex-test.coil  tstype-test.coil  jsl-test.coil
+│   ├── number-test.coil             ; StringToNumber grammar and the Number word (aot.rt.number)
 │   ├── test262-test.coil            ; metadata, runner policy and accounting regressions
 │   ├── harness.coil                 ; source in → linked binary out → node's answer beside it
 │   ├── bloat-test.coil              ; graph-size budgets: node-count ceilings after optimization
