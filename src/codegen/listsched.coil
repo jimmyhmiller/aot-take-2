@@ -17,6 +17,14 @@
 ;; is the authoritative def-use multiset, so sparse collection follows those zero-byte Projs from
 ;; the multi and `CodeGen.schedule` records them explicitly in a flattened order with per-block
 ;; bounds.
+;;
+;; Simple's XSched.computeSingleRDef follows each output back through the user's input list to
+;; intersect register masks. Its reverse edges, like ours, retain duplicate operands. A k-arm Phi
+;; using one value therefore repeats the same k-arm search k times. We transpose that computation:
+;; a pass-scoped scan of actual input slots accumulates each definition's allowed mask and both
+;; remote flags once per edge. Intersections are idempotent, so no information depends on the old
+;; repeated visits. Block-local two-address propagation and the scheduling scores remain unchanged.
+;; These facts expire with SchedState, before allocation edits operands or erases Casts.
 (module aot.codegen.listsched)
 (import "aot.util.arena" :use [compiler-allocator compiler-state CompilerStateSlot])
 (import "coil.alloc" :as alloc)
@@ -37,6 +45,8 @@
    (member (ArrayList bool))
    (remote-use (ArrayList bool))
    (remote-def (ArrayList bool))
+   (fixed-single (ArrayList bool))
+   (facts-ready bool)
    (single (ArrayList bool))
    (announced (ArrayList bool))
    (emitted (ArrayList bool))])
@@ -44,7 +54,7 @@
 ;; Production diagnostics used by scale regressions. Final Simple's `local` visits `bb._outputs`
 ;; once per block and creates metadata only for those members. Our nid-indexed tables are allocated
 ;; once per scheduling pass, then reset sparsely; neither count may scale as arena-size * blocks.
-(defstruct SchedStats [(collect-visits i64) (state-init-visits i64)])
+(defstruct SchedStats [(collect-visits i64) (state-init-visits i64) (fact-input-visits i64)])
 
 (defn sched-stats [] (-> (ptr SchedStats))
   (compiler-state [SchedStats] (primitive/alloc-static CompilerStateSlot)))
@@ -62,6 +72,7 @@
         (mut member) (al-new [bool] a)
         (mut remote-use) (al-new [bool] a)
         (mut remote-def) (al-new [bool] a)
+        (mut fixed-single) (al-new [bool] a)
         (mut single) (al-new [bool] a)
         (mut announced) (al-new [bool] a)
         (mut emitted) (al-new [bool] a)
@@ -75,6 +86,7 @@
                 (push! [bool] (mut member) false)
                 (push! [bool] (mut remote-use) false)
                 (push! [bool] (mut remote-def) false)
+                (push! [bool] (mut fixed-single) false)
                 (push! [bool] (mut single) false)
                 (push! [bool] (mut announced) false)
                 (push! [bool] (mut emitted) false)
@@ -90,6 +102,7 @@
       (set! (.member (mut state)) (load member))
       (set! (.remote-use (mut state)) (load remote-use))
       (set! (.remote-def (mut state)) (load remote-def))
+      (set! (.fixed-single (mut state)) (load fixed-single))
       (set! (.single (mut state)) (load single))
       (set! (.announced (mut state)) (load announced))
       (set! (.emitted (mut state)) (load emitted))
@@ -105,8 +118,6 @@
                 (set! (mut (.bcnt state)) id 0)
                 (set! (mut (.rcnt state)) id 0)
                 (set! (mut (.member state)) id false)
-                (set! (mut (.remote-use state)) id false)
-                (set! (mut (.remote-def state)) id false)
                 (set! (mut (.single state)) id false)
                 (set! (mut (.announced state)) id false)
                 (set! (mut (.emitted state)) id false)
@@ -166,107 +177,68 @@
   (and (not (n-dead? n))
        (and (= (n-block-nid n) (n-nid block)) (or (cfg? n) (mach? n)))))
 
-(defn sched-edge-register? [(def (dyn NodeOps)) (use_ (dyn NodeOps))] (-> bool)
-  (match (mach-of use_)
-    (None [] false)
-    (Some [mach]
-          (let [(mut i) 1
-                (mut found) false]
-            (loop (if (or (>= (load i) (n-nins use_)) (load found))
-                      (break 0)
-                      (do
-                        (match (n-in use_ (load i))
-                          (Some [input]
-                                (if (n-same? input def)
-                                    (match (m-regmap mach (load i))
-                                      (Some [_] (set! (mut found) true))
-                                      (None [] 0))
-                                    0))
-                          (None [] 0))
-                        (set! (mut i) (+ (load i) 1))
-                        (continue))))
-            (load found)))))
-
-(defn sched-output-single? [(n (dyn NodeOps))] (-> bool)
-  (match (mach-of n)
-    (None [] false)
-    (Some [mach]
-          (match (m-outregmap mach)
-            (None [] false)
-            (Some [out-mask]
-                  (let [(mut allowed) out-mask
-                        (mut oi) 0]
-                    (loop (if (>= (load oi) (n-nouts n))
-                              (break 0)
+;; Build immutable scheduling facts by visiting each machine operand at its actual slot.
+(defn sched-build-facts! [(state (mut SchedState))] (-> i64)
+  (let [limit (len (.member state))
+        (mut allowed) (al-new [(Option (ptr RegMask))] (compiler-allocator))
+        (mut id) 0]
+    (loop (if (>= (load id) limit) (break 0)
+      (do
+        (push! [(Option (ptr RegMask))] (mut allowed)
+          (match (arena-node (load id))
+            (Some [n] (match (mach-of n) (Some [mach] (m-outregmap mach))
+                                        (None [] (None [(ptr RegMask)]))))
+            (None [] (None [(ptr RegMask)]))))
+        (set! (mut id) (+ (load id) 1)) (continue))))
+    (set! (mut id) 1)
+    (loop (if (>= (load id) limit) (break 0)
+      (do
+        (match (arena-node (load id))
+          (Some [use_]
+            (match (mach-of use_)
+              (Some [mach]
+                (let [(mut ii) 1]
+                  (loop (if (>= (load ii) (n-nins use_)) (break 0)
+                    (do
+                      (set! (.fact-input-visits (sched-stats))
+                            (+ (.fact-input-visits (sched-stats)) 1))
+                      (match (n-in use_ (load ii))
+                        (Some [def]
+                          (match (m-regmap mach (load ii))
+                            (Some [mask]
                               (do
-                                (match (n-out n (load oi))
-                                  (Some [use_]
-                                        (match (mach-of use_)
-                                          (Some [use-mach]
-                                                (let [(mut ii) 1]
-                                                  (loop (if (>= (load ii) (n-nins use_))
-                                                            (break 0)
-                                                            (do
-                                                              (match (n-in use_ (load ii))
-                                                                (Some [input]
-                                                                      (if (n-same? input n)
-                                                                          (match (m-regmap use-mach (load ii))
-                                                                            (Some [use-mask]
-                                                                                  (set! (mut allowed)
-                                                                                        (mask-and (load allowed)
-                                                                                                  use-mask)))
-                                                                            (None [] 0))
-                                                                          0))
-                                                                (None [] 0))
-                                                              (set! (mut ii) (+ (load ii) 1))
-                                                              (continue))))))
-                                          (None [] 0)))
-                                  (None [] 0))
-                                (set! (mut oi) (+ (load oi) 1))
-                                (continue))))
-                    (mask-singleton? (load allowed))))))))
+                                (if (!= (n-block-nid def) (n-block-nid use_))
+                                    (do
+                                      (set! (mut (.remote-use state)) (n-nid use_) true)
+                                      (set! (mut (.remote-def state)) (n-nid def) true)) 0)
+                                (match (get (load allowed) (n-nid def))
+                                  (Some [prior]
+                                    (set! (mut allowed) (n-nid def) (Some (mask-and prior mask))))
+                                  (None [] 0))))
+                            (None [] 0)))
+                        (None [] 0))
+                      (set! (mut ii) (+ (load ii) 1)) (continue))))))
+              (None [] 0)))
+          (None [] 0))
+        (set! (mut id) (+ (load id) 1)) (continue))))
+    (set! (mut id) 1)
+    (loop (if (>= (load id) limit) (break 0)
+      (do
+        (set! (mut (.fixed-single state)) (load id)
+          (match (get (load allowed) (load id))
+            (Some [mask] (mask-singleton? mask)) (None [] false)))
+        (set! (mut id) (+ (load id) 1)) (continue))))
+    (al-free! (mut allowed))
+    (set! (.facts-ready state) true)
+    0))
 
 (defn sched-compute-flags! [(block (dyn NodeOps)) (state (mut SchedState))] (-> i64)
+  (if (.facts-ready state) 0 (sched-build-facts! (mut state)))
   (let [(mut mi) 0]
-    (loop (if (>= (load mi) (len (.members state)))
-              (break 0)
-              (let [n
-                      (match (arena-node (get (.members state) (load mi)))
-                        (Some [x] x)
-                        (None [] (unreachable-node)))
-                    (mut remote-use) false
-                    (mut remote-def) false
-                    (mut i) 1]
-                (loop (if (>= (load i) (n-nins n))
-                          (break 0)
-                          (do
-                            (match (n-in n (load i))
-                              (Some [def]
-                                    (if (and (!= (n-block-nid def) (n-nid block))
-                                             (sched-edge-register? def n))
-                                        (set! (mut remote-use) true)
-                                        0))
-                              (None [] 0))
-                            (set! (mut i) (+ (load i) 1))
-                            (continue))))
-                (set! (mut i) 0)
-                (loop (if (>= (load i) (n-nouts n))
-                          (break 0)
-                          (do
-                            (match (n-out n (load i))
-                              (Some [use_]
-                                    (if (and (!= (n-block-nid use_) (n-nid block))
-                                             (sched-edge-register? n use_))
-                                        (set! (mut remote-def) true)
-                                        0))
-                              (None [] 0))
-                            (set! (mut i) (+ (load i) 1))
-                            (continue))))
-                (set! (mut (.remote-use state)) (n-nid n) (load remote-use))
-                (set! (mut (.remote-def state)) (n-nid n) (load remote-def))
-                (set! (mut (.single state)) (n-nid n) (sched-output-single? n))
-                (set! (mut mi) (+ (load mi) 1))
-                (continue))))
+    (loop (if (>= (load mi) (len (.members state))) (break 0)
+      (let [id (get (.members state) (load mi))]
+        (set! (mut (.single state)) id (get (.fixed-single state) id))
+        (set! (mut mi) (+ (load mi) 1)) (continue))))
     ;; Simple propagates `_single` through the input an instruction must overwrite. Iterate because
     ;; arena order need not be definition order and two-address chains can be arbitrarily long.
     (let [(mut changed) true
@@ -290,7 +262,8 @@
                                                  (not (get (.single state) (n-nid n))))
                                             (match (n-in n two)
                                               (Some [def]
-                                                    (if (get (.single state) (n-nid def))
+                                                    (if (and (sched-member? def block)
+                                                             (get (.single state) (n-nid def)))
                                                         (do
                                                           (set! (mut (.single state)) (n-nid n) true)
                                                           (set! (mut changed) true))
@@ -694,6 +667,7 @@
   (do
     (set! (.collect-visits (sched-stats)) 0)
     (set! (.state-init-visits (sched-stats)) 0)
+    (set! (.fact-input-visits (sched-stats)) 0)
     (let [(mut state) (sched-state-new)
         (mut i) 0
         (mut blocks) 0]

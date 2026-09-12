@@ -1,5 +1,45 @@
 # Decisions
 
+## 2026-09-12 — Input-slot scheduling facts, memory wait groups, and stack-required splits
+
+Local scheduling computes register-mask intersections and remote-use/definition flags in a
+pass-scoped scan of machine input slots. Final Simple's `XSched.computeSingleRDef` follows
+reverse outputs and searches the user's inputs. Duplicate edges in a wide Phi repeat that
+search quadratically. The input-slot scan computes the same intersections once per operand;
+idempotence removes the need to revisit duplicate matches. Block-local two-address propagation,
+pressure scores, dependency multiplicity, and deterministic ready ordering stay unchanged.
+The facts expire before Cast erasure and allocator operand edits. A 4,096-arm regression checks
+the exact slot-visit count, fixed-register intersections, and remote flags.
+
+GCM groups selected Loads by their memory definition for the duration of late scheduling.
+Each group counts unfinished clobber edges and wakes its Loads when the count reaches zero.
+Final Simple's `breadth` searches each completed node's definitions' outputs for waiting Loads;
+on high-fanout control and constants that repeats searches with no memory dependency to find.
+The group index visits each participating memory definition's outputs once. Duplicate MemPhi
+arms contribute separate edges and separate decrements. Ordinary def-use wakeups, pinned-node
+placement, loop-Phi handling, and alias-sensitive anti-dependence placement keep their existing
+rules. Late placement preserves memory inputs; added anti-edges consume loaded values. Tests
+cover duplicate clobber edges, one wake per waiting Load, and zero memory searches without Loads.
+
+IFG records positive evidence that a range requires a stack home: a live movable root at a GC
+site, or a live range at a clobber of the target's complete allocatable-register set. We retain
+this evidence even after another constraint empties the mask, propagate it through LRG union,
+and discard it at the next round. The target exposes allocatable registers as a separate ABI
+fact. Its never-save mask cannot supply that fact: AArch64's dedicated X28 context register is
+unavailable to ordinary values but still needs preservation at the host boundary.
+
+After self-conflict and callee-save handling, an empty stack-required range splits its register
+definitions and uses together. Simple's `splitEmptyMaskSimple` first isolates fixed endpoints;
+its generic `splitByLoop` chooses a loop boundary. With our root-home and all-volatile JS-call
+constraints, that sequence can leave ordinary register uses in the failed range and require
+another whole IFG build to discover the same need. The existing boundary splitter now uses
+the retained evidence to isolate both sides in one invocation. It keeps rematerialization,
+Phi-edge placement, and loop-backedge protections. Partial clobbers still allow scalar values
+in preserved registers. The masks and stack-map checks, not this split policy, enforce safety.
+
+The allocator also reuses each computed intersection for trace reporting; disabled tracing
+previously evaluated and discarded a second identical mask operation.
+
 ## 2026-09-12 — Amortize control queries over shared dominator paths
 
 We compute a wide Region's dominator as one N-way intersection. Final Simple's

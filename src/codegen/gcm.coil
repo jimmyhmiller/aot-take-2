@@ -61,6 +61,13 @@
 ;; waits on those clobbers. A Loop explicitly wakes its Phis to break the loop-carried data cycle.
 ;; This is final Simple's `breadth`; rescanning the whole arena once per dependency layer turns a
 ;; deep expression chain into quadratic compile time.
+;; Simple also scans every definition's outputs on each completed use, looking for waiting Loads.
+;; That is quadratic in fanout even when there are no Loads. Here each memory definition with
+;; Loads owns a pass-local group: its load list and the number of unfinished clobber edges. Only
+;; completing a clobber decrements that count; reaching zero wakes the group's Loads once. Duplicate
+;; edges are counted and retired separately, including repeated MemPhi arms. Ordinary value-use
+;; wakeups, early placement of pinned/CFG nodes, and the loop-Phi escape remain Simple's rules.
+;; Memory inputs do not change during late placement; new anti-edges consume values, not memory.
 ;;
 ;; Some placements are known immediately rather than computed:
 ;;
@@ -836,48 +843,13 @@
                   (None [] 0))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
-    ;; A Load also waits for the users of its memory definition. Stores and calls are not ordinary
-    ;; uses of the loaded value, but their chosen blocks determine whether an anti-edge is needed.
-    (if (load ready)
-        (match (mem-of n)
-          (Some [access]
-                (if (not (mem-is-load? access))
-                    true
-                    (let [memory (mem-in access)
-                          (mut j) 0]
-                      (loop (if (or (>= (load j) (n-nouts memory))
-                                    (not (load ready)))
-                                (break 0)
-                                (do
-                                  (match (n-out memory (load j))
-                                    (Some [use_]
-                                          (if (n-same? use_ n)
-                                              0
-                                              (let [op (gcm-ideal-op use_)
-                                                    clobber
-                                                      (match (mem-of use_)
-                                                        (Some [other]
-                                                              (not (mem-is-load? other)))
-                                                        (None []
-                                                              (or (= op OP-CALL)
-                                                                  (= op
-                                                                     OP-MEMPHI))))]
-                                                (if (and clobber
-                                                         (and (gcm-selected-reachable? use_)
-                                                              (not (get (load done)
-                                                                        (n-nid use_)))))
-                                                    (set! (mut ready) false)
-                                                    0))))
-                                    (None [] 0))
-                                  (set! (mut j) (+ (load j) 1))
-                                  (continue))))
-                      (load ready))))
-          (None [] true))
-        false)))
-
-;; Simple's _doSchedLate visits every output edge, and use_block scans all Phi arms
-;; matching the definition. Node.addUse preserves duplicate edges. For k copies of
-;; one value in a wide Phi that repeats the same k-arm dominance calculation k times.
+    ;; The memory group's exact clobber count replaces repeated memory-output searches.
+    (and (load ready)
+         (match (mem-of n)
+           (Some [access]
+             (or (not (mem-is-load? access))
+                 (= (get (.pending (gcm-memory-waits)) (n-nid (mem-in access))) 0)))
+           (None [] true)))))
 ;; LCA is idempotent: visit each distinct user once, while use_block still includes
 ;; EVERY matching predecessor. Scratch marks last only for this query; no dominance
 ;; answer survives graph edits. Clearing through the output list costs O(use edges).
@@ -1087,7 +1059,70 @@
       (None [] 0))))
 
 (defstruct GcmLateStats
-  [(pushes i64) (pops i64) (use-queries i64) (phi-arms i64)])
+  [(pushes i64) (pops i64) (use-queries i64) (phi-arms i64)
+   (memory-edges i64) (memory-wakes i64)])
+
+(defstruct GcmMemoryWaits
+  [(heads (ArrayList i64)) (next (ArrayList i64)) (pending (ArrayList i64))])
+
+(defn gcm-memory-waits [] (-> (ptr GcmMemoryWaits))
+  (compiler-state [GcmMemoryWaits] (primitive/alloc-static CompilerStateSlot)))
+
+(defn gcm-memory-clobber? [(n (dyn NodeOps))] (-> bool)
+  (match (mem-of n)
+    (Some [access] (not (mem-is-load? access)))
+    (None [] (let [op (gcm-ideal-op n)] (or (= op OP-CALL) (= op OP-MEMPHI))))))
+
+;; Index only memory definitions actually consumed by a selected Load. In particular, a Fun or
+;; a shared scalar constant with thousands of users never triggers a search for memory waiters.
+(defn gcm-memory-waits-begin! [(limit i64)] (-> i64)
+  (let [state (gcm-memory-waits) a (compiler-allocator)
+        (mut groups) (al-new [i64] a) (mut i) 0]
+    (set! (.heads state) (al-new [i64] a))
+    (set! (.next state) (al-new [i64] a))
+    (set! (.pending state) (al-new [i64] a))
+    (loop (if (>= (load i) limit) (break 0)
+      (do (push! [i64] (mut (.heads state)) -1)
+          (push! [i64] (mut (.next state)) -1)
+          (push! [i64] (mut (.pending state)) 0)
+          (set! (mut i) (+ (load i) 1)) (continue))))
+    (set! (mut i) 1)
+    (loop (if (>= (load i) limit) (break 0)
+      (do
+        (match (arena-node (load i))
+          (Some [n]
+            (if (gcm-selected-reachable? n)
+              (match (mem-of n)
+                (Some [access]
+                  (if (mem-is-load? access)
+                    (let [memory (n-nid (mem-in access)) head (get (.heads state) memory)]
+                      (if (= head -1) (push! [i64] (mut groups) memory) 0)
+                      (set! (mut (.next state)) (n-nid n) head)
+                      (set! (mut (.heads state)) memory (n-nid n))) 0))
+                (None [] 0)) 0))
+          (None [] 0))
+        (set! (mut i) (+ (load i) 1)) (continue))))
+    (al-for [id (load groups)]
+      (let [memory (match (arena-node id) (Some [n] n) (None [] (unreachable-node)))
+            (mut oi) 0]
+        (loop (if (>= (load oi) (n-nouts memory)) (break 0)
+          (do
+            (set! (.memory-edges (gcm-late-stats)) (+ (.memory-edges (gcm-late-stats)) 1))
+            (match (n-out memory (load oi))
+              (Some [use_]
+                (if (and (gcm-selected-reachable? use_) (gcm-memory-clobber? use_))
+                    (set! (mut (.pending state)) id (+ (get (.pending state) id) 1)) 0))
+              (None [] 0))
+            (set! (mut oi) (+ (load oi) 1)) (continue))))))
+    (al-free! (mut groups))
+    0))
+
+(defn gcm-memory-waits-end! [] (-> i64)
+  (let [state (gcm-memory-waits)]
+    (al-free! (mut (.heads state)))
+    (al-free! (mut (.next state)))
+    (al-free! (mut (.pending state)))
+    0))
 
 (defn gcm-late-stats [] (-> (ptr GcmLateStats))
   (compiler-state [GcmLateStats] (primitive/alloc-static CompilerStateSlot)))
@@ -1118,37 +1153,31 @@
                            (done (mut (ArrayList bool)))
                            (on (mut (ArrayList bool)))
                            (work (mut (ArrayList i64)))] (-> i64)
-  (let [(mut i) 0]
-    (loop (if (>= (load i) (n-nins n))
-              (break 0)
-              (do
-                (match (n-in n (load i))
-                  (Some [def]
+  (let [(mut i) 0
+        state (gcm-memory-waits)
+        clobber (gcm-memory-clobber? n)]
+    (loop (if (>= (load i) (n-nins n)) (break 0)
+      (do
+        (match (n-in n (load i))
+          (Some [def]
+            (do
+              (gcm-late-push! def (mut done) (mut on) (mut work))
+              (if (and clobber (>= (get (.heads state) (n-nid def)) 0))
+                (let [memory (n-nid def) old (get (.pending state) memory)]
+                  (if (<= old 0) (broken "gcm-late-wake-defs!: memory pending count underflow") 0)
+                  (set! (mut (.pending state)) memory (- old 1))
+                  (if (= old 1)
+                    (let [(mut id) (get (.heads state) memory)]
+                      (loop (if (< (load id) 0) (break 0)
                         (do
-                          (gcm-late-push! def (mut done) (mut on) (mut work))
-                          ;; Completing any use of a memory definition may make a waiting Load's
-                          ;; anti-dependence layer ready. This is final Simple's def-triggered wakeup.
-                          (let [(mut oi) 0]
-                            (loop (if (>= (load oi) (n-nouts def))
-                                      (break 0)
-                                      (do
-                                        (match (n-out def (load oi))
-                                          (Some [use_]
-                                                (match (mem-of use_)
-                                                  (Some [access]
-                                                        (if (mem-is-load? access)
-                                                            (gcm-late-push! use_
-                                                                            (mut done)
-                                                                            (mut on)
-                                                                            (mut work))
-                                                            0))
-                                                  (None [] 0)))
-                                          (None [] 0))
-                                        (set! (mut oi) (+ (load oi) 1))
-                                        (continue)))))))
-                  (None [] 0))
-                (set! (mut i) (+ (load i) 1))
-                (continue))))
+                          (set! (.memory-wakes (gcm-late-stats))
+                                (+ (.memory-wakes (gcm-late-stats)) 1))
+                          (match (arena-node (load id))
+                            (Some [load_] (gcm-late-push! load_ (mut done) (mut on) (mut work)))
+                            (None [] (broken "gcm-late-wake-defs!: missing waiting Load")))
+                          (set! (mut id) (get (.next state) (load id))) (continue))))) 0)) 0)))
+          (None [] 0))
+        (set! (mut i) (+ (load i) 1)) (continue))))
     (if (= (gcm-ideal-op n) OP-LOOP)
         (let [(mut oi) 0]
           (loop (if (>= (load oi) (n-nouts n))
@@ -1187,6 +1216,9 @@
     (set! (.pops (gcm-late-stats)) 0)
     (set! (.use-queries (gcm-late-stats)) 0)
     (set! (.phi-arms (gcm-late-stats)) 0)
+    (set! (.memory-edges (gcm-late-stats)) 0)
+    (set! (.memory-wakes (gcm-late-stats)) 0)
+    (gcm-memory-waits-begin! limit)
     ;; Final Simple's sparse backwards walk: Stop is the only seed. A completed use wakes its defs;
     ;; a completed memory use additionally wakes Loads sharing that memory definition.
     (gcm-late-push! (code-stop) (mut done) (mut on) (mut work))
@@ -1227,6 +1259,7 @@
         (do (println "aot gcm dominators: {} indexed queries; {} lifting steps"
                      (.queries (gcm-dom-index)) (.steps (gcm-dom-index))) 0) 0)
     (set! (.active (gcm-dom-index)) false)
+    (gcm-memory-waits-end!)
     0))
 
 ;; The block in which `use_` consumes `n`. For a Phi arm this is the matching Region PREDECESSOR,

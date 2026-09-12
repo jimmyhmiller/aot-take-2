@@ -1,5 +1,12 @@
 # Compile time: the shape of the graph, the frame model, and the budgets
 
+Current policy amendments appear in `docs/DECISIONS.md`: the September 10 runtime-clobber
+decision preserves AAPCS64 scalar registers across runtime calls and requires separate GC root
+homes. That supersedes the uniform-clobber policy in §3 below. September 12 adds shared-path
+control queries, input-slot scheduling facts, memory wait groups, and stack-required split
+evidence. The measurements below retain their original workloads and dates; they are not current
+performance claims for the Temporal compilation fixture.
+
 This document is the architecture for how much a compile may cost and why. It exists because the
 same failure has now happened twice: the pipeline was correct, every pass was locally reasonable,
 and compiling two hundred lines of JavaScript took seconds. Each time the cause was not a slow
@@ -350,4 +357,3 @@ What this says:
   `dyn{undefined,double,string,function}` is sharper than `dyn` and inlining does fold a test or
   two. Making the rule stricter (a single tag, or a constant) would turn those sites into calls
   and shrink the graph further; that is a knob to revisit with the campaign's numbers.
-

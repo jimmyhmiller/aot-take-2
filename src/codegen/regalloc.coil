@@ -85,6 +85,16 @@
 ;; produce a stack map for a moving collector, so the kind rides along with the live range from
 ;; here into src/codegen/gcmeta.coil.
 ;;
+;; Constraint failures also retain their CAUSE. Simple's splitEmptyMaskSimple first isolates the
+;; few fixed-register endpoints; splitByLoop otherwise separates shallow/deep loop boundaries.
+;; With preserved scalar registers that often resolves an empty mask in one retry. Our GC roots
+;; require writable stack locations, and our JS ABI kills all allocatable physical registers.
+;; For those proven stack-required ranges, isolating only a fixed endpoint merely rediscovers the
+;; same impossible register lifetime in later rounds. IFG records that positive evidence even if
+;; the mask was already empty. After self-conflict and callee-save handling, the splitter isolates
+;; ALL register endpoints at once, retaining ordinary rematerialization and Phi-edge placement.
+;; Evidence is unioned with its LRG, reset each round, and never substitutes for liveness or masks.
+;;
 ;; ## Post-colouring
 ;;
 ;; `postColor` removes no-op spills — a split whose two halves ended up in the same register is a
@@ -139,6 +149,8 @@
   [(parent (ArrayList i64))
    (masks (ArrayList (Option (ptr RegMask))))
    (kinds (ArrayList i64))
+   (stack-required (ArrayList bool))
+   (allocatable-registers (Option (ptr RegMask)))
    ;; The fixed entry definition for a whole-function saved register. Final Simple keeps this in
    ;; LRG._machDef for spill-risk scoring; zero means this LRG has no such definition.
    (callee-save-defs (ArrayList i64))
@@ -228,6 +240,8 @@
     (set! (.parent state) (al-new [i64] a))
     (set! (.masks state) (al-new [(Option (ptr RegMask))] a))
     (set! (.kinds state) (al-new [i64] a))
+    (set! (.stack-required state) (al-new [bool] a))
+    (set! (.allocatable-registers state) (None [(ptr RegMask)]))
     (set! (.callee-save-defs state) (al-new [i64] a))
     (set! (.mach-defs state) (al-new [i64] a))
     (set! (.mach-uses state) (al-new [i64] a))
@@ -274,6 +288,7 @@
     (push! [i64] (mut (.parent state)) 0)
     (push! [(Option (ptr RegMask))] (mut (.masks state)) (None [(ptr RegMask)]))
     (push! [i64] (mut (.kinds state)) LRG-SCALAR)
+    (push! [bool] (mut (.stack-required state)) false)
     (push! [i64] (mut (.callee-save-defs state)) 0)
     (push! [i64] (mut (.mach-defs state)) 0)
     (push! [i64] (mut (.mach-uses state)) 0)
@@ -322,6 +337,7 @@
         (push! [i64] (mut (.parent state)) id)
         (push! [(Option (ptr RegMask))] (mut (.masks state)) (None [(ptr RegMask)]))
         (push! [i64] (mut (.kinds state)) (ra-kind-of-node n))
+        (push! [bool] (mut (.stack-required state)) false)
         (push! [i64] (mut (.callee-save-defs state)) 0)
         (push! [i64] (mut (.mach-defs state)) 0)
         (push! [i64] (mut (.mach-uses state)) 0)
@@ -406,7 +422,9 @@
         state (ra-state)
         next
           (match (get (.masks state) leader)
-            (Some [prior] (do (ra-trace-tail-loss! leader "and-mask" prior mask (mask-and prior mask)) (mask-and prior mask)))
+            (Some [prior]
+              (let [next (mask-and prior mask)]
+                (ra-trace-tail-loss! leader "and-mask" prior mask next) next))
             (None [] mask))]
     (set! (mut (.masks state)) leader (Some next))
     (if (mask-empty? next)
@@ -441,10 +459,14 @@
                 (match (get (.masks state) leader)
                   (Some [lm]
                         (match (get (.masks state) child)
-                          (Some [cm] (do (ra-trace-tail-loss! leader "union" lm cm (mask-and lm cm)) (Some (mask-and lm cm))))
+                          (Some [cm]
+                            (let [next (mask-and lm cm)]
+                              (ra-trace-tail-loss! leader "union" lm cm next) (Some next)))
                           (None [] (Some lm))))
                   (None [] (get (.masks state) child)))]
           (set! (mut (.parent state)) child leader)
+          (set! (mut (.stack-required state)) leader
+                (or (get (.stack-required state) leader) (get (.stack-required state) child)))
           (set! (mut (.masks state)) leader merged-mask)
           (set! (mut (.kinds state))
                 leader
@@ -1014,6 +1036,18 @@
 (defn ra-gc-site-op? [(op i64)] (-> bool)
   (or (= op OP-CALL) (= op OP-NEW) (= op OP-JSOP) (= op OP-SAFEPOINT)))
 
+(defn ra-stack-required? [(lrg i64)] (-> bool)
+  (get (.stack-required (ra-state)) (ra-find! lrg)))
+
+;; The target is fixed for a round. Its immutable register universe is a round fact, not another
+;; mask to reconstruct at each call visited by the backwards liveness worklist.
+(defn ra-allocatable-registers [] (-> (ptr RegMask))
+  (let [state (ra-state)]
+    (match (.allocatable-registers state)
+      (Some [mask] mask)
+      (None [] (let [mask (mach-active-allocatable)]
+                 (set! (.allocatable-registers state) (Some mask)) mask)))))
+
 (defn ra-ifg-kills! [(mach (dyn MachNode)) (live (mut RaLive))] (-> i64)
   (do
     ;; Simple subtracts ABI clobbers from live masks. GC placement is a separate constraint:
@@ -1029,13 +1063,19 @@
                (m-killmap mach))
       (None [] 0)
       (Some [kills]
-            (let [(mut i) 0]
+            (let [(mut i) 0
+                  ;; This is a target-wide proof, not an inference from an already-empty mask.
+                  ;; Runtime calls that preserve any allocatable register do not establish it.
+                  no-registers (mask-empty? (mask-sub (ra-allocatable-registers) kills))]
               (loop (if (>= (load i) (len (load (.ids live))))
                         (break 0)
                         (let [lrg (ra-find! (get (load (.ids live)) (load i)))]
                           (if (!= (ra-live-get (mut live) lrg) 0)
                               (do
                               (let [kind (ra-lrg-kind lrg)]
+                                (if (or no-registers
+                                        (and root-site (or (= kind LRG-RAW-REF) (= kind LRG-BOXED))))
+                                    (set! (mut (.stack-required (ra-state))) lrg true) 0)
                                 (if (and (or (= kind LRG-RAW-REF) (= kind LRG-BOXED))
                                          root-site)
                                     (do (ra-lrg-and-mask! lrg (selected-gc-root-mask)) 0) 0))
@@ -3152,14 +3192,15 @@
               fixed-defs (get (.fixed-def-counts state) leader)
               fixed-uses (get (.fixed-use-counts state) leader)
               empty (match (ra-lrg-mask leader) (Some [mask] (mask-empty? mask)) (None [] false))
-              ;; An empty mask with no fixed endpoint at all was emptied by a kill: the range
+              ;; Explicit stack-required evidence, or an empty mask with no fixed endpoint,
+              ;; identifies a lifetime that needs both sides isolated. In the latter case the range
               ;; crosses a call and must become stack-resident on EVERY side, so every def gets
               ;; its copy and every use its reload whatever its loop depth. Simple's deep-side
               ;; rule below isolates fixed-register conflicts; it never meets this case because
               ;; Simple's calls spare the callee-saved registers (docs/DECISIONS.md, the
               ;; compile-time architecture). Splitting only the deep side left the shallow
               ;; register use in the range and the same failure every round.
-              kill-empty (and empty (= (+ fixed-defs fixed-uses) 0))
+              kill-empty (and empty (or (ra-stack-required? leader) (= (+ fixed-defs fixed-uses) 0)))
               empty-multi
                 (and empty
                      (not kill-empty)
@@ -3579,6 +3620,9 @@
                 fixed-defs (get (.fixed-def-counts state) leader)
                 fixed-uses (get (.fixed-use-counts state) leader)
                 empty (ra-lrg-mask-empty? leader)]
+            (if (and empty (ra-stack-required? leader))
+                (do (ra-trace-policy! "required-stack-boundaries")
+                    (ra-split-by-loop-boundary! round leader))
             (if (and empty (<= fixed-defs 1) (<= fixed-uses 1) (> (+ fixed-defs fixed-uses) 0))
                     ;; Simple's empty1 returns true even when a cloneable fixed def with multiple
                     ;; uses causes both insertion guards to skip. A shared XZR constant joined to
@@ -3603,7 +3647,7 @@
                                 (if (do (ra-trace-policy! "loop-boundary") (ra-split-by-loop-boundary! round leader))
                                     true
                                     (do (ra-trace-policy! "pressure-use")
-                                        (ra-split-pressure-use! round leader)))))))))))
+                                        (ra-split-pressure-use! round leader))))))))))))
 ;; A range whose only allowed register is R fails while a neighbour BORN in R — a fixed
 ;; single-register definition such as an allocation or call result in X0 — still holds R at our
 ;; definition (its last use, a copy into another argument register, comes after ours). Copies of
