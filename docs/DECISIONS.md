@@ -1,5 +1,38 @@
 # Decisions
 
+## 2026-09-12 — Amortize control queries over shared dominator paths
+
+We compute a wide Region's dominator as one N-way intersection. Final Simple's
+`RegionNode.idom` folds `CFGNode._idom` over live predecessors with a parallel chain walk.
+On a Script with many throwing operations, that fold walks the same normal-continuation
+prefix for successive exceptional exits. The existing idom cache avoids repeating a whole
+query, but cannot reduce the quadratic work inside its first computation.
+
+After each connected pair meets, we record the traversed nodes as descendants of the running
+LCA. A later input that reaches this covered subtree has that LCA as its answer. The running
+LCA can move toward the root without invalidating coverage. Two-input Regions keep the
+ordinary pairwise walk. A disconnected transient path uses the existing dead-root rule and
+clears coverage; high inputs still do not constrain dominance. Coverage belongs to one query,
+so graph edits cannot leave stale coverage behind. The final answer retains the existing
+control-edit-version cache.
+
+Instruction selection now uses `cfg-owner-fun`, the versioned path-compressed owner query.
+Its former private implementation followed Simple's `CFGNode.fun` walk from each Call and
+CallEnd to Fun, repeating the same prefix. Selection still derives ownership from control
+and preserves the caller's incoming stack-argument area in outgoing ABI locations.
+
+The identical-graph `tools/control-study.coil` experiment measures the original pairwise
+walk against the covered traversal with warmed depth caches. At 1,001, 2,001 and 4,001 exit
+paths, the pairwise walk took 37, 144 and 560 ms. The covered traversal took at most 1 ms
+and 2,998, 5,998 and 11,998 chain steps. Tests compare answers across permuted and duplicate
+predecessors, retain dead-subtree cases, and impose linear-work bounds. Ownership tests
+also change an upstream control edge and check the new function answer.
+
+We kept graph construction, JSL policy, register allocation and machine block layout unchanged.
+The investigation pad records rejected constant-materialization, operand-copy, stack-home
+and call-block-fusion experiments. This change addresses a measured scaling defect; it does
+not establish that graph expansion or allocation needs no further work.
+
 ## 2026-09-10 — Precise memory updates, lexical identities and guarded graph inlining
 
 Property writes follow final Simple Parser.storeMem/mergeAlias: a fresh MemMerge keeps the

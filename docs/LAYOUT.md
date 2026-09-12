@@ -280,6 +280,7 @@ aot-take-2/
     ├── dot-dump.coil
     ├── memory-run.coil      ; source-to-memory compilation and execution without subprocesses
     ├── compile-study.coil   ; diagnostic retained-Script pass timings, graph counts and project DOT snapshots
+    ├── control-study.coil   ; identical-graph pairwise versus covered-subtree dominator scaling
     ├── test262-metadata.coil ; test262 frontmatter, required variants and include ordering
     ├── test262-policy.coil   ; independent source-unit plans and observed-result classification
     ├── test262-worker.coil   ; bounded sequential compiler/linker/native process execution

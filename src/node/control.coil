@@ -159,6 +159,7 @@
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
 (import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
 (import "aot.node.cfg" :use *)
@@ -727,6 +728,8 @@
 (defn region-idom [(r (dyn NodeOps))] (-> (Option (dyn NodeOps)))
   (if (n-idom-cache-valid? r)
       (n-idom-cached r)
+      (if (> (n-nins r) 3)
+          (region-idom-wide r)
       (let [cnt (n-nins r)
             (mut i) 1
             (mut lca) (None [(dyn NodeOps)])]
@@ -742,7 +745,74 @@
                     (set! (mut i) (+ (load i) 1))
                     (continue))))
         (n-set-idom-cache! r (load lca))
-        (load lca))))
+        (load lca)))))
+
+;; A multi-path merge is one N-way intersection, not N independent two-path queries.
+;; Simple folds Region inputs with CFGNode._idom's parallel chain walk. After each fold,
+;; every traversed node is dominated by the new LCA. Remember that covered subtree: when
+;; the next path reaches any covered node, its intersection is the running LCA immediately.
+;; This avoids rewalking the shared normal path for every exception exit in a long Script.
+;; Two-path Regions retain the allocation-free ordinary walk. Disconnected transient paths
+;; use the existing dead-root rule and clear coverage; no fact crosses into another tree.
+(defstruct RegionLcaStats [(steps i64) (paths i64)])
+(defn region-lca-stats [] (-> (ptr RegionLcaStats))
+  (compiler-state [RegionLcaStats] (primitive/alloc-static CompilerStateSlot)))
+
+(defn region-lca-covered [(path (dyn NodeOps)) (prior (dyn NodeOps))
+                         (covered (mut (HashMap i64 bool)))
+                         (pending (mut (ArrayList i64)))] (-> (Option (dyn NodeOps)))
+  (let [(mut lhs) (Some path) (mut rhs) (Some prior)
+        (mut answer) (None [(dyn NodeOps)]) (mut connected) false]
+    (al-clear! (mut pending))
+    (set! (.paths (region-lca-stats)) (+ (.paths (region-lca-stats)) 1))
+    (loop
+      (match (load lhs)
+        (None [] (break 0))
+        (Some [l]
+          (if (hm-contains? (load covered) (n-nid l))
+              (do (set! (mut answer) (Some prior)) (set! (mut connected) true) (break 0))
+              (match (load rhs)
+                (None [] (break 0))
+                (Some [r]
+                  (if (n-same? l r)
+                      (do (set! (mut answer) (Some l)) (set! (mut connected) true) (break 0))
+                      (let [ld (cfg-idepth-of l) rd (cfg-idepth-of r)]
+                        (if (>= ld rd)
+                            (do (push! [i64] (mut pending) (n-nid l))
+                                (set! (mut lhs) (cfg-idom-of l))) 0)
+                        (if (<= ld rd)
+                            (do (push! [i64] (mut pending) (n-nid r))
+                                (set! (mut rhs) (cfg-idom-of r))) 0)
+                        (set! (.steps (region-lca-stats)) (+ (.steps (region-lca-stats)) 1))
+                        (if (> (len (load pending)) (* 2 (+ (arena-node-count) 1)))
+                            (broken "region-lca-covered: cyclic dominator chain") 0)
+                        (continue)))))))))
+    (if (load connected)
+        (do
+          (al-for [id (load pending)] (set! (mut covered) id true))
+          (match (load answer) (Some [n] (set! (mut covered) (n-nid n) true)) (None [] 0))
+          (load answer))
+        (do (hm-clear! (mut covered)) (region-lca-path path (Some prior))))))
+
+(defn region-idom-wide [(r (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [a (compiler-allocator)
+        (mut covered) (hm-new [i64 bool] a (i64-keyops))
+        (mut pending) (al-new [i64] a)
+        (mut lca) (None [(dyn NodeOps)]) (mut i) 1]
+    (loop (if (>= (load i) (n-nins r)) (break 0)
+      (do
+        (match (n-in r (load i))
+          (Some [v]
+            (if (ty-high? (n-ty v)) 0
+              (set! (mut lca)
+                (match (load lca)
+                  (None [] (do (set! (mut covered) (n-nid v) true) (Some v)))
+                  (Some [prior] (region-lca-covered v prior (mut covered) (mut pending)))))))
+          (None [] 0))
+        (set! (mut i) (+ (load i) 1)) (continue))))
+    (n-set-idom-cache! r (load lca))
+    (hm-free! (mut covered)) (al-free! (mut pending))
+    (load lca)))
 
 ;; The LCA of one more live path with the running answer. When the two chains never meet, at least
 ;; one of them ended at a root that is not Start — a dead subtree not yet retyped, whose chain ends
@@ -881,6 +951,10 @@
 (defn cfg--owner-test [(fun? (fnptr c [(ref (dyn NodeOps))] bool)) (c (dyn NodeOps))] (-> bool)
   (primitive/call-ptr fun? c))
 
+(defstruct CfgOwnerStats [(steps i64)])
+(defn cfg-owner-stats [] (-> (ptr CfgOwnerStats))
+  (compiler-state [CfgOwnerStats] (primitive/alloc-static CompilerStateSlot)))
+
 (defn cfg-owner-fun [(n (dyn NodeOps)) (fun? (fnptr c [(ref (dyn NodeOps))] bool))] (-> (Option (dyn NodeOps)))
   (let [a (compiler-allocator)
         (mut path) (al-new [i64] a)
@@ -902,6 +976,7 @@
                               (do (set! (mut answer) (Some c)) (set! (mut done) true))
                               (do
                                 (push! [i64] (mut path) (n-nid c))
+                                (set! (.steps (cfg-owner-stats)) (+ (.steps (cfg-owner-stats)) 1))
                                 (set! (mut cur) (cfg-idom-of c))
                                 (set! (mut guard) (+ (load guard) 1))
                                 (continue))))))))
