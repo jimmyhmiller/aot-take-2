@@ -309,6 +309,15 @@ on a missing read, implicit global on a sloppy write) wait for global-object bin
 properties. `typeof` of such a name is "undefined". Standard globals (`syntax-standard-global?`)
 refuse at run time even under `typeof`.
 
+The external-mutation source boundary now resolves otherwise unknown names through the global
+object record, including catchable ReferenceError completions and getter exceptions. Its
+`typeof` path reads unknown object bindings at execution instead of folding them to undefined.
+Retained Script assembly now supplies shared global let/const cells, lexical-first reads and
+typeof, retained assignment references, and runtime declaration checks. Cross-unit callbacks
+can read and write those cells. Classes/destructuring and captured local/block environments
+remain unsupported; closed-program lexical lowering retains its earlier limitations. See the
+2026-09-10 retained Script lexical decision in `docs/DECISIONS.md`.
+
 Backend: a Script whose control never reaches its Return (`for (;;) ;`) panics in the loop tree
 (`looptree-walk!: postvisited child has no loop tree`) — an infinite loop with no exit has no
 path to Stop; a program with such a loop does not compile yet. The CallEnd optimistic rule that

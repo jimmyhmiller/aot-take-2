@@ -13,6 +13,7 @@
 ;; unpinned single-result scalar instructions; CFG, calls, memory and multi-result nodes retain
 ;; their own concrete structs because their NodeOps/CFGOps behavior differs.
 (module aot.node.cpus.arm64.base)
+(import "aot.util.arena" :use [compiler-allocator compiler-state CompilerStateSlot])
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
 (import "coil.arraylist" :use *)
@@ -23,6 +24,7 @@
 (import "aot.codegen.machine" :use *)
 (import "aot.codegen.encoding" :use *)
 (import "aot.codegen.regmask" :use *)
+(import "aot.rt.abi" :use [RT-HEAP-OFFSET-UNIT-OBJECTS RT-HEAP-OFFSET-UNIT-KEYS RT-HEAP-OFFSET-UNIT-SHAPES])
 
 (const ARM64-CLASS-NONE 0)
 (const ARM64-CLASS-GPR 1)
@@ -75,6 +77,8 @@
 
 ;; Object OR function object: the two heap prefixes property machinery treats alike.
 (const ARM64-FORM-TYPETEST-OBJECTLIKE 24)
+(const ARM64-FORM-UNITDATA 25)
+(const ARM64-FORM-UNITIDENTITY 26)
 
 (const ARM64-X0 0)
 (const ARM64-X17 17)
@@ -106,7 +110,7 @@
 (defstruct Arm64ClassMasks [(gpr (ptr RegMask)) (fpr (ptr RegMask)) (flags (ptr RegMask)) (built bool)])
 
 (defn arm64-class-masks [] (-> (ptr Arm64ClassMasks))
-  (let [t (primitive/alloc-static Arm64ClassMasks)]
+  (let [t (compiler-state [Arm64ClassMasks] (primitive/alloc-static CompilerStateSlot))]
     (if (.built t)
         t
         (do
@@ -155,7 +159,7 @@
                           (commutative bool)
                           (clone-cheap bool)]
                          (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [Arm64ScalarNode] (alloc/create [Arm64ScalarNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.ideal-op p) ideal-op)
@@ -217,6 +221,56 @@
 (defn arm64-scalar-control-input! [(n (dyn NodeOps)) (ctrl (Option (dyn NodeOps)))] (-> i64)
   (do (set! (mut (.ins (hdr n))) 0 ctrl) 0))
 
+(defn arm64-encode-unit-data! [(encoder i64) (p (ptr Arm64ScalarNode))] (-> i64)
+  (let [d (m-node (primitive/make-dyn MachNode p)) rd (arm64-enc-gpr encoder d)
+        index (.imm p) (mut word) 0]
+    (if (= rd 16) (panic "arm64-encode-unit-data!: result aliases scratch X16") 0)
+    ;; LDR Xd,[X28,#unit-objects]; materialize the installation slot (zero in object files).
+    (enc-add4! encoder (| 0xf9400380 (| (primitive/ishl (/ RT-HEAP-OFFSET-UNIT-OBJECTS 8) 10) rd)))
+    (enc-add-unit-site! encoder ENC-UNIT-DATA (.imm p) 16)
+    (enc-add4! encoder 0xd2800010)
+    (enc-add4! encoder 0xf2a00010)
+    ;; LDR Xd,[Xd,X16,LSL #3] selects this unit's local-object map.
+    (enc-add4! encoder (| 0xf8707800 (| (primitive/ishl rd 5) rd)))
+    (loop (if (>= (load word) 4) (break 0)
+              (do
+                (enc-add4! encoder
+                  (| (if (= (load word) 0) 0xd2800010 0xf2800010)
+                     (| (primitive/ishl (load word) 21)
+                        (primitive/ishl (& (primitive/ishr index (* 16 (load word))) 0xffff) 5))))
+                (set! (mut word) (+ (load word) 1)) (continue))))
+    ;; The final lookup binds object identity; text no longer bakes a payload's image offset.
+    (enc-add4! encoder (| 0xf8707800 (| (primitive/ishl rd 5) rd)))
+    0))
+
+;; The same stable installation slot selects an immutable identity map in each fresh realm.
+;; Local IDs are 32-bit metadata indices, never runtime constants. Two MOV words materialize
+;; the index and LDR reads its mapped word. The caller supplies disjoint result/scratch registers;
+;; allocation needs X17 scratch because its fast path retains the header address in X16.
+(defn arm64-encode-unit-identity-to! [(encoder i64) (kind i64) (id i64) (rd i64) (scratch i64)] (-> i64)
+  (let [key (= kind ENC-UNIT-KEY)
+        offset (if key RT-HEAP-OFFSET-UNIT-KEYS RT-HEAP-OFFSET-UNIT-SHAPES)
+        indexed (| 0xf8607800 (primitive/ishl scratch 16))]
+    (if (or (not (or key (= kind ENC-UNIT-SHAPE)))
+            (< rd 0) (> rd 30) (= rd ARM64-X28)
+            (< scratch 0) (> scratch 30) (= scratch ARM64-X28) (= rd scratch))
+        (panic "arm64-encode-unit-identity-to!: invalid kind or register pair") 0)
+    (if (or (<= id 0) (> id 0xffffffff))
+        (panic "arm64-encode-unit-identity!: identity exceeds the metadata ABI") 0)
+    (enc-add4! encoder (| 0xf9400380 (| (primitive/ishl (/ offset 8) 10) rd)))
+    (enc-add-unit-site! encoder kind id scratch)
+    (enc-add4! encoder (| 0xd2800000 scratch))
+    (enc-add4! encoder (| 0xf2a00000 scratch))
+    (enc-add4! encoder (| indexed (| (primitive/ishl rd 5) rd)))
+    (enc-add4! encoder (| (| 0xd2800000 scratch) (primitive/ishl (& id 0xffff) 5)))
+    (enc-add4! encoder (| (| 0xf2a00000 scratch) (primitive/ishl (primitive/ishr id 16) 5)))
+    (enc-add4! encoder (| indexed (| (primitive/ishl rd 5) rd)))
+    0))
+
+(defn arm64-encode-unit-identity! [(encoder i64) (p (ptr Arm64ScalarNode))] (-> i64)
+  (arm64-encode-unit-identity-to! encoder (if (= (.ideal-op p) OP-KEYREF) ENC-UNIT-KEY ENC-UNIT-SHAPE)
+                                 (.imm p) (arm64-enc-gpr encoder (m-node (primitive/make-dyn MachNode p))) 16))
+
 (defn arm64-scalar-set-kill! [(n (dyn NodeOps)) (class i64)] (-> i64)
   (do (set! (.kill-class (arm64-scalar-node n)) class) 0))
 
@@ -230,7 +284,8 @@
 
 (defn arm64-scalar-op-name [(p (ptr Arm64ScalarNode))] (-> (slice u8))
   (let [op (.ideal-op p)]
-    (case op OP-CON "mov" OP-FUNPTR "adrp" OP-STATICREF "adrp" OP-ADD
+    (case op OP-CON "mov" OP-FUNPTR "adrp" OP-STATICREF "unit-data"
+          OP-KEYREF "unit-key" OP-SHAPEREF "unit-shape" OP-ADD
           (if (= (.form p) ARM64-FORM-IMM12) "addi" "add") OP-SUB
           (if (= (.form p) ARM64-FORM-IMM12) "subi" "sub") OP-MUL
           "mul" OP-DIV
@@ -523,14 +578,17 @@
         (if (= form ARM64-FORM-HEAPSTATE)
             ;; ORR Xd, XZR, X28.
             (enc-add4! encoder (| 0xaa1c03e0 (arm64-enc-gpr encoder d)))
-        (if (= form ARM64-FORM-FUNPTR)
+        (if (or (= form ARM64-FORM-FUNPTR) (= form ARM64-FORM-UNITDATA) (= form ARM64-FORM-UNITIDENTITY))
             ;; ADRP Xd, sym@PAGE ; ADD Xd, Xd, sym@PAGEOFF. Both immediates are zero here and are
             ;; filled by the linker through the page relocations recorded against the function.
+            (if (or (= form ARM64-FORM-UNITDATA) (= form ARM64-FORM-UNITIDENTITY))
+                (if (= form ARM64-FORM-UNITDATA) (arm64-encode-unit-data! encoder p)
+                    (arm64-encode-unit-identity! encoder p))
             (let [rd (arm64-enc-gpr encoder d)]
               (enc-add4! encoder (| 0x90000000 rd))
               (enc-add-symbol-fixup-at! encoder ENC-FIXUP-A64-PAGE21 d 0 (.imm p) (.symbol p))
               (enc-add4! encoder (| 0x91000000 (| (primitive/ishl rd 5) rd)))
-              (enc-add-symbol-fixup-at! encoder ENC-FIXUP-A64-PAGEOFF12 d 4 (.imm p) (.symbol p)))
+              (enc-add-symbol-fixup-at! encoder ENC-FIXUP-A64-PAGEOFF12 d 4 (.imm p) (.symbol p))))
         (if (= form ARM64-FORM-SET)
             ;; CSET Xd,cond is CSINC Xd,XZR,XZR,invert(cond).
             (enc-add4! encoder

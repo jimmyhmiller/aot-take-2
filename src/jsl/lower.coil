@@ -27,6 +27,8 @@
 ;; by `aot.jsl.check` yet. Consequently `jsl-check-transitions` is truthfully empty for today's pure
 ;; graph set; admitting allocation or a callback requires its safepoint/relocation walk first.
 (module aot.jsl.lower)
+(import "aot.util.arena" :use [compiler-allocator compiler-state CompilerStateSlot])
+(import "aot.codegen.callabi" :use *)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
@@ -47,7 +49,7 @@
 (import "aot.node.gc" :use *)
 (import "aot.node.jsops" :use *)
 (import "aot.shape" :use *)
-(import "aot.heap" :use [heap-global-entry heap-intrinsic-entry])
+(import "aot.heap" :use [heap-global-reference-entry heap-intrinsic-entry])
 (import "aot.facts" :use [facts-ready?])
 (import "aot.type.type" :use *)
 (import "aot.jsl.reader" :use *)
@@ -58,7 +60,7 @@
 ;; it (0 until then). Every definition in the index is declared for every compile, so indices are
 ;; the index's order; a graph is built and its body lowered only for a definition something calls
 ;; (docs/DECISIONS.md, JSL definitions are built on demand).
-(defstruct JslGraph [(name (slice u8)) (nid i64) (fidx i64)])
+(defstruct JslGraph [(name (slice u8)) (nid i64) (fidx i64) (form (ptr rd/Sexp))])
 
 ;; `pending` holds the table positions of built graphs whose bodies are not yet lowered;
 ;; `closed` is set by `jsl-close-world!`, after which a new demand is an error.
@@ -66,18 +68,76 @@
   [(items (ArrayList JslGraph))
    (pending (ArrayList i64))
    (closed bool)
+   (link-mode i64)
    (booted bool)])
 
+(const JSL-LINK-LOCAL 0)
+(const JSL-LINK-IMPORT 1)
+(const JSL-LINK-PROVIDER 2)
+
+;; The shared library exports explicit semantic boundaries, not caller-specialized functions.
+;; Other builtins remain available for ordinary evidence-driven graph inlining.
+(defn jsl-shared-definition? [(form (ptr rd/Sexp))] (-> bool)
+  (or (>= (jsl-form-option form "noinline") 0) (>= (jsl-form-option form "specialize") 0)
+      (>= (jsl-form-option form "inline-when") 0)))
+
+(defn jsl-set-link-mode! [(mode i64)] (-> i64)
+  (jsl-graphs-boot!)
+  (if (or (< mode JSL-LINK-LOCAL) (> mode JSL-LINK-PROVIDER))
+      (panic "jsl-set-link-mode!: invalid mode") 0)
+  (set! (.link-mode (jsl-graphs)) mode) 0)
+
+(defn jsl-form-result-type [(form (ptr rd/Sexp))] (-> i64)
+  (let [checked (jsl-check-ret-type form)]
+    (if (jsl-check-dyn-type? checked) (ty-dyn (jsl-check-dyn-tags checked))
+        (jsl-lower-type (jsl-form-ret form)))))
+
+(defn jsl-form-signature [(form (ptr rd/Sexp))] (-> i64)
+  (let [(mut types) (al-new [i64] (compiler-allocator)) params (jsl-form-params form)
+        (mut i) 0]
+    (push! [i64] (mut types) (jsl-form-result-type form))
+    (loop (if (>= (load i) (rd/sexp-count params)) (break 0)
+      (do (push! [i64] (mut types) (jsl-lower-type (rd/sexp-nth (rd/sexp-nth params (load i)) 1)))
+          (set! (mut i) (+ (load i) 1)) (continue))))
+    (let [signature (ty-tuple (al-slice (load types)))]
+      (al-free! (mut types)) signature)))
+
+(defn jsl-call-target [(name (slice u8))] (-> (dyn NodeOps))
+  (let [index (jsl-graph-index name)]
+    (if (< index 0) (panic "jsl-call-target: unknown builtin") 0)
+    (let [entry (get (.items (jsl-graphs)) index)]
+      (if (and (= (.link-mode (jsl-graphs)) JSL-LINK-IMPORT) (jsl-shared-definition? (.form entry)))
+          (external-make (arena-declare-external! (.fidx entry) name (jsl-form-signature (.form entry))))
+          (funptr-make (jsl-graph-of name) (.fidx entry))))))
+
+(defn jsl-root-provider! [(start (dyn NodeOps))] (-> i64)
+  (al-for [entry (.items (jsl-graphs))]
+    (let [e entry]
+      (if (jsl-shared-definition? (.form e)) (do (jsl-graph-of (.name e)) 0) 0)))
+  (jsl-define-pending!)
+  (al-for [entry (.items (jsl-graphs))]
+    (let [e entry]
+      (if (jsl-shared-definition? (.form e))
+          (let [fun (jsl-node (.nid e))]
+            ;; Keep the external caller hook but attach every exported function to this unit's
+            ;; canonical Start. Private JSL Starts normally disappear when the world closes.
+            (n-set-def! fun 1 (Some start))
+            (match (fun-mem-parm fun)
+              (Some [mem] (parm-set-unknown-input! mem (proj-make start 1 "provider.start.mem")))
+              (None [] (panic "jsl-root-provider!: missing memory parameter")))
+            0) 0)))
+  0)
+
 (defn jsl-graphs [] (-> (ptr JslGraphs))
-  (primitive/alloc-static JslGraphs))
+  (compiler-state [JslGraphs] (primitive/alloc-static CompilerStateSlot)))
 
 (defn jsl-graphs-boot! [] (-> i64)
   (let [g (jsl-graphs)]
     (if (.booted g)
         0
         (do
-          (set! (.items g) (al-new [JslGraph] (alloc/malloc-allocator)))
-          (set! (.pending g) (al-new [i64] (alloc/malloc-allocator)))
+          (set! (.items g) (al-new [JslGraph] (compiler-allocator)))
+          (set! (.pending g) (al-new [i64] (compiler-allocator)))
           (set! (.closed g) false)
           (set! (.booted g) true)
           0))))
@@ -89,13 +149,15 @@
     (al-clear! [i64] (mut (.pending (jsl-graphs))))
     (set! (.closed (jsl-graphs)) false)
     (set! (.set (jsl-value-call-abi)) false)
+    (set-call-specialize-ext! (primitive/fnptr-of jsl-specialize-call!))
     0))
 
-(defn jsl-graph-new [(name (slice u8)) (nid i64) (fidx i64)] (-> JslGraph)
+(defn jsl-graph-new [(name (slice u8)) (nid i64) (fidx i64) (form (ptr rd/Sexp))] (-> JslGraph)
   (let [(mut g) (primitive/zeroed JslGraph)]
     (set! (.name (mut g)) name)
     (set! (.nid (mut g)) nid)
     (set! (.fidx (mut g)) fidx)
+    (set! (.form (mut g)) form)
     (load g)))
 
 (defstruct JslExprResult
@@ -138,10 +200,129 @@
 (defn jsl-node [(nid i64)] (-> (dyn NodeOps))
   (match (arena-node nid) (Some [n] n) (None [] (unreachable-node))))
 
+;; Simple's CallEnd inline worklist expands one body and then cleans up. For a JSL definition
+;; with :specialize, the same worklist instead lowers the checked source with actual arguments.
+;; The annotation lists alternative tag proofs sufficient to justify expansion; it grants no
+;; type assumption. Unknown/TOP arguments keep an ordinary call, including its full memory and
+;; exception tuple. A satisfied rule only permits lowering: ordinary JSL if/guard lowering still
+;; proves which branches disappear. This avoids cloning the generic graph before discarding it.
+;; The full generic body and its dependencies must exist before specialization; facts therefore
+;; see its effects. Proven parse-time types may specialize in the initial pessimistic solve;
+;; unknown types wait for SCCP or a caller inline. No operation-specific name dispatch is used.
+(defn jsl-specialization-parameter [(params (ptr rd/Sexp)) (name (slice u8))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (rd/sexp-count params))
+      (break (do (panic "jsl-specialization: checked parameter missing") 0))
+      (if (= name (rd/sexp-sym (rd/sexp-nth (rd/sexp-nth params (load i)) 0)))
+          (break (load i)) (do (set! (mut i) (+ (load i) 1)) (continue)))))))
+
+(defn jsl-specialization-proven? [(form (ptr rd/Sexp)) (c (dyn NodeOps)) (end (dyn NodeOps))] (-> bool)
+  (let [source-policy (jsl-form-option form "specialize")
+        rules (rd/sexp-nth form (if (>= source-policy 0) source-policy (jsl-form-option form "inline-when")))
+        params (jsl-form-params form) (mut ready) false (mut i) 0]
+    (loop (if (>= (load i) (rd/sexp-count rules)) (break 0)
+      (let [rule (rd/sexp-nth rules (load i))
+            predicate (rd/sexp-sym (rd/sexp-nth rule 0))
+            arg (call-arg c (jsl-specialization-parameter params (rd/sexp-sym (rd/sexp-nth rule 1))))
+            t (n-ty arg)]
+        (n-add-dep! arg end)
+        (if (and (!= t TY-INVALID) (not (ty-high? t)))
+          (if (= (rd/sexp-count rule) 2)
+              (if (ty-isa? t (ty-dyn (jsl-tag-predicate predicate))) (set! (mut ready) true) 0)
+              (let [key-node (call-arg c (jsl-specialization-parameter params (rd/sexp-sym (rd/sexp-nth rule 2))))
+                    key (keyref-local key-node) mem (call-mem c)]
+                (n-add-dep! key-node end) (n-add-dep! mem end)
+                (if (if (or (= predicate "%StringLength") (= predicate "%ArrayLength"))
+                        (and (>= key 0) (= (shape-key-name key) "length")
+                             (ty-isa? t (ty-dyn (if (= predicate "%StringLength") TAG-STRING TAG-ARRAY))))
+                        (and (ty-isa? t (ty-dyn (jsl-tag-predicate "%IsObjectLike")))
+                             (property-specialization-proven? mem arg key (= predicate "%OwnWritableDataProperty"))))
+                    (set! (mut ready) true) 0))) 0)
+        (set! (mut i) (+ (load i) 1)) (continue))))
+    (load ready)))
+
+(defn jsl-specialize-call! [(end (dyn NodeOps)) (mutate bool)] (-> i64)
+  (if (or (n-dead? end) (cend-folding? end)) INLINE-UNHANDLED
+    (match (n-in-safe end 0)
+      (None [] INLINE-UNHANDLED)
+      (Some [c]
+        (if (!= (n-op c) OP-CALL) INLINE-UNHANDLED
+          (let [fp (call-fptr c) ft (n-ty fp)]
+            (if (not (and (or (= (n-op fp) OP-FUNPTR) (= (n-op fp) OP-EXTERN)) (ty-funptr? ft)
+                          (ty-funptr-single? ft))) INLINE-UNHANDLED
+              (let [index (ty-funptr-target-at ft 0) g (jsl-graphs)]
+                (if (or (< index 0) (>= index (len (.items g)))) INLINE-UNHANDLED
+                  (let [entry (get (.items g) index) form (.form entry)]
+                    (if (or (and (< (jsl-form-option form "specialize") 0)
+                                 (< (jsl-form-option form "inline-when") 0))
+                            (if (= (n-op fp) OP-EXTERN)
+                                (!= (.link-mode g) JSL-LINK-IMPORT)
+                                (!= (.nid entry) (n-nid (n-in! fp 0))))) INLINE-UNHANDLED
+                      (if (or (> (len (.pending g)) 0)
+                              (!= (n-nins end) (if (= (n-op fp) OP-EXTERN) 1 2))
+                              (!= (call-nargs c) (rd/sexp-count (jsl-form-params form)))
+                              (= (n-ty (call-ctrl c)) TY-XCTRL)
+                              (ty-high? (n-ty (call-mem c)))
+                              (not (jsl-specialization-proven? form c end))) INLINE-DEFER
+                        ;; A guarded graph inline retains the established Call/Return edges and
+                        ;; proven types via Simple's copier. It does not manufacture fresh calls
+                        ;; after SCCP. An imported provider has no local graph to copy, so its
+                        ;; generic ABI stays intact. No proof means no clone, even if some other
+                        ;; argument (such as an error message) happens to be constant.
+                        (if (>= (jsl-form-option form "inline-when") 0)
+                            (if (= (n-op fp) OP-FUNPTR) INLINE-UNHANDLED INLINE-DEFER)
+                        (if (and (= (n-op fp) OP-FUNPTR) (fun-self-recursive? (n-in! fp 0)))
+                            (do (n-add-dep! (n-in! fp 0) end) INLINE-DEFER)
+                            (if (not mutate) INLINE-TRIVIAL
+                              (do (jsl-specialize-body! form c end) INLINE-TRIVIAL))))))))))))))))
+
+(defn jsl-specialize-body! [(form (ptr rd/Sexp)) (c (dyn NodeOps)) (end (dyn NodeOps))] (-> i64)
+  (let [prior (n-origin-enter! (rd/sexp-sym (rd/sexp-nth form 1)) "specialize"
+                               (n-source-lo c) (n-source-hi c))]
+    (jsl-specialize-body-inner! form c end)
+    (n-origin-leave! prior)))
+
+(defn jsl-specialize-body-inner! [(form (ptr rd/Sexp)) (c (dyn NodeOps)) (end (dyn NodeOps))] (-> i64)
+  (let [(mut args) (al-new [(dyn NodeOps)] (compiler-allocator))
+        (mut names) (al-new [(slice u8)] (compiler-allocator))
+        (mut values) (al-new [(dyn NodeOps)] (compiler-allocator))
+        (mut i) 0 first (+ (arena-node-count) 1)]
+    (n-keep! c) (n-keep! end)
+    (loop (if (>= (load i) (call-nargs c)) (break 0)
+      (do (push! [(dyn NodeOps)] (mut args) (call-arg c (load i)))
+          (set! (mut i) (+ (load i) 1)) (continue))))
+    (let [body (jsl-lower-expr (jsl-form-body form) (jsl-form-params form) (load args)
+                              (mut names) (mut values) (call-ctrl c) (call-mem c))
+          local (= (n-op (call-fptr c)) OP-FUNPTR)]
+      (n-keep! (.ctrl body)) (n-keep! (.mem body)) (n-keep! (.value body))
+      (if local
+          (match (return-fun (n-in! end 1))
+            (Some [fun] (call-unlink! c fun))
+            (None [] (panic "jsl-specialize: missing function owner"))) 0)
+      (prop-access-forward! end (.ctrl body) (.mem body) (.value body))
+      (n-unkeep! end) (if (n-unused? end) (n-kill! end) 0)
+      (n-unkeep! c) (if (n-unused? c) (n-kill! c) 0)
+      (n-unkeep! (.ctrl body)) (n-unkeep! (.mem body)) (n-unkeep! (.value body)))
+    ;; Only the residual body's freshly allocated nodes, not a whole-arena reseed per call.
+    (set! (mut i) first)
+    (loop (if (> (load i) (arena-node-count)) (break 0)
+      (do (match (arena-node (load i)) (Some [n] (if (n-dead? n) 0 (do (code-add! n) 0))) (None [] 0))
+          (set! (mut i) (+ (load i) 1)) (continue))))
+    (al-free! (mut args)) (al-free! (mut names)) (al-free! (mut values))
+    (fun-size-epoch-bump!) (invalidate-cfg!) 0))
+
 (defn jsl-lower-macro-values [(name (slice u8))
                               (args (ArrayList (dyn NodeOps)))
                               (ctrl (dyn NodeOps))
                               (mem (dyn NodeOps))] (-> JslExprResult)
+  (let [prior (n-origin-enter! name "macro" (n-source-context-lo) (n-source-context-hi))
+        answer (jsl-lower-macro-values-inner name args ctrl mem)]
+    (n-origin-leave! prior)
+    answer))
+
+(defn jsl-lower-macro-values-inner [(name (slice u8))
+                                    (args (ArrayList (dyn NodeOps)))
+                                    (ctrl (dyn NodeOps)) (mem (dyn NodeOps))] (-> JslExprResult)
   (match (jsl-definition-form name)
     (None []
           (do
@@ -157,9 +338,9 @@
                     (panic "jsl-lower-macro-values: wrong argument count")
                     (jsl-expr-result (unreachable-node) ctrl mem))
                   (let [(mut local-names)
-                          (al-new [(slice u8)] (alloc/malloc-allocator))
+                          (al-new [(slice u8)] (compiler-allocator))
                         (mut local-values)
-                          (al-new [(dyn NodeOps)] (alloc/malloc-allocator))]
+                          (al-new [(dyn NodeOps)] (compiler-allocator))]
                     ;; An argument may have no use yet other than this expansion. Peepholes inside
                     ;; the body (a tag test folding on a proven singleton, an arm dying) kill nodes
                     ;; that lose their last use, and a later reference to the same parameter would
@@ -177,6 +358,17 @@
                       answer)))))))
 
 (defn jsl-lower-type [(x (ptr rd/Sexp))] (-> i64)
+  (if (rd/sexp-sym-is x "never") (ty-dyn 0)
+      (if (rd/sexp-sym-is x "argument-vector") (callabi-vector-type)
+          (if (rd/sexp-sym-is x "argument-count") (ty-int-range 0 CALL-ABI-MAX-ARGUMENTS)
+              (jsl-lower-type-refined x)))))
+
+(defn jsl-lower-type-refined [(x (ptr rd/Sexp))] (-> i64)
+  (if (rd/sexp-sym-is x "dyn-object-like")
+      (ty-dyn (+ TAG-OBJECT (+ TAG-FUNCTION TAG-ARRAY)))
+      (jsl-lower-type-base x)))
+
+(defn jsl-lower-type-base [(x (ptr rd/Sexp))] (-> i64)
   (let [name (rd/sexp-sym x)]
     (if (= name "dyn")
         (ty-dyn TAG-ANY)
@@ -347,6 +539,43 @@
     (memmerge-set-alias! merged ALIAS-OBJECT-PROPERTIES properties-state)
     (jsl-expr-result ptr_ ctrl merged)))
 
+;; Final Simple Parser.makeAllocator allocates the complete TypeStruct once, obtains its private
+;; memory projection, runs initialization, then publishes that memory. A JS literal likewise has
+;; a known final layout when all keys are fixed. Unlike Simple, its values are arbitrary JS
+;; expressions: initialize every GC-visible slot to undefined before evaluating any of them.
+;; The object stays unpublished until the literal finishes; pre-created own keys are therefore
+;; unobservable. Calls can lose the static backing proof, but the runtime still sees the final
+;; backing and updates it in place. Never turn the compiler-local layout operand into a runtime
+;; integer: New carries the layout through the existing image shape-remapping machinery.
+(defn jsl-lower-new-shaped-object [(ctrl (dyn NodeOps)) (mem (dyn NodeOps))
+                                  (layout (dyn NodeOps))] (-> JslExprResult)
+  (let [t (n-ty layout)]
+    (if (not (and (ty-int? t) (ty-constant? t)))
+        (panic "%NewObjectWithShape: layout must be a compiler constant") 0)
+    (let [shape (ty-int-lo t)]
+      (if (or (not (shape-valid? shape)) (= shape SHAPE-STRING))
+          (panic "%NewObjectWithShape: invalid object property layout") 0)
+      (if (not (shape-extensible? shape))
+          (panic "%NewObjectWithShape: literal layout must be extensible") 0)
+      (let [(mut row) shape]
+        (loop (if (= (load row) SHAPE-EMPTY) (break 0)
+          (do
+            (if (!= (get (.attrs (shape-table)) (load row)) SHAPE-ATTRS-DEFAULT)
+                (panic "%NewObjectWithShape: literal layout requires default data attributes") 0)
+            (set! (mut row) (get (.parent (shape-table)) (load row)))
+            (continue)))))
+      (let [raw (jsl-lower-new-object ctrl mem)]
+        (if (= shape SHAPE-EMPTY) raw
+            (let [(mut initial) (al-new [(dyn NodeOps)] (compiler-allocator))
+                  (mut i) 0]
+              (loop (if (>= (load i) (shape-field-count shape)) (break 0)
+                (do (push! (mut initial) (dyn-undefined-make))
+                    (set! (mut i) (+ (load i) 1)) (continue))))
+              (let [storage (property-storage-new ctrl (.mem raw) shape (load initial))
+                    installed (property-storage-install ctrl (.mem raw) (.value raw) shape storage)]
+                (al-free! (mut initial))
+                (jsl-expr-result (.value raw) ctrl installed))))))))
+
 (defn jsl-utf8-cont [(text (slice u8)) (i i64)] (-> i64)
   (if (>= i (len text))
       (do (panic "jsl string: truncated UTF-8") 0)
@@ -420,7 +649,7 @@
     0))
 
 (defn jsl-string-utf16-units [(text (slice u8))] (-> (ArrayList i64))
-  (let [(mut units) (al-new [i64] (alloc/malloc-allocator))]
+  (let [(mut units) (al-new [i64] (compiler-allocator))]
     (jsl-string-append-utf8! text (mut units))
     (load units)))
 
@@ -509,10 +738,10 @@
                       (local-names (mut (ArrayList (slice u8))))
                       (local-values (mut (ArrayList (dyn NodeOps))))
                       (ctrl (dyn NodeOps))
-                      (mem (dyn NodeOps))] (-> JslExprResult)
+                       (mem (dyn NodeOps))] (-> JslExprResult)
   (let [(mut ctrl-nid) (n-nid ctrl)
         (mut mem-nid) (n-nid mem)
-        (mut args) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))
         (mut i) 1]
     (loop (if (>= (load i) (rd/sexp-count x))
               (break 0)
@@ -540,7 +769,7 @@
                                         (load args)
                                         (jsl-node (load ctrl-nid))
                                         (jsl-node (load mem-nid)))
-                (let [target (jsl-graph-of name)
+                (let [target (jsl-call-target name)
                       c
                         (call-make-with-mem (jsl-node (load ctrl-nid))
                                             (jsl-node (load mem-nid)))
@@ -551,7 +780,7 @@
                               (call-add-arg! c (get (load args) (load arg)))
                               (set! (mut arg) (+ (load arg) 1))
                               (continue))))
-                  (call-set-fptr! c (funptr-make target (jsl-fidx-of name)))
+                  (call-set-fptr! c target)
                   (let [end (callend-make c)]
                     (if (jsl-noinline? name) (callend-set-never-inline! end) 0)
                     (jsl-expr-result (proj-make end
@@ -594,7 +823,7 @@
                           (mut local-values)
                           (.ctrl key)
                           (.mem key))
-        key-ty (n-ty (.value key))
+        key-id (keyref-local (.value key))
         ;; The attributes operand must be a constant: the transition it names is compile-time.
         attrs
           (if with-attrs
@@ -615,7 +844,7 @@
               SHAPE-ATTRS-DEFAULT)]
     ;; A runtime key (ToPropertyKey's result) takes the runtime shape-tree store directly; with
     ;; attributes, the store whose added key takes them.
-    (if (not (and (ty-int? key-ty) (ty-constant? key-ty)))
+    (if (< key-id 0)
         (let [stored
                 (if (= attrs SHAPE-ATTRS-DEFAULT)
                     (property-generic-access (.ctrl value)
@@ -640,13 +869,13 @@
                                                        (.mem value)
                                                        (.value object)
                                                        (Some (.value value))
-                                                       (ty-int-lo key-ty)
+                                                       key-id
                                                        PROP-STORE
                                                        attrs))
                   (_ (property-store-known-owner (.ctrl value)
                                                  (.mem value)
                                                  (.value object)
-                                                 (ty-int-lo key-ty)
+                                                 key-id
                                                  (.value value)
                                                  attrs)))]
           (jsl-expr-result (.value stored) (.ctrl stored) (.mem stored))))))
@@ -685,14 +914,14 @@
                           (mut local-values)
                           (.ctrl key)
                           (.mem key))
-        key-ty (n-ty (.value key))
+        key-id (keyref-local (.value key))
         stored
-          (if (and (ty-int? key-ty) (ty-constant? key-ty))
+          (if (>= key-id 0)
               (prop-access-emit (.ctrl value)
                                 (.mem value)
                                 (.value object)
                                 (Some (.value value))
-                                (ty-int-lo key-ty)
+                                key-id
                                 PROP-SET)
               (property-set-generic (.ctrl value)
                                     (.mem value)
@@ -701,17 +930,16 @@
                                     (.value value)))]
     (jsl-expr-result (.value stored) (.ctrl stored) (.mem stored))))
 
-;; The value-call ABI a body's `%CallFunction` lowers against: the program-wide slot count and
-;; the function-pointer set a code word may hold (every function the program lowered). The
-;; frontend settles both before any body is lowered (aot.parse.parser, parse-program-sources).
-(defstruct JslValueCallAbi [(slots i64) (funptr-ty i64) (set bool)])
+;; The closed-program target set for `%CallFunction`. Code words name fixed-signature callable
+;; adapters, independent of the program's local formal slots. The frontend installs this set
+;; before demanding JSL bodies (aot.parse.parser, parse-program-sources).
+(defstruct JslValueCallAbi [(funptr-ty i64) (set bool)])
 
 (defn jsl-value-call-abi [] (-> (ptr JslValueCallAbi))
-  (primitive/alloc-static JslValueCallAbi))
+  (compiler-state [JslValueCallAbi] (primitive/alloc-static CompilerStateSlot)))
 
-(defn jsl-set-value-call-abi! [(slots i64) (funptr-ty i64)] (-> i64)
+(defn jsl-set-value-call-abi! [(funptr-ty i64)] (-> i64)
   (let [abi (jsl-value-call-abi)]
-    (set! (.slots abi) slots)
     (set! (.funptr-ty abi) funptr-ty)
     (set! (.set abi) true)
     0))
@@ -720,9 +948,8 @@
 ;; value (aot.parse.parser, lower-value-call-with-receiver), minus the callable guard — the checker
 ;; required the callee narrowed to a function — and minus the completion test — the result IS the
 ;; completion, tested by the body. The code word is loaded from the function object and the call
-;; carries `this`, an undefined `new.target` and the program's argument slots, missing ones
-;; `undefined`; an argument past the slot count is unobservable by any callee (no `arguments`
-;; object) and is not passed.
+;; carries callee, `this`, undefined `new.target`, actual count and a managed vector. The adapter
+;; supplies undefined for missing formals; it does not change the caller's actual count.
 (defn jsl-lower-call-function [(x (ptr rd/Sexp))
                                (params (ptr rd/Sexp))
                                (values (ArrayList (dyn NodeOps)))
@@ -731,9 +958,10 @@
                                (ctrl (dyn NodeOps))
                                (mem (dyn NodeOps))] (-> JslExprResult)
   (let [abi (jsl-value-call-abi)
+        packed-call (rd/sexp-sym-is (rd/sexp-nth x 0) "%CallFunctionPacked")
         (mut ctrl-nid) (n-nid ctrl)
         (mut mem-nid) (n-nid mem)
-        (mut args) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))
         (mut i) 1]
     (if (not (.set abi))
         (panic "jsl-lower-call-function: the value-call ABI is not settled (the frontend installs it before bodies are lowered)")
@@ -765,22 +993,23 @@
                        (con-int OFFSET-FUNCTION-CODE)
                        ALIAS-FUNCTION-CODE
                        (.funptr-ty abi))
-          call (call-make-with-mem c m)
-          (mut k) 0]
-      (call-add-arg! call receiver)
-      ;; A call, never a construct: `new.target` is undefined.
-      (call-add-arg! call (dyn-undefined-make))
-      (loop (if (>= (load k) (.slots abi))
+          (mut actuals) (al-new [(dyn NodeOps)] (compiler-allocator))
+          (mut k) (if packed-call 5 2)]
+      (loop (if (>= (load k) (len (load args)))
                 (break 0)
                 (do
-                  (call-add-arg! call
-                                 (if (< (+ (load k) 2) (len (load args)))
-                                     (get (load args) (+ (load k) 2))
-                                     (dyn-undefined-make)))
+                  (push! [(dyn NodeOps)] (mut actuals) (get (load args) (load k)))
                   (set! (mut k) (+ (load k) 1))
                   (continue))))
-      (call-set-fptr! call code)
-      (let [end (callend-make call)]
+      (let [packed (if packed-call
+                       (load (CallArguments :vector (get (load args) 4) :count (get (load args) 3)
+                                            :memory m :direct (load actuals)))
+                       (callabi-pack! c m (load actuals)))
+            end (callabi-invoke! c (.memory packed) code callee receiver
+                                 (if packed-call (get (load args) 2) (dyn-undefined-make))
+                                 packed)]
+        (al-free! (mut actuals))
+        (al-free! (mut args))
         (jsl-expr-result (proj-make end RETURN-VALUE "jsl.value-call.value")
                          (cproj-make end RETURN-CTRL "jsl.value-call.ctrl")
                          (proj-make end RETURN-MEM "jsl.value-call.mem"))))))
@@ -795,7 +1024,7 @@
                                    (mem (dyn NodeOps))] (-> JslExprResult)
   (let [(mut ctrl-nid) (n-nid ctrl)
         (mut mem-nid) (n-nid mem)
-        (mut args) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))
         (mut i) 1]
     (loop (if (>= (load i) (rd/sexp-count x))
               (break 0)
@@ -1152,7 +1381,7 @@
                                       (n-unkeep! (.value pred))
                                       (n-unkeep! (.mem pred))
                                       (jsl-expr-result phi region memphi)))))))
-                        (if (= name "%CallFunction")
+                        (if (or (= name "%CallFunction") (= name "%CallFunctionPacked"))
                             (jsl-lower-call-function x
                                                      params
                                                      values
@@ -1218,7 +1447,7 @@
                                                                      ctrl
                                                                      mem)
                                                     (if (= name "%PropertyKey")
-                                                        (jsl-expr-result (con-int (shape-key-intern (rd/sexp-str (rd/sexp-nth x
+                                                        (jsl-expr-result (keyref-make (shape-key-intern (rd/sexp-str (rd/sexp-nth x
                                                                                                                               1))))
                                                                          ctrl
                                                                          mem)
@@ -1232,7 +1461,8 @@
                                                                                          (mut local-values)
                                                                                          ctrl
                                                                                          mem)
-                                                            (if (or (= name
+                                                            (if (or (= name "%NewObjectWithShape")
+                                                                    (= name
                                                                        "%NewObject")
                                                                     (= name
                                                                        "%Undefined")
@@ -1240,10 +1470,13 @@
                                                                        "%Null")
                                                                     (= name
                                                                        "%GlobalObject"))
-                                                                (if (= name
-                                                                       "%NewObject")
-                                                                    (jsl-lower-new-object ctrl
-                                                                                          mem)
+                                                                (if (or (= name "%NewObject") (= name "%NewObjectWithShape"))
+                                                                    (if (= name "%NewObject")
+                                                                        (jsl-lower-new-object ctrl mem)
+                                                                        (let [layout (jsl-lower-expr (rd/sexp-nth x 1)
+                                                                                      params values (mut local-names)
+                                                                                      (mut local-values) ctrl mem)]
+                                                                          (jsl-lower-new-shaped-object (.ctrl layout) (.mem layout) (.value layout))))
                                                                     (jsl-expr-result (if (= name
                                                                                             "%Null")
                                                                                          (box-make-rep-at (Some ctrl)
@@ -1251,11 +1484,11 @@
                                                                                                           REP-NULL)
                                                                                          (if (= name
                                                                                                 "%GlobalObject")
-                                                                                             ;; A realm's global object is an image constant; a
-                                                                                             ;; program without a realm reads the runtime root.
-                                                                                             (if (>= (heap-global-entry)
+                                                                                             ;; Share the frontend's binding decision: reusable
+                                                                                             ;; units read the executing realm's root.
+                                                                                             (if (>= (heap-global-reference-entry)
                                                                                                      0)
-                                                                                                 (box-make (staticref-make (heap-global-entry)
+                                                                                                 (box-make (staticref-make (heap-global-reference-entry)
                                                                                                                            REP-OBJECT))
                                                                                                  (realm-global-object-load ctrl
                                                                                                                            mem))
@@ -1345,11 +1578,10 @@
                                                                                                        "%PropChainHolder")
                                                                                                     (= name
                                                                                                        "%PropGetNamed"))
-                                                                                                (let [key-ty
-                                                                                                        (n-ty (.value rhs))]
+                                                                                                (let [key-id
+                                                                                                        (keyref-local (.value rhs))]
                                                                                                   (let [constant-key
-                                                                                                          (and (ty-int? key-ty)
-                                                                                                               (ty-constant? key-ty))
+                                                                                                          (>= key-id 0)
                                                                                                         ;; A constant key is a PropAccess node: it folds
                                                                                                         ;; to a Load or a constant when the owner's backing
                                                                                                         ;; store is visible, now or after inlining, and
@@ -1363,7 +1595,7 @@
                                                                                                                                     (.mem rhs)
                                                                                                                                     (.value lhs)
                                                                                                                                     (None [(dyn NodeOps)])
-                                                                                                                                    (ty-int-lo key-ty)
+                                                                                                                                    key-id
                                                                                                                                     PROP-LOAD)
                                                                                                                   (property-load-own-keyed (.ctrl rhs)
                                                                                                                                            (.mem rhs)
@@ -1376,7 +1608,7 @@
                                                                                                                                         (.mem rhs)
                                                                                                                                         (.value lhs)
                                                                                                                                         (None [(dyn NodeOps)])
-                                                                                                                                        (ty-int-lo key-ty)
+                                                                                                                                        key-id
                                                                                                                                         PROP-GET)
                                                                                                                       (property-generic-access (.ctrl rhs)
                                                                                                                                                (.mem rhs)
@@ -1391,7 +1623,7 @@
                                                                                                                                             (.mem rhs)
                                                                                                                                             (.value lhs)
                                                                                                                                             (None [(dyn NodeOps)])
-                                                                                                                                            (ty-int-lo key-ty)
+                                                                                                                                            key-id
                                                                                                                                             PROP-HOLDER)
                                                                                                                           (property-holder-keyed (.ctrl rhs)
                                                                                                                                                  (.mem rhs)
@@ -1404,7 +1636,7 @@
                                                                                                                                                 (.mem rhs)
                                                                                                                                                 (.value lhs)
                                                                                                                                                 (None [(dyn NodeOps)])
-                                                                                                                                                (ty-int-lo key-ty)
+                                                                                                                                                key-id
                                                                                                                                                 PROP-ATTRS)
                                                                                                                               (property-attrs-own-keyed (.ctrl rhs)
                                                                                                                                                         (.mem rhs)
@@ -1415,7 +1647,7 @@
                                                                                                                                                 (.mem rhs)
                                                                                                                                                 (.value lhs)
                                                                                                                                                 (None [(dyn NodeOps)])
-                                                                                                                                                (ty-int-lo key-ty)
+                                                                                                                                                key-id
                                                                                                                                                 PROP-HAS)
                                                                                                                               (property-has-own-keyed (.ctrl rhs)
                                                                                                                                                       (.mem rhs)
@@ -1438,7 +1670,7 @@
       ;; have a FunPtr use, so relying on `funptr-make` to advance the allocator lets the source
       ;; frontend reuse a runtime-library identity and relocations can bind to the wrong symbol.
       (reserve-fidx! fidx)
-      (push! [JslGraph] (mut (.items (jsl-graphs))) (jsl-graph-new name 0 fidx))
+      (push! [JslGraph] (mut (.items (jsl-graphs))) (jsl-graph-new name 0 fidx form))
       fidx)))
 
 ;; The position of a declared definition in the table, or -1.
@@ -1466,7 +1698,7 @@
     (jsl-build-graph-now! index)))
 
 (defn jsl-build-graph-now! [(index i64)] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         entry (get (.items (jsl-graphs)) index)
         name (.name entry)
         form
@@ -1478,11 +1710,7 @@
                     (primitive/cast (ptr rd/Sexp) 0))))
         params (jsl-form-params form)
         ;; A `:throws` definition returns a completion: its value or the exception sentinel.
-        ret-ty
-          (let [declared (jsl-lower-type (jsl-form-ret form))]
-            (if (and (jsl-form-throws? form) (ty-dyn? declared))
-                (ty-dyn (primitive/ior (ty-dyn-tags declared) TAG-EXCEPTION))
-                declared))
+        ret-ty (jsl-form-result-type form)
         (mut sig-members) (al-new [i64] a)]
     ;; Signature layout is `(return, arg0, arg1, ...)`, exactly the layout Fun/Parm consume.
     (push! [i64] (mut sig-members) ret-ty)
@@ -1499,6 +1727,9 @@
                   (continue)))))
     (let [start (start-make ret-ty)
           fun (fun-make start (ty-tuple (al-slice (load sig-members))) name)]
+      ;; Exported definitions need their declared identity even when no local FunPtr refers to
+      ;; them. Registration must not depend on whether this unit happens to call its own export.
+      (arena-register-function! (.fidx entry) fun)
       ;; A JSL definition inlines only on evidence (aot.node.call, callend--inline-evidence?).
       (fun-set-jsl! fun)
       (let [mem-parm (parm-make-slot fun CALL-MEM (ty-mem 1 TY-BOT) "$mem")]
@@ -1518,12 +1749,18 @@
                     (continue)))))
       (set! (mut (.items (jsl-graphs)))
             index
-            (jsl-graph-new name (n-nid fun) (.fidx entry)))
+            (jsl-graph-new name (n-nid fun) (.fidx entry) form))
       (push! [i64] (mut (.pending (jsl-graphs))) index)
       fun)))
 
 (defn jsl-define-form! [(form (ptr rd/Sexp))] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [prior (n-origin-enter! (rd/sexp-sym (rd/sexp-nth form 1)) "generic" -1 -1)
+        answer (jsl-define-form-inner! form)]
+    (n-origin-leave! prior)
+    answer))
+
+(defn jsl-define-form-inner! [(form (ptr rd/Sexp))] (-> (dyn NodeOps))
+  (let [a (compiler-allocator)
         name (rd/sexp-sym (rd/sexp-nth form 1))
         params (jsl-form-params form)
         fun (jsl-graph-of name)
@@ -1699,19 +1936,20 @@
   (do
     (jsl-reset!)
     (jsl-lower-reset!)
-    (let [units (jsl-load-index! path)
+    (let [units (jsl-load-library! path)
           (mut unit) 1]
       ;; Check the complete table first, then declare every function. Declaring is the JSL
       ;; equivalent of JavaScript function hoisting: forward references are independent of file
       ;; order and function indices follow index order. No body is lowered here — a definition's
       ;; graph is built when the program (or another body) first calls it, and the bodies are
       ;; lowered by `jsl-close-world!` before the hooks come off.
-      (loop (if (> (load unit) units)
+      (loop (if (or (.checked (jsl-library)) (> (load unit) units))
                 (break 0)
                 (do
                   (jsl-check-unit (load unit))
                   (set! (mut unit) (+ (load unit) 1))
                   (continue))))
+      (set! (.checked (jsl-library)) true)
       (set! (mut unit) 1)
       (loop (if (> (load unit) units)
                 (break 0)
@@ -1747,7 +1985,9 @@
                       0
                       (match (arena-node (.nid g))
                         (Some [fun]
-                              (if (fun-unknown-callers? fun)
+                              (if (and (fun-unknown-callers? fun)
+                                       (not (and (= (.link-mode (jsl-graphs)) JSL-LINK-PROVIDER)
+                                                 (jsl-shared-definition? (.form g)))))
                                   (fun-drop-unknown-callers! fun)
                                   0))
                         (None [] (panic "jsl-close-world!: stale graph id"))))

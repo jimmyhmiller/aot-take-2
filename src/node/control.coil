@@ -155,6 +155,7 @@
 ;; Each is named where it would go, and reaching one is a hard error, never a quiet default.
 ;; ============================================================================
 (module aot.node.control)
+(import "aot.util.arena" :use [compiler-allocator compiler-state CompilerStateSlot])
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
 (import "coil.arraylist" :use *)
@@ -211,7 +212,7 @@
   (cfg-idepth [(self (ptr StartNode))] (-> i64) 0))
 
 (defn start-make [(arg-ty i64)] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [StartNode] (alloc/create [StartNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.arg-ty p) arg-ty)
@@ -290,7 +291,7 @@
     (if (!= before (n-nins d)) (Some d) (None [(dyn NodeOps)]))))
 
 (defn stop-make [] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [StopNode] (alloc/create [StopNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.pad p) 0)
@@ -329,7 +330,7 @@
   (cfg-idepth [(self (ptr XCtrlNode))] (-> i64) 0))
 
 (defn xctrl-make [] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [XCtrlNode] (alloc/create [XCtrlNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.pad p) 0)
@@ -791,7 +792,7 @@
             (load out)))))
 
 (defn region-make [] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [RegionNode] (alloc/create [RegionNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.pad p) 0)
@@ -881,7 +882,7 @@
   (primitive/call-ptr fun? c))
 
 (defn cfg-owner-fun [(n (dyn NodeOps)) (fun? (fnptr c [(ref (dyn NodeOps))] bool))] (-> (Option (dyn NodeOps)))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         (mut path) (al-new [i64] a)
         (mut cur) (Some n)
         (mut answer) (None [(dyn NodeOps)])
@@ -1032,7 +1033,7 @@
 ;; `scope-end-loop!` owns steps 4 and 5. The low-level mutation remains public for graph tests, but
 ;; frontend lowering must not split finalization or expose its intermediate state.
 (defn loop-make [(entry (dyn NodeOps))] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [LoopNode] (alloc/create [LoopNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.pad p) 0)
@@ -1127,13 +1128,57 @@
                                 (Some source)
                                 (None [(dyn NodeOps)]))))))))))
 
+;; Final Simple IfNode.idealize walks from idom to the root, registering dependencies,
+;; and folds a matching predicate (or its nonzero Guard) on a dominating CProj arm.
+;; Simple's GCM schedEarly places a value no earlier than its inputs; Phis are pinned
+;; and their backedges are not traversed. Apply that availability rule to this search:
+;; any one transitive data input supplies a safe boundary, not necessarily the deepest.
+;; Follow one nonconstant input chain, stopping at pinned control (including Phi's
+;; Region and a call result's CallEnd). Never follow CFG predecessors or Phi backedges.
+;; Cast's control is deliberately ignored: the matching rule also tests its unguarded
+;; source, whose definition, not the guard, must bound the search. Watch every traversed
+;; value so rewrites invalidate the answer. No cached dominance facts or search budget.
+(defn if--predicate-definition [(pred (dyn NodeOps)) (watcher (dyn NodeOps))]
+  (-> (Option (dyn NodeOps)))
+  (let [(mut current) (Some pred)
+        (mut answer) (None [(dyn NodeOps)])
+        (mut steps) 0]
+    (loop (match (load current)
+      (None [] (break 0))
+      (Some [value]
+        (do
+          (if (> (load steps) (arena-node-count))
+              (broken "if--predicate-definition: cyclic unpinned data chain") 0)
+          (set! (mut steps) (+ (load steps) 1))
+          (n-add-dep! value watcher)
+          (set! (mut current) (None [(dyn NodeOps)]))
+          (if (and (!= (n-op value) OP-CAST) (is-pinned? value))
+              (match (n-in-safe value 0)
+                (Some [producer]
+                  (match (cfg-of producer)
+                    (Some [_] (set! (mut answer) (Some producer)))
+                    (None [] (set! (mut current) (Some producer)))))
+                (None [] 0))
+              (let [(mut i) 1]
+                (loop (if (>= (load i) (n-nins value)) (break 0)
+                  (do
+                    (match (n-in value (load i))
+                      (Some [input]
+                        (if (not (is-const? input))
+                            (do (set! (mut current) (Some input)) (break 0)) 0))
+                      (None [] 0))
+                    (set! (mut i) (+ (load i) 1)) (continue))))))
+          (match (load answer) (Some [_] (break 0)) (None [] (continue)))))))
+    (load answer)))
+
 (defn if-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
   (match (if-pred d)
     (None [] (None [(dyn NodeOps)]))
     (Some [pred]
           (if (ty-high-or-const? (n-ty pred))
               (None [(dyn NodeOps)])
-              (let [(mut prior) (Some d)
+              (let [definition (if--predicate-definition pred d)
+                    (mut prior) (Some d)
                     (mut dom) (cfg-idom-of d)
                     (mut out) (None [(dyn NodeOps)])
                     (mut guard) 0]
@@ -1144,6 +1189,10 @@
                             (Some [dm]
                                   (do
                                     (n-add-dep! dm d)
+                                    (if (match definition
+                                          (Some [anchor] (n-same? anchor dm))
+                                          (None [] false))
+                                        (break 0) 0)
                                     (if (and (= (n-op dm) OP-IF)
                                              (match (load prior) (Some [pr] (= (n-op pr) OP-CPROJ)) (None [] false)))
                                         (match (if-pred dm)
@@ -1210,7 +1259,7 @@
               (cfg-idepth-default (primitive/make-dyn NodeOps self))))
 
 (defn if--alloc [(ctrl (dyn NodeOps)) (pred (Option (dyn NodeOps))) (never bool) (opcode i64)] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [IfNode] (alloc/create [IfNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.never p) never)
@@ -1372,7 +1421,7 @@
   (hash-extra [(self (ptr ProjNode))] (-> i64) (+ 139 (.idx self))))
 
 (defn cproj-make [(multi (dyn NodeOps)) (idx i64) (name (slice u8))] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [CProjNode] (alloc/create [CProjNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.idx p) idx)
@@ -1383,7 +1432,7 @@
     d))
 
 (defn proj-make [(multi (dyn NodeOps)) (idx i64) (name (slice u8))] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [ProjNode] (alloc/create [ProjNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.idx p) idx)
@@ -1486,7 +1535,7 @@
                    (val (dyn NodeOps))
                    (rpc (Option (dyn NodeOps)))
                    (fun (Option (dyn NodeOps)))] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [ReturnNode] (alloc/create [ReturnNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.fun-nid p) (match fun (Some [f] (n-nid f)) (None [] 0)))
@@ -1549,7 +1598,7 @@
 (defstruct CfgExt [(f (fnptr c [(ref (dyn NodeOps))] (Option (dyn CFGOps)))) (installed bool)])
 
 (defn cfg-ext [] (-> (ptr CfgExt))
-  (primitive/alloc-static CfgExt))
+  (compiler-state [CfgExt] (primitive/alloc-static CompilerStateSlot)))
 
 (defn set-cfg-ext! [(f (fnptr c [(ref (dyn NodeOps))] (Option (dyn CFGOps))))] (-> i64)
   (do (set! (.f (cfg-ext)) f) (set! (.installed (cfg-ext)) true) 0))
@@ -1570,7 +1619,7 @@
    (installed bool)])
 
 (defn selected-cfg-ext [] (-> (ptr SelectedCfgExt))
-  (primitive/alloc-static SelectedCfgExt))
+  (compiler-state [SelectedCfgExt] (primitive/alloc-static CompilerStateSlot)))
 
 (defn set-selected-cfg-ext! [(f (fnptr c [(ref (dyn NodeOps))] (Option (dyn CFGOps))))] (-> i64)
   (do (set! (.f (selected-cfg-ext)) f) (set! (.installed (selected-cfg-ext)) true) 0))
@@ -1584,7 +1633,7 @@
   [(f (fnptr c [(ref (dyn NodeOps)) i64] (Option (dyn NodeOps)))) (installed bool)])
 
 (defn pcopy-extension [] (-> (ptr PCopyExt))
-  (primitive/alloc-static PCopyExt))
+  (compiler-state [PCopyExt] (primitive/alloc-static CompilerStateSlot)))
 
 (defn set-pcopy-ext! [(f (fnptr c [(ref (dyn NodeOps)) i64] (Option (dyn NodeOps))))] (-> i64)
   (do (set! (.f (pcopy-extension)) f) (set! (.installed (pcopy-extension)) true) 0))

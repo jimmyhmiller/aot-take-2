@@ -50,6 +50,7 @@
 ;;   32  u32 per relocation: the section offset of a REF word
 ;;       pad to 8, then the entries end to end
 (module aot.heap)
+(import "aot.util.arena" :use [compiler-allocator compiler-state CompilerStateSlot])
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
@@ -89,6 +90,7 @@
   [(entries (ArrayList HeapEntry))
    (object-prefix i64)  ; the boxed prefix of an ordinary object reference (storage pointers)
    (global i64)  ; the realm's global object entry, or -1
+   (shared-global bool)  ; lowering reads the executing realm's root rather than this template
    (intrinsic-names (ArrayList (slice u8)))  ; well-known intrinsics the lowering names ("Array.prototype")
    (intrinsic-entries (ArrayList i64))
    (image (ArrayList u8))
@@ -100,12 +102,12 @@
    (booted bool)])
 
 (defn heap-table [] (-> (ptr StaticHeap))
-  (primitive/alloc-static StaticHeap))
+  (compiler-state [StaticHeap] (primitive/alloc-static CompilerStateSlot)))
 
 ;; Entry identities are compilation-local, like shape ids: a `boot!` empties the image.
 (defn heap-reset! [(object-prefix i64)] (-> i64)
   (let [t (heap-table)
-        a (alloc/malloc-allocator)]
+        a (compiler-allocator)]
     (if (.booted t)
         (do
           (let [(mut i) 0]
@@ -140,6 +142,7 @@
           (set! (.booted t) true)))
     (set! (.object-prefix t) object-prefix)
     (set! (.global t) -1)
+    (set! (.shared-global t) false)
     (set! (.image-built t) false)
     0))
 
@@ -221,7 +224,7 @@
                   (continue))))
       (if (>= (load found) 0)
           (load found)
-          (let [a (alloc/malloc-allocator)
+          (let [a (compiler-allocator)
                 (mut copy) (al-new [i64] a)]
             (al-for [u units] (push! [i64] (mut copy) u))
             (heap--push! (HeapEntry
@@ -238,15 +241,29 @@
   (heap--push! (HeapEntry
                  :shape shape
                  :string false
-                 :units (al-new [i64] (alloc/malloc-allocator))
+                 :units (al-new [i64] (compiler-allocator))
                  :words words
                  :kinds kinds
                  :storage -1)))
 
+;; Compiler-owned immutable argument payload. Copy the caller's temporary buffers; ordinary
+;; heap-image relocation and GC scanning handle embedded boxed references.
+(defn heap-add-argument-vector! [(words (ArrayList i64)) (kinds (ArrayList i64))] (-> i64)
+  (if (or (= (len words) 0) (!= (len words) (len kinds)))
+      (panic "heap-add-argument-vector!: invalid payload") 0)
+  (let [(mut copied-words) (al-new [i64] (compiler-allocator))
+        (mut copied-kinds) (al-new [i64] (compiler-allocator))]
+    (al-for [kind kinds]
+      (if (not (or (= kind HEAP-WORD-CONST) (= kind HEAP-WORD-REF)))
+          (panic "heap-add-argument-vector!: invalid word kind") 0)
+      (push! [i64] (mut copied-kinds) kind))
+    (al-for [word words] (push! [i64] (mut copied-words) word))
+    (heap--add-words! SHAPE-ELEMENTS (load copied-words) (load copied-kinds))))
+
 ;; An ordinary object with no properties yet: a null prototype and a null properties word, the
 ;; two words `JsNewObjectRaw` stores.
 (defn heap-add-object! [(null-word i64)] (-> i64)
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         (mut words) (al-new [i64] a)
         (mut kinds) (al-new [i64] a)]
     (push! [i64] (mut words) null-word)
@@ -258,7 +275,7 @@
 ;; A function object: an ordinary object's two words, the raw code word of function `fidx` and a
 ;; null environment word (docs/DECISIONS.md, function values).
 (defn heap-add-function! [(fidx i64) (null-word i64)] (-> i64)
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         (mut words) (al-new [i64] a)
         (mut kinds) (al-new [i64] a)]
     (if (< fidx 0)
@@ -341,7 +358,7 @@
         next (shape-transition-attrs shape name attrs)]
     (set! (.image-built t) false)
     (if (< (.storage e) 0)
-        (let [a (alloc/malloc-allocator)
+        (let [a (compiler-allocator)
               (mut words) (al-new [i64] a)
               (mut kinds) (al-new [i64] a)]
           (push! [i64] (mut words) word)
@@ -400,6 +417,16 @@
 (defn heap-global-entry [] (-> i64)
   (do (heap--require-booted) (.global (heap-table))))
 
+;; Layout ownership and reference binding are separate. A reusable source unit may carry a
+;; global template, but its code must use the global selected by the executing realm. Configure
+;; this before graph lowering; both the frontend and JSL use the same binding decision.
+(defn heap-use-shared-global! [(shared bool)] (-> i64)
+  (do (heap--require-booted) (set! (.shared-global (heap-table)) shared) 0))
+
+(defn heap-global-reference-entry [] (-> i64)
+  (do (heap--require-booted)
+      (if (.shared-global (heap-table)) -1 (.global (heap-table)))))
+
 ;; Well-known intrinsic objects the lowering names by their specification name ("Array.prototype"
 ;; for %Array.prototype%): registered by the realm layout, read by the JSL primitives that need
 ;; them (`%ArrayPrototype`). -1 when the realm did not materialize the intrinsic.
@@ -422,6 +449,10 @@
     (if (or (< i 0) (>= i (heap-intrinsic-count)))
         (do (panic-i "heap-intrinsic-entry-at: index out of range" i) 0)
         (get (.intrinsic-entries (heap-table)) i))))
+
+(defn heap-intrinsic-name-at [(i i64)] (-> (slice u8))
+  (heap-intrinsic-entry-at i)
+  (get (.intrinsic-names (heap-table)) i))
 
 (defn heap-intrinsic-entry [(name (slice u8))] (-> i64)
   (do
@@ -450,7 +481,7 @@
   (+ HEAP-HEADER-BYTES (heap--align8 (heap-entry-payload-bytes i))))
 
 (defn heap-symbol [(i i64)] (-> (slice u8))
-  (let [(mut b) (sb-new (alloc/malloc-allocator))]
+  (let [(mut b) (sb-new (compiler-allocator))]
     (heap--entry i)
     (sb-push-str! (mut b) "$aot$.heap.")
     (sb-push-i64! (mut b) i)
@@ -544,7 +575,7 @@
     (heap--require-booted)
     (if (.image-built t)
         0
-        (let [(mut out) (al-new [u8] (alloc/malloc-allocator))
+        (let [(mut out) (al-new [u8] (compiler-allocator))
               count (len (.entries t))
               nrelocs (heap--count-refs)
               entries-offset
@@ -690,7 +721,7 @@
   (do
     (heap--require-image)
     (if (= (heap-count) 0)
-        (al-slice (al-new [u8] (alloc/malloc-allocator)))
+        (al-slice (al-new [u8] (compiler-allocator)))
         (al-slice (.image (heap-table))))))
 
 ;; An entry's payload offset within the section: the value of its local symbol.

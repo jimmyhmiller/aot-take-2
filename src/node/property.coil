@@ -11,10 +11,10 @@
 ;;                           the prototype chain), and its own-property step is one runtime
 ;;                           operation over the shape tree (`property-generic-access`).
 ;;
-;; The generic path is not a runtime call to a C function. It is the JSL definition of the ECMA-262
-;; abstract operation, lowered into this same graph — which is why it can be inlined and
-;; specialised into the caller like any other code, and why the fast path is a SPECIALISATION of
-;; the generic one rather than a separate implementation that has to agree with it.
+;; The complete named-read operation stays a call to the JSL JsGetNamed definition. Its
+;; :specialize policy lowers that same checked source at sites with proven receiver tags; unknown
+;; sites share the generic helper. The PropAccess nodes below are the representation-level
+;; operations exposed inside that helper or a specialized caller, not the frontend's full Get.
 ;;
 ;; Keyed access (`o[k]`) with a non-constant key stays generic unless the key is proven to be an
 ;; array index, which is the one case worth its own node.
@@ -33,6 +33,7 @@
 ;; layout. The dispatch here is the JavaScript divergence; the folding rule is Simple's
 ;; Load-after-Store idealization reached through the owner's properties word.
 (module aot.node.property)
+(import "aot.util.arena" :use [compiler-allocator compiler-state CompilerStateSlot])
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
 (import "coil.arraylist" :use *)
@@ -327,6 +328,30 @@
         (load answer))))
 
 ;; The attributes a fresh-object shape answers for `key`: the field's bits, or -1/-2 by extensibility.
+;; Eligibility only: reuse the same owner/storage and image facts as PropAccess. This function
+;; creates no graph and grants no assumption. The actual access still proves/folds itself when
+;; JSL is lowered. Simple's typed field access already knows its offset; JavaScript must establish
+;; an own data descriptor first. A broad object tag does not establish that descriptor.
+(defn property-specialization-proven? [(mem (dyn NodeOps)) (boxed (dyn NodeOps))
+                                       (key i64) (write? bool)] (-> bool)
+  (if (or (< key 0) (!= (n-op boxed) OP-BOX)) false
+    (let [object (n-in! boxed 1)]
+      (if (and (= (n-op object) OP-STATICREF) (!= (staticref-rep object) REP-STRING))
+          (if (not (facts-ready?)) false
+            (let [entry (staticref-entry object) shape (heap-storage-shape entry)
+                  written (facts-written? entry key)]
+              (and (shape-has-key? shape key)
+                   (not (and written (facts-descriptors?)))
+                   (= (& (shape-key-attrs shape key) SHAPE-ATTR-ACCESSOR) 0)
+                   (or (and (not write?) (not written))
+                       (!= (& (shape-key-attrs shape key) SHAPE-ATTR-WRITABLE) 0)))))
+          (match (prop-static-storage mem object)
+            (PropStorage [_ shape]
+              (and (shape-has-key? shape key)
+                   (= (& (shape-key-attrs shape key) SHAPE-ATTR-ACCESSOR) 0)
+                   (or (not write?) (!= (& (shape-key-attrs shape key) SHAPE-ATTR-WRITABLE) 0))))
+            (PropUnknown [] false) (PropNoStorage [] false))))))
+
 (defn prop-shape-attrs [(shape i64) (key i64)] (-> i64)
   (if (shape-has-key? shape key)
       (shape-key-attrs shape key)
@@ -343,7 +368,7 @@
 
 ;; Forward every projection of a resolved access and let the worklist collect the access itself.
 (defn prop-access-forward! [(d (dyn NodeOps)) (ctrl (dyn NodeOps)) (mem (dyn NodeOps)) (value (dyn NodeOps))] (-> i64)
-  (let [(mut projs) (al-new [i64] (alloc/malloc-allocator))
+  (let [(mut projs) (al-new [i64] (compiler-allocator))
         (mut i) 0]
     (n-keep! ctrl)
     (n-keep! mem)
@@ -618,7 +643,7 @@
 (impl NodeOps PropAccessNode
   (hdr [(self (ptr PropAccessNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
   (label [(self (ptr PropAccessNode))] (-> (slice u8))
-         (let [(mut b) (sb-new (alloc/malloc-allocator))]
+         (let [(mut b) (sb-new (compiler-allocator))]
            (sb-push-str! (mut b) (if (= (.kind self) PROP-LOAD)
                                      "PropLoad"
                                      (if (= (.kind self) PROP-HAS)
@@ -673,7 +698,7 @@
                         (value (Option (dyn NodeOps)))
                         (key i64)
                         (kind i64)] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [PropAccessNode] (alloc/create [PropAccessNode] a))
         d (primitive/make-dyn NodeOps p)]
     (if (or (<= key 0) (> key (shape-key-count)))
@@ -735,23 +760,27 @@
                               (if (!= (.res-mem p) 0)
                                   0
                                   (let [ctrl (n-in! n PROP-CTRL)
+                                        origin-prior (.current (node-origins))
+                                        origin-set (do (set! (.current (node-origins)) (.origin (hdr n))) 0)
                                         mem (n-in! n PROP-MEM)
                                         object (n-in! n PROP-OBJECT)
                                         access
                                           (if (= (.kind p) PROP-STORE)
                                               (if (= (.attrs p) SHAPE-ATTRS-DEFAULT)
                                                   (property-store-generic-owner ctrl mem object (.key p) (n-in! n PROP-VALUE))
-                                                  (property-store-generic-owner-attrs ctrl mem object (con-int (.key p)) (n-in! n PROP-VALUE) (.attrs p)))
+                                                  (property-store-generic-owner-attrs ctrl mem object (keyref-make (.key p)) (n-in! n PROP-VALUE) (.attrs p)))
                                               (if (= (.kind p) PROP-ATTRS)
                                                   (property-attrs-own-named ctrl mem object (.key p))
                                                   (if (= (.kind p) PROP-HOLDER)
                                                       (property-holder-named ctrl mem object (.key p))
                                                       (if (= (.kind p) PROP-GET)
-                                                          (property-generic-access ctrl mem object (con-int (.key p)) (None [(dyn NodeOps)]) JS-PROP-GET)
+                                                          (property-generic-access ctrl mem object (keyref-make (.key p)) (None [(dyn NodeOps)]) JS-PROP-GET)
                                                           (if (= (.kind p) PROP-SET)
-                                                              (property-set-generic ctrl mem object (con-int (.key p)) (n-in! n PROP-VALUE))
+                                                              (property-set-generic ctrl mem object (keyref-make (.key p)) (n-in! n PROP-VALUE))
                                                               (property-own-named ctrl mem object (.key p) (= (.kind p) PROP-LOAD)))))))]
                                     (set! (mut expanded) (+ (load expanded) 1))
+                                    origin-set
+                                    (n-origin-leave! origin-prior)
                                     (set! (.res-mem p) (n-nid (.mem access)))
                                     (set! (.res-value p) (n-nid (.value access)))
                                     (prop-access-forward! n (.ctrl access) (.mem access) (.value access))
@@ -936,7 +965,7 @@
     (if (or (<= key 0) (> key (shape-key-count)))
         (panic-i "property-attrs-own-named: invalid property key" key)
         0)
-    (property-generic-access ctrl mem object (con-int key) (None [(dyn NodeOps)]) JS-PROP-ATTRIBUTES)))
+    (property-generic-access ctrl mem object (keyref-make key) (None [(dyn NodeOps)]) JS-PROP-ATTRIBUTES)))
 
 ;; The runtime's chain walk (`rt-prop-chain-holder`) over a constant or a runtime key.
 (defn property-holder-named [(ctrl (dyn NodeOps))
@@ -947,7 +976,7 @@
     (if (or (<= key 0) (> key (shape-key-count)))
         (panic-i "property-holder-named: invalid property key" key)
         0)
-    (property-generic-access ctrl mem object (con-int key) (None [(dyn NodeOps)]) JS-PROP-CHAIN-HOLDER)))
+    (property-generic-access ctrl mem object (keyref-make key) (None [(dyn NodeOps)]) JS-PROP-CHAIN-HOLDER)))
 
 (defn property-holder-keyed [(ctrl (dyn NodeOps))
                              (mem (dyn NodeOps))
@@ -990,7 +1019,7 @@
     (property-generic-access ctrl
                              mem
                              object
-                             (con-int key)
+                             (keyref-make key)
                              (None [(dyn NodeOps)])
                              (if load-value? JS-PROP-GET-OWN JS-PROP-HAS-OWN))))
 
@@ -1005,20 +1034,11 @@
   (let [alias (shape-alias-key shape key)
         stored
           (store-make ctrl mem storage (con-int (shape-offset-key shape key)) value alias (ty-dyn TAG-ANY))
-        merged (memmerge-make)
-        fields (shape-field-count shape)
-        (mut i) 0]
-    (memmerge-set-alias! merged ALIAS-BULK (mem-effective mem ALIAS-BULK))
-    (memmerge-set-alias! merged ALIAS-OBJECT-PROTOTYPE (mem-effective mem ALIAS-OBJECT-PROTOTYPE))
-    (memmerge-set-alias! merged ALIAS-OBJECT-PROPERTIES (mem-effective mem ALIAS-OBJECT-PROPERTIES))
-    (loop (if (>= (load i) fields)
-              (break 0)
-              (let [field-alias (shape-field-alias-at shape (load i))]
-                (memmerge-set-alias! merged
-                                     field-alias
-                                     (if (= field-alias alias) stored (mem-effective mem field-alias)))
-                (set! (mut i) (+ (load i) 1))
-                (continue))))
+        merged (memmerge-make)]
+    ;; Final Simple Parser.mergeAlias: preserve ALL prior memory, overriding just this field.
+    ;; MemMerge idealization collapses stacked defaults without losing unrelated aliases.
+    (memmerge-set-alias! merged ALIAS-BULK mem)
+    (memmerge-set-alias! merged alias stored)
     (property-access-result value ctrl merged)))
 
 (defn property-load-own-named [(ctrl (dyn NodeOps))
@@ -1067,7 +1087,7 @@
     (if (or (<= key 0) (> key (shape-key-count)))
         (panic-i "property-store-generic-owner: invalid property key" key)
         0)
-    (property-generic-access ctrl mem object (con-int key) (Some value) JS-PROP-SET-OWN)))
+    (property-generic-access ctrl mem object (keyref-make key) (Some value) JS-PROP-SET-OWN)))
 
 ;; A store whose owner's backing store is statically visible, with the attributes a new key takes.
 ;; A present key is written in place when it is a writable data property with the same attributes
@@ -1087,12 +1107,12 @@
     (match (prop-owner-store mem object)
       (None [] (if (= attrs SHAPE-ATTRS-DEFAULT)
                    (property-store-generic-owner ctrl mem object key value)
-                   (property-store-generic-owner-attrs ctrl mem object (con-int key) value attrs)))
+                   (property-store-generic-owner-attrs ctrl mem object (keyref-make key) value attrs)))
       (Some [owner-state]
           (let [storage-word (n-in! owner-state STORE-VAL)]
             (if (= (n-ty storage-word) (ty-dyn TAG-NULL))
                 (let [shape (shape-transition-attrs SHAPE-EMPTY (shape-key-name key) attrs)
-                      (mut values) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))]
+                      (mut values) (al-new [(dyn NodeOps)] (compiler-allocator))]
                   (push! [(dyn NodeOps)] (mut values) value)
                   (let [storage (property-storage-new ctrl mem shape (load values))
                         installed (property-storage-install ctrl mem object shape storage)]
@@ -1118,42 +1138,14 @@
                                     (and (not present) (not (shape-extensible? shape))))
                                 (if (= attrs SHAPE-ATTRS-DEFAULT)
                                     (property-store-generic-owner ctrl mem object key value)
-                                    (property-store-generic-owner-attrs ctrl mem object (con-int key) value attrs))
+                                    (property-store-generic-owner-attrs ctrl mem object (keyref-make key) value attrs))
                             (if in-place
-                                (let [alias (shape-alias-key shape key)
-                                      stored
-                                        (store-make ctrl
-                                                    mem
-                                                    storage
-                                                    (con-int (shape-offset-key shape key))
-                                                    value
-                                                    alias
-                                                    (ty-dyn TAG-ANY))
-                                      merged (memmerge-make)
-                                      fields (shape-field-count shape)
-                                      (mut i) 0]
-                                  (memmerge-set-alias! merged ALIAS-BULK
-                                                       (mem-effective mem ALIAS-BULK))
-                                  (memmerge-set-alias! merged ALIAS-OBJECT-PROTOTYPE
-                                                       (mem-effective mem ALIAS-OBJECT-PROTOTYPE))
-                                  (memmerge-set-alias! merged ALIAS-OBJECT-PROPERTIES owner-state)
-                                  (loop (if (>= (load i) fields)
-                                            (break 0)
-                                            (let [field-alias (shape-field-alias-at shape (load i))]
-                                              (memmerge-set-alias!
-                                                merged
-                                                field-alias
-                                                (if (= field-alias alias)
-                                                    stored
-                                                    (mem-effective mem field-alias)))
-                                              (set! (mut i) (+ (load i) 1))
-                                              (continue))))
-                                  (property-access-result value ctrl merged))
+                                (property-store-in-shape ctrl mem storage shape key value)
                                 (let [next-shape
                                         (shape-transition-attrs shape (shape-key-name key) attrs)
                                       fields (shape-field-count shape)
                                       (mut values)
-                                        (al-new [(dyn NodeOps)] (alloc/malloc-allocator))
+                                        (al-new [(dyn NodeOps)] (compiler-allocator))
                                       (mut i) 0]
                                   (loop (if (>= (load i) fields)
                                             (break 0)

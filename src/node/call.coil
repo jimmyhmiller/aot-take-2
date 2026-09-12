@@ -146,6 +146,7 @@
 ;; threading through Call/Return/CallEnd state tuples.
 ;; ============================================================================
 (module aot.node.call)
+(import "aot.util.arena" :use [compiler-allocator compiler-state CompilerStateSlot])
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
 (import "coil.arraylist" :use *)
@@ -182,7 +183,7 @@
   [(f (fnptr c [(ref (dyn NodeOps))] i64)) (installed bool)])
 
 (defn fun-body-size-ext [] (-> (ptr FunBodySizeExt))
-  (primitive/alloc-static FunBodySizeExt))
+  (compiler-state [FunBodySizeExt] (primitive/alloc-static CompilerStateSlot)))
 
 (defn set-fun-body-size-ext! [(f (fnptr c [(ref (dyn NodeOps))] i64))] (-> i64)
   (do
@@ -196,7 +197,7 @@
 ;; measured earlier in the epoch can only be stale upward (peepholes shrink bodies), which delays
 ;; an inline to the next epoch and never admits one wrongly.
 (defn fun-size-epoch [] (-> (ptr i64))
-  (primitive/alloc-static i64))
+  (compiler-state [i64] (primitive/alloc-static CompilerStateSlot)))
 
 (defn fun-size-epoch-bump! [] (-> i64)
   (do (set! (fun-size-epoch) (+ (load (fun-size-epoch)) 1)) 0))
@@ -218,8 +219,22 @@
 (defstruct CloneInlineExt
   [(f (fnptr c [(ref (dyn NodeOps)) (ref (dyn NodeOps))] i64)) (installed bool)])
 
+;; Simple's CallEnd.maybeInline rations one expansion between cleanup rounds. A frontend may
+;; specialize a retained semantic definition from its source instead of cloning its generic
+;; graph. The callback returns INLINE-DEFER, a positive success, or INLINE-UNHANDLED. It must
+;; honor mid-assert, preserve the ordinary call's state tuple, and register proof dependencies.
+;; No JavaScript operation names or semantics enter this module.
+(const INLINE-UNHANDLED -3)
+(defstruct CallSpecializeExt
+  [(f (fnptr c [(ref (dyn NodeOps)) bool] i64)) (installed bool)])
+(defn call-specialize-ext [] (-> (ptr CallSpecializeExt))
+  (compiler-state [CallSpecializeExt] (primitive/alloc-static CompilerStateSlot)))
+(defn set-call-specialize-ext! [(f (fnptr c [(ref (dyn NodeOps)) bool] i64))] (-> i64)
+  (do (set! (.f (call-specialize-ext)) f)
+      (set! (.installed (call-specialize-ext)) true) 0))
+
 (defn clone-inline-ext [] (-> (ptr CloneInlineExt))
-  (primitive/alloc-static CloneInlineExt))
+  (compiler-state [CloneInlineExt] (primitive/alloc-static CompilerStateSlot)))
 
 (defn set-clone-inline-ext! [(f (fnptr c
                                        [(ref (dyn NodeOps)) (ref (dyn NodeOps))]
@@ -531,7 +546,7 @@
 ;; Replace the return member of a signature tuple.
 (defn fun--sig-with-ret [(sig i64) (ret i64)] (-> i64)
   (let [n (ty-tuple-len sig)
-        a (alloc/malloc-allocator)
+        a (compiler-allocator)
         (mut members) (al-new [i64] a)
         (mut i) 0]
     (loop (if (>= (load i) n)
@@ -594,7 +609,7 @@
 
 ;; Build a Fun with the unknown-caller hook already installed.
 (defn fun-make [(start (dyn NodeOps)) (sig i64) (name (slice u8))] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [FunNode] (alloc/create [FunNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.sig p) sig)
@@ -784,7 +799,7 @@
                       (slot i64)
                       (declared i64)
                       (name (slice u8))] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [ParmNode] (alloc/create [ParmNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.idx p) slot)
@@ -928,7 +943,7 @@
     0))
 
 (defn funptr-make [(fun (dyn NodeOps)) (fidx i64)] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [FunPtrNode] (alloc/create [FunPtrNode] a))
         d (primitive/make-dyn NodeOps p)
         t (ty-funptr-singleton (fun-sig fun) (reserve-fidx! fidx))]
@@ -1060,7 +1075,7 @@
 
 ;; Build a call site. Arguments are appended, then the function pointer LAST.
 (defn call-make-with-mem [(ctrl (dyn NodeOps)) (mem (dyn NodeOps))] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [CallNode] (alloc/create [CallNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.cend-nid p) 0)
@@ -1073,7 +1088,7 @@
 ;; Legacy graph-construction entry point retained for tests that deliberately exercise incomplete
 ;; calls. Production lowering uses `call-make-with-mem`; backend handoff rejects a null memory slot.
 (defn call-make [(ctrl (dyn NodeOps))] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [CallNode] (alloc/create [CallNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.cend-nid p) 0)
@@ -1165,11 +1180,46 @@
 ;; phase-independent marker that reset-to-top has run; an unresolved call then contributes TOP,
 ;; exactly as final Simple's `phase >= Opto` branch requires. Returning the declared result during
 ;; Opto is non-monotone when the newly linked Return is still TOP.
+;; Final Simple counts declared external FIDXs separately from linked Returns. A declared import
+;; contributes reachable control, public-memory bottom and its declared result. It never supplies
+;; an inlineable Return. Undeclared/missing targets keep the provisional unresolved-call answer.
+;; Include imports even in a mixed local/external target set; otherwise the local Return would
+;; incorrectly specialize the imported result and memory effects away.
+(defn call-external-target-count [(c (dyn NodeOps))] (-> i64)
+  (let [ft (n-ty (call-fptr c)) (mut count) 0 (mut i) 0]
+    (if (and (ty-funptr? ft) (not (ty-funptr-high? ft))
+             (= (call-nargs c) (ty-sig-nargs (ty-funptr-sig ft))))
+        (loop (if (>= (load i) (ty-funptr-target-count ft)) (break 0)
+                  (do
+                    (match (arena-external-function (ty-funptr-target-at ft (load i)))
+                      (Some [_] (set! (mut count) (+ (load count) 1))) (None [] 0))
+                    (set! (mut i) (+ (load i) 1)) (continue))))
+        0)
+    (load count)))
+
+;; Simple's declared externals contribute their declared result and public-memory bottom without
+;; a local Return. An opaque callback has the same state contribution, but no fabricated FIDX to
+;; enumerate or symbol to resolve. Known members of a mixed pointer still link in the usual way.
+(defn call-opaque-target? [(c (dyn NodeOps))] (-> bool)
+  (let [ft (n-ty (call-fptr c))]
+    (and (ty-funptr-external? ft) (= (call-nargs c) (ty-sig-nargs (ty-funptr-sig ft))))))
+
+(defn call-has-external-target? [(c (dyn NodeOps))] (-> bool)
+  (or (call-opaque-target? c) (> (call-external-target-count c) 0)))
+
 (defn cend--linked-state [(e (dyn NodeOps)) (declared i64)] (-> i64)
   (let [cnt (n-nins e)
+        c (n-in! e 0)
+        externs (call-external-target-count c)
+        ft (n-ty (call-fptr c))
+        opaque (call-opaque-target? c)
+        complete (or opaque (= externs 0)
+                     (>= (+ (- cnt 1) externs) (ty-funptr-target-count ft)))
         (mut i) 1
-        (mut state) (ty-tuple-of3 TY-XCTRL (ty-mem-top 1) TY-TOP)
-        (mut any) false]
+        (mut state) (if (or opaque (> externs 0))
+                        (ty-tuple-of3 TY-CTRL (ty-mem 1 TY-BOT) declared)
+                        (ty-tuple-of3 TY-XCTRL (ty-mem-top 1) TY-TOP))
+        (mut any) (or opaque (> externs 0))]
     (loop (if (>= (load i) cnt)
               (break 0)
               (do
@@ -1186,7 +1236,7 @@
                   (None [] 0))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
-    (if (load any)
+    (if (and (load any) complete)
         ;; Final Simple preserves a reachable continuation when every linked Return is only
         ;; provisionally unreachable during Opto. Otherwise CallEnd moves CTRL -> XCTRL, tears
         ;; down the caller, and may later need to widen when argument evidence reaches the callee.
@@ -1202,7 +1252,7 @@
         ;; Linked, but every Return is a TY-INVALID transient (a Return being replaced one
         ;; worklist turn before this CallEnd recomputes). That is graph state, not lattice
         ;; evidence: keep the last monotone answer, as the folding branch does.
-        (if (and (> cnt 1) (!= (n-ty e) TY-INVALID))
+        (if (and complete (> cnt 1) (!= (n-ty e) TY-INVALID))
             (n-ty e)
             (if (!= (n-pesi-ty e) TY-INVALID)
                 (ty-tuple-of3 TY-CTRL (ty-mem-top 1) TY-TOP)
@@ -1250,7 +1300,7 @@
               (cfg-idepth-default (primitive/make-dyn NodeOps self))))
 
 (defn callend-make [(c (dyn NodeOps))] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [CallEndNode] (alloc/create [CallEndNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.folding p) false)
@@ -1451,6 +1501,12 @@
 ;; Decide WITHOUT acting, setting no flags. Split out because the expensive-assert path must be able
 ;; to ask the question with no side effects.
 (defn callend-inline-candidate [(e (dyn NodeOps))] (-> i64)
+  (let [specialized (if (.installed (call-specialize-ext))
+                       (primitive/call-ptr (.f (call-specialize-ext)) e false)
+                       INLINE-UNHANDLED)]
+    (if (!= specialized INLINE-UNHANDLED) specialized (callend-inline-candidate-ordinary e))))
+
+(defn callend-inline-candidate-ordinary [(e (dyn NodeOps))] (-> i64)
   (if (.never-inline (primitive/cast (ptr CallEndNode) (hdr e)))
       INLINE-NEVER
       (if (cend-folding? e)
@@ -1461,7 +1517,7 @@
                   (if (!= (n-op c) OP-CALL)
                       INLINE-NEVER
                       ;; Not exactly ONE linked target yet. SCCP may still link one, so DEFER.
-                      (if (!= (n-nins e) 2)
+                      (if (or (!= (n-nins e) 2) (call-has-external-target? c))
                           INLINE-DEFER
                           (callend--candidate-with-target e c (n-in! e 1)))))))))
 
@@ -1469,6 +1525,12 @@
 ;; sharper than the formal it meets (a discharged annotation, a literal, a known shape, a constant),
 ;; or a body too small to be worth a call. Without evidence every argument and the Fun are
 ;; registered as dependencies, so the question is reasked when SCCP or an outer inline sharpens one.
+;; Final Simple's inlineCandidate checks argument compatibility against the declared signature
+;; and applies its size bound before choosing trivial versus clone. Our additional JSL gate must
+;; distinguish new caller facts from facts SCCP already propagated into a shared body. For a
+;; clone, compare with the live Parm type: a constant key shared by the callers is not new evidence,
+;; and an eliminated Parm cannot benefit from substitution. Depend on both sides of the comparison.
+;; The single-caller path retains the declaration test because it moves, rather than clones, code.
 (defn callend--inline-evidence? [(c (dyn NodeOps)) (fun (dyn NodeOps)) (e (dyn NodeOps))] (-> bool)
   (let [sig (fun-sig fun)
         n (ty-sig-nargs sig)
@@ -1484,8 +1546,14 @@
               (break 0)
               (let [arg (call-arg c (load i))
                     at (n-ty arg)
-                    formal (ty-sig-arg sig (load i))]
-                (if (and (!= at TY-INVALID) (ty-isa? at formal) (!= at formal))
+                    formal (ty-sig-arg sig (load i))
+                    known (if (> (n-nins fun) 2)
+                              (match (fun-parm fun (load i))
+                                (Some [p] (do (n-add-dep! p e) (n-ty p)))
+                                (None [] at))
+                              formal)]
+                (if (and (!= at TY-INVALID) (!= known TY-INVALID)
+                         (ty-isa? at formal) (ty-isa? at known) (!= at known))
                     (set! (mut evidence) true)
                     (n-add-dep! arg e))
                 (set! (mut i) (+ (load i) 1))
@@ -1732,7 +1800,13 @@
 ;; its boot-installed callback preserves an acyclic module graph while keeping this public contract
 ;; complete for direct callers and IterPeeps alike.
 (defn callend-maybe-inline! [(e (dyn NodeOps))] (-> i64)
-  (let [d (callend-inline-candidate e)]
+  (let [specialized (if (.installed (call-specialize-ext))
+                       (primitive/call-ptr (.f (call-specialize-ext)) e (not (mid-assert?)))
+                       INLINE-UNHANDLED)]
+    (if (!= specialized INLINE-UNHANDLED) specialized (callend-maybe-inline-ordinary! e))))
+
+(defn callend-maybe-inline-ordinary! [(e (dyn NodeOps))] (-> i64)
+  (let [d (callend-inline-candidate-ordinary e)]
     (if (mid-assert?)
         d  ; an expensive assert must not mutate
         (do

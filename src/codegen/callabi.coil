@@ -1,0 +1,251 @@
+;; Stable callable boundary for separately compiled JavaScript units.
+;;
+;; Final Simple's Call/Parm use one shared signature for each function-pointer set. Keep those
+;; ordinary Call/Fun edges, including memory and exceptional completion, rather than introducing
+;; another call operator. JavaScript's variable arity uses an explicit count, three direct boxed
+;; arguments and an immutable managed overflow vector. A local adapter unpacks into optimized formal slots;
+;; neither the exported signature nor the vector layout depends on those slots.
+;;
+;; Final Simple maps each Call argument directly to a Parm, without a heap allocation. We do
+;; likewise for the first three actuals: together with the five ABI metadata operands these fit
+;; AArch64's eight integer argument registers. Missing direct actuals are undefined, independent
+;; of the actual count. Only dynamic tails beyond those three allocate storage. Constant tails
+;; use immutable image payloads with ordinary reference relocation. No arity is truncated.
+;; Layout: one boxed word per overflow argument, scanned with SHAPE-ELEMENTS. The vector is compiler-owned,
+;; never a JS Array, so prototypes, indexed getters and user mutation cannot affect unpacking.
+;; The caller evaluates arguments before packing, and allocates/initializes the vector once. Its
+;; base remains a managed reference through the ordinary safepoint/root machinery; no interior
+;; pointer crosses a call. Without overflow its value is a typed null and there is no allocation.
+;; Bounds-checked reads retain control as Simple's LoadNode does for array accesses.
+(module aot.codegen.callabi)
+(import "coil.arraylist" :use *)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "aot.util.panic" :use *)
+(import "aot.type.type" :use *)
+(import "aot.shape" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.compare" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.call" :use *)
+(import "aot.heap" :use *)
+
+(const CALL-ABI-VERSION 2)
+(const CALL-ABI-CALLEE 0)
+(const CALL-ABI-THIS 1)
+(const CALL-ABI-NEW-TARGET 2)
+(const CALL-ABI-COUNT 3)
+(const CALL-ABI-VECTOR 4)
+(const CALL-ABI-DIRECT0 5)
+(const CALL-ABI-DIRECT-COUNT 3)
+(const CALL-ABI-ARITY (+ CALL-ABI-DIRECT0 CALL-ABI-DIRECT-COUNT))
+;; The count must permit payload, collector header and alignment in a signed address-sized word.
+(const CALL-ABI-MAX-ARGUMENTS (/ (- 0x7fffffffffffffff 31) 8))
+
+(defstruct CallArguments [(vector (dyn NodeOps)) (count (dyn NodeOps)) (memory (dyn NodeOps))
+                          (direct (ArrayList (dyn NodeOps)))])
+(defstruct CallArgumentRead [(value (dyn NodeOps)) (control (dyn NodeOps))])
+(defstruct ScriptSequence [(control (dyn NodeOps)) (memory (dyn NodeOps)) (completion (dyn NodeOps))])
+
+(defn callabi-vector-type [] (-> i64)
+  (ty-memptr true (ty-struct "$aot.ArgumentVector")))
+
+(defn callabi-signature [] (-> i64)
+  (let [(mut members) (al-new [i64] (compiler-allocator))]
+    (push! [i64] (mut members) (ty-dyn TAG-COMPLETION))
+    (push! [i64] (mut members) (ty-dyn TAG-ANY))
+    (push! [i64] (mut members) (ty-dyn TAG-ANY))
+    (push! [i64] (mut members) (ty-dyn TAG-ANY))
+    (push! [i64] (mut members) (ty-int-range 0 CALL-ABI-MAX-ARGUMENTS))
+    (push! [i64] (mut members) (callabi-vector-type))
+    (let [(mut i) 0]
+      (loop (if (>= (load i) CALL-ABI-DIRECT-COUNT) (break 0)
+                (do (push! [i64] (mut members) (ty-dyn TAG-ANY))
+                    (set! (mut i) (+ (load i) 1)) (continue)))))
+    (let [signature (ty-tuple (al-slice (load members)))]
+      (al-free! (mut members))
+      signature)))
+
+(defn callabi-static-tail [(values (ArrayList (dyn NodeOps)))] (-> (Option (dyn NodeOps)))
+  (let [(mut words) (al-new [i64] (compiler-allocator))
+        (mut kinds) (al-new [i64] (compiler-allocator))
+        (mut i) CALL-ABI-DIRECT-COUNT (mut valid) true]
+    (loop (if (or (>= (load i) (len values)) (not (load valid))) (break 0)
+      (do (match (boxed-image-word (get values (load i)))
+            (None [] (set! (mut valid) false))
+            (Some [encoded] (let [w encoded]
+              (push! [i64] (mut words) (.word w)) (push! [i64] (mut kinds) (.kind w)))))
+          (set! (mut i) (+ (load i) 1)) (continue))))
+    (let [result (if (and (load valid) (> (len (load words)) 0))
+                    (Some (staticref-make (heap-add-argument-vector! (load words) (load kinds))
+                                          STATICREF-ARGUMENT-VECTOR))
+                    (None [(dyn NodeOps)]))]
+      (al-free! (mut words)) (al-free! (mut kinds)) result)))
+
+(defn callabi-pack! [(control (dyn NodeOps)) (memory (dyn NodeOps))
+                     (values (ArrayList (dyn NodeOps)))] (-> CallArguments)
+  (let [count (len values) (mut i) 0
+        (mut direct) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (if (> count CALL-ABI-MAX-ARGUMENTS) (panic "callabi-pack!: argument vector size overflow") 0)
+    (al-for [value values]
+      (if (not (ty-isa? (n-ty value) (ty-dyn TAG-ANY)))
+          (panic "callabi-pack!: arguments must be boxed JavaScript values") 0))
+    (loop (if (>= (load i) CALL-ABI-DIRECT-COUNT) (break 0)
+              (do (push! [(dyn NodeOps)] (mut direct)
+                         (if (< (load i) count) (get values (load i)) (dyn-undefined-make)))
+                  (set! (mut i) (+ (load i) 1)) (continue))))
+    (if (<= count CALL-ABI-DIRECT-COUNT)
+        (CallArguments :vector (con-make (ty-memptr-state 1 (ty-struct "$aot.ArgumentVector")))
+                       :count (con-int count) :memory memory :direct (load direct))
+    (match (callabi-static-tail values)
+      (Some [vector] (CallArguments :vector vector :count (con-int count) :memory memory :direct (load direct)))
+      (None []
+    (let [created (new-make control (con-int (* (- count CALL-ABI-DIRECT-COUNT) 8)) memory
+                            SHAPE-ELEMENTS (ty-struct "$aot.ArgumentVector"))
+          vector (proj-make created 0 "arguments.vector")
+          (mut state) (proj-make created 1 "arguments.private")
+          merged (memmerge-make)]
+      (loop (if (>= (load i) count) (break 0)
+                (do
+                  (set! (mut state)
+                    (store-make control (load state) vector (con-int (* (- (load i) CALL-ABI-DIRECT-COUNT) 8))
+                                (get values (load i))
+                                ALIAS-CALL-ARGUMENTS (ty-dyn TAG-ANY)))
+                  (set! (mut i) (+ (load i) 1)) (continue))))
+      (memmerge-set-alias! merged ALIAS-BULK memory)
+      (memmerge-set-alias! merged ALIAS-CALL-ARGUMENTS (load state))
+      (CallArguments :vector vector :count (con-int count) :memory merged :direct (load direct))))))))
+
+;; The same positional contract at an unknown-caller entry; no heap reads for direct arguments.
+(defn callabi-formals! [(fun (dyn NodeOps)) (memory (dyn NodeOps))] (-> CallArguments)
+  (let [(mut direct) (al-new [(dyn NodeOps)] (compiler-allocator)) (mut i) 0]
+    (loop (if (>= (load i) CALL-ABI-DIRECT-COUNT) (break 0)
+              (do (push! [(dyn NodeOps)] (mut direct)
+                         (parm-make fun (+ CALL-ABI-DIRECT0 (load i)) (ty-dyn TAG-ANY) "argument.direct"))
+                  (set! (mut i) (+ (load i) 1)) (continue))))
+    (CallArguments :vector (parm-make fun CALL-ABI-VECTOR (callabi-vector-type) "argv.overflow")
+                   :count (parm-make fun CALL-ABI-COUNT (ty-int-range 0 CALL-ABI-MAX-ARGUMENTS) "argc")
+                   :memory memory :direct (load direct))))
+
+;; A callee asks for a formal by its nonnegative position. Omitted arguments are undefined;
+;; supplied undefined still contributes to COUNT, and extra arguments remain in the vector.
+(defn callabi-argument! [(control (dyn NodeOps)) (memory (dyn NodeOps))
+                         (arguments CallArguments) (index i64)]
+                        (-> CallArgumentRead)
+  (if (or (< index 0) (> index CALL-ABI-MAX-ARGUMENTS))
+      (panic "callabi-argument!: formal index outside the callable ABI") 0)
+  (if (< index CALL-ABI-DIRECT-COUNT)
+      (CallArgumentRead :value (get (.direct arguments) index) :control control)
+  (let [test (if-make control (lt-make (con-int index) (.count arguments)))
+        arms (if-arms! test)
+        loaded (load-make-mode (arms-true arms) memory (.vector arguments) (con-int (* (- index CALL-ABI-DIRECT-COUNT) 8))
+                               ALIAS-CALL-ARGUMENTS (ty-dyn TAG-ANY) true)
+        region (region-make)
+        value (phi-make region (ty-dyn TAG-ANY) "argument.or.undefined")]
+    (region-add-path! region (arms-true arms))
+    (phi-add-value! value loaded)
+    (region-add-path! region (arms-false arms))
+    (phi-add-value! value (dyn-undefined-make))
+    (CallArgumentRead :value value :control region))))
+
+;; Ordinary calls retain memory SSA and the existing interprocedural optimizer. The pointer type
+;; supplies its finite/local or imported target contract; this helper only fixes the ABI operands.
+(defn callabi-invoke! [(control (dyn NodeOps)) (memory (dyn NodeOps)) (target (dyn NodeOps))
+                       (callee (dyn NodeOps)) (receiver (dyn NodeOps)) (new-target (dyn NodeOps))
+                       (arguments CallArguments)] (-> (dyn NodeOps))
+  (let [site (call-make-with-mem control memory)]
+    (call-add-arg! site callee)
+    (call-add-arg! site receiver)
+    (call-add-arg! site new-target)
+    (call-add-arg! site (.count arguments))
+    (call-add-arg! site (.vector arguments))
+    (if (!= (len (.direct arguments)) CALL-ABI-DIRECT-COUNT)
+        (panic "callabi-invoke!: invalid direct argument count") 0)
+    (al-for [value (.direct arguments)] (call-add-arg! site value))
+    (call-set-fptr! site target)
+    (callend-make site)))
+
+;; Simple's CallEnd projects control, memory and the declared return value; external calls
+;; conservatively crush public memory without a local Return edge. Script orchestration uses
+;; those same edges. Each exception arm joins the exit, while only the normal arm reaches the
+;; next initializer. The memory Phi preserves the pending exception and effects of the last
+;; executed initializer. No later call can overwrite them. Successful setup returns undefined.
+;; The caller supplies retained Script initializer entries, not arbitrary JS function objects.
+(defn callabi-script-sequence! [(control (dyn NodeOps)) (memory (dyn NodeOps))
+                               (targets (ArrayList (dyn NodeOps)))] (-> ScriptSequence)
+  (al-for [target targets]
+    (let [t (n-ty target)]
+      (if (or (not (ty-funptr? t)) (!= (ty-funptr-sig t) (callabi-signature)))
+          (panic "callabi-script-sequence!: initializer has incompatible callable signature") 0)))
+  (if (= (len targets) 0)
+      (ScriptSequence :control control :memory memory :completion (dyn-undefined-make))
+      (let [(mut empty) (al-new [(dyn NodeOps)] (compiler-allocator))
+            packed (callabi-pack! control memory (load empty))
+            (mut next-control) (load control) (mut next-memory) (.memory packed)
+            exit (region-make)
+            exit-memory (phi-make exit (ty-mem ALIAS-BULK TY-BOT) "scripts.memory")
+            completion (phi-make exit (ty-dyn TAG-COMPLETION) "scripts.completion")]
+        (al-free! (mut empty))
+        (al-for [target targets]
+          (let [end (callabi-invoke! (load next-control) (load next-memory) target
+                                    (dyn-undefined-make) (dyn-undefined-make) (dyn-undefined-make)
+                                    packed)
+                returned (proj-make end RETURN-VALUE "script.completion")
+                state (proj-make end RETURN-MEM "script.memory")
+                test (if-make (cproj-make end RETURN-CTRL "script.returned")
+                              (typetest-make returned TAG-EXCEPTION))
+                arms (if-arms! test)]
+            (region-add-path! exit (arms-true arms))
+            (phi-add-value! exit-memory state)
+            (phi-add-value! completion (dyn-exception-make))
+            (set! (mut next-control) (arms-false arms))
+            (set! (mut next-memory) state)))
+        (region-add-path! exit (load next-control))
+        (phi-add-value! exit-memory (load next-memory))
+        (phi-add-value! completion (dyn-undefined-make))
+        (ScriptSequence :control exit :memory exit-memory :completion completion))))
+
+;; Publish a stable entry for a local boxed-slot function. Simple maps Call inputs positionally
+;; onto Parm Phis; this adapter uses exactly those edges and forwards the completion unchanged.
+;; Only declared formals need vector reads. Extra actuals remain available at the public entry,
+;; while unused local padding receives undefined. The local entry is free to specialize or inline
+;; under its callers; taking the adapter's address does not expose that internal signature.
+(defn callabi-adapter! [(start (dyn NodeOps)) (target (dyn NodeOps)) (fidx i64)
+                       (formals i64) (name (slice u8))] (-> (dyn NodeOps))
+  (let [local-signature (fun-sig target)
+        slots (- (ty-tuple-len local-signature) 3)]
+    (if (or (< formals 0) (> formals slots))
+        (panic "callabi-adapter!: formal count does not fit the local signature") 0)
+    (let [signature (callabi-signature)
+          (mut control) (fun-make start signature name)
+          fun (load control)
+          memory (parm-make-slot fun CALL-MEM (ty-mem ALIAS-BULK TY-BOT) "$mem")
+          receiver (parm-make fun CALL-ABI-THIS (ty-dyn TAG-ANY) "this")
+          new-target (parm-make fun CALL-ABI-NEW-TARGET (ty-dyn TAG-ANY) "new.target")
+          arguments (callabi-formals! fun memory)
+          (mut values) (al-new [(dyn NodeOps)] (compiler-allocator)) (mut i) 0]
+      (parm-set-unknown-input! memory (proj-make start 1 "start.mem"))
+      (loop (if (>= (load i) slots) (break 0)
+                (do
+                  (if (< (load i) formals)
+                      (let [arg (callabi-argument! (load control) memory arguments (load i))]
+                        (set! (mut control) (.control arg))
+                        (push! [(dyn NodeOps)] (mut values) (.value arg)))
+                      (push! [(dyn NodeOps)] (mut values) (dyn-undefined-make)))
+                  (set! (mut i) (+ (load i) 1)) (continue))))
+      (let [site (call-make-with-mem (load control) memory)]
+        (call-add-arg! site receiver)
+        (call-add-arg! site new-target)
+        (al-for [arg (load values)] (call-add-arg! site arg))
+        (call-set-fptr! site (funptr-make target fidx))
+        (let [end (callend-make site)
+              ret (return-make (cproj-make end RETURN-CTRL "adapter.returned")
+                               (Some (proj-make end RETURN-MEM "adapter.memory"))
+                               (proj-make end RETURN-VALUE "adapter.completion")
+                               (None [(dyn NodeOps)]) (Some fun))]
+          (fun-set-ret! fun ret)))
+      (al-free! (mut values))
+      fun)))

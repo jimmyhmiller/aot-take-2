@@ -64,13 +64,14 @@
 ;; Both are monotone; they move in opposite directions. A single shared assertion would be wrong for
 ;; one of them.
 (module aot.node.node)
+(import "aot.util.arena" :use [compiler-allocator compiler-state CompilerStateSlot])
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
 (import "coil.hashmap" :use *)
 (import "coil.slice" :use *)
 (import "coil.os" :as os)
-(import "coil.str" :use [StrBuf sb-new sb-push-str! sb-push-i64! sb-str])
+(import "coil.str" :use [StrBuf sb-new sb-push-str! sb-push-i64! sb-str str-keyops-borrowed])
 (import "aot.util.panic" :use *)
 (import "aot.util.ary" :use *)
 (import "aot.util.worklist" :use *)
@@ -220,6 +221,10 @@
 
 (const OP-TOINT 116)
 
+;; Unit-local metadata identities; their runtime words come from program assembly.
+(const OP-KEYREF 117)
+(const OP-SHAPEREF 118)
+
 ;; -- selected machine graph --
 ;; Machine families retain their ideal opcode as payload.  These coarse tags make it impossible to
 ;; mistake a selected node for an ideal node while walking the post-selection graph.
@@ -241,6 +246,7 @@
 ;; The header
 (defstruct NodeHdr
   [(nid i64)  ; dense unique id within a compilation
+   (origin i64)  ; diagnostic construction origin; never a semantic/GVN key
    ;; Half-open byte range in retained user source; -1/-1 means no source attribution.
    (source-lo i64)
    (source-hi i64)
@@ -332,6 +338,11 @@
 ;; Simple keeps these on its `CodeGen` god-object, which makes `Node` and `CodeGen` mutually
 ;; dependent. Coil resolves forward references within a file but not across a module cycle, so the
 ;; part the graph itself needs lives here and the phase driver imports this one-way.
+;; Simple CodeGen keeps external FIDX declarations separate from local Fun owners. The declared
+;; signature is a contract, not a body sharpened by this compilation. Imported calls may read or
+;; write public memory, allocate, throw and call back; no narrower effect summary is assumed.
+(defstruct ExternalFunction [(name (slice u8)) (signature i64)])
+
 (defstruct NodeArena
   [(next-nid i64)
    (nodes (ArrayList (Option (dyn NodeOps))))  ; every node ever made, indexed by nid
@@ -348,18 +359,20 @@
    (cfg-edit-version i64)  ; bumped by every control-node edge edit; guards the region idom cache
    (next-fidx i64)  ; compilation-local function identity; inline clones reserve from this space
    (function-nids (ArrayList i64))  ; fidx -> owner nid; metadata, not a liveness edge
+   (external-functions (HashMap i64 ExternalFunction))
+   (external-names (HashMap (slice u8) i64))
    (source-lo i64)  ; active parser range inherited by newly constructed nodes
    (source-hi i64)
    (booted bool)])
 
 (defn arena [] (-> (ptr NodeArena))
-  (primitive/alloc-static NodeArena))
+  (compiler-state [NodeArena] (primitive/alloc-static CompilerStateSlot)))
 
 (defn arena-boot! [] (-> i64)
   (let [t (arena)]
     (if (.booted t)
         0
-        (let [a (alloc/malloc-allocator)]
+        (let [a (compiler-allocator)]
           (set! (.nodes t) (al-new [(Option (dyn NodeOps))] a))
           (set! (.gvn-index t) (hm-new [i64 i64] a (i64-keyops)))
           (set! (.gvn-next t) (al-new [i64] a))
@@ -373,6 +386,8 @@
           (set! (.cfg-edit-version t) 1)
           (set! (.next-fidx t) 0)
           (set! (.function-nids t) (al-new [i64] a))
+          (set! (.external-functions t) (hm-new [i64 ExternalFunction] a (i64-keyops)))
+          (set! (.external-names t) (hm-new [(slice u8) i64] a (str-keyops-borrowed)))
           (set! (.source-lo t) -1)
           (set! (.source-hi t) -1)
           (set! (.booted t) true)
@@ -389,8 +404,9 @@
 (defn arena-reset! [(seed i64)] (-> i64)
   (do
     (arena-boot!)
+    (n-origin-reset!)
     (let [t (arena)
-          a (alloc/malloc-allocator)]
+          a (compiler-allocator)]
       (set! (.nodes t) (al-new [(Option (dyn NodeOps))] a))
       (set! (.gvn-index t) (hm-new [i64 i64] a (i64-keyops)))
       (set! (.gvn-next t) (al-new [i64] a))
@@ -403,6 +419,8 @@
       (set! (.next-nid t) 1)
       (set! (.next-fidx t) 0)
       (set! (.function-nids t) (al-new [i64] a))
+      (set! (.external-functions t) (hm-new [i64 ExternalFunction] a (i64-keyops)))
+      (set! (.external-names t) (hm-new [(slice u8) i64] a (str-keyops-borrowed)))
       (set! (.source-lo t) -1)
       (set! (.source-hi t) -1)
       (set! (.mid-assert t) false)
@@ -434,6 +452,9 @@
 (defn arena-register-function! [(fidx i64) (fun (dyn NodeOps))] (-> i64)
   (do
     (reserve-fidx! fidx)
+    (match (arena-external-function fidx)
+      (Some [_] (panic "arena-register-function!: identity already declares an import"))
+      (None [] 0))
     (if (!= (n-op fun) OP-FUN)
         (panic "arena-register-function!: owner is not a Fun")
         0)
@@ -466,6 +487,42 @@
     (if (or (< fidx 0) (>= fidx (len (.function-nids (arena)))))
         (None [(dyn NodeOps)])
         (arena-node (get (.function-nids (arena)) fidx)))))
+
+(defn arena-external-function [(fidx i64)] (-> (Option ExternalFunction))
+  (arena-boot!)
+  (get (.external-functions (arena)) fidx))
+
+(defn arena-declare-external! [(fidx i64) (name (slice u8)) (signature i64)] (-> i64)
+  (reserve-fidx! fidx)
+  (if (or (= (len name) 0) (not (ty-tuple? signature)) (= (ty-tuple-len signature) 0))
+      (panic "arena-declare-external!: empty name or invalid signature") 0)
+  (match (arena-function fidx)
+    (Some [_] (panic "arena-declare-external!: identity already has a local owner"))
+    (None [] 0))
+  (match (arena-external-named name)
+    (Some [prior]
+      (let [p prior]
+        (if (!= (.signature p) signature) (panic "arena-declare-external!: symbol has conflicting signatures") 0)))
+    (None [] 0))
+  (match (arena-external-function fidx)
+    (Some [prior]
+      (let [p prior]
+        (if (or (!= (.name p) name) (!= (.signature p) signature))
+            (panic "arena-declare-external!: conflicting declaration") 0)))
+    (None []
+      (let [(mut owned) (sb-new (compiler-allocator))]
+        (sb-push-str! (mut owned) name)
+        (let [spelling (sb-str (load owned))]
+          (set! (mut (.external-functions (arena))) fidx
+                (ExternalFunction :name spelling :signature signature))
+          (set! (mut (.external-names (arena))) spelling fidx)))))
+  fidx)
+
+(defn arena-external-named [(name (slice u8))] (-> (Option ExternalFunction))
+  (arena-boot!)
+  (match (get (.external-names (arena)) name)
+    (Some [fidx] (arena-external-function fidx))
+    (None [] (None [ExternalFunction]))))
 
 ;; Read accessors do not boot: an unbooted arena has no nodes, count zero, and version zero.
 (defn arena-node-count [] (-> i64)
@@ -535,6 +592,30 @@
 (defn n-nid [(n (dyn NodeOps))] (-> i64)
   (.nid (hdr n)))
 
+;; Construction attribution is a side channel, not an optimization fact. Nested expansions own
+;; disjoint node sets; their parent id permits inclusive accounting without double-counting.
+;; Simple carries source locations on nodes, but has no JSL expansion provenance. Rewrites and
+;; target selection inherit the originating node's context. A shared GVN survivor keeps its first
+;; construction owner: these are ownership counts, not a claim of exclusive semantic dependence.
+(defstruct NodeOrigin [(name (slice u8)) (kind (slice u8)) (parent i64) (lo i64) (hi i64)])
+(defstruct NodeOrigins [(items (ArrayList NodeOrigin)) (current i64) (booted bool)])
+(defn node-origins [] (-> (ptr NodeOrigins))
+  (compiler-state [NodeOrigins] (primitive/alloc-static CompilerStateSlot)))
+(defn n-origin-reset! [] (-> i64)
+  (let [s (node-origins)]
+    (if (.booted s) (al-clear! (mut (.items s)))
+        (set! (.items s) (al-new [NodeOrigin] (compiler-allocator))))
+    (set! (.booted s) true) (set! (.current s) 0) 0))
+(defn n-origin-enter! [(name (slice u8)) (kind (slice u8)) (lo i64) (hi i64)] (-> i64)
+  (let [s (node-origins) prior (.current s)]
+    (if (not (.booted s)) (n-origin-reset!) 0)
+    (push! [NodeOrigin] (mut (.items s))
+      (NodeOrigin :name name :kind kind :parent prior :lo lo :hi hi))
+    (set! (.current s) (len (.items s)))
+    prior))
+(defn n-origin-leave! [(prior i64)] (-> i64)
+  (do (set! (.current (node-origins)) prior) 0))
+
 (defn n-source-lo [(n (dyn NodeOps))] (-> i64)
   (.source-lo (hdr n)))
 
@@ -572,6 +653,7 @@
 
 (defn n-source-copy! [(n (dyn NodeOps)) (origin (dyn NodeOps))] (-> i64)
   (do
+    (set! (.origin (hdr n)) (.origin (hdr origin)))
     (set! (.source-lo (hdr n)) (n-source-lo origin))
     (set! (.source-hi (hdr n)) (n-source-hi origin))
     0))
@@ -659,7 +741,7 @@
 (defn n-in [(n (dyn NodeOps)) (i i64)] (-> (Option (dyn NodeOps)))
   (if (or (< i 0) (>= i (n-nins n)))
       (do
-        (let [(mut b) (sb-new (alloc/malloc-allocator))]
+        (let [(mut b) (sb-new (compiler-allocator))]
           (sb-push-str! (mut b) "n-in: input index ")
           (sb-push-i64! (mut b) i)
           (sb-push-str! (mut b) " is out of range")
@@ -684,7 +766,7 @@
     (Some [v] v)
     (None []
           (do
-            (let [(mut b) (sb-new (alloc/malloc-allocator))]
+            (let [(mut b) (sb-new (compiler-allocator))]
               (sb-push-str! (mut b) "n-in!: required input ")
               (sb-push-i64! (mut b) i)
               (sb-push-str! (mut b) " is absent")
@@ -753,7 +835,7 @@
         t)))
 
 (defn n-text [(n (dyn NodeOps))] (-> (slice u8))
-  (let [(mut b) (sb-new (alloc/malloc-allocator))]
+  (let [(mut b) (sb-new (compiler-allocator))]
     (n-text-into! (mut b) n)
     (sb-str (mut b))))
 
@@ -765,6 +847,10 @@
     (p--str msg)
     (p--str "\n  node:  ")
     (p--str (n-text n))
+    (if (> (.origin (hdr n)) 0)
+        (let [o (get (.items (node-origins)) (- (.origin (hdr n)) 1))]
+          (p--str "\n  origin: ") (p--str (.kind o)) (p--str " ") (p--str (.name o))
+          (p--str " source ") (p--int (.lo o)) (p--str ":") (p--int (.hi o)) 0) 0)
     (let [(mut i) 0]
       (loop (if (>= (load i) (n-nins n))
                 (break 0)
@@ -817,7 +903,7 @@
         0
         (do
           (if (and (!= old TY-INVALID) (not (ty-isa? t old)))
-              (let [(mut b) (sb-new (alloc/malloc-allocator))]
+              (let [(mut b) (sb-new (compiler-allocator))]
                 (sb-push-str! (mut b)
                               "n-set-ty!: monotonicity violated: new type ")
                 (ty-text-into! (mut b) t)
@@ -1017,7 +1103,7 @@
 (defstruct TraceTopFlag [(state i64)])
 
 (defn trace-top? [] (-> bool)
-  (let [f (primitive/alloc-static TraceTopFlag)]
+  (let [f (compiler-state [TraceTopFlag] (primitive/alloc-static CompilerStateSlot))]
     (if (= (.state f) 0)
         (set! (.state f) (if (!= (primitive/cast i64 (os/getenv c"AOT_TRACE_TOP")) 0) 1 2))
         0)
@@ -1445,8 +1531,9 @@
 ;; Initialise a freshly allocated node: assign a nid, set the opcode, give it empty edge lists.
 ;; Every constructor calls this first.
 (defn n-init! [(n (dyn NodeOps)) (opcode i64)] (-> i64)
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         h (hdr n)]
+    (set! (.origin h) (.current (node-origins)))
     (set! (.op h) opcode)
     (set! (.source-lo h) (.source-lo (arena)))
     (set! (.source-hi h) (.source-hi (arena)))
@@ -1484,7 +1571,7 @@
 (defstruct ConHook [(make (fnptr c [i64] (dyn NodeOps))) (set bool)])
 
 (defn con-hook [] (-> (ptr ConHook))
-  (primitive/alloc-static ConHook))
+  (compiler-state [ConHook] (primitive/alloc-static CompilerStateSlot)))
 
 (defn set-con-hook! [(f (fnptr c [i64] (dyn NodeOps)))] (-> i64)
   (do (set! (.make (con-hook)) f) (set! (.set (con-hook)) true) 0))
@@ -1508,6 +1595,13 @@
 ;;   4. ask the node to idealize itself
 ;;   5. otherwise report progress iff the type improved
 (defn n-peephole-opt! [(n (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [prior (.current (node-origins))]
+    (set! (.current (node-origins)) (.origin (hdr n)))
+    (let [answer (n-peephole-opt-inner! n)]
+      (set! (.current (node-origins)) prior)
+      answer)))
+
+(defn n-peephole-opt-inner! [(n (dyn NodeOps))] (-> (Option (dyn NodeOps)))
   (let [old (n-ty n)
         now (compute n)]
     (n-set-ty! n now)
@@ -1649,7 +1743,7 @@
 (defstruct CfgEditHook [(f (fnptr c [(ref (dyn NodeOps))] bool)) (set bool)])
 
 (defn cfg-edit-hook [] (-> (ptr CfgEditHook))
-  (primitive/alloc-static CfgEditHook))
+  (compiler-state [CfgEditHook] (primitive/alloc-static CompilerStateSlot)))
 
 (defn set-cfg-edit-hook! [(f (fnptr c [(ref (dyn NodeOps))] bool))] (-> i64)
   (do (set! (.f (cfg-edit-hook)) f) (set! (.set (cfg-edit-hook)) true) 0))
@@ -1657,17 +1751,33 @@
 (defn cfg-edit-version [] (-> i64)
   (do (arena-boot!) (.cfg-edit-version (arena))))
 
+;; Selected CFG structs may represent both merges and single-predecessor instructions. The
+;; target supplies the distinction; memoizing it by coarse opcode would confuse If with Region.
+(defstruct MachineCfgMergeHook [(f (fnptr c [(ref (dyn NodeOps))] bool)) (set bool)])
+
+(defn machine-cfg-merge-hook [] (-> (ptr MachineCfgMergeHook))
+  (compiler-state [MachineCfgMergeHook] (primitive/alloc-static CompilerStateSlot)))
+
+(defn set-machine-cfg-merge-hook! [(f (fnptr c [(ref (dyn NodeOps))] bool))] (-> i64)
+  (set! (.f (machine-cfg-merge-hook)) f)
+  (set! (.set (machine-cfg-merge-hook)) true) 0)
+
+(defn machine-cfg-merge? [(n (dyn NodeOps))] (-> bool)
+  (if (.set (machine-cfg-merge-hook))
+      (primitive/call-ptr (.f (machine-cfg-merge-hook)) n)
+      true))
+
 ;; Whether an opcode is control, memoized per opcode: the hook's answer is a function of the
 ;; opcode alone (a machine kind has one coarse opcode per node struct), and this is asked on every
 ;; edge edit.
 (defstruct CfgOpMemo [(table (ArrayList i64)) (booted bool)])  ; per op: 0 unknown, 1 control, 2 not
 
 (defn cfg-op-memo [] (-> (ptr CfgOpMemo))
-  (let [t (primitive/alloc-static CfgOpMemo)]
+  (let [t (compiler-state [CfgOpMemo] (primitive/alloc-static CompilerStateSlot))]
     (if (.booted t)
         t
         (do
-          (set! (.table t) (al-new [i64] (alloc/malloc-allocator)))
+          (set! (.table t) (al-new [i64] (compiler-allocator)))
           (loop (if (>= (len (.table t)) 512) (break 0) (do (push! [i64] (mut (.table t)) 0) (continue))))
           (set! (.booted t) true)
           t))))
@@ -1691,7 +1801,8 @@
 (defn n-cfg-control-edge? [(n (dyn NodeOps)) (i i64)] (-> bool)
   (let [op (n-op n)]
     (or (= i 0)
-        (= op OP-REGION) (= op OP-LOOP) (= op OP-FUN) (= op OP-STOP) (= op OP-MACH-CFG))))
+        (= op OP-REGION) (= op OP-LOOP) (= op OP-FUN) (= op OP-STOP)
+        (and (= op OP-MACH-CFG) (machine-cfg-merge? n)))))
 
 ;; Control edge `i` of `n` is about to change. Bumps the edit version that guards the idom and owner
 ;; caches. A dying control node does not bump: both caches check the node they name is alive and
@@ -1795,7 +1906,7 @@
 ;; The visited state is per call, so nested and consecutive walks cannot leak marks into each other.
 (defn n-walk-find [(root (dyn NodeOps))
                    (pred (fnptr c [(ref (dyn NodeOps))] bool))] (-> (Option (dyn NodeOps)))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         cnt (arena-node-count)
         (mut seen) (al-new [bool] a)
         (mut i) 0]

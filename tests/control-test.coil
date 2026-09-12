@@ -14,6 +14,8 @@
 (import "aot.node.control" :use *)
 (import "aot.node.phi" :use *)
 (import "aot.node.dynamic" :use *)
+(import "aot.node.call" :use *)
+(import "aot.util.worklist" :use *)
 (import "aot.node.cfg" :use *)
 (import "aot.codegen.iterpeeps" :use *)
 (import "aot.tests.support" :use *)
@@ -137,6 +139,106 @@
                            (and (n-same? progress inner)
                                 (= (n-ty (n-in! inner 1)) (ty-int-con 1))))
                      (None [] false)))))
+
+;; ---------------------------------------------------------------------------
+;; Call-result predicate availability
+(defn control-test-call-result [(ctrl (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [sig (ty-tuple-of2 (ty-dyn TAG-COMPLETION) (ty-int-bot))
+        target (external-make (arena-declare-external! 41 "control::result" sig))
+        site (call-make-with-mem ctrl (con-make (ty-mem 1 TY-BOT)))]
+    (call-add-arg! site (con-int 0))
+    (call-set-fptr! site target)
+    (callend-make site)))
+
+(deftest call_result_tests_do_not_watch_control_before_the_result_exists
+  (boot! 1)
+  (let [st (start-make (ty-int-bot))
+        (mut ctrl) (cproj-make st 0 "entry")
+        (mut i) 0]
+    (loop (if (= (load i) 512) (break 0)
+      (let [before (load ctrl)
+            end (control-test-call-result before)
+            returned (proj-make end RETURN-VALUE "result")
+            pred (typetest-make returned TAG-EXCEPTION)
+            test (if-make (cproj-make end RETURN-CTRL "returned") pred)]
+        (assert (match (if-idealize test) (None [] true) (Some [_] false)))
+        (assert (not (n-has? (.deps (hdr before)) test)))
+        (assert (not (n-has? (.deps (hdr st)) test)))
+        (assert (n-has? (.deps (hdr end)) test))
+        (assert (n-has? (.deps (hdr returned)) test))
+        (set! (mut ctrl) (cproj-make test IF-FALSE-IDX "normal"))
+        (set! (mut i) (+ (load i) 1)) (continue))))))
+
+(deftest repeated_call_result_tests_still_fold_on_both_dominating_arms
+  (boot! 1)
+  (let [st (start-make (ty-int-bot))
+        end (control-test-call-result (cproj-make st 0 "entry"))
+        pred (typetest-make (proj-make end RETURN-VALUE "result") TAG-EXCEPTION)
+        outer (if-make (cproj-make end RETURN-CTRL "returned") pred)
+        yes (if-make (cproj-make outer IF-TRUE-IDX "yes") pred)
+        no (if-make (cproj-make outer IF-FALSE-IDX "no") pred)]
+    (assert (match (if-idealize yes) (Some [_] true) (None [] false)))
+    (assert-eq (n-ty (n-in! yes 1)) (ty-int-con 1))
+    (assert (match (if-idealize no) (Some [_] true) (None [] false)))
+    (assert-eq (n-ty (n-in! no 1)) (ty-int-con 0))))
+
+(deftest composite_predicate_searches_stop_at_transitive_value_definitions
+  (boot! 1)
+  (let [st (start-make (ty-int-bot))
+        (mut ctrl) (cproj-make st 0 "entry")
+        (mut i) 0]
+    (loop (if (= (load i) 512) (break 0)
+      (let [before (load ctrl)
+            end (control-test-call-result before)
+            returned (proj-make end RETURN-VALUE "result")
+            tag (typetest-make returned TAG-EXCEPTION)
+            pred (eq-make (con-int 0) tag)
+            test (if-make (cproj-make end RETURN-CTRL "returned") pred)]
+        (assert (match (if-idealize test) (None [] true) (Some [_] false)))
+        (assert (not (n-has? (.deps (hdr before)) test)))
+        (assert (not (n-has? (.deps (hdr st)) test)))
+        (assert (n-has? (.deps (hdr end)) test))
+        (assert (n-has? (.deps (hdr returned)) test))
+        (let [yes (if-make (cproj-make test IF-TRUE-IDX "yes") pred)
+              no (if-make (cproj-make test IF-FALSE-IDX "no") pred)]
+          (assert (match (if-idealize yes) (Some [_] true) (None [] false)))
+          (assert-eq (n-ty (n-in! yes 1)) (ty-int-con 1))
+          (assert (match (if-idealize no) (Some [_] true) (None [] false)))
+          (assert-eq (n-ty (n-in! no 1)) (ty-int-con 0)))
+        (set! (mut ctrl) (cproj-make test IF-FALSE-IDX "normal"))
+        (set! (mut i) (+ (load i) 1)) (continue))))))
+
+(deftest predicate_availability_stops_at_loop_phis_without_following_backedges
+  (boot! 1)
+  (let [st (start-make (ty-int-bot))
+        entry (cproj-make st 0 "entry")
+        region (region-make)
+        value (phi-make region (ty-int-bot) "loop-value")]
+    (region-add-path! region entry)
+    (region-add-path! region entry)
+    (phi-add-value! value (con-int 1))
+    (phi-add-value! value value)
+    (let [pred (eq-make value (con-int 0))
+          test (if-make region pred)]
+      (assert (match (if--predicate-definition pred test)
+                (Some [anchor] (n-same? anchor region)) (None [] false)))
+      (assert (match (if-idealize test) (None [] true) (Some [_] false)))
+      (assert (not (n-has? (.deps (hdr entry)) test))))))
+
+(deftest rewiring_a_call_result_requeues_the_bounded_predicate_search
+  (boot! 1)
+  (let [st (start-make (ty-int-bot))
+        first (control-test-call-result (cproj-make st 0 "entry"))
+        second (control-test-call-result (cproj-make first RETURN-CTRL "first"))
+        result (proj-make second RETURN-VALUE "result")
+        pred (eq-make (typetest-make result TAG-EXCEPTION) (con-int 0))
+        test (if-make (cproj-make second RETURN-CTRL "second") pred)]
+    (if-idealize test)
+    (code-clear-worklists!)
+    (n-set-def! result 0 (Some first))
+    (assert (wl-on? (.work (arena)) (n-nid test)))
+    (assert (match (if--predicate-definition pred test)
+              (Some [anchor] (n-same? anchor first)) (None [] false)))))
 
 ;; ---------------------------------------------------------------------------
 ;; The MULTI window

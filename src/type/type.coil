@@ -15,6 +15,7 @@
 ;; Getting `dual` wrong breaks the optimistic analysis in ways the pessimistic one cannot see, so
 ;; `dual(dual(t)) == t` is a tested identity.
 (module aot.type.type)
+(import "aot.util.arena" :use [compiler-allocator compiler-state CompilerStateSlot])
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
@@ -43,7 +44,7 @@
   ;; Nullability is a four-point set lattice: 0 none/high, 1 nil-only, 2 non-null-only, 3 either.
   (TPtr [(nilstate i64) (to i64)])
   (TMemPtr [(nilstate i64) (strct i64)])
-  (TFunPtr [(sig i64) (fidx i64) (high bool)])  ; signature + finite function set + lattice side
+  (TFunPtr [(sig i64) (fidx i64) (high bool) (external bool)])  ; known identities plus an opaque ABI-compatible target class
   ;; --- memory and aggregates ---
   ;; `one`: a private slice — its element type describes exactly the object of its last store, not
   ;; the alias in general (Simple's TypeMem._one). Public readers must not trust it.
@@ -91,13 +92,13 @@
    (booted bool)])
 
 (defn ty-table [] (-> (ptr TyTable))
-  (primitive/alloc-static TyTable))
+  (compiler-state [TyTable] (primitive/alloc-static CompilerStateSlot)))
 
 (defn ty-boot! [] (-> i64)
   (let [t (ty-table)]
     (if (.booted t)
         0
-        (let [a (alloc/malloc-allocator)]
+        (let [a (compiler-allocator)]
           (set! (.kinds t) (al-new [TyKind] a))
           (set! (.kids t) (al-new [i64] a))
           (set! (.bytes t) (al-new [u8] a))
@@ -223,7 +224,7 @@
     (TFlt [sz bits] (^ (* sz 7919) bits))
     (TPtr [nilstate to] (^ (* nilstate 17) (* to 131)))
     (TMemPtr [nilstate strct] (^ (* nilstate 23) (* strct 137)))
-    (TFunPtr [sig fidx high] (^ (^ (* sig 139) (* fidx 149)) (if high 151 157)))
+    (TFunPtr [sig fidx high external] (^ (^ (^ (* sig 139) (* fidx 149)) (if high 151 157)) (if external 163 167)))
     (TMem [alias elem one] (^ (^ (* alias 151) (* elem 157)) (if one 5 0)))
     (TStruct [no nl fo fl] (^ (bytes--hash no nl) (kids--hash fo fl)))
     (TTuple [off ln] (tuple--hash off ln))
@@ -251,9 +252,9 @@
     (TPtr [ns to] (match b (TPtr [n2 t2] (and (= ns n2) (= to t2))) (_ false)))
     (TMemPtr [ns s]
              (match b (TMemPtr [n2 s2] (and (= ns n2) (= s s2))) (_ false)))
-    (TFunPtr [sg fx hi]
+    (TFunPtr [sg fx hi ex]
              (match b
-               (TFunPtr [g2 x2 h2] (and (and (= sg g2) (= fx x2)) (= hi h2)))
+               (TFunPtr [g2 x2 h2 e2] (and (and (= sg g2) (= fx x2)) (= hi h2) (= ex e2)))
                (_ false)))
     (TMem [al el o1]
           (match b
@@ -363,7 +364,7 @@
     (TInt [lo hi widen] (> lo hi))
     ;; A dynamic type is high exactly when its flag says so.
     (TDyn [tags high] high)
-    (TFunPtr [sig fidx high] high)
+    (TFunPtr [sig fidx high external] high)
     (TPtr [nilstate to] (and (< nilstate 2) (ty-high? to)))
     (TMemPtr [nilstate strct] (and (< nilstate 2) (ty-high? strct)))
     (TMem [alias elem one] (ty-high? elem))
@@ -376,6 +377,11 @@
     (TInt [lo hi widen] (= lo hi))
     (TFlt [sz bits] (= sz 0))
     (TNil [] true)
+    ;; Simple canonicalizes null through TypeNil. Our pointer families retain their referent
+    ;; beside the four-state null bitset: state 1 contains only the zero pointer. It is a real
+    ;; machine constant, unlike nullable state 3 and non-null state 2.
+    (TPtr [nilstate to] (= nilstate 1))
+    (TMemPtr [nilstate strct] (= nilstate 1))
     ;; A low singleton undefined or null tag denotes the language's one undefined or one null
     ;; value, and the exception tag its one sentinel word. Other dynamic singleton tags (bool, int,
     ;; double, string, object...) still contain several distinct payloads.
@@ -418,11 +424,11 @@
     ;; The dynamic axis duals by flipping the high/low flag and KEEPING the set. That is why the flag
     ;; exists: a pure set with complement-duality has no centreline, so nothing could be `high`.
     (TDyn [tags high] (if high (ty-dyn tags) (ty-dyn-high tags)))
-    (TFunPtr [sig fidx high]
+    (TFunPtr [sig fidx high external]
              (ty-intern (TFunPtr
                           :sig (ty-dual sig)
                           :fidx fidx
-                          :high (not high))))
+                          :high (not high) :external external)))
     ;; Pointer nullability is an independent two-point axis; the referent duals recursively.
     (TPtr [nilstate to] (ty-ptr-state (^ nilstate 3) (ty-dual to)))
     (TMemPtr [nilstate strct] (ty-memptr-state (^ nilstate 3) (ty-dual strct)))
@@ -436,7 +442,7 @@
     ;; A tuple duals MEMBERWISE. `dual(IF_TRUE)` is therefore `(~ctrl, ctrl)`, which is `IF_FALSE` —
     ;; and that symmetry is what makes `join` on If outcomes mean the right thing.
     (TTuple [off ln]
-            (let [a (alloc/malloc-allocator)
+            (let [a (compiler-allocator)
                   (mut members) (al-new [i64] a)
                   (mut i) 0]
               (loop (if (>= (load i) ln)
@@ -451,7 +457,7 @@
                 (al-free! [i64] (mut members))
                 answer)))
     (TRpc [off ln]
-          (let [a (alloc/malloc-allocator)
+          (let [a (compiler-allocator)
                 (mut members) (al-new [i64] a)
                 (mut i) 0]
             (loop (if (>= (load i) ln)
@@ -565,9 +571,9 @@
                                                                        atags))))))
             (_ TY-BOT)))
     ;; Function pointers mirror the dynamic set axis, but also meet their complete signatures.
-    (TFunPtr [asig afidx ahigh]
+    (TFunPtr [asig afidx ahigh aexternal]
              (match (ty-kind b)
-               (TFunPtr [bsig bfidx bhigh]
+               (TFunPtr [bsig bfidx bhigh bexternal]
                         (ty-intern (TFunPtr
                                      :sig (ty-meet asig bsig)
                                      :fidx
@@ -579,7 +585,11 @@
                                            (if ahigh
                                                (fidx-set-difference afidx bfidx)
                                                (fidx-set-difference bfidx afidx)))
-                                     :high (or ahigh bhigh))))
+                                     :high (or ahigh bhigh)
+                                     :external (if (= ahigh bhigh)
+                                                   (if ahigh (and aexternal bexternal) (or aexternal bexternal))
+                                                   (if ahigh (and aexternal (not bexternal))
+                                                             (and bexternal (not aexternal)))))))
                (_ TY-BOT)))
     (TPtr [anil ato]
           (match (ty-kind b)
@@ -624,7 +634,7 @@
               (TTuple [boff bln]
                       (if (!= aln bln)
                           TY-BOT
-                          (let [alc (alloc/malloc-allocator)
+                          (let [alc (compiler-allocator)
                                 (mut members) (al-new [i64] alc)
                                 (mut i) 0]
                             (loop (if (>= (load i) aln)
@@ -645,7 +655,7 @@
             (TRpc [boff bln]
                   (if (!= aln bln)
                       TY-BOT
-                      (let [alc (alloc/malloc-allocator)
+                      (let [alc (compiler-allocator)
                             (mut members) (al-new [i64] alc)
                             (mut i) 0]
                         (loop (if (>= (load i) aln)
@@ -1025,7 +1035,7 @@
         an (get (.fidx-lens t) a)
         bo (get (.fidx-offs t) b)
         bn (get (.fidx-lens t) b)
-        alc (alloc/malloc-allocator)
+        alc (compiler-allocator)
         (mut out) (al-new [i64] alc)
         (mut i) 0
         (mut j) 0]
@@ -1069,7 +1079,7 @@
         an (get (.fidx-lens t) a)
         bo (get (.fidx-offs t) b)
         bn (get (.fidx-lens t) b)
-        alc (alloc/malloc-allocator)
+        alc (compiler-allocator)
         (mut out) (al-new [i64] alc)
         (mut i) 0
         (mut j) 0]
@@ -1098,7 +1108,7 @@
         an (get (.fidx-lens t) a)
         bo (get (.fidx-offs t) b)
         bn (get (.fidx-lens t) b)
-        alc (alloc/malloc-allocator)
+        alc (compiler-allocator)
         (mut out) (al-new [i64] alc)
         (mut i) 0
         (mut j) 0]
@@ -1126,35 +1136,48 @@
       answer)))
 
 (defn ty-funptr [(sig i64) (fidxs i64)] (-> i64)
+  (ty-funptr-boundary sig fidxs false))
+
+;; The opaque class is a set coordinate, not a fabricated function index or unresolved symbol.
+;; It follows the same union/intersection/difference rules as known identities, and duality keeps
+;; its stored membership while flipping the lattice side. Low external pointers may call code
+;; outside the current graph with this signature; their concrete local identities remain linkable.
+(defn ty-funptr-boundary [(sig i64) (fidxs i64) (external bool)] (-> i64)
   (do
     (ty-boot!)
     (ty-intern (TFunPtr
                  :sig sig
                  :fidx fidxs
-                 :high false))))
+                 :high false :external external))))
+
+(defn ty-funptr-external? [(t i64)] (-> bool)
+  (match (ty-kind t)
+    (TFunPtr [sig fidx high external] (and (not high) external))
+    (_ false)))
 
 (defn ty-funptr-singleton [(sig i64) (fidx i64)] (-> i64)
   (ty-funptr sig (fidx-set-single fidx)))
 
 (defn ty-funptr? [(t i64)] (-> bool)
-  (match (ty-kind t) (TFunPtr [sig fidx high] true) (_ false)))
+  (match (ty-kind t) (TFunPtr [sig fidx high external] true) (_ false)))
 
 (defn ty-funptr-sig [(t i64)] (-> i64)
   (match (ty-kind t)
-    (TFunPtr [sig fidx high] sig)
+    (TFunPtr [sig fidx high external] sig)
     (_ (panic "ty-funptr-sig: not a function pointer"))))
 
 (defn ty-funptr-fidxs [(t i64)] (-> i64)
   (match (ty-kind t)
-    (TFunPtr [sig fidx high] fidx)
+    (TFunPtr [sig fidx high external] fidx)
     (_ (panic "ty-funptr-fidxs: not a function pointer"))))
 
 (defn ty-funptr-high? [(t i64)] (-> bool)
   (match (ty-kind t)
-    (TFunPtr [sig fidx high] high)
+    (TFunPtr [sig fidx high external] high)
     (_ (do (panic "ty-funptr-high?: not a function pointer") false))))
 
-;; Enumerate a finite closed-world target set without exposing its interned storage layout.
+;; Enumerate known concrete targets without exposing interned storage. The external possibility
+;; is separate; callers must not treat this count as exhaustive when ty-funptr-external? is true.
 (defn ty-funptr-target-count [(t i64)] (-> i64)
   (if (ty-funptr-high? t)
       (do
@@ -1172,6 +1195,7 @@
 ;; Exactly one function index — a DIRECT call.
 (defn ty-funptr-single? [(t i64)] (-> bool)
   (and (not (ty-funptr-high? t))
+       (not (ty-funptr-external? t))
        (= (get (.fidx-lens (ty-table)) (ty-funptr-fidxs t)) 1)))
 
 ;; The one index in a singleton set, as a bit position.
@@ -1544,7 +1568,7 @@
                                          (if (= nilstate 2) "!*" "~*"))))
                    (ty-text-into! (mut b) strct)
                    0))
-        (TFunPtr [sig fidx high]
+        (TFunPtr [sig fidx high external]
                  (do
                    (if high (sb-push-str! (mut b) "~") 0)
                    (sb-push-str! (mut b) "{")
@@ -1562,7 +1586,7 @@
                                  (continue))))
                      (sb-push-str! (mut b) "->")
                      (if (> n 0) (ty-text-into! (mut b) (ty-tuple-at sig 0)) 0))
-                   (sb-push-str! (mut b) "}#")
+                   (sb-push-str! (mut b) (if external "}+external#" "}#"))
                    (let [table (ty-table)
                          off (get (.fidx-offs table) fidx)
                          ln (get (.fidx-lens table) fidx)
@@ -1706,6 +1730,6 @@
 ;; A type as text. The returned slice is owned by the caller's allocator lifetime: diagnostics
 ;; print it and move on.
 (defn ty-text [(t i64)] (-> (slice u8))
-  (let [(mut b) (sb-new (alloc/malloc-allocator))]
+  (let [(mut b) (sb-new (compiler-allocator))]
     (ty-text-into! (mut b) t)
     (sb-str (mut b))))

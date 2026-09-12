@@ -91,6 +91,7 @@
 ;; register-to-register move from a register to itself.
 ;;
 (module aot.codegen.regalloc)
+(import "aot.util.arena" :use [compiler-allocator compiler-state CompilerStateSlot])
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
 (import "coil.hashmap" :use *)
@@ -128,7 +129,8 @@
 ;; scratch clears in time proportional to its use rather than to the live-range count. Both are
 ;; POINTERS into the allocator state: an ArrayList copied by value carries its own length, and a
 ;; push through the copy would leave the state's list empty and the next block's clear a no-op.
-(defstruct RaLive [(defs (ptr (ArrayList i64))) (ids (ptr (ArrayList i64)))])
+(defstruct RaLive [(defs (ptr (ArrayList i64))) (ids (ptr (ArrayList i64)))
+                  (positions (ptr (ArrayList i64)))])
 
 ;; Dense, compilation-owned LRG state. Index zero means "this node has no register value" and is
 ;; never a union-find member. Lower numbered leaders always win, matching final Simple and making
@@ -161,6 +163,7 @@
    ;; Reused by the sequential IFG worklist; block revisits do not allocate another sparse set.
    (live-scratch-defs (ArrayList i64))
    (live-scratch-ids (ArrayList i64))
+   (live-scratch-positions (ArrayList i64))
    (ifg (HashMap i64 bool))  ; canonical (low,high) interference pair
    ;; Sparse symmetric adjacency. Hash keys deduplicate construction; these lists drive all hot
    ;; degree, simplify, coalesce and coloring walks without scanning the complete LRG id space.
@@ -197,7 +200,7 @@
    (booted bool)])
 
 (defn ra-state [] (-> (ptr RaState))
-  (primitive/alloc-static RaState))
+  (compiler-state [RaState] (primitive/alloc-static CompilerStateSlot)))
 
 (defn ra-kind-of-node [(n (dyn NodeOps))] (-> i64)
   (let [t (n-ty n)]
@@ -219,7 +222,7 @@
               LRG-BOXED-SCALAR))))
 
 (defn ra-reset-state! [(round i64)] (-> i64)
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         state (ra-state)
         (mut id) 1]
     (set! (.parent state) (al-new [i64] a))
@@ -243,6 +246,7 @@
     (set! (.liveout-next state) (al-new [i64] a))
     (set! (.live-scratch-defs state) (al-new [i64] a))
     (set! (.live-scratch-ids state) (al-new [i64] a))
+    (set! (.live-scratch-positions state) (al-new [i64] a))
     (set! (.ifg state) (hm-new [i64 bool] a (i64-keyops)))
     (set! (.adj-heads state) (al-new [i64] a))
     (set! (.adj-to state) (al-new [i64] a))
@@ -383,7 +387,7 @@
 (defstruct RaTraceCursor [(nid i64) (round i64)])
 
 (defn ra-trace-cursor [] (-> (ptr RaTraceCursor))
-  (primitive/alloc-static RaTraceCursor))
+  (compiler-state [RaTraceCursor] (primitive/alloc-static CompilerStateSlot)))
 
 (defn ra-trace-visit! [(n (dyn NodeOps))] (-> i64)
   (do (set! (.nid (ra-trace-cursor)) (n-nid n)) 0))
@@ -945,25 +949,44 @@
     (al-clear! [i64] (mut (.live-scratch-ids state)))
     (loop (if (> (len (.live-scratch-defs state)) (ra-lrg-count))
               (break 0)
-              (do (push! [i64] (mut (.live-scratch-defs state)) 0) (continue))))
+              (do (push! [i64] (mut (.live-scratch-defs state)) 0)
+                  (push! [i64] (mut (.live-scratch-positions state)) 0) (continue))))
     (set! (.defs (mut live)) (field state live-scratch-defs))
     (set! (.ids (mut live)) (field state live-scratch-ids))
+    (set! (.positions (mut live)) (field state live-scratch-positions))
     (load live)))
 
 (defn ra-live-get [(live (mut RaLive)) (lrg i64)] (-> i64)
   (let [leader (ra-find! lrg)]
     (if (< leader (len (load (.defs live)))) (get (load (.defs live)) leader) 0)))
 
-;; Membership is "has a nonzero definition": a zero clears the entry (the leader stays in `ids`
-;; so the scratch clear still finds it).
+;; Final Simple IFG.do_node removes a killed definition from TMP before iterating its live keys.
+;; Retaining dead keys here made every later instruction revisit historical definitions, and
+;; reactivation appended duplicate keys. A sparse set keeps exactly the live keys: remove by
+;; swapping the last key into its slot, updating its position; insertion happens only on 0 -> live.
+;; Definitions are cleared on removal, so the next block only needs to reset surviving keys.
 (defn ra-live-set! [(live (mut RaLive)) (lrg i64) (nid i64)] (-> i64)
   (let [leader (ra-find! lrg)]
     (if (>= leader (len (load (.defs live))))
         (panic-i "ra-live-set!: live range outside the dense live set" leader)
         0)
-    (if (= (get (load (.defs live)) leader) 0)
-        (push! [i64] (.ids live) leader)
-        0)
+    (let [old (get (load (.defs live)) leader)]
+      (if (= nid 0)
+          (if (!= old 0)
+              (let [position (get (load (.positions live)) leader)
+                    last-index (- (len (load (.ids live))) 1)
+                    last (get (load (.ids live)) last-index)]
+                (set! (.ids live) position last)
+                (set! (.positions live) last position)
+                (pop! [i64] (.ids live))
+                0)
+              0)
+          (if (= old 0)
+              (do
+                (set! (.positions live) leader (len (load (.ids live))))
+                (push! [i64] (.ids live) leader)
+                0)
+              0)))
     (set! (.defs live) leader nid)
     0))
 
@@ -988,13 +1011,22 @@
         (ra-self-conflict! lrg n))
       0))
 
+(defn ra-gc-site-op? [(op i64)] (-> bool)
+  (or (= op OP-CALL) (= op OP-NEW) (= op OP-JSOP) (= op OP-SAFEPOINT)))
+
 (defn ra-ifg-kills! [(mach (dyn MachNode)) (live (mut RaLive))] (-> i64)
   (do
-    ;; A JavaScript frame preserves no registers: a call, allocation, runtime primitive or
-    ;; safepoint kills every register (its kill map), so a value live across one keeps only its
-    ;; stack tail, or fails and is split there, exactly as Simple's kill handling does. The stack
-    ;; map then reads slots only. Barrier is explicitly non-collecting and kills its scratch alone.
-    (match (m-killmap mach)
+    ;; Simple subtracts ABI clobbers from live masks. GC placement is a separate constraint:
+    ;; movable references need writable stack homes even when the ABI preserves their register.
+    ;; Scalar values may retain callee-save registers across runtime calls. JavaScript calls
+    ;; still use the all-volatile ABI. Barrier is non-collecting and only kills its scratch.
+    (let [op (m-ideal-op mach)
+          root-site (ra-gc-site-op? op)]
+    ;; Calls carry their ABI kills on CallEnd, but the return-PC stack map belongs to Call.
+    ;; Apply root placement at that exact instruction even when its own kill map is absent.
+    (match (if root-site (Some (match (m-killmap mach)
+                                (Some [mask] mask) (None [] (mask-empty))))
+               (m-killmap mach))
       (None [] 0)
       (Some [kills]
             (let [(mut i) 0]
@@ -1002,16 +1034,21 @@
                         (break 0)
                         (let [lrg (ra-find! (get (load (.ids live)) (load i)))]
                           (if (!= (ra-live-get (mut live) lrg) 0)
+                              (do
+                              (let [kind (ra-lrg-kind lrg)]
+                                (if (and (or (= kind LRG-RAW-REF) (= kind LRG-BOXED))
+                                         root-site)
+                                    (do (ra-lrg-and-mask! lrg (selected-gc-root-mask)) 0) 0))
                               (match (ra-lrg-mask lrg)
                                 (Some [allowed]
                                       (if (mask-overlap? allowed kills)
                                           (do (ra-lrg-sub-mask! lrg kills) 0)
                                           0))
-                                (None [] 0))
+                                (None [] 0)))
                               0)
                           (set! (mut i) (+ (load i) 1))
                           (continue))))
-              0)))))
+              0))))))
 
 (defn ra-ifg-node! [(n (dyn NodeOps)) (live (mut RaLive))] (-> i64)
   (ra-trace-visit! n)
@@ -1365,7 +1402,7 @@
 (defstruct RaTraceFlag [(state i64)])  ; 0 unread, 1 on, 2 off
 
 (defn ra-trace? [] (-> bool)
-  (let [f (primitive/alloc-static RaTraceFlag)]
+  (let [f (compiler-state [RaTraceFlag] (primitive/alloc-static CompilerStateSlot))]
     (if (= (.state f) 0)
         (set! (.state f) (if (!= (primitive/cast i64 (os/getenv c"AOT_RA_TRACE")) 0) 1 2))
         0)
@@ -1536,6 +1573,46 @@
 
 ;; Build the interference graph — liveness and interference in ONE pass. A single-register def or
 ;; use DENIES its register to neighbours rather than adding an edge.
+(defn ra-propagate-singleton-masks! [] (-> i64)
+  ;; Simple's IFG.do_block denies registers at single-register definitions and uses. Aggregate
+  ;; constraints can also leave a multi-definition Phi with one location (for example, X0 at a
+  ;; Return). That location is mandatory throughout the range, including interference edges far
+  ;; from the fixed use. Propagate those singleton domains before coloring, so a flexible neighbor
+  ;; cannot take the required register merely because the Phi was selected as a risky range.
+  ;; Each range enters the queue only on becoming singleton; every queued adjacency is visited
+  ;; once. Empty domains use the ordinary failure/splitting mechanism, never a relaxed constraint.
+  (let [(mut work) (al-new [i64] (compiler-allocator)) (mut i) 1 (mut next) 0]
+    (loop (if (> (load i) (ra-lrg-count)) (break 0)
+      (do (if (= (ra-find! (load i)) (load i))
+              (match (ra-lrg-mask (load i))
+                (Some [mask] (if (mask-singleton? mask) (do (push! [i64] (mut work) (load i)) 0) 0))
+                (None [] 0)) 0)
+          (set! (mut i) (+ (load i) 1)) (continue))))
+    (loop (if (>= (load next) (len (load work))) (break 0)
+      (let [id (get (load work) (load next))]
+        (match (ra-lrg-mask id)
+          (Some [mask]
+            (if (mask-singleton? mask)
+                (let [reg (mask-first mask) (mut edge) (get (.adj-heads (ra-state)) id)]
+                  (loop (if (< (load edge) 0) (break 0)
+                    (let [raw (get (.adj-to (ra-state)) (load edge))]
+                      (if (> raw 0)
+                          (let [other (ra-find! raw)]
+                            (if (!= other id)
+                                (match (ra-lrg-mask other)
+                                  (Some [prior]
+                                    (if (mask-test prior reg)
+                                        (do (ra-lrg-deny-reg! other reg)
+                                            (match (ra-lrg-mask other)
+                                              (Some [remaining] (if (mask-singleton? remaining)
+                                                (do (push! [i64] (mut work) other) 0) 0))
+                                              (None [] 0)) 0) 0))
+                                  (None [] 0)) 0)) 0)
+                      (set! (mut edge) (get (.adj-next (ra-state)) (load edge))) (continue))))) 0))
+          (None [] 0))
+        (set! (mut next) (+ (load next) 1)) (continue))))
+    (al-free! (mut work)) 0))
+
 (defn ra-build-ifg! [(round i64)] (-> bool)
   (do
     round
@@ -1579,6 +1656,7 @@
     (loop (match (ra-ifg-pop-work!)
             (None [] (break 0))
             (Some [block] (do (ra-ifg-do-block! block) (continue)))))
+    (ra-propagate-singleton-masks!)
     (ra-success?)))
 
 (defn ra-colour-capacity [(id i64)] (-> i64)
@@ -2324,7 +2402,7 @@
                                 (lrg i64)
                                 (def (dyn NodeOps))
                                 (kind i64)] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         (mut uses) (al-new [i64] a)
         (mut indices) (al-new [i64] a)
         (mut seen-uses) (hm-new [i64 bool] a (i64-keyops))
@@ -2391,7 +2469,7 @@
 ;; durable schedules keeps coalescing and postcolor proportional to emitted work, independent of
 ;; dead declarations or disconnected constants retained elsewhere in the compilation arena.
 (defn ra-snapshot-scheduled-splits [] (-> (ArrayList i64))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         (mut splits) (al-new [i64] a)
         (mut ci) 0]
     (loop (if (>= (load ci) (code-cfg-count))
@@ -2421,7 +2499,7 @@
 ;; directly: coalescing many copies is proportional to their incident edges, never one full liveness
 ;; and IFG rebuild per copy.
 (defn ra-coalesce! [(round i64)] (-> bool)
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         splits (ra-snapshot-scheduled-splits)
         (mut remove) (al-new [i64] a)
         (mut progress) false]
@@ -2445,7 +2523,12 @@
                                           0)
                                       (ra-forget-coalesced-split! left split)
                                       (push! [i64] (mut remove) (n-nid split)))
-                                    (if (not (ra-ifg-interferes? left right))
+                                    ;; GC constraints were computed before coalescing. Merging a
+                                    ;; scalar range into a root range would retroactively require
+                                    ;; stack homes at the scalar's safepoints. Keep that copy;
+                                    ;; equal root kinds preserve the established constraints.
+                                    (if (and (= (ra-lrg-kind left) (ra-lrg-kind right))
+                                             (not (ra-ifg-interferes? left right)))
                                         (match (ra-lrg-mask left)
                                           (Some [left-mask]
                                                 (match (ra-lrg-mask right)
@@ -2642,7 +2725,7 @@
 ;; Simple snapshots and nid-sorts the self-conflict set before graph surgery. Keep the same
 ;; deterministic contract while walking only the sparse conflict index, not every arena slot.
 (defn ra-self-conflicts-for [(lrg i64)] (-> (ArrayList i64))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         (mut conflicts) (al-new [i64] a)
         nids (.self-conflict-nids (ra-state))
         (mut i) 0]
@@ -2821,7 +2904,7 @@
 
 (defn ra-split-callee-save! [(round i64) (lrg i64)] (-> bool)
   (let [leader (ra-find! lrg)
-        a (alloc/malloc-allocator)
+        a (compiler-allocator)
         (mut uses) (al-new [i64] a)
         (mut indices) (al-new [i64] a)
         (mut seen-uses) (hm-new [i64 bool] a (i64-keyops))
@@ -2892,7 +2975,7 @@
         (None [] 0))))
 
 (defn ra-find-all-lrg [(lrg i64)] (-> (ArrayList i64))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         state (ra-state)
         leader (ra-find! lrg)
         (mut members) (al-new [i64] a)
@@ -2951,7 +3034,7 @@
 ;; caused by a finite Call-use range overlapping Return's fixed callee-save uses.
 (defn ra-split-by-loop-boundary! [(round i64) (lrg i64)] (-> bool)
   (let [leader (ra-find! lrg)
-        a (alloc/malloc-allocator)
+        a (compiler-allocator)
         (mut defs) (al-new [i64] a)
         (mut def-depths) (al-new [i64] a)
         (mut uses) (al-new [i64] a)
@@ -3296,7 +3379,7 @@
 ;; private copy at every call/ABI use; more than one Call declines because caller-save kills dominate
 ;; the benefit.
 (defn ra-split-empty-by-use-class! [(round i64) (lrg i64)] (-> bool)
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         state (ra-state)
         leader (ra-find! lrg)
         def-id (get (.mach-defs state) leader)
@@ -3586,7 +3669,7 @@
 
 (defn ra-split-self-conflict! [(round i64) (lrg i64)] (-> bool)
   (let [leader (ra-find! lrg)
-        a (alloc/malloc-allocator)
+        a (compiler-allocator)
         (mut defer-now) (hm-new [i64 bool] a (i64-keyops))
         conflicts (ra-self-conflicts-for leader)
         (mut nid) 0
@@ -3738,7 +3821,7 @@
 ;; Finalize each function from its actual colored high-water mark. Stack argument locations and
 ;; spill locations share the allocator namespace, so this one scan accounts for both.
 (defn ra-finalize-frames! [] (-> i64)
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         (mut block-owners) (hm-new [i64 i64] a (i64-keyops))
         (mut max-locations) (hm-new [i64 i64] a (i64-keyops))
         (mut call-functions) (hm-new [i64 bool] a (i64-keyops))
@@ -3835,7 +3918,10 @@
               (break 0)
               (let [source (n-in! (load hi) 1)]
                 (if (= (n-reg source) defreg)
-                    (set! (mut found) true)
+                    (do
+                      (set! (mut found) (= (ra-lrg-kind (ra-lrg-of! source))
+                                           (ra-lrg-kind (ra-lrg-of! split))))
+                      (break 0))
                     (set! (mut hi) source))
                 (continue))))
     (if (or (not (load found)) (< split-index 0))
@@ -3847,7 +3933,11 @@
                     (let [n (code-schedule-at block (load i))]
                       (if (n-same? n (load hi))
                           (break 0)
-                          (if (ra-node-clobbers-reg? n defreg)
+                          (if (or (ra-node-clobbers-reg? n defreg)
+                                  (and (< defreg (mach-active-max-reg))
+                                       (let [kind (ra-lrg-kind (ra-lrg-of! split))]
+                                         (or (= kind LRG-RAW-REF) (= kind LRG-BOXED)))
+                                       (ra-gc-site-op? (ra-ideal-op n))))
                               (set! (mut clear) false)
                               0))
                       (set! (mut i) (- (load i) 1))
@@ -3860,7 +3950,7 @@
 
 ;; Remove no-op spills after attempting Simple's no-clobber chain bypass.
 (defn ra-post-colour! [] (-> i64)
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         (mut remove) (al-new [i64] a)
         splits (ra-snapshot-scheduled-splits)]
     (ra-finalize-frames!)
@@ -3879,7 +3969,12 @@
                                          (ra-post-colour-bypass! split defreg))
                                     (set! (mut usereg) (n-reg (n-in! split 1)))
                                     0)
-                                (if (= defreg (load usereg))
+                                ;; Retain representation boundaries even for zero-byte moves:
+                                ;; removing one can extend a root LRG into scalar-only liveness
+                                ;; where no collector home was required during allocation.
+                                (if (and (= defreg (load usereg))
+                                         (= (ra-lrg-kind (ra-lrg-of! split))
+                                            (ra-lrg-kind (ra-lrg-of! (n-in! split 1)))))
                                     (push! [i64] (mut remove) (n-nid split))
                                     0))
                               0))

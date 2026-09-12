@@ -84,6 +84,60 @@
            (assert-eq (get (load values) 4) 91)
            (assert-eq (get (load values) 5) 1000)))
 
+(deftest singleton_range_constraints_propagate_through_interference_edges
+  (boot! 1) (ra-reset-state! 0)
+  (let [fixed (ra-new-lrg! (con-make (ty-int-bot)))
+        next (ra-new-lrg! (con-make (ty-int-bot)))
+        last (ra-new-lrg! (con-make (ty-int-bot)))
+        stack (ra-new-lrg! (con-make (ty-int-bot)))]
+    (assert (ra-lrg-and-mask! fixed (mask-of ARM-X0)))
+    (assert (ra-lrg-and-mask! next (mask-or (mask-of ARM-X0) (mask-of ARM-X1))))
+    (assert (ra-lrg-and-mask! last (mask-or (mask-of ARM-X1) (mask-of (+ ARM-X1 1)))))
+    (assert (ra-lrg-and-mask! stack (mask-or (mask-of ARM-X0) (mask-of 513))))
+    (ra-ifg-add! fixed next) (ra-ifg-add! next last) (ra-ifg-add! fixed stack)
+    (ra-propagate-singleton-masks!)
+    (assert (ra-success?))
+    (assert (match (ra-lrg-mask next)
+              (Some [mask] (and (mask-singleton? mask) (= (mask-first mask) ARM-X1))) (None [] false)))
+    (assert (match (ra-lrg-mask last)
+              (Some [mask] (and (mask-singleton? mask) (= (mask-first mask) (+ ARM-X1 1)))) (None [] false)))
+    (assert (match (ra-lrg-mask stack)
+              (Some [mask] (and (mask-singleton? mask) (= (mask-first mask) 513))) (None [] false)))
+    (ra-propagate-singleton-masks!)
+    (assert (ra-success?))))
+
+(deftest live_scratch_removes_dead_ranges_and_never_duplicates_reactivated_ranges
+  (boot! 1) (ra-reset-state! 0)
+  (let [first (ra-new-lrg! (con-make (ty-int-bot)))
+        second (ra-new-lrg! (con-make (ty-int-bot)))
+        (mut live) (ra-live-scratch!)
+        (mut i) 0]
+    (ra-live-set! (mut live) first 11)
+    (ra-live-set! (mut live) second 22)
+    (loop (if (= (load i) 1000) (break 0)
+      (do
+        (ra-live-set! (mut live) first 0)
+        (ra-live-set! (mut live) first 0)
+        (assert-eq (len (load (.ids (mut live)))) 1)
+        (assert-eq (ra-live-get (mut live) second) 22)
+        (ra-live-set! (mut live) first 33)
+        (assert-eq (len (load (.ids (mut live)))) 2)
+        (set! (mut i) (+ (load i) 1)) (continue))))
+    (ra-live-set! (mut live) second 0)
+    (assert-eq (ra-live-get (mut live) first) 33)
+    (let [(mut fresh) (ra-live-scratch!)]
+      (assert-eq (len (load (.ids (mut fresh)))) 0)
+      (assert-eq (ra-live-get (mut fresh) first) 0)
+      (assert-eq (ra-live-get (mut fresh) second) 0))))
+
+(deftest incompatible_singleton_neighbors_require_splitting
+  (boot! 1) (ra-reset-state! 0)
+  (let [a (ra-new-lrg! (con-make (ty-int-bot))) b (ra-new-lrg! (con-make (ty-int-bot)))]
+    (assert (ra-lrg-and-mask! a (mask-of ARM-X0)))
+    (assert (ra-lrg-and-mask! b (mask-of ARM-X0)))
+    (ra-ifg-add! a b) (ra-propagate-singleton-masks!)
+    (assert (not (ra-success?)))))
+
 (deftest low_degree_coloring_worklist_preserves_simples_reverse_coloring_priority
          (do
            (boot! 1)
@@ -517,6 +571,52 @@
                    (assert-eq (n-reg selected-value) ARM-X0)
                    (assert-eq (n-reg split) ARM-X0)))))))
 
+(deftest gc_root_homes_are_independent_of_runtime_register_preservation
+  (boot! 1) (code-reset! 1) (arm64-install-hooks!) (ra-reset-state! 0)
+  (let [control (con-make TY-CTRL)
+        allocation (new-make control (con-int 8) (con-make (ty-mem ALIAS-BULK TY-BOT))
+                             SHAPE-ELEMENTS (ty-struct "GcRootMaskTest"))
+        selected (arm64-new-select allocation)
+        raw (con-make (ty-memptr false (ty-struct "GcRootMaskTest")))
+        boxed (con-make (ty-dyn TAG-ANY))
+        scalar (con-int 42)
+        raw-id (ra-new-lrg! raw) boxed-id (ra-new-lrg! boxed) scalar-id (ra-new-lrg! scalar)
+        available (mask-or (arm64-gpr-mask) (mask-stack (mach-active-max-reg)))]
+    (ra-lrg-and-mask! raw-id available) (ra-lrg-and-mask! boxed-id available)
+    (ra-lrg-and-mask! scalar-id available)
+    (let [(mut live) (ra-live-scratch!)]
+      (ra-live-set! (mut live) raw-id (n-nid raw))
+      (ra-live-set! (mut live) boxed-id (n-nid boxed))
+      (ra-live-set! (mut live) scalar-id (n-nid scalar))
+      (match (mach-of selected)
+        (Some [mach] (ra-ifg-kills! mach (mut live))) (None [] (assert false)))
+      (match (ra-lrg-mask raw-id)
+        (Some [m] (assert (not (mask-test m ARM-X19))) (assert (mask-test m (mach-active-max-reg))))
+        (None [] (assert false)))
+      (match (ra-lrg-mask boxed-id)
+        (Some [m] (assert (not (mask-test m ARM-X19))) (assert (mask-test m (mach-active-max-reg))))
+        (None [] (assert false)))
+      (match (ra-lrg-mask scalar-id)
+        (Some [m] (assert (mask-test m ARM-X19)) (assert (not (mask-test m ARM-X0))))
+        (None [] (assert false))))))
+
+(deftest callsite_without_its_own_kill_mask_still_requires_gc_root_homes
+  (boot! 1) (code-reset! 1) (arm64-install-hooks!) (ra-reset-state! 0)
+  (let [site (call-make (con-make TY-CTRL))
+        selected (arm64-call-alloc site false false 0 0)
+        root (con-make (ty-dyn TAG-ANY)) id (ra-new-lrg! root)]
+    (ra-lrg-and-mask! id (mask-or (arm64-gpr-mask) (mask-stack (mach-active-max-reg))))
+    (let [(mut live) (ra-live-scratch!)]
+      (ra-live-set! (mut live) id (n-nid root))
+      (match (mach-of selected)
+        (Some [mach]
+          (assert (match (m-killmap mach) (None [] true) (Some [_] false)))
+          (ra-ifg-kills! mach (mut live)))
+        (None [] (assert false)))
+      (match (ra-lrg-mask id)
+        (Some [m] (assert (not (mask-test m ARM-X19))) (assert (mask-test m (mach-active-max-reg))))
+        (None [] (assert false))))))
+
 (deftest ifg_subtracts_call_clobbers_from_a_value_live_across_allocation
          (do
            (boot! 1)
@@ -565,16 +665,15 @@
                  (assert (< (regalloc-scheduled-index selected-fun selected-allocation)
                             (regalloc-scheduled-index selected-fun selected-post)))
                  (assert (ra-build-lrg! 0))
-                 ;; A JavaScript frame preserves no registers: the allocation kills every one,
-                 ;; so a register-only value live across it has no colour left and the round
-                 ;; fails; splitting gives it a stack slot across the call.
-                 (assert (not (ra-build-ifg! 0)))
+                 ;; The Coil runtime follows AAPCS64. This scalar may stay in a preserved
+                 ;; register; movable references have a separate stack-home constraint.
+                 (assert (ra-build-ifg! 0))
                  (match (ra-lrg-mask (n-lrg selected-value))
                    (Some [mask]
                          (do
                            (assert (not (mask-test mask ARM-X0)))
-                           (assert (not (mask-test mask ARM-X19)))
-                           (assert (mask-empty? mask))))
+                           (assert (mask-test mask ARM-X19))
+                           (assert (not (mask-empty? mask)))))
                    (None [] (assert false)))))))))
 
 (deftest splitting_a_fixed_return_use_repairs_a_value_live_across_a_call
@@ -619,7 +718,8 @@
                             (regalloc-scheduled-index selected-fun selected-allocation)))
                  (assert (ra-build-lrg! 0))
                  (assert (not (ra-build-ifg! 0)))
-                 (assert-eq (ra-split-all! 0) 1)
+                 ;; Propagation also exposes the allocation-size argument's fixed X0 conflict.
+                 (assert-eq (ra-split-all! 0) 2)
                  (let [split (n-in! selected-ret RETURN-VALUE)]
                    (assert-eq (n-op split) OP-MACH-SPLIT)
                    (assert (n-same? (n-in! split 1) selected-value))
@@ -628,8 +728,8 @@
                               (regalloc-scheduled-index selected-fun split)))
                    (assert (< (regalloc-scheduled-index selected-fun split)
                               (regalloc-scheduled-index selected-fun selected-ret)))
-                   ;; The value itself still crosses the allocation and, as a managed root, needs a
-                   ;; stack home; further rounds split it there. Colour within Simple's budget.
+                   ;; The scalar crossing value may use a callee-save register. Resolve remaining
+                   ;; fixed-register constraints within Simple's budget.
                    (let [(mut round) 1 (mut coloured) false]
                      (loop (if (or (load coloured) (> (load round) 7))
                                (break 0)
@@ -641,7 +741,16 @@
                                  (continue))))
                      (assert (load coloured)))
                    (assert-eq (n-reg (n-in! selected-ret RETURN-VALUE)) ARM-X0)
-                   (assert (!= (n-reg selected-value) ARM-X0))))))))
+                   ;; The crossing scalar retains a preserved register and is copied to X0
+                   ;; below allocation, without a round trip through the stack.
+                   (let [reload (n-in! selected-ret RETURN-VALUE) home (n-in! reload 1)]
+                     (assert-eq (n-op reload) OP-MACH-SPLIT)
+                     (assert (n-same? home selected-value))
+                     (assert (mask-test (arm64-callee-save) (n-reg home)))
+                     (assert (< (regalloc-scheduled-index selected-fun home)
+                                (regalloc-scheduled-index selected-fun selected-allocation)))
+                     (assert (< (regalloc-scheduled-index selected-fun selected-allocation)
+                                (regalloc-scheduled-index selected-fun reload))))))))))
 
 (deftest a_failed_cloneable_box_is_rematerialized_at_its_fixed_use
          (do
@@ -783,6 +892,7 @@
                    ;; the block has no intervening clobber, then removes the outer no-op Split.
                    (sched-run!)
                    (assert-eq (len (ra-snapshot-scheduled-splits)) 2)
+                   (assert (ra-build-lrg! 1))
                    (n-set-reg! selected-value 7)
                    (n-set-reg! middle-split 8)
                    (n-set-reg! use-split 7)
@@ -803,6 +913,8 @@
                  block-id (n-nid fun)]
              (arm64-split-bind! high fun source)
              (arm64-split-bind! low fun high)
+             (ra-reset-state! 0)
+             (ra-new-lrg! source) (ra-new-lrg! high) (ra-new-lrg! low)
              (n-set-reg! source ARM-X0)
              (n-set-reg! high 65)
              (n-set-reg! low ARM-X0)
@@ -829,7 +941,7 @@
              (assert (ra-post-colour-bypass! low ARM-X0))
              (assert (n-same? (n-in! low 1) source)))))
 
-(deftest full_allocator_spills_a_callee_save_range_for_a_value_live_across_a_call
+(deftest full_allocator_keeps_a_scalar_in_a_preserved_register_across_runtime_allocation
          (do
            (boot! 1)
            (code-reset! 1)
@@ -869,13 +981,12 @@
                    (gcm-build-cfg!)
                    (sched-run!)
                    (let [rounds (ra-run!)]
-                     (assert (> rounds 0))
+                     (assert-eq rounds 0)
                      (assert (< rounds RA-MAX-ROUNDS)))
-                   ;; No register survives the call: the value reaches the post-call use through a
-                   ;; stack slot (a split copy whose location is past the register namespace).
+                   ;; The runtime preserves this scalar register. No spill copy is required.
                    (let [post-input (n-in! selected-post 1)]
-                     (assert (= (n-op post-input) OP-MACH-SPLIT))
-                     (assert (>= (n-reg (n-in! post-input 1)) (mach-active-max-reg))))))))))
+                     (assert (n-same? post-input selected-value))
+                     (assert (mask-test (arm64-callee-save) (n-reg post-input))))))))))
 
 (deftest incompatible_fixed_parameter_definitions_are_split_before_a_phi_retry
          (do

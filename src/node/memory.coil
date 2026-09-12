@@ -100,6 +100,7 @@
 ;; alias-inference and broad unrelated-store walk are stated above instead of hidden behind a stale
 ;; scaffold claim.
 (module aot.node.memory)
+(import "aot.util.arena" :use [compiler-allocator compiler-state CompilerStateSlot])
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
 (import "aot.util.panic" :use *)
@@ -142,7 +143,7 @@
 
 (const STORE-VAL 4)
 
-(defstruct LoadNode [(hdr NodeHdr) (alias i64) (declared i64)])
+(defstruct LoadNode [(hdr NodeHdr) (alias i64) (declared i64) (bounded bool)])
 
 (defstruct StoreNode [(hdr NodeHdr) (alias i64) (declared i64)])
 
@@ -160,7 +161,7 @@
    (set bool)])
 
 (defn selected-mem-hook [] (-> (ptr SelectedMemHook))
-  (primitive/alloc-static SelectedMemHook))
+  (compiler-state [SelectedMemHook] (primitive/alloc-static CompilerStateSlot)))
 
 (defn set-selected-mem-hook! [(get (fnptr c [(ref (dyn NodeOps))] (Option (dyn MemOps))))] (-> i64)
   (do (set! (.get (selected-mem-hook)) get) (set! (.set (selected-mem-hook)) true) 0))
@@ -181,6 +182,13 @@
   (if (!= (n-op n) OP-LOAD)
       (do (panic-i "load-declared: not a Load" (n-op n)) TY-BOT)
       (.declared (primitive/cast (ptr LoadNode) (hdr n)))))
+
+;; Final Simple retains control on array loads until a range proof makes it redundant. Our
+;; variable-length compiler-owned vectors need the same rule independently of struct naming.
+;; A bounded load's control is the successful bounds check, not merely a null-pointer guard.
+(defn load-bounded? [(n (dyn NodeOps))] (-> bool)
+  (if (!= (n-op n) OP-LOAD) (panic "load-bounded?: not a Load") 0)
+  (.bounded (primitive/cast (ptr LoadNode) (hdr n))))
 
 (defn store-declared [(n (dyn NodeOps))] (-> i64)
   (if (!= (n-op n) OP-STORE)
@@ -251,11 +259,12 @@
         mem (mem-effective raw-mem alias)]
     ;; A fresh allocation's runtime header is established by New itself. Exposing that exact shape
     ;; is what collapses JSL's closed-world property dispatch without inventing a second shape
-    ;; analysis or teaching the frontend about object layouts.
+    ;; analysis or teaching the frontend about object layouts. The identity stays symbolic until
+    ;; the realm supplies its shape map; reserved string/elements shapes remain fixed words.
     (if (and (= alias ALIAS-OBJECT-SHAPE)
              (and (= (n-op ptr_) OP-PROJ)
                   (and (= (proj-idx ptr_) 0) (= (n-op (n-in! ptr_ 0)) OP-NEW))))
-        (Some (con-int (new-shape (n-in! ptr_ 0))))
+        (Some (shaperef-make (new-shape (n-in! ptr_ 0))))
     ;; A string literal is static data (StrConst): its length is the literal's unit count, so the
     ;; load folds the way a load from a fresh allocation's known store does.
     (if (and (= alias ALIAS-STRING-LENGTH) (strconst? ptr_))
@@ -270,7 +279,8 @@
                          (heap-entry-word-kind (staticref-entry ptr_) HEAP-OFFSET-PROTOTYPE-WORD))
     ;; Object accesses do not need control after the pointer type proves an object; nullability is
     ;; discharged before this point by ordinary guard control.
-    (if (and (match (n-in d MEM-CTRL) (Some [_] true) (None [] false))
+    (if (and (not (load-bounded? d))
+             (match (n-in d MEM-CTRL) (Some [_] true) (None [] false))
              (mem-base? (n-ty ptr_)))
         (do (n-set-def! d MEM-CTRL (None [(dyn NodeOps)])) (Some d))
         (if (not (n-same? mem raw-mem))
@@ -354,8 +364,10 @@
             (if (!= (n-op other) OP-LOAD)
                 false
                 (let [o (primitive/cast (ptr LoadNode) (hdr other))]
-                  (and (= (.alias self) (.alias o)) (= (.declared self) (.declared o))))))
-  (hash-extra [(self (ptr LoadNode))] (-> i64) (^ (* (.alias self) 251) (.declared self))))
+                  (and (= (.alias self) (.alias o)) (= (.declared self) (.declared o))
+                       (= (.bounded self) (.bounded o))))))
+  (hash-extra [(self (ptr LoadNode))] (-> i64)
+              (^ (^ (* (.alias self) 251) (.declared self)) (if (.bounded self) 65537 0))))
 
 (impl MemOps LoadNode
   (mem-node [(self (ptr LoadNode))] (-> (dyn NodeOps)) (primitive/make-dyn NodeOps self))
@@ -461,11 +473,17 @@
                  (off (dyn NodeOps))
                  (alias i64)
                  (declared i64)] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (load-make-mode ctrl mem ptr_ off alias declared false))
+
+(defn load-make-mode [(ctrl (dyn NodeOps)) (mem (dyn NodeOps)) (ptr_ (dyn NodeOps))
+                      (off (dyn NodeOps)) (alias i64) (declared i64) (bounded bool)]
+                     (-> (dyn NodeOps))
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [LoadNode] (alloc/create [LoadNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.alias p) alias)
     (set! (.declared p) declared)
+    (set! (.bounded p) bounded)
     (n-init! d OP-LOAD)
     (n-add-def! d (Some ctrl))
     (n-add-def! d (Some mem))
@@ -481,7 +499,7 @@
                   (val (dyn NodeOps))
                   (alias i64)
                   (declared i64)] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [StoreNode] (alloc/create [StoreNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.alias p) alias)
@@ -573,11 +591,14 @@
                       (shape i64)
                       (object-ty i64)] (-> (dyn NodeOps))
   (do
-    (if (not (shape-valid? shape)) (panic-i "new-make: invalid hidden-class shape" shape) 0)
+    ;; Elements vectors use a runtime scanning descriptor, not an entry in the property-shape
+    ;; table. Admit that allocation layout without making it a valid property transition parent.
+    (if (not (or (= shape SHAPE-ELEMENTS) (shape-valid? shape)))
+        (panic-i "new-make: invalid allocation shape" shape) 0)
     (match (ty-kind object-ty)
       (TStruct [_ _ _ _] 0)
       (_ (panic "new-make: object type is not a struct")))
-    (let [a (alloc/malloc-allocator)
+    (let [a (compiler-allocator)
           p (alloc/unwrap-ptr [NewNode] (alloc/create [NewNode] a))
           d (primitive/make-dyn NodeOps p)]
       (set! (.shape p) shape)
@@ -627,6 +648,26 @@
     (Some [mem] (if (ty-mem? (n-ty mem)) (n-ty mem) (if (ty-high? (n-ty mem)) (ty-mem-top 1) (ty-mem 1 TY-BOT))))
     (None [] (ty-mem-top 1))))
 
+;; Final Simple MemMergeNode.idealize first refuses mutable construction, removes aliases equal
+;; to the default, and returns the default when no overrides remain. Otherwise it collapses a
+;; nested default, copying only aliases not overridden by the outer merge. Outer stores must win;
+;; dropping an inner override loses an unrelated field write. Parser.mergeAlias constructs just
+;; one override over prior whole memory rather than eagerly enumerating a receiver's fields.
+(defn memmerge-collapse-default! [(d (dyn NodeOps)) (default (dyn NodeOps))] (-> i64)
+  (let [(mut i) 2]
+    (loop (if (>= (load i) (n-nins default)) (break 0)
+      (do
+        (match (n-in default (load i))
+          (Some [v]
+            (match (n-in-safe d (load i))
+              (None [] (n-set-def-x! d (load i) (Some v)))
+              (Some [_] 0)))
+          (None [] 0))
+        (set! (mut i) (+ (load i) 1)) (continue))))
+    (code-add! (n-in! default 1))
+    (n-set-def! d 1 (Some (n-in! default 1)))
+    0))
+
 (defn memmerge-idealize [(d (dyn NodeOps))] (-> (Option (dyn NodeOps)))
   (let [p (primitive/cast (ptr MemMergeNode) (hdr d))]
     (if (.in-progress p)
@@ -652,7 +693,9 @@
                               (continue))))
                   (if (not (load distinct))
                       (Some default)
-                      (if (load changed) (Some d) (None [(dyn NodeOps)])))))))))
+                      (if (= (n-op default) OP-MEMMERGE)
+                          (do (memmerge-collapse-default! d default) (Some d))
+                          (if (load changed) (Some d) (None [(dyn NodeOps)]))))))))))
 
 (impl NodeOps MemMergeNode
   (hdr [(self (ptr MemMergeNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
@@ -673,7 +716,7 @@
   (hash-extra [(self (ptr MemMergeNode))] (-> i64) 263))
 
 (defn memmerge-make [] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [MemMergeNode] (alloc/create [MemMergeNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.in-progress p) false)
@@ -724,7 +767,7 @@
   (hash-extra [(self (ptr ReadOnlyNode))] (-> i64) 269))
 
 (defn readonly-make [(v (dyn NodeOps))] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [ReadOnlyNode] (alloc/create [ReadOnlyNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.pad p) 0)

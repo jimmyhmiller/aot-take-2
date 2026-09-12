@@ -154,6 +154,7 @@ aot-take-2/
 │           ; number-methods.jsl Number.prototype and Boolean.prototype,
 │           ; math.jsl the Math object and isNaN/isFinite/parseInt/parseFloat,
 │           ; array-generic.jsl the array-like arms of the callback and search methods, and `in`
+│           ; call.jsl shared dynamic-call dispatch over the checked callable ABI
 │       function/ array-buffer/ data-view/ typed-array/
 ├── src/
 │   ├── main.coil            ; CLI driver: compile, emit, run, dump; `AOT_SEED=N` compiles under a test's arena seed
@@ -163,7 +164,7 @@ aot-take-2/
 │   │   ├── sb.coil          ; string builder and byte sink              SB/BAOS
 │   │   ├── table.coil       ; int-keyed hash maps, the intern tables    IntHashMap
 │   │   ├── worklist.coil    ; the seeded random worklist                IterPeeps.WorkList
-│   │   └── arena.coil       ; the id arenas nodes and types live in
+│   │   └── arena.coil       ; compiler-region allocator and generation-scoped singleton ownership
 │   │
 │   ├── type/
 │   │   ├── type.coil        ; Ty sum, interning, meet/dual/join/isa, the xmeet dispatch
@@ -183,7 +184,7 @@ aot-take-2/
 │   │   ├── cfg.coil         ; CFGNode: idom, depth, blocks, loop depth, the loop tree
 │   │   ├── control.coil     ; Start, Stop, Region, Loop, If, Never, XCtrl, Proj, CProj, Multi
 │   │   ├── phi.coil         ; Phi and the region/phi arity invariant
-│   │   ├── constant.coil    ; Constant, FunPtr, ConFldOff, Extern, FRef
+│   │   ├── constant.coil    ; Constant, Extern, symbolic unit KeyRef/ShapeRef; ConFldOff, FRef
 │   │   ├── arith.coil       ; Add, Sub, Mul, Div, Minus, ToFloat, ToInt, RoundF32 + the int/float modes
 │   │   ├── bits.coil        ; And, Or, Xor, Shl, Shr, Sar, Not
 │   │   ├── compare.coil     ; EQ, NE, LT, LE, ULT
@@ -217,8 +218,11 @@ aot-take-2/
 │   │   ├── regmask.coil     ; register masks and the stack-slot numbering
 │   │   ├── machine.coil     ; MachineVT — the port interface               Machine
 │   │   ├── encoding.coil    ; encoding and relocations
+│   │   ├── image.coil       ; owned native images, Script entries and realm-object identities; checked installation, fresh realm-data instantiation and native program execution
+│   │   ├── sourcecache.coil ; bounded Script/host image caches, exact source/JSL keys, leased handles and owned Script programs
 │   │   ├── serialize.coil   ; the ideal graph into the object file
-│   │   ├── compunit.coil    ; compilation units, dependency tree, cross-unit linking
+│   │   ├── compunit.coil    ; owned Script declarations, shape/key assembly, static-image remapping; dependency tree, cross-unit IR linking
+│   │   ├── callabi.coil     ; cross-unit call signature: three direct actuals and managed overflow
 │   │   ├── objfile.coil     ; Mach-O and ELF writing/reading
 │   │   └── gcmeta.coil      ; safepoint placement, stack maps, barrier lowering
 │   │
@@ -238,9 +242,9 @@ aot-take-2/
 │   │
 │   ├── rt/                  ; the runtime, in Coil, built as its own object (Coil.toml `runtime`)
 │   │   ├── number.coil      ; Number conversions shared by compiler and runtime: exact radix integers, `strtod` decimals, StringToNumber, parseInt/parseFloat, the NaN-box word; the libm-backed Math table
-│   │   ├── abi.coil         ; RtHeap layout + folded field offsets shared with the encoders
+│   │   ├── abi.coil         ; RtHeap, realm lexical cells, unit data/key/shape bindings + folded offsets shared with encoders
 │   │   ├── shapes.coil      ; the runtime shape tree: static `__aot_shapes` blob + runtime transitions
-│   │   └── rt.coil          ; allocation, generational collector, the static heap image as a root region, strings, generic property access, throw entry points
+│   │   └── rt.coil          ; allocation, generational collector, static/lexical roots, realm lexical storage, strings, generic property access, throw entry points
 │   │
 │   ├── print/
 │   │   ├── ir.coil          ; the pretty printer                          IRPrinter
@@ -263,6 +267,7 @@ aot-take-2/
 │   ├── lex-test.coil  parse-test.coil  regex-test.coil  tstype-test.coil  jsl-test.coil
 │   ├── number-test.coil             ; StringToNumber grammar and the Number word (aot.rt.number)
 │   ├── imagefacts-test.coil         ; the closed-world image facts: named, parameter and runtime-key stores
+│   ├── image-test.coil              ; in-memory relocation, entry ABI, realm isolation and moving GC
 │   ├── test262-test.coil            ; metadata, runner policy and accounting regressions
 │   ├── harness.coil                 ; source in → linked binary out → node's answer beside it
 │   ├── bloat-test.coil              ; graph-size budgets: node-count ceilings after optimization
@@ -273,9 +278,12 @@ aot-take-2/
 ├── web/                     ; GitHub Pages graph playground; HTML/CSS/JS presentation over Coil/Wasm
 └── tools/
     ├── dot-dump.coil
+    ├── memory-run.coil      ; source-to-memory compilation and execution without subprocesses
+    ├── compile-study.coil   ; diagnostic retained-Script pass timings, graph counts and project DOT snapshots
     ├── test262-metadata.coil ; test262 frontmatter, required variants and include ordering
     ├── test262-policy.coil   ; independent source-unit plans and observed-result classification
     ├── test262-worker.coil   ; bounded sequential compiler/linker/native process execution
+    ├── test262-memory.coil   ; persistent native-memory workers, bounded protocol and supervision
     ├── test262.coil          ; pinned-suite inventory and sequential conformance runner
     └── graph-wasm.coil      ; browser Wasm entry: source → phase snapshot
 ```

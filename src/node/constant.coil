@@ -27,14 +27,116 @@
 ;; (`set-con-hook!`) and the engine calls through it. A missing hook is a hard error rather than a
 ;; silent fallback — the alternative is an optimiser that quietly never folds anything.
 (module aot.node.constant)
+(import "aot.util.arena" :use [compiler-allocator compiler-state CompilerStateSlot])
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
 (import "coil.arraylist" :use *)
+(import "coil.str" :use [sb-new sb-push-str! sb-push-i64! sb-str])
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
 (import "aot.type.type" :use *)
+(import "aot.shape" :use [shape-key-count shape-count SHAPE-STRING SHAPE-ELEMENTS])
 
 (defstruct ConNode [(hdr NodeHdr) (con-ty i64)])
+
+;; Final Simple's ExternNode retains a symbol beside its type and serializes both; it uses node
+;; identity equality because an external declaration has no local function owner. Unit metadata
+;; has a different equality rule: a key or shape is canonical within the compiling namespace.
+;; Keep the local ID in payload, GVN by opcode plus ID, and copy it with the node. Crucially, the
+;; integer lattice describes the eventual word, NOT that local ID. A singleton integer type would
+;; allow a consumer to fold before assembly even if this node itself refused constant folding.
+;; Property proofs must ask keyref-local; ordinary integer literals provide no identity evidence.
+(defstruct UnitRefNode [(hdr NodeHdr) (local-id i64)])
+
+(defn unitref-node [(n (dyn NodeOps))] (-> (ptr UnitRefNode))
+  (if (not (or (= (n-op n) OP-KEYREF) (= (n-op n) OP-SHAPEREF)))
+      (panic "unitref-node: node is not a symbolic unit identity") 0)
+  (primitive/cast (ptr UnitRefNode) (hdr n)))
+
+(defn unitref-local [(n (dyn NodeOps))] (-> i64)
+  (.local-id (unitref-node n)))
+
+;; -1 is the absence of compile-time key evidence, not a runtime property key.
+(defn keyref-local [(n (dyn NodeOps))] (-> i64)
+  (if (= (n-op n) OP-KEYREF) (unitref-local n) -1))
+
+(impl NodeOps UnitRefNode
+  (hdr [(self (ptr UnitRefNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr UnitRefNode))] (-> (slice u8))
+    (let [(mut b) (sb-new (compiler-allocator))]
+      (sb-push-str! (mut b) (if (= (.op (.hdr self)) OP-KEYREF) "KeyRef(" "ShapeRef("))
+      (sb-push-i64! (mut b) (.local-id self))
+      (sb-push-str! (mut b) ")")
+      (sb-str (load b))))
+  (compute [(self (ptr UnitRefNode))] (-> i64) (ty-int-bot))
+  (idealize [(self (ptr UnitRefNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
+  (is-const? [(self (ptr UnitRefNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr UnitRefNode))] (-> bool) true)
+  (is-pinned? [(self (ptr UnitRefNode))] (-> bool) false)
+  (binop-copy [(self (ptr UnitRefNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
+  (eq-extra [(self (ptr UnitRefNode)) (other (dyn NodeOps))] (-> bool)
+    (and (= (.op (.hdr self)) (n-op other)) (= (.local-id self) (unitref-local other))))
+  (hash-extra [(self (ptr UnitRefNode))] (-> i64) (* (.local-id self) 1000003)))
+
+;; Raw construction permits graph-copy's shell/edge protocol. Callers choose when to peephole.
+;; Reserved runtime shapes are process-wide words and are deliberately not unit references.
+(defn unitref-make [(op i64) (local-id i64)] (-> (dyn NodeOps))
+  (if (= op OP-KEYREF)
+      (if (or (<= local-id 0) (> local-id (shape-key-count)))
+          (panic "unitref-make: unknown unit-local key") 0)
+      (if (= op OP-SHAPEREF)
+          (if (or (<= local-id 0) (>= local-id (shape-count)))
+              (panic "unitref-make: unknown unit-local shape") 0)
+          (panic "unitref-make: unsupported identity kind")))
+  (let [p (alloc/unwrap-ptr [UnitRefNode] (alloc/create [UnitRefNode] (compiler-allocator)))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.local-id p) local-id)
+    (n-init! d op)
+    (n-set-ty! d (ty-int-bot))
+    d))
+
+(defn keyref-make [(key i64)] (-> (dyn NodeOps))
+  (unitref-make OP-KEYREF key))
+
+(defn shaperef-make [(shape i64)] (-> (dyn NodeOps))
+  (if (or (= shape SHAPE-STRING) (= shape SHAPE-ELEMENTS))
+      (con-int shape)
+      (unitref-make OP-SHAPEREF shape)))
+
+;; Final Simple's ExternNode is a typed constant with a symbol and no local Fun edge. Its FIDX
+;; is declared in CodeGen's external table; identity equality prevents merging unrelated symbols.
+;; Here the arena owns the declaration and signature, and the node keeps its exact function type.
+;; Copies preserve that identity, while arena reset drops the entire declaration namespace.
+(defstruct ExternalNode [(hdr NodeHdr) (con-ty i64)])
+
+(impl NodeOps ExternalNode
+  (hdr [(self (ptr ExternalNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr ExternalNode))] (-> (slice u8)) "Extern")
+  (compute [(self (ptr ExternalNode))] (-> i64) (.con-ty self))
+  (idealize [(self (ptr ExternalNode))] (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
+  (is-const? [(self (ptr ExternalNode))] (-> bool) true)
+  (no-const-fold? [(self (ptr ExternalNode))] (-> bool) true)
+  (is-pinned? [(self (ptr ExternalNode))] (-> bool) false)
+  (binop-copy [(self (ptr ExternalNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps))) (None [(dyn NodeOps)]))
+  (eq-extra [(self (ptr ExternalNode)) (other (dyn NodeOps))] (-> bool)
+    (n-same? (primitive/make-dyn NodeOps self) other))
+  (hash-extra [(self (ptr ExternalNode))] (-> i64)
+    (n-nid (primitive/make-dyn NodeOps self))))
+
+(defn external-make [(fidx i64)] (-> (dyn NodeOps))
+  (let [decl (match (arena-external-function fidx)
+                (Some [d] d)
+                (None [] (do (panic "external-make: undeclared function identity")
+                             (primitive/zeroed ExternalFunction))))
+        t (ty-funptr-singleton (.signature decl) fidx)
+        p (alloc/unwrap-ptr [ExternalNode] (alloc/create [ExternalNode] (compiler-allocator)))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.con-ty p) t)
+    (n-init! d OP-EXTERN)
+    (n-set-ty! d t)
+    d))
 
 (impl NodeOps ConNode
   (hdr [(self (ptr ConNode))] (-> (ptr NodeHdr)) (primitive/cast (ptr NodeHdr) self))
@@ -66,7 +168,7 @@
 ;; Make a constant of interned type `t`. NOT peepholed here: the caller decides, exactly as in
 ;; Simple, because `idealize` must be free to return a raw node.
 (defn con-make [(t i64)] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [ConNode] (alloc/create [ConNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.con-ty p) t)

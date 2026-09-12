@@ -28,18 +28,25 @@
 ;; populated object have changed?" — the same question Simple's Load-after-Store idealization
 ;; answers for a fresh allocation, asked of an allocation that predates the program.
 (module aot.facts)
+(import "aot.util.arena"
+        :use
+        [compiler-allocator compiler-state CompilerStateSlot])
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
 (import "aot.util.panic" :use *)
 
+;; Named writes occupy only observed object/key pairs; unrelated keys do not widen
+;; object rows. The cached pair count preserves the existing convergence signature.
 (defstruct ImageFacts
   [(ready bool)
    (heap-count i64)  ; image entries the analysis saw
    (key-count i64)  ; property keys interned when the analysis ran
    (escaped (ArrayList bool))  ; per entry
    (any-key (ArrayList bool))  ; per entry: the named target of a store whose key is a runtime value
-   (written (ArrayList bool))  ; entry * (key-count + 1) + key
+   (written (ArrayList (HashMap i64 bool)))  ; sparse named keys per entry
+   (written-count i64)
    (unknown-owner-key (ArrayList bool))  ; per key: stored to an owner the analysis could not name
    (unknown-owner-any bool)  ; a store of a runtime key to an owner the analysis could not name
    (prototypes-written bool)
@@ -47,11 +54,33 @@
    (booted bool)])
 
 (defn facts-table [] (-> (ptr ImageFacts))
-  (primitive/alloc-static ImageFacts))
+  (compiler-state [ImageFacts] (primitive/alloc-static CompilerStateSlot)))
+
+(defn facts-release! [] (-> i64)
+  (let [t (facts-table)
+        (mut i) 0]
+    (if (.booted t)
+        (do
+          (loop (if (>= (load i) (len (.written t)))
+                    (break 0)
+                    (do
+                      (hm-free! (al-elem [(HashMap i64 bool)]
+                                         (mut (.written t))
+                                         (load i)))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (al-free! (mut (.written t)))
+          (al-free! (mut (.escaped t)))
+          (al-free! (mut (.any-key t)))
+          (al-free! (mut (.unknown-owner-key t)))
+          (set! (.booted t) false))
+        0)
+    0))
 
 ;; Facts are compilation-local: a new realm starts with none.
 (defn facts-reset! [] (-> i64)
   (let [t (facts-table)]
+    (facts-release!)
     (set! (.ready t) false)
     (set! (.booted t) false)
     (set! (.heap-count t) 0)
@@ -73,19 +102,29 @@
 ;; Begin recording over `heap-count` image entries and `key-count` property keys.
 (defn facts-begin! [(heap-count i64) (key-count i64)] (-> i64)
   (let [t (facts-table)
-        a (alloc/malloc-allocator)]
+        a (compiler-allocator)]
     (if (.ready t)
         (panic "facts-begin!: the image facts were already computed for this realm")
         0)
+    (facts-release!)
     (set! (.heap-count t) heap-count)
     (set! (.key-count t) key-count)
     (set! (.escaped t) (al-new [bool] a))
     (set! (.any-key t) (al-new [bool] a))
-    (set! (.written t) (al-new [bool] a))
+    (set! (.written t) (al-new [(HashMap i64 bool)] a))
+    (set! (.written-count t) 0)
     (set! (.unknown-owner-key t) (al-new [bool] a))
     (facts--fill! (mut (.escaped t)) heap-count)
     (facts--fill! (mut (.any-key t)) heap-count)
-    (facts--fill! (mut (.written t)) (* heap-count (+ key-count 1)))
+    (let [(mut entry) 0]
+      (loop (if (>= (load entry) heap-count)
+                (break 0)
+                (do
+                  (push! [(HashMap i64 bool)]
+                         (mut (.written t))
+                         (hm-new [i64 bool] a (i64-keyops)))
+                  (set! (mut entry) (+ (load entry) 1))
+                  (continue)))))
     (facts--fill! (mut (.unknown-owner-key t)) (+ key-count 1))
     (set! (.unknown-owner-any t) false)
     (set! (.prototypes-written t) false)
@@ -98,6 +137,7 @@
 (defn facts-reopen! [] (-> i64)
   (let [t (facts-table)]
     (if (not (.ready t)) (panic "facts-reopen!: no finished facts to reopen") 0)
+    (facts-release!)
     (set! (.ready t) false)
     (set! (.booted t) false)
     0))
@@ -106,30 +146,31 @@
 (defn facts-signature [] (-> i64)
   (let [t (facts-table)
         (mut n) 0]
-    (if (not (.ready t)) (panic "facts-signature: the facts are not finished") 0)
+    (if (not (.ready t))
+        (panic "facts-signature: the facts are not finished")
+        0)
     (let [(mut i) 0
           e (len (.escaped t))]
       (loop (if (>= (load i) e)
                 (break 0)
                 (do
-                  (if (get (.escaped t) (load i)) (set! (mut n) (+ (load n) 1)) 0)
-                  (if (get (.any-key t) (load i)) (set! (mut n) (+ (load n) 1)) 0)
+                  (if (get (.escaped t) (load i))
+                      (set! (mut n) (+ (load n) 1))
+                      0)
+                  (if (get (.any-key t) (load i))
+                      (set! (mut n) (+ (load n) 1))
+                      0)
                   (set! (mut i) (+ (load i) 1))
                   (continue)))))
-    (let [(mut i) 0
-          w (len (.written t))]
-      (loop (if (>= (load i) w)
-                (break 0)
-                (do
-                  (if (get (.written t) (load i)) (set! (mut n) (+ (load n) 1)) 0)
-                  (set! (mut i) (+ (load i) 1))
-                  (continue)))))
+    (set! (mut n) (+ (load n) (.written-count t)))
     (let [(mut i) 0
           u (len (.unknown-owner-key t))]
       (loop (if (>= (load i) u)
                 (break 0)
                 (do
-                  (if (get (.unknown-owner-key t) (load i)) (set! (mut n) (+ (load n) 1)) 0)
+                  (if (get (.unknown-owner-key t) (load i))
+                      (set! (mut n) (+ (load n) 1))
+                      0)
                   (set! (mut i) (+ (load i) 1))
                   (continue)))))
     (if (.unknown-owner-any t) (set! (mut n) (+ (load n) 1)) 0)
@@ -175,10 +216,13 @@
         (panic-i "facts-mark-written!: a key interned after the analysis began"
                  key)
         0)
-    (let [i (+ (* entry (+ (.key-count t) 1)) key)]
-      (if (get (.written t) i)
+    (let [keys (al-elem [(HashMap i64 bool)] (mut (.written t)) entry)]
+      (if (hm-contains? (load keys) key)
           false
-          (do (set! (mut (.written t)) i true) true)))))
+          (do
+            (set! keys key true)
+            (set! (.written-count t) (+ (.written-count t) 1))
+            true)))))
 
 (defn facts-mark-any-key! [(entry i64)] (-> bool)
   (let [t (facts-table)]
@@ -243,7 +287,7 @@
         (and (get (.escaped t) entry) (.unknown-owner-any t))
         (if (> key (.key-count t))
             false
-            (or (get (.written t) (+ (* entry (+ (.key-count t) 1)) key))
+            (or (hm-contains? (get (.written t) entry) key)
                 (and (get (.escaped t) entry) (get (.unknown-owner-key t) key)))))))
 
 (defn facts-prototypes-written? [] (-> bool)

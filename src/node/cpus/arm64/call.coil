@@ -9,7 +9,14 @@
 ;; multi's indexed mask.
 ;; Masks are cached at selection time: allocation consumes machine constraints and never
 ;; reinterprets an ideal signature after rewriting begins.
+;;
+;; Final Simple's NewARM passes size to calloc and emits MOVZ/BL; it has no runtime shape header.
+;; Our nursery fast path and collecting slow call must use the same realm-mapped shape. Ordinary
+;; shapes load their installation's map in seven instructions. Reserved string/elements shapes
+;; keep process-wide words. Fast allocation preserves its header in X16 and uses X17 scratch;
+;; the slow path uses X1 for the mapped argument and X16 scratch. Both are in the call kill set.
 (module aot.node.cpus.arm64.call)
+(import "aot.util.arena" :use [compiler-allocator compiler-state CompilerStateSlot])
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
 (import "coil.arraylist" :use *)
@@ -26,10 +33,11 @@
 (import "aot.node.cpus.arm64.branch" :use *)
 (import "aot.node.cpus.arm64.split" :use *)
 (import "aot.rt.abi" :use *)
+(import "aot.shape" :use [SHAPE-STRING SHAPE-ELEMENTS])
 
 (defstruct Arm64CallNode
   [(hdr NodeHdr) (ideal-op i64) (result-ty i64) (block-head bool) (direct bool) (fidx i64)
-   (symbol (slice u8)) (size i64) (process-entry bool) (entry-return bool)
+   (symbol (slice u8)) (size i64) (process-entry bool) (entry-return bool) (signature i64)
    (alloc-shape i64) (alloc-bytes i64) (alloc-map-id i64) (js-prim i64) (js-argc i64)
    (barrier-kind i64)
    (max-arg-slot i64) (frame-adjust i64) (has-calls bool)
@@ -70,7 +78,7 @@
 
 (defn arm64-call-alloc [(src (dyn NodeOps)) (block-head bool) (direct bool) (fidx i64) (size i64)]
                        (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [Arm64CallNode] (alloc/create [Arm64CallNode] a))
         d (primitive/make-dyn NodeOps p)
         (mut i) 0]
@@ -83,6 +91,7 @@
     (set! (.size p) size)
     (set! (.process-entry p) false)
     (set! (.entry-return p) false)
+    (set! (.signature p) TY-INVALID)
     (set! (.alloc-shape p) 0)
     (set! (.alloc-bytes p) 0)
     (set! (.alloc-map-id p) 0)
@@ -124,14 +133,22 @@
 (defn arm64-call-set-alloc-bytes! [(n (dyn NodeOps)) (bytes i64)] (-> i64)
   (do (set! (.alloc-bytes (arm64-call-node n)) bytes) 0))
 
+(defn arm64-allocation-shape-insns [(shape i64)] (-> i64)
+  (if (or (= shape SHAPE-STRING) (= shape SHAPE-ELEMENTS)) (arm64-const-insns shape) 7))
+
+(defn arm64-encode-allocation-shape! [(encoder i64) (shape i64) (reg i64) (scratch i64)] (-> i64)
+  (if (or (= shape SHAPE-STRING) (= shape SHAPE-ELEMENTS))
+      (arm64-encode-immediate-to-reg! encoder shape reg)
+      (arm64-encode-unit-identity-to! encoder ENC-UNIT-SHAPE shape reg scratch)))
+
 (defn arm64-call-set-alloc-map-id! [(n (dyn NodeOps)) (map-id i64)] (-> i64)
   (let [p (arm64-call-node n)]
     (set! (.alloc-map-id p) map-id)
     ;; X1 materializes shape, X2 materializes the stable safepoint id, X3 snapshots caller SP,
     ;; then BL enters the runtime. This size is part of layout and stack-map return-PC identity.
     (let [words (/ (+ (.alloc-bytes p) 7) 8)
-          shape-insns (arm64-const-insns (.alloc-shape p))
-          map-insns (arm64-const-insns map-id)]
+          shape-insns (arm64-allocation-shape-insns (.alloc-shape p))
+          map-insns 4]
       (set! (.size p) (* (+ (+ (+ 18 (* shape-insns 2)) map-insns) words) 4)))
     0))
 
@@ -151,7 +168,7 @@
               ;; A transitioning JsOp continues its argument registers with the allocation shape
               ;; (string capabilities only), the safepoint id and a snapshot of SP, then calls.
               ;; Other admitted JsOps are non-collecting one-instruction calls.
-              (+ (* (+ (if (!= shape 0) (arm64-const-insns shape) 0) (arm64-const-insns map-id)) 4)
+              (+ (* (+ (if (!= shape 0) (arm64-const-insns shape) 0) 4) 4)
                  8)
               4))
     0))
@@ -294,19 +311,24 @@
 ;; bytes. Final Simple rounds only non-leaf frames; AAPCS64 additionally requires SP to remain
 ;; 16-byte aligned whenever it is used for memory access, so every nonempty frame is rounded here.
 ;; A leaf spill frame otherwise subtracts eight and immediately addresses an ABI-misaligned SP.
+;; Simple's FunARM bases non-leaf padding on _hasCalls; it emits no host-runtime bootstrap call.
+;; Our process entry does call rt-heap-state even when its ideal graph is a leaf. Count that call
+;; here, where the frame/return contract is finalized, or BL overwrites the caller's LR and RET
+;; re-enters the function instead of returning to its host.
 (defn arm64-fun-finalize-frame! [(fun (dyn NodeOps)) (max-location i64) (has-calls bool)]
                                  (-> i64)
   (let [p (arm64-call-node fun)
         entry (arm64-fun-process-entry? p)
+        calls (or has-calls entry)
         incoming (.max-arg-slot p)
         seen-slots (if (> (- max-location 65) incoming) (- max-location 65) incoming)
-        raw (+ (+ (* (- seen-slots incoming) 8) (if has-calls 16 0)) (if entry 16 0))
+        raw (+ (+ (* (- seen-slots incoming) 8) (if calls 16 0)) (if entry 16 0))
         adjusted (if (> raw 0) (* (/ (+ raw 15) 16) 16) 0)]
-    (set! (.has-calls p) has-calls)
+    (set! (.has-calls p) calls)
     (set! (.frame-adjust p) adjusted)
     (set! (.size p)
           (+ (+ (* 4 (arm64-frame-adjust-insns adjusted))
-                (if has-calls
+                (if calls
                     (* 4 (arm64-split-stack-insns (- adjusted 16)))
                     0))
              (if entry
@@ -315,7 +337,7 @@
     (arm64-set-return-size! fun
                             (+ 4
                                (+ (+ (* 4 (arm64-frame-adjust-insns adjusted))
-                                     (if has-calls
+                                     (if calls
                                          (* 4 (arm64-split-stack-insns (- adjusted 16)))
                                          0))
                                   (if entry
@@ -436,13 +458,26 @@
         (panic-i "arm64 barrier: encoded size mismatch" (load at))
         0)))
 
+;; Keep map tokens full width even for a small local ID: installation qualifies the high word
+;; without changing layout, return PCs, branch ranges or stack-map offsets.
+(defn arm64-encode-map-token! [(encoder i64) (local-id i64) (reg i64)] (-> i64)
+  (enc-add-map-site! encoder local-id reg)
+  (let [(mut word) 0]
+    (loop (if (>= (load word) 4) (break 0)
+              (do
+                (enc-add4! encoder
+                  (| (if (= (load word) 0) 0xd2800000 0xf2800000)
+                     (| (primitive/ishl (load word) 21)
+                        (| (primitive/ishl (arm64-const-chunk local-id (load word)) 5) reg))))
+                (set! (mut word) (+ (load word) 1)) (continue))))))
+
 (defn arm64-encode-allocation! [(encoder i64) (p (ptr Arm64CallNode))] (-> i64)
   (let [d (primitive/make-dyn NodeOps p)
         bytes (.alloc-bytes p)
         total (& (+ bytes 31) -8)
         words (/ (+ bytes 7) 8)
-        shape-insns (arm64-const-insns (.alloc-shape p))
-        map-insns (arm64-const-insns (.alloc-map-id p))
+        shape-insns (arm64-allocation-shape-insns (.alloc-shape p))
+        map-insns 4
         fast-insns (+ (+ 16 shape-insns) words)
         slow-insns (+ (+ shape-insns map-insns) 2)
         (mut at) 0
@@ -498,7 +533,7 @@
     (set! (mut at) (+ (load at) 1))
     (enc-add4! encoder (| 0xf900040f (primitive/ishl 16 5)))  ; str x15,[x16,#8]
     (set! (mut at) (+ (load at) 1))
-    (arm64-encode-immediate-to-reg! encoder (.alloc-shape p) 15)
+    (arm64-encode-allocation-shape! encoder (.alloc-shape p) 15 17)
     (set! (mut at) (+ (load at) shape-insns))
     (enc-add4! encoder (| 0xf900080f (primitive/ishl 16 5)))  ; str x15,[x16,#16]
     (set! (mut at) (+ (load at) 1))
@@ -515,9 +550,9 @@
                 (continue))))
     (enc-add4! encoder (| 0x14000000 (+ slow-insns 1)))
     (set! (mut at) (+ (load at) 1))
-    (arm64-encode-immediate-to-reg! encoder (.alloc-shape p) 1)
+    (arm64-encode-allocation-shape! encoder (.alloc-shape p) 1 16)
     (set! (mut at) (+ (load at) shape-insns))
-    (arm64-encode-immediate-to-reg! encoder (.alloc-map-id p) 2)
+    (arm64-encode-map-token! encoder (.alloc-map-id p) 2)
     (set! (mut at) (+ (load at) map-insns))
     (enc-add4! encoder 0x910003e3)  ; add x3,sp,#0
     (set! (mut at) (+ (load at) 1))
@@ -567,7 +602,7 @@
                                   (arm64-encode-immediate-to-reg! encoder (.alloc-shape p) (load reg))
                                   (set! (mut reg) (+ (load reg) 1)))
                                 0)
-                            (arm64-encode-immediate-to-reg! encoder (.alloc-map-id p) (load reg))
+                            (arm64-encode-map-token! encoder (.alloc-map-id p) (load reg))
                             ;; add x<reg+1>,sp,#0
                             (enc-add4! encoder (| 0x910003e0 (+ (load reg) 1))))
                           0)

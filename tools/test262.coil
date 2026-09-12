@@ -18,6 +18,7 @@
 (import "aot.tools.test262-metadata" :use *)
 (import "aot.tools.test262-policy" :use *)
 (import "aot.tools.test262-worker" :use *)
+(import "aot.tools.test262-memory" :use [memory-close-worker! memory-now])
 (import "aot.util.panic" :use *)
 
 (const TEST262-REVISION "419d3e0a2273ba01a3bfcbec423f2801425b8e93")
@@ -27,8 +28,8 @@
 (extern mkdir :cc c [(ptr i8) i32] (-> i32))
 
 
-;; One test file of a campaign: every variant the metadata asks for, each compiled, linked and run
-;; as its own process. Appends one report row per variant, updates the verdict counts, and says
+;; One test file of a campaign: every variant the metadata asks for, each in its own realm, via
+;; the selected file or memory engine. Appends one report row per variant, updates counts, and says
 ;; whether the file passed. `file-index` names the artifacts (`case-<file>-<variant>`), so shards
 ;; running in parallel never collide.
 (defn t262-run-file! [(root (slice u8)) (compiler (slice u8)) (runtime (slice u8)) (directory (slice u8))
@@ -116,18 +117,20 @@
 ;; k-th eligible file, in suite order, and writes its rows and counts to `shard-k.tsv` /
 ;; `shard-k.counts`; the parent merges them into `results.tsv` and `summary.txt`. `AOT_T262_SAMPLE=N`
 ;; runs every N-th file only, for a quick campaign whose pass rate is over the sampled files; the
-;; summary records both settings. Each case is still one compile, one link and one run, so the
-;; per-case time — not the campaign's length — is the number to watch (docs/TEST262.md).
+;; summary records both settings. The memory engine uses a persistent native worker per shard;
+;; the file engine retains one external compile/link/run sequence per case (docs/TEST262.md).
 (defn t262-campaign [(root (slice u8)) (compiler (slice u8))
                      (runtime (slice u8)) (directory (slice u8))] (-> i64)
   (let [a (alloc/malloc-allocator)
         revision (t262-git root "rev-parse HEAD")
         dirty (t262-git root "status --porcelain --untracked-files=normal -- test harness")
-        compiler-hash (t262-file-hash compiler)
+        compiler-hash (if (= compiler ":memory:") (t262-file-hash runtime) (t262-file-hash compiler))
         runtime-hash (t262-file-hash runtime)
         cdir (t262-concat directory "\0")
         jobs (t262-env-int c"AOT_T262_JOBS" 8)
         sample (t262-env-int c"AOT_T262_SAMPLE" 1)
+        limit (t262-env-int c"AOT_T262_LIMIT" 0)
+        started (memory-now)
         (mut files) 0 (mut passed) 0 (mut variants) 0
         (mut counts) (al-new [i64] a)]
     (if (!= (str-trim revision) TEST262-REVISION) (panic "test262: unexpected suite revision") 0)
@@ -143,6 +146,8 @@
           (mut all) (str-split a listing "\0")
           (mut tests) (al-new [(slice u8)] a)]
       (for path (iter (load all)) (if (t262-test-path? path) (push! [(slice u8)] (mut tests) path) 0))
+      (if (> limit (len (load tests))) (panic "test262: limit exceeds suite file count") 0)
+      (if (and (> limit 0) (!= sample 1)) (panic "test262: choose limit or sample, not both") 0)
       ;; Workers.
       (let [(mut shard) 0 (mut pids) (al-new [i64] a)]
         (loop (if (>= (load shard) jobs)
@@ -157,7 +162,10 @@
                               (mut index) 0]
                           (for path (iter (load tests))
                             (do
-                              (if (= (% (load index) sample) 0)
+                              (if (if (> limit 0)
+                                      (< (/ (* (load index) limit) (len (load tests)))
+                                         (/ (* (+ (load index) 1) limit) (len (load tests))))
+                                      (= (% (load index) sample) 0))
                                   (do
                                     (if (= (% (load eligible) jobs) (load shard))
                                         (do
@@ -179,6 +187,7 @@
                                           (set! (mut v) (+ (load v) 1)) (continue)))))
                           (t262-write! (t262-shard-path directory (load shard) ".tsv") (sb-str (load report)))
                           (t262-write! (t262-shard-path directory (load shard) ".counts") (sb-str (load summary)))
+                          (memory-close-worker! false)
                           (os/_exit 0)
                           0)
                         (push! [i64] (mut pids) (primitive/cast i64 pid)))
@@ -229,6 +238,11 @@
           (sb-push-str! (mut summary) "\ncompiler-git-blob=") (sb-push-str! (mut summary) (str-trim compiler-hash))
           (sb-push-str! (mut summary) "\nruntime-git-blob=") (sb-push-str! (mut summary) (str-trim runtime-hash))
           (sb-push-str! (mut summary) "\njobs=") (sb-push-i64! (mut summary) jobs)
+          (sb-push-str! (mut summary) "\nengine=")
+          (sb-push-str! (mut summary) (if (= compiler ":memory:") "memory" "file"))
+          (sb-push-str! (mut summary) "\nlimit=") (sb-push-i64! (mut summary) limit)
+          (sb-push-str! (mut summary) "\nelapsed-ms=")
+          (sb-push-i64! (mut summary) (/ (- (memory-now) started) 1000000))
           (sb-push-str! (mut summary) "\nsample=") (sb-push-i64! (mut summary) sample)
           (sb-push-str! (mut summary) "\nfiles=") (sb-push-i64! (mut summary) (load files))
           (sb-push-str! (mut summary) "\npassed-files=") (sb-push-i64! (mut summary) (load passed))
@@ -246,6 +260,8 @@
           (t262-write! result-path (sb-str (load report)))
           (t262-write! summary-path (sb-str (load summary)))
           (print "{}" (sb-str (load summary)))
+          (println "engine={} limit={} elapsed-ms={}" (if (= compiler ":memory:") "memory" "file")
+                   limit (/ (- (memory-now) started) 1000000))
           (alloc/free [u8] a result-path) (alloc/free [u8] a summary-path) (sb-free! (mut summary)))
         (sb-free! (mut report))))
     (al-free! (mut counts))
@@ -386,8 +402,10 @@
 
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
   (args/args-set! argc argv)
-  (if (and (= (args/args-count) 3) (= (args/args-nth 1) "inventory"))
+  (if (and (= (args/args-count) 4) (= (args/args-nth 1) "run-memory"))
+      (t262-campaign (args/args-nth 2) ":memory:" (args/args-nth 0) (args/args-nth 3))
+      (if (and (= (args/args-count) 3) (= (args/args-nth 1) "inventory"))
       (t262-inventory (args/args-nth 2))
       (if (and (= (args/args-count) 6) (= (args/args-nth 1) "run"))
           (t262-campaign (args/args-nth 2) (args/args-nth 3) (args/args-nth 4) (args/args-nth 5))
-          (do (println "usage: test262 inventory ROOT | run ROOT COMPILER RUNTIME_OBJECT NEW_OUTPUT_DIR") 64))))
+          (do (println "usage: test262 inventory ROOT | run ROOT COMPILER RUNTIME_OBJECT NEW_OUTPUT_DIR | run-memory ROOT NEW_OUTPUT_DIR") 64)))))

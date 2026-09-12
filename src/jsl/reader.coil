@@ -18,13 +18,17 @@
 ;; Index loading is deliberately line-oriented: ordering is semantic, comments are trivia, and a
 ;; missing entry is fatal. The reader retains every file buffer because Sexp symbols slice it.
 (module aot.jsl.reader)
+(import "aot.util.arena" :use [compiler-allocator compiler-state CompilerStateSlot CompilerRegion compiler-region-clear!])
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
 (import "coil.reader" :as rd)
 (import "coil.fs" :as fs)
+(import "coil.mem" :as mem)
 (import "coil.slice" :use *)
 (import "aot.util.panic" :use *)
+
+(const JSL-COMPILER-INDEX "jsl/compiler/index")
 
 (defstruct JslUnit
   [(forms (ptr (ArrayList rd/Sexp)))
@@ -33,15 +37,34 @@
 
 (defstruct JslStore [(units (ArrayList JslUnit)) (booted bool)])
 
+;; One immutable library snapshot, owned independently of compilation scratch. No graph nodes,
+;; interned type/shape IDs, or whole-program assumptions cross this boundary. The exact index
+;; bytes and every indexed source are compared on reuse; paths and order are part of the key.
+;; Only the production library loader uses this cache; ad-hoc reader/checker clients stay local.
+(defstruct JslLibrary
+  [(units (ArrayList JslUnit)) (index (slice u8)) (path (slice u8))
+   (loaded bool) (checked bool) (building bool) (hits i64) (misses i64)])
+
+(defn jsl-library [] (-> (ptr JslLibrary))
+  (primitive/alloc-static JslLibrary))
+
+(defn jsl-library-region [] (-> (ptr CompilerRegion))
+  (primitive/alloc-static CompilerRegion))
+
+(defn jsl-reader-allocator [] (-> (dyn alloc/Allocator))
+  (if (.building (jsl-library))
+      (primitive/make-dyn alloc/Allocator (jsl-library-region))
+      (compiler-allocator)))
+
 (defn jsl-store [] (-> (ptr JslStore))
-  (primitive/alloc-static JslStore))
+  (compiler-state [JslStore] (primitive/alloc-static CompilerStateSlot)))
 
 (defn jsl-store-boot! [] (-> i64)
   (let [s (jsl-store)]
     (if (.booted s)
         0
         (do
-          (set! (.units s) (al-new [JslUnit] (alloc/malloc-allocator)))
+          (set! (.units s) (al-new [JslUnit] (compiler-allocator)))
           (set! (.booted s) true)
           0))))
 
@@ -65,7 +88,7 @@
 (defn jsl-read-source! [(source (slice u8)) (path (slice u8))] (-> i64)
   (do
     (jsl-store-boot!)
-    (match (rd/read-all (alloc/malloc-allocator) source 0)
+    (match (rd/read-all (jsl-reader-allocator) source 0)
       (Err [d]
            (let [diag d]
              (do (panic-i "jsl-read-source!: reader error at byte" (.lo diag)) 0)))
@@ -78,7 +101,7 @@
 
 (defn jsl-read-file [(path (slice u8))] (-> i64)
   (try (let [source
-               (try-or! (fs/read-file (alloc/malloc-allocator) path)
+               (try-or! (fs/read-file (jsl-reader-allocator) path)
                         (do (panic "jsl-read-file: cannot read file") 0))]
          (jsl-read-source! source path))))
 
@@ -213,9 +236,12 @@
 ;; below it.
 (defn jsl-load-index! [(path (slice u8))] (-> i64)
   (try (let [source
-               (try-or! (fs/read-file (alloc/malloc-allocator) path)
-                        (do (panic "jsl-load-index!: cannot read index") 0))
-             n (len source)
+               (try-or! (fs/read-file (jsl-reader-allocator) path)
+                        (do (panic "jsl-load-index!: cannot read index") 0))]
+         (jsl-load-index-source! source))))
+
+(defn jsl-load-index-source! [(source (slice u8))] (-> i64)
+  (let [n (len source)
              (mut lo) 0
              (mut loaded) 0]
          (loop (if (> (load lo) n)
@@ -245,4 +271,52 @@
                      (if (>= (load hi) n)
                          (break 0)
                          (do (set! (mut lo) (+ (load hi) 1)) (continue))))))
-         (load loaded))))
+         (load loaded)))
+
+;; The checker has no side effects on the forms: its result depends only on this entire table and
+;; this compiler's primitive/type-family rules. Its successful result is cached only for an exact
+;; table match. The executable itself fixes the checker version; this is not a disk cache.
+(defn jsl-load-library! [(path (slice u8))] (-> i64)
+  (let [cache (jsl-library) a (compiler-allocator)
+        index (try (try-or! (fs/read-file a path) (do (panic "jsl-load-library!: cannot read index") "")))
+        (mut same) (and (.loaded cache) (= (.path cache) path) (= (.index cache) index))]
+    (if (load same)
+        (al-for [item (.units cache)]
+          (let [unit item source (try (try-or! (fs/read-file a (.path unit))
+                                    (do (panic "jsl-load-library!: cannot read unit") "")))]
+            (if (!= source (.source unit)) (set! (mut same) false) 0)
+            (alloc/free [u8] a source)))
+        0)
+    (jsl-reset!)
+    (if (load same)
+        (do
+          (al-for [unit (.units cache)] (push! [JslUnit] (mut (.units (jsl-store))) unit))
+          (set! (.hits cache) (+ (.hits cache) 1)))
+        (do
+          (compiler-region-clear! (jsl-library-region))
+          (set! (.loaded cache) false)
+          (set! (.checked cache) false)
+          (set! (.building cache) true)
+          (let [owned (jsl-reader-allocator)]
+            (set! (.index cache) (jsl-library-copy index))
+            (set! (.path cache) (jsl-library-copy path))
+            (jsl-load-index-source! (.index cache))
+            (set! (.units cache) (al-new [JslUnit] owned))
+            (al-for [unit (.units (jsl-store))] (push! [JslUnit] (mut (.units cache)) unit)))
+          (set! (.building cache) false)
+          (set! (.loaded cache) true)
+          (set! (.misses cache) (+ (.misses cache) 1))))
+    (alloc/free [u8] a index)
+    (jsl-unit-count)))
+
+(defn jsl-library-clear! [] (-> i64)
+  (jsl-reset!)
+  (compiler-region-clear! (jsl-library-region))
+  (set! (jsl-library) (primitive/zeroed JslLibrary))
+  0)
+
+(defn jsl-library-copy [(bytes (slice u8))] (-> (slice u8))
+  (let [copy (match (alloc/alloc [u8] (jsl-reader-allocator) (len bytes))
+               (Some [s] s) (None [] (do (panic "jsl-library: allocation failed") "")))]
+    (mem/mem-copy [u8] (slice-data copy) (slice-data bytes) (len bytes))
+    copy))

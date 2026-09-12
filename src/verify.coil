@@ -24,6 +24,9 @@
 (import "aot.node.control" :use *)
 (import "aot.node.gc" :use *)
 (import "aot.type.type" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "aot.util.arena" :use [compiler-allocator compiler-state CompilerStateSlot])
 
 (const VERR-OK 0)
 
@@ -48,8 +51,85 @@
 (const VERR-UNREACHABLE-USE 10)  ; a live use in a block proven unreachable
 
 ;; Verify the whole graph. Returns VERR-OK or the first failing code.
+(defstruct VerifyEdgeStats [(visits i64)])
+
+(defn verify-edge-stats [] (-> (ptr VerifyEdgeStats))
+  (compiler-state [VerifyEdgeStats] (primitive/alloc-static CompilerStateSlot)))
+
+;; Census both directions of the edge multiset in O(nodes + edges). Bucket actual inputs by
+;; producer, then count their consumers and subtract that producer's output list. A successful
+;; bucket leaves all its counters zero, so no dense reset is needed between producers. Duplicate
+;; operands remain separate edges; output keeps are not edges. No hashes or packed node IDs.
+;; On corruption, verify-all uses the isolated checker below to preserve its error precedence.
+(defn verify-edges-linear? [] (-> bool)
+  (let [a (compiler-allocator) limit (arena-node-count)
+        (mut heads) (al-new [i64] a) (mut counts) (al-new [i64] a)
+        (mut users) (al-new [i64] a) (mut nexts) (al-new [i64] a)
+        (mut nid) 0 (mut valid) true (mut visits) 0]
+    (loop (if (> (load nid) limit) (break 0)
+              (do (push! [i64] (mut heads) -1) (push! [i64] (mut counts) 0)
+                  (set! (mut nid) (+ (load nid) 1)) (continue))))
+    (set! (mut nid) 1)
+    (loop (if (or (> (load nid) limit) (not (load valid))) (break 0)
+      (do
+        (match (arena-node (load nid))
+          (None [] 0)
+          (Some [use_]
+            (if (n-dead? use_) 0
+              (let [(mut i) 0]
+                (loop (if (or (>= (load i) (n-nins use_)) (not (load valid))) (break 0)
+                  (do
+                    (set! (mut visits) (+ (load visits) 1))
+                    (match (n-in use_ (load i))
+                      (None [] 0)
+                      (Some [def]
+                        (if (n-dead? def) (set! (mut valid) false)
+                          (let [id (n-nid def) edge (len (load users))]
+                            (push! [i64] (mut users) (load nid))
+                            (push! [i64] (mut nexts) (get (load heads) id))
+                            (set! (mut heads) id edge)))))
+                    (set! (mut i) (+ (load i) 1)) (continue))))))))
+        (set! (mut nid) (+ (load nid) 1)) (continue))))
+    (set! (mut nid) 1)
+    (loop (if (or (> (load nid) limit) (not (load valid))) (break 0)
+      (do
+        (match (arena-node (load nid))
+          (None [] 0)
+          (Some [def]
+            (if (n-dead? def) 0
+              (let [(mut edge) (get (load heads) (load nid)) (mut i) 0]
+                (loop (if (< (load edge) 0) (break 0)
+                  (let [use-id (get (load users) (load edge))]
+                    (set! (mut visits) (+ (load visits) 1))
+                    (set! (mut counts) use-id (+ (get (load counts) use-id) 1))
+                    (set! (mut edge) (get (load nexts) (load edge))) (continue))))
+                (loop (if (or (>= (load i) (n-nouts def)) (not (load valid))) (break 0)
+                  (do
+                    (set! (mut visits) (+ (load visits) 1))
+                    (match (n-out def (load i))
+                      (None [] 0)
+                      (Some [use_]
+                        (let [id (n-nid use_)]
+                          (if (= (get (load counts) id) 0)
+                              (set! (mut valid) false)
+                              (set! (mut counts) id (- (get (load counts) id) 1))))))
+                    (set! (mut i) (+ (load i) 1)) (continue))))
+                (set! (mut edge) (get (load heads) (load nid)))
+                (loop (if (or (< (load edge) 0) (not (load valid))) (break 0)
+                  (do
+                    (set! (mut visits) (+ (load visits) 1))
+                    (if (!= (get (load counts) (get (load users) (load edge))) 0)
+                        (set! (mut valid) false) 0)
+                    (set! (mut edge) (get (load nexts) (load edge))) (continue))))))))
+        (set! (mut nid) (+ (load nid) 1)) (continue))))
+    (set! (.visits (verify-edge-stats)) (load visits))
+    (al-free! (mut heads)) (al-free! (mut counts))
+    (al-free! (mut users)) (al-free! (mut nexts))
+    (load valid)))
+
 (defn verify-all [] (-> i64)
   (let [cnt (arena-node-count)
+        edges-valid (verify-edges-linear?)
         (mut i) 1
         (mut answer) VERR-OK]
     ;; Computing types during verification must not register dependencies or perturb worklists.
@@ -61,7 +141,8 @@
                   (Some [n]
                         (if (n-dead? n)
                             0
-                            (set! (mut answer) (verify-node n))))
+                            (set! (mut answer)
+                              (if edges-valid (verify-node-properties n) (verify-node n)))))
                   (None [] 0))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
@@ -104,7 +185,10 @@
                 (continue))))
     (if (!= (load answer) VERR-OK)
         (load answer)
-        (if (= (n-op n) OP-SAFEPOINT)
+        (verify-node-properties n))))
+
+(defn verify-node-properties [(n (dyn NodeOps))] (-> i64)
+  (if (= (n-op n) OP-SAFEPOINT)
             (verify--safepoint n)
             (if (or (= (n-op n) OP-PHI) (= (n-op n) OP-MEMPHI) (= (n-op n) OP-PARM))
             (match (n-in n 0)
@@ -113,7 +197,7 @@
                         (verify--type-and-gvn n)
                         VERR-PHI-ARITY))
               (None [] VERR-PHI-ARITY))
-              (verify--type-and-gvn n))))))
+              (verify--type-and-gvn n))))
 
 (defn verify--safepoint-projection? [(sp (dyn NodeOps)) (slot i64)] (-> bool)
   (let [(mut i) 0 (mut found) false]

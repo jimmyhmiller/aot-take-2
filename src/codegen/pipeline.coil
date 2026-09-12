@@ -6,6 +6,7 @@
 ;; single-unit frontend does not yet persist serialized IR; that format remains the compilation-unit
 ;; boundary, while every semantic and machine phase required to execute this unit runs here.
 (module aot.codegen.pipeline)
+(import "aot.util.arena" :use [compiler-allocator compiler-state CompilerStateSlot])
 (import "aot.print.text" :use *)
 (import "aot.print.dot" :use *)
 (import "coil.primitive" :as primitive)
@@ -18,6 +19,16 @@
 (import "aot.node.imagefacts" :use *)
 (import "aot.node.control" :use *)
 (import "aot.node.call" :use *)
+(import "aot.node.constant" :use [con-make con-int external-make])
+(import "aot.node.memory" :use [ALIAS-BULK load-make])
+(import "aot.shape" :use [ALIAS-EXCEPTION-VALUE])
+(import "aot.node.dynamic" :use [typetest-make box-make])
+(import "aot.node.phi" :use [phi-make phi-add-value!])
+(import "aot.node.gc" :use [heapstate-make])
+(import "aot.node.jsops" :use [jsop-make jsop-add-arg! JS-UNCAUGHT])
+(import "aot.rt.abi" :use [RT-HEAP-OFFSET-EXCEPTION-VALUE])
+(import "aot.type.type" :use *)
+(import "aot.codegen.callabi" :use [callabi-signature callabi-script-sequence!])
 (import "aot.codegen.codegen" :use *)
 (import "aot.codegen.machine" :use *)
 (import "aot.codegen.iterpeeps" :use *)
@@ -31,6 +42,12 @@
 (import "aot.codegen.regalloc" :use *)
 (import "aot.codegen.encoding" :use *)
 (import "aot.codegen.objfile" :use *)
+(import "aot.codegen.image" :use [CodeImage image-capture image-add-script! image-bind-script-initializer!
+                                 ImageBinding image-abi-script-entry?
+                                 image-add-realm-object! IMAGE-REALM-GLOBAL IMAGE-REALM-INTRINSIC IMAGE-REALM-OWNED-PROTOTYPE])
+(import "aot.codegen.compunit" :use [CuScriptCallableRoot])
+(import "aot.heap" :use [heap-entry-offset heap-global-entry heap-intrinsic-count
+                         heap-intrinsic-entry-at heap-intrinsic-name-at])
 (import "aot.node.cpus.arm64" :use *)
 (import "aot.jsl.lower" :use *)
 (import "aot.parse.parser" :use *)
@@ -45,9 +62,50 @@
 ;; times (two rounds in practice; docs/COMPILE-TIME.md).
 (const PIPELINE-FACTS-ROUNDS 3)
 
+;; Capture only after encoding has fixed the static-image layout. Source-local function ordinals
+;; bind to payload offsets in the owned image; no SyntaxFun or heap-entry identity escapes.
+(defn pipeline-capture-script-image [] (-> CodeImage)
+  (let [(mut image) (image-capture) p (parser-state) (mut script) 0
+        (mut offsets) (al-new [i64] (compiler-allocator))]
+    (if (= (len (.scripts p)) 0) (panic "pipeline-capture-script-image: no Script compilation") 0)
+    (image-add-realm-object! (mut image) IMAGE-REALM-GLOBAL "" (heap-entry-offset (heap-global-entry)) false)
+    (let [(mut intrinsic) 0]
+      (loop (if (>= (load intrinsic) (heap-intrinsic-count)) (break 0)
+                (do (image-add-realm-object! (mut image) IMAGE-REALM-INTRINSIC
+                                             (heap-intrinsic-name-at (load intrinsic))
+                                             (heap-entry-offset (heap-intrinsic-entry-at (load intrinsic))) false)
+                    (set! (mut intrinsic) (+ (load intrinsic) 1)) (continue))))
+      (set! (mut intrinsic) 0)
+      (loop (if (>= (load intrinsic) (len (.funs p))) (break 0)
+                (do (if (syntax-intrinsic-fun? (load intrinsic))
+                        (let [f (syntax-fun-at (load intrinsic))
+                              table (intrinsic-table) entry (get table (intrinsic-index table (.name f)))]
+                          (image-add-realm-object! (mut image) IMAGE-REALM-INTRINSIC (.name f)
+                                                   (heap-entry-offset (.static-entry f)) true)
+                          (if (intrinsic-method? entry)
+                              (image-add-realm-object! (mut image) IMAGE-REALM-OWNED-PROTOTYPE (.name f)
+                                (heap-entry-offset (realm-image-prototype-of (.static-entry f))) false) 0)) 0)
+                    (set! (mut intrinsic) (+ (load intrinsic) 1)) (continue)))))
+    (loop (if (>= (load script) (len (.scripts p))) (break 0)
+              (do
+                (al-clear! (mut offsets))
+                (al-for [fun (get (.script-functions p) (load script))]
+                  (let [f (syntax-fun-at fun)]
+                    (if (< (.static-entry f) 0)
+                        (panic "pipeline-capture-script-image: declaration has no static function object") 0)
+                    (push! [i64] (mut offsets) (heap-entry-offset (.static-entry f)))))
+                (image-add-script! (mut image) (syntax-fun-strict (get (.scripts p) (load script)))
+                                   (get (.script-declarations p) (load script)) (load offsets))
+                (if (.script-unit p)
+                    (image-bind-script-initializer! (mut image) (load script)
+                                                     (parser-callable-name (get (.scripts p) (load script)))) 0)
+                (set! (mut script) (+ (load script) 1)) (continue))))
+    (al-free! (mut offsets))
+    (load image)))
+
 (defn pipeline-opto-under-facts! [(stop (dyn NodeOps))] (-> i64)
   (do
-    (imagefacts-compute!)
+    (imagefacts-compute-with-boundary! (.external-mutation (parser-state)))
     (parser-prepare-opto! stop)
     (opto-run!)
     (let [(mut round) 1]
@@ -55,7 +113,7 @@
                 (break 0)
                 (let [before (facts-signature)]
                   (facts-reopen!)
-                  (imagefacts-compute!)
+                  (imagefacts-compute-with-boundary! (.external-mutation (parser-state)))
                   (if (= (facts-signature) before)
                       (break 0)
                       (do
@@ -73,7 +131,7 @@
 
 (defn pipeline-compile-macho-mode! [(source (slice u8)) (object-path (slice u8)) (seed i64)
                                     (script-mode bool)] (-> i64)
-  (let [(mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))]
+  (let [(mut sources) (al-new [(slice u8)] (compiler-allocator))]
     (push! [(slice u8)] (mut sources) source)
     (let [answer (pipeline-compile-macho-sources! (load sources) object-path seed script-mode)]
       (al-free! [(slice u8)] (mut sources))
@@ -107,13 +165,59 @@
                 (continue))))
     (code-set-stats! rounds (load nodes) (load blocks) (load saves) (load casts))))
 
-(defn pipeline-compile-macho-sources! [(sources (ArrayList (slice u8))) (object-path (slice u8))
-                                       (seed i64) (script-mode bool)] (-> i64)
+(defn pipeline-encode-sources! [(sources (ArrayList (slice u8)))
+                                (seed i64) (script-mode bool)] (-> i64)
+  (let [(mut roots) (al-new [CuScriptCallableRoot] (compiler-allocator))]
+    (pipeline-encode-sources-with-roots! sources seed script-mode (load roots))
+    (al-free! (mut roots))
+    0))
+
+(defn pipeline-encode-sources-with-roots! [(sources (ArrayList (slice u8)))
+                                         (seed i64) (script-mode bool)
+                                         (roots (ArrayList CuScriptCallableRoot))] (-> i64)
+  (pipeline-encode-sources-config! sources seed script-mode roots (> (len roots) 0) false))
+
+;; A unit may consist entirely of top-level setup and function-valued properties. Its external
+;; boundary therefore cannot depend on a nonempty list of named declaration roots.
+(defn pipeline-encode-script-unit! [(sources (ArrayList (slice u8))) (seed i64)] (-> i64)
+  (let [(mut roots) (al-new [CuScriptCallableRoot] (compiler-allocator))]
+    (pipeline-encode-sources-config! sources seed true (load roots) true true)
+    (al-free! (mut roots))
+    0))
+
+(defn pipeline-encode-shared-jsl-script! [(sources (ArrayList (slice u8))) (seed i64)] (-> i64)
+  (let [(mut roots) (al-new [CuScriptCallableRoot] (compiler-allocator))]
+    (pipeline-encode-sources-jsl-config! sources seed true (load roots) true true JSL-LINK-IMPORT)
+    (al-free! (mut roots)) 0))
+
+;; Compile an empty retained Script realm plus exported JSL boundaries with unknown callers.
+;; Its initializer is never executed. Image installation binds its realm references alongside
+;; the consuming Scripts, so no test's global objects or closed-world facts enter this artifact.
+(defn pipeline-shared-jsl-image [(seed i64)] (-> CodeImage)
+  (let [(mut sources) (al-new [(slice u8)] (compiler-allocator))
+        (mut roots) (al-new [CuScriptCallableRoot] (compiler-allocator))]
+    (push! [(slice u8)] (mut sources) "")
+    (pipeline-encode-sources-jsl-config! (load sources) seed true (load roots) true true JSL-LINK-PROVIDER)
+    (let [image (pipeline-capture-script-image)]
+      (al-free! (mut sources)) (al-free! (mut roots)) image)))
+
+(defn pipeline-encode-sources-config! [(sources (ArrayList (slice u8))) (seed i64) (script-mode bool)
+                                      (roots (ArrayList CuScriptCallableRoot))
+                                      (external-mutation bool) (script-unit bool)] (-> i64)
+  (pipeline-encode-sources-jsl-config! sources seed script-mode roots external-mutation script-unit JSL-LINK-LOCAL))
+
+(defn pipeline-encode-sources-jsl-config! [(sources (ArrayList (slice u8))) (seed i64) (script-mode bool)
+                                          (roots (ArrayList CuScriptCallableRoot))
+                                          (external-mutation bool) (script-unit bool) (jsl-mode i64)] (-> i64)
   (do
     (boot! seed)
     (code-reset! seed)
+    (jsl-set-link-mode! jsl-mode)
     (code-enter-phase! PHASE-PARSE)
-    (let [stop (parse-program-sources sources script-mode)]
+    (let [stop (parse-program-sources-config sources script-mode external-mutation script-unit)]
+      (if (= jsl-mode JSL-LINK-PROVIDER) (jsl-root-provider! (parser-entry-start)) 0)
+      (al-for [root roots]
+        (let [r root] (parser-add-callable-root! (.script r) (.ordinal r))))
       (let [start (parser-entry-start)]
         (n-keep! start)
         (code-enter-phase! PHASE-ITER)
@@ -152,6 +256,13 @@
         (jsl-prepare-codegen! start)
         (call-unlink-all!)
         (n-unkeep! start)
+        (pipeline-encode-machine! stop)))))
+
+;; The source frontend and generated Script hosts share the backend phase order from final
+;; Simple's CodeGen.driver: selection, global/local scheduling, allocation, encoding, export.
+;; Precise GC maps use final instruction offsets between layout and emission.
+(defn pipeline-encode-machine! [(stop (dyn NodeOps))] (-> i64)
+  (do
         (code-enter-phase! PHASE-SELECT)
         (let [selected-stop (arm64-select-graph stop)
               selected-start (pipeline-find-selected-start selected-stop)]
@@ -171,9 +282,65 @@
           (enc-emit!)
           (enc-relocate!)
           (code-enter-phase! PHASE-EXPORT)
-          (let [answer (macho-write object-path)]
-            (code-time-finish!)
-            answer))))))
+          0)))
+
+;; Compile an ordered host against retained initializer bindings, without parsing source or
+;; revisiting provider graphs. Bindings remain caller-owned through installation; image capture
+;; owns the host's symbol names and bytes. The platform entry reports an uncaught completion by
+;; the same runtime path as a source program. This entry returns status zero on normal completion.
+(defn pipeline-script-sequence-image [(bindings (ArrayList ImageBinding)) (seed i64)] (-> CodeImage)
+  (al-for [binding bindings]
+    (let [b binding]
+      (if (or (= (len (.name b)) 0) (not (image-abi-script-entry? (.abi b))))
+          (panic "pipeline-script-sequence-image: expected named Script initializer binding") 0)))
+  (boot! seed) (code-reset! seed)
+  (code-enter-phase! PHASE-PARSE)
+  (let [start (start-make (ty-int-bot)) stop (stop-make)
+        main (fun-make start (ty-tuple-of2 (ty-dyn TAG-COMPLETION) (ty-int-bot)) "main")
+        memory (con-make (ty-mem ALIAS-BULK TY-BOT))
+        (mut targets) (al-new [(dyn NodeOps)] (compiler-allocator))
+        (mut index) 1]
+    (al-for [binding bindings]
+      (let [b binding]
+        (push! [(dyn NodeOps)] (mut targets)
+          (external-make (arena-declare-external! (load index) (.name b) (callabi-signature))))
+        (set! (mut index) (+ (load index) 1))))
+    (let [sequence (callabi-script-sequence! main memory (load targets))
+          arms (if-arms! (if-make (.control sequence) (typetest-make (.completion sequence) TAG-EXCEPTION)))
+          thrown (load-make (arms-true arms) (.memory sequence) (heapstate-make)
+                           (con-int RT-HEAP-OFFSET-EXCEPTION-VALUE) ALIAS-EXCEPTION-VALUE (ty-dyn TAG-ANY))
+          report (jsop-make (arms-true arms) (.memory sequence) JS-UNCAUGHT)
+          exit (region-make)
+          exit-memory (phi-make exit (ty-mem ALIAS-BULK TY-BOT) "host.memory")
+          status (phi-make exit (ty-dyn TAG-INT) "host.status")]
+      (jsop-add-arg! report thrown)
+      (region-add-path! exit (arms-true arms))
+      (phi-add-value! exit-memory (proj-make report 1 "host.uncaught.memory"))
+      (phi-add-value! status (box-make (con-int 3)))
+      (region-add-path! exit (arms-false arms))
+      (phi-add-value! exit-memory (.memory sequence))
+      (phi-add-value! status (box-make (con-int 0)))
+    (let [ret (return-make exit (Some exit-memory) status
+                           (None [(dyn NodeOps)]) (Some main))]
+      (fun-set-ret! main ret) (stop-add-return! stop ret)
+      (n-keep! start)
+      (code-enter-phase! PHASE-ITER) (iter-seed-connected! stop) (iter-run!)
+      (code-enter-phase! PHASE-OPTO) (opto-run!)
+      (code-enter-phase! PHASE-TYPECHECK) (typecheck-run! stop)
+      (code-enter-phase! PHASE-LOOPTREE) (looptree-build! start stop)
+      (code-enter-phase! PHASE-SERIALIZE) (gc-lower-barriers-from! stop)
+      (code-enter-phase! PHASE-UNLINK) (fun-prepare-codegen! main start) (call-unlink-all!)
+      (n-unkeep! start)
+      (pipeline-encode-machine! stop)
+      (al-free! (mut targets))
+      (image-capture)))))
+
+(defn pipeline-compile-macho-sources! [(sources (ArrayList (slice u8))) (object-path (slice u8))
+                                       (seed i64) (script-mode bool)] (-> i64)
+  (pipeline-encode-sources! sources seed script-mode)
+  (let [answer (macho-write object-path)]
+    (code-time-finish!)
+    answer))
 
 ;; The phases `aot dump` can stop after. Selection and later phases dump the selected graph.
 (defn pipeline-dump-phase-known? [(phase (slice u8))] (-> bool)
@@ -188,7 +355,7 @@
 ;; early; an unknown phase name is a hard error listing the known ones.
 (defn pipeline-dump-mode! [(source (slice u8)) (phase (slice u8)) (seed i64) (script-mode bool) (dot bool)]
   (-> (slice u8))
-  (let [(mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))]
+  (let [(mut sources) (al-new [(slice u8)] (compiler-allocator))]
     (push! [(slice u8)] (mut sources) source)
     (let [answer (pipeline-dump-sources! (load sources) phase seed script-mode dot)]
       (al-free! [(slice u8)] (mut sources))
@@ -273,7 +440,7 @@
                                   (object-path (slice u8))
                                   (executable-path (slice u8))
                                   (seed i64) (script-mode bool)] (-> i64)
-  (let [(mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))]
+  (let [(mut sources) (al-new [(slice u8)] (compiler-allocator))]
     (push! [(slice u8)] (mut sources) source)
     (let [answer (pipeline-compile-link-run-sources! (load sources) object-path executable-path seed script-mode)]
       (al-free! [(slice u8)] (mut sources))

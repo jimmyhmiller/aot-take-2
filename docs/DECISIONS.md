@@ -1,5 +1,1013 @@
 # Decisions
 
+## 2026-09-10 — Precise memory updates, lexical identities and guarded graph inlining
+
+Property writes follow final Simple Parser.storeMem/mergeAlias: a fresh MemMerge keeps the
+whole prior memory as its default and overrides only the written alias. The MemMerge peephole
+removes redundant overrides, returns the default if possible, then flattens nested defaults with
+outer overrides winning. No field enumeration is needed merely to preserve unrelated memory.
+
+Script instantiation checks remain before all binding creation. Their generic throwing logic is
+a shared JSL builtin. Creation returns a stable positive lexical slot stored under a compiler-only
+Scope name. Own-Script initialization and reads can reuse that identity; reads still observe
+mutable contents, TDZ and const rules. Functions and unresolved/imported references do not capture
+another Script's initializer SSA value or cache an absent/object-record binding identity.
+
+JSL `:inline-when [predicates...]` uses the same proof vocabulary as `:specialize`, but authorizes
+the ordinary graph-copy inliner rather than checked-source re-expansion. These options are mutually
+exclusive. Unknown arguments retain a shared helper even when unrelated operands are constant.
+Proven local calls remain subject to normal size and recursion guards. Imported providers have no
+local graph to copy and remain ABI calls. This is not a cross-unit effects-summary system.
+
+Late source re-expansion of the callable adapter was rejected: fresh internal calls after type
+refinement broke existing return/control relationships. No type assertion suppression or
+old-result cast workaround is part of the solution.
+
+## 2026-09-10 — Backend live sets and physical layout ownership
+
+Final Simple IFG removes a definition from its temporary live map before scanning live ranges.
+Our dense live map now has sparse-set membership with swap removal, so killed and reactivated
+ranges do not accumulate dead or duplicate iteration keys. Liveness propagation, moving-GC root
+constraints, singleton exclusions and failed-range splitting retain their existing semantics.
+
+Final Simple Encoding splices UJmp into CFG/RPO. Our encoder already keeps a separate physical
+layout without rewiring target predecessors, so both jump endpoints are layout metadata. A jump
+is allocated directly, without a dummy ideal XCTRL constructor. Neither operation changes logical
+dominance. Selected If data inputs likewise do not change dominance; the target distinguishes
+merges from branches despite their shared machine opcode. Real predecessor edits still invalidate
+the caches. Diagnostic phase labels separate owner-cache population, offsets, relaxation, veneers,
+stack maps and byte emission without adding clocks to the production encoder.
+
+## 2026-09-10 — Fixed-key literals allocate their final backing once
+
+The frontend plans the final ordered shape of an object literal containing fixed data keys.
+Duplicate keys retain their first slot; their expressions and writes still occur every time.
+The special prototype entry is excluded from that data layout. Unsupported computed keys,
+methods/accessors and spreads still refuse rather than entering this path approximately.
+
+`JsNewObjectLiteralRaw` uses the checked `%NewObjectWithShape` allocation primitive. Its layout
+operand must be a valid compile-time object-property shape, consumed during lowering. Runtime
+shape identities remain the responsibility of New and image remapping, never an embedded local
+integer. The ordinary object and its one final backing are fresh; every slot is initialized to
+boxed undefined before any source property expression can call, allocate or throw.
+
+Pre-created keys are unobservable because the literal object has not escaped. Property values,
+prototype changes, and definitions retain their existing left-to-right JSL sequence. If a call
+loses the static backing proof, generic stores remain correct and see the already-final layout.
+Dynamic property additions outside this construction path retain ordinary shape growth.
+
+Final Simple's `Parser.makeAllocator` likewise knows the complete struct, allocates it once and
+initializes through private memory before publication. JavaScript requires the additional
+unpublished-literal restriction and GC-safe initialization across arbitrary RHS effects.
+
+Tests count backing allocations before optimization, so manufacturing a large graph and deleting
+it later cannot satisfy the regression. Executable tests cover duplicate-key ordering, prototype
+behavior, fresh identity, abrupt completion and forced moving GC across property values.
+
+## 2026-09-10 — Runtime clobbers, GC homes, constant tails, and late CFG caches
+
+Runtime allocation and JsOp calls use AAPCS64 caller-save masks. Explicit Safepoint nodes
+emit no instruction and clobber no scalar registers. JavaScript calls retain their existing
+all-volatile ABI; this change does not introduce per-JavaScript-function callee saves.
+The allocator constrains live raw references and reference-capable boxed ranges to writable
+stack homes at GC boundaries, independent of the hardware clobber mask. Simple subtracts
+call clobbers from live ranges; moving GC requires this additional constraint here.
+
+Optional Split coalescing requires equal GC kinds. A merge of a scalar range into a root
+range after interference construction would create root requirements at earlier scalar
+safepoints without establishing stack homes there. We retain that copy. Mandatory Phi
+and two-address unions still establish their joined kind before interference construction.
+Post-color cleanup follows the same kind rule and cannot bypass a root's spill/reload across
+a GC boundary just because the physical register survives. Calls impose root constraints at
+the Call instruction, where the return-PC stack map belongs, even though CallEnd carries
+their hardware clobber mask. Stack-map construction and allocation share one GC-site predicate.
+
+The callable packer emits a static SHAPE-ELEMENTS payload when all overflow actuals have
+exact boxed image encodings. It preserves existing static-reference identities and uses
+ordinary heap-image relocation for their words. Dynamic tails retain allocation and stores.
+The payload is compiler-owned, immutable, and inaccessible as a JavaScript object. It has
+the managed ArgumentVector type, with no JavaScript boxing representation. Ordinary object
+literal evaluation still creates fresh objects. Image encoding canonicalizes floating NaNs
+and preserves negative zero. The ABI layout and actual count remain unchanged.
+
+Phase entry retains dominator and owner caches on transitions to local scheduling, register
+allocation, and encoding. These phases operate on the completed CFG and use the edge-edit
+API for structural edits; that API invalidates cached answers. Earlier phase boundaries still
+invalidate after bulk construction. Rebuilding dominance merely because the phase changed
+had charged about 87 ms to Temporal's allocator setup without any CFG change.
+
+## 2026-09-10 — Direct actuals, shared callable dispatch, and Script const reads
+
+Callable ABI version 2 passes three boxed actuals after the five metadata arguments
+(callee, receiver, new target, actual count, overflow vector). These eight words fit
+the AArch64 integer argument registers. Callers pad missing direct slots with undefined
+and preserve the actual count. Calls with at most three actuals allocate no argument
+vector. Larger calls allocate only the tail, starting at actual index three. Callees
+guard overflow loads with the actual count. Image ABI version 5 rejects older artifacts.
+Direct boxed arguments and overflow vectors retain the collector's root and safepoint
+rules; allocation stress tests exercise both paths across callable boundaries.
+
+Simple maps Call arguments to Parm inputs without a per-call heap container. We use
+that model for the direct slots while retaining JavaScript's variable arity and missing
+argument semantics. The nullable managed vector type admits a typed nil singleton.
+Its referent describes the family; the singleton still denotes only the zero pointer.
+
+Unknown JavaScript calls use the shared, proof-gated JSL body JsInvokeCallable. JSL checks
+callability and constructs TypeError. The caller evaluates lookup and arguments in source
+order, then checks one completion. The checked %CallFunctionPacked primitive accepts
+an argument-count and argument-vector plus three boxed actuals, and forwards this ABI
+without allocating a second vector. Frontend-proven function values use ordinary Call
+nodes, retaining interprocedural optimization. The later guarded graph-copy policy above permits
+local inlining only with function proof. We do not enable late source specialization
+for this helper: replacing a narrowed call with newly lowered indirect calls exposed a
+type-monotonicity failure. The project pad records that unresolved invalidation problem.
+
+After publishing a root Script const into its realm cell, the frontend also records its
+initialized SSA value in the current Scope. Dominated reads in that Script reuse the value.
+Other functions and later Scripts still read the realm cell. Reads before initialization
+retain TDZ checks. Mutable bindings retain memory-dependent reads. A write to the SSA
+mirror evaluates its RHS before throwing TypeError; it must not invoke Scope's compile-time
+final-variable rejection. Holding an object in const does not make its fields immutable.
+
+## 2026-09-10 — Property evidence, expansion ownership, and shared JSL providers
+
+Named assignments now call `JsDefineOwnNamed`, alongside the retained `JsGetNamed` read
+boundary. JSL owns both bodies. Their specialization predicates require an own data
+descriptor, an own writable data descriptor, or a string/array length read. A broad receiver
+tag no longer suffices for these operations. The predicates consult the same memory/shape
+and image facts as PropAccess; they allocate no speculative graph and grant no assumptions.
+The source lowerer still proves the resulting accesses. Unknown cases keep their calls.
+
+The checker accepts property predicates over declared dynamic receiver and integer-key
+parameters. Existing tag predicates remain available for operations where a tag proves useful
+simplification. This policy does not introduce a shared specialized-body cache: callers share
+the generic provider, and proven small residual operations are lowered at their own sites.
+
+`source-cache-new-shared` owns a compiled provider for JSL definitions marked `:noinline` or
+`:specialize`, plus their private dependencies. It compiles those exports with unknown callers,
+external-mutation image facts, and the unit's canonical Start. It registers exported function
+identities even without local FunPtr uses. Returns follow the existing temporary-keep and
+post-optimization Stop-root protocol. Other JSL definitions retain ordinary graph optimization.
+
+Clients import the explicit boundaries instead of rebuilding their generic graphs. Source
+specialization can replace an imported call using checked JSL source and caller evidence;
+the caller never imports a provider's graph nodes or inferred caller-specific facts. Imported
+calls conservatively clobber public memory and use checked declared completion types. JSL
+`dyn-object-like` expresses an internal boxed-object precondition; calls must establish it.
+`never` declares no normal result, so `:throws true :ret never` returns only the exception
+sentinel. Result lowering uses the checker's tag set rather than unioning the stored bits of
+a complemented ideal type. This distinction matters for the empty normal-result type.
+
+The provider materializes every admitted intrinsic constructor/namespace and its parent, even
+though its initializer Script is empty. A generic body must not fold `%IntrinsicPrototype` to
+null merely because this empty Script did not mention the constructor. Method fields requested
+by later clients merge into those canonical identities at realm assembly. Tests exercise a
+provider built before a later client introduces string, number, and boolean `valueOf` calls.
+
+The process-local provider key contains the exact JSL snapshot and worklist seed. The running
+executable fixes compiler, runtime, target, and ABI/layout versions. Source and provider snapshots
+must match, including after compilation. Leased Script artifacts own their provider snapshot;
+installed clients pin its installation. SourceProgram binds only the imports a client requests,
+includes the provider in fresh-realm assembly, and uninstalls clients before the provider.
+On a miss, the cache compiles and captures the client before acquiring its provider. An
+unsupported client therefore does not trigger a wasted provider build after worker replacement.
+The cache retains at most capacity+1 provider snapshots, with a spare slot for replacing a
+Script victim. It evicts only snapshots with no artifact users or installations. It does not
+persist addresses, heap state, or native artifacts across executable versions. Self-contained
+image clients keep `source-cache-new`; the memory runner and test262 worker use the shared API.
+
+Construction origins are diagnostic node metadata, excluded from GVN and semantic types.
+They identify generic JSL bodies, macro expansion instances, source specializations, and inline
+clones, with parent identities and source ranges. Frontend expressions have their own origins
+so call/constructor scaffolding does not disappear into the unowned bucket. Nested origins own disjoint node sets.
+Peepholes, property expansion, selection, and spill copies carry the origin forward. A GVN
+survivor keeps its construction owner, so the counts describe ownership rather than all
+semantic dependencies. `compile-study` reports allocated and connected nodes and surviving
+branches per origin at each snapshot, including origin zero for unowned compiler work. It
+counts in one arena pass and one connected-graph pass per snapshot, not one scan per expansion.
+
+The provider tests exposed a separate graph-copy bug: both body-selection walks followed
+input zero of any call target. Only FunPtr has a callee edge there; Extern has no inputs and
+indirect targets may have unrelated inputs. Both walks now restrict that step to FunPtr.
+
+Retaining writes also requires preserving receiver/key correlation in image facts. Merging
+the two formal parameter sets independently would turn writes to `f.a` and `g.c` into writes
+to `f.c` and `g.a` too. The pass indexes known linked and finite unlinked callers once, then
+substitutes paired forwarded formals through the same call. Seen operand pairs terminate
+recursive forwarding; cached terminal pairs read the evolving points-to sets during the
+fixpoint. Unknown callers and non-forwarding dataflow keep the conservative transfer. This
+analysis follows IR writes, not builtin names, and preserves the existing exact-pair tests.
+
+Regressions cover retained write growth, rejected broad-tag specialization, precise exported
+contracts, nested origin ownership, fresh realms with getters/setters and forced GC, provider
+reuse across different sources, exact snapshot invalidation, and bounded provider eviction.
+
+## 2026-09-10 — Retain named reads and specialize JSL source on proven tags
+
+Named member reads, member-call lookup and constructor prototype lookup emit an ordinary
+Call/CallEnd to `JsGetNamed`. Its checked JSL body owns receiver classification, property
+lookup and abrupt completion. The caller retains the ordinary memory/result/control tuple
+and sentinel completion check. Unknown receivers do not expand the generic body per site.
+
+JSL builtins may declare `:specialize [(%IsObjectLike object) (%IsString object)]`.
+Each entry is an alternative tag predicate over a declared `dyn` parameter. The annotation
+permits expansion; it supplies no type assumption. An actual argument must have a non-high
+inferred type contained in a listed tag set. Unknown arguments defer with dependencies.
+Macros and `:noinline` declarations cannot use this option. Ordinary builtins keep their
+existing inlining policy; annotated definitions use source specialization instead of cloning.
+
+Final Simple's CallEnd worklist admits one inline before another cleanup. The same worklist
+invokes a frontend callback for source specialization, including a non-mutating candidate
+query for fixpoint checks. JSL lowers the original checked body with actual arguments, so
+constant conditions discard branches before graph construction. It forwards the complete
+state tuple and unlinks the old call through the existing paired-edge protocol. Cleanup
+queues the newly constructed residual body, not the entire arena. Direct self-recursion
+defers as in the ordinary inliner. No builtin-specific opcode or backend dispatch is added.
+
+The generic body and its dependencies exist before specialization. Known types can specialize
+in the initial pessimistic solve; later facts and caller inlining can expose more candidates.
+This preserves literal-property folding without forcing a large generic clone. Remaining
+calls share one emitted helper definition within the compilation unit. A process-wide,
+independently compiled helper cache is not part of this change.
+
+## 2026-09-10 — Propagate mandatory register locations across interference edges
+
+Simple's IFG denies a fixed definition/use register to simultaneously live values. Aggregate
+constraints can also force a multi-definition range into one location, such as a Phi feeding
+an X0 Return. After constructing interference, propagate singleton range masks to neighbors.
+A queue visits a range when it becomes singleton and subtracts its mandatory location from
+adjacent masks. Empty masks enter the existing split protocol. This prevents a flexible
+neighbor from taking a mandatory location during reverse coloring. It does not add registers,
+relax interference, change the ABI or increase the allocation-round limit.
+
+The named-read change exposed this case in the array execution regression. Tests cover
+transitive propagation, fixed stack locations, repeat calls and incompatible singletons.
+
+## 2026-09-10 — Sparse named-write facts and grouped loop layout
+
+Named writes in image facts use key sets per object. They occupy space for observed
+pairs, with linear object/key tables for the existing escape and unknown-owner rules.
+The distinct-pair count replaces scanning the object/key matrix in the convergence
+signature. Reset and rescan release the previous tables. Duplicate writes, runtime
+keys, escaped owners and keys interned after analysis retain their prior meaning.
+Simple has no prepopulated JavaScript image, so this representation is a local choice.
+
+Final Simple's Encoding._rpo_cfg builds private loop RPO lists and splices them into
+parents. Our layout retains its existing preferred-RPO projection but groups blocks
+once by loop owner. A child reference occupies the position of its first descendant.
+Each parent chain registers once; an iterative traversal expands child references.
+This takes expected O(blocks + containers) work and storage, avoiding both per-loop
+whole-program scans and repeated nested-list copying. Missing roots, orphan blocks
+and cyclic parent chains remain hard errors.
+
+Regressions cover a sparse 65,536-by-65,536 fact domain and 512 nested or sibling
+containers, including deepest-first discovery, exact order and bounded visit counts.
+
+## 2026-09-10 — Copy selected bodies and store sparse GC liveness words
+
+Final Simple copies function bodies through a node map and repairs links by walking
+the copied entries. Our body-clone path now consumes the selector's touched IDs and
+uses a body-sized hash map. Shell creation, ordered-edge wiring, metadata repair,
+function-pointer identity replacement and call relinking visit selected nodes.
+The selector's backward-closure seed scan visits admitted candidates rather than
+the arena. Reusable membership tables grow with the arena and clear touched slots;
+they do not refill the arena for each clone. The bitmap copy API remains available
+for callers that supply a dense selection. Existing identity and cycle rules remain.
+
+Simple's interference builder stores actual live ranges in per-block maps. Our
+separate moving-GC dataflow now stores nonzero 64-range words per block, removing
+the blocks-by-program-ranges allocation for OUT, GEN and KILL. GEN/KILL construction
+and predecessor-edge Phi uses retain their rules. Each transfer computes a sparse
+IN snapshot before updating predecessors, including the block itself on a self-loop.
+Clearing the final bit removes the word. Stack-map entries carry explicit locations
+and kinds, so hash iteration order does not define their meaning.
+
+Regressions exercise a one-node copy after 65,536 unrelated nodes and 512 sparse
+liveness rows with widely separated range IDs, including removal of the final bit.
+Native execution, cycles, link repair and moving-GC tests remain correctness gates.
+
+## 2026-09-10 — Linear graph verification and indexed late-pass dominators
+
+Whole-graph verification counts the input/output edge multiset in O(nodes + edges).
+It buckets input edges by producer, counts consumers, subtracts output edges and
+checks the remaining counts. Duplicate operands count as distinct edges; keep
+markers do not. A valid graph proceeds through the existing property checks. On
+edge corruption, the original per-node verifier preserves first-error precedence.
+The isolated peephole verifier remains unchanged.
+
+Final Simple computes use LCAs by walking dominator chains. Our late GCM pass builds
+a binary-ancestor index from the ordinary immediate-dominator answers, including
+ancestors outside the supplied CFG table. Exact tree depths support logarithmic
+queries across a forest of independent function roots. The index does not compute
+region dominators or alter Simple's placement and anti-dependence rules. Queries
+outside the pass, outside the index, or after a CFG version change use the original
+walk. Rebuilding releases the previous index storage.
+
+Regression tests cover high fanout, duplicate-edge corruption, deep branching,
+independent function roots, control-edit invalidation and index rebuilding. On the
+361-line Temporal fixture, initial phase measurements dropped from 359 to 19 ms
+for verification/typecheck and from 940 to 287 ms for GCM. These measurements do
+not establish a Temporal conformance pass or the 100 ms compile-time target.
+
+## 2026-09-10 — Shared JSL clones require facts absent from live parameters
+
+For a shared JSL body, inline evidence compares actual argument types with the
+live Parm types as well as the declared signature. A fact already present in the
+callee cannot justify a clone. An eliminated Parm supplies no evidence. Dependencies
+on surviving Parms and actual arguments allow reevaluation as their types change.
+Single-caller evidence and the existing tiny-body policy retain their prior rules.
+This restriction passes focused tests but did not reduce the Temporal graph size;
+it is not a residual-body cost model.
+
+## 2026-09-10 — Record stack maps from a sparse live set
+
+The stack-map recorder scanned all program live ranges at each safepoint and cleared
+that same dense table at each block. It now maintains an active-range vector, node-id
+slots and reverse positions. Insertion, replacement and swap removal take constant
+time; block reset and map recording visit active ranges. The existing live-out dataflow,
+canonical-range checks, GC kinds and stack-home requirements remain unchanged.
+Stack-map slot order carries no meaning because each entry stores its location and kind.
+
+The regression exercises sparse high range IDs, replacement, repeated deletion,
+swap removal and block reset. Existing map serialization and moving-GC tests remain gates.
+On the 361-line retained Temporal fixture, encoding dropped from 1,566 ms to 401 ms
+in the fresh measurements. Compiler phases total 3,996 ms; process wall time is 4.04 s.
+The input still throws ReferenceError because Temporal is absent. This is a compile-cost
+measurement, not a passing Temporal conformance test. The 100 ms target remains open.
+Logs: `build/temporal-100ms-baseline.log` and
+`build/sparse-live-final-temporal-20260910.log`.
+
+## 2026-09-10 — Share encoder ownership-query prefixes
+
+Simple's `CFGNode.fun` walks immediate dominators to the first Fun. Our encoder filled
+its block-owner cache with one such full walk per block. On the large retained Temporal
+fixture, the sampler attributed 755 of 766 samples during encoding to this lookup.
+
+The encoder now uses `cfg-owner-fun`, which caches the answer along the traversed path
+under the control-edit version. Its block-owner table also uses that edit version,
+so rewiring control invalidates both layers. A 256-block regression bounds total visits
+and checks that moving the chain to another function changes the answer after a warm query.
+
+The Math fixture now takes 824 ms of compiler phases. The large Temporal fixture takes
+4,813 ms, with encoding reduced from 2,337 to 1,505 ms. Further compile-cost work remains.
+Logs: `build/encoder-owner-math-20260910.log` and
+`build/encoder-owner-zoned-temporal-20260910.log`.
+
+## 2026-09-10 — Distinct scheduling users and shared global lookup bodies
+
+Final Simple's `Node.addUse` records an edge, including duplicates. GCM's `_doSchedLate`
+iterates those edges and `use_block` scans every Phi arm for the definition. A value used
+in many arms of one Phi therefore repeats the same full predecessor-LCA calculation for
+each edge. Our generated exception merges expose this cost: the retained Math fixture
+visited 255,147 Phi arms and spent 5.462 seconds scheduling.
+
+GCM now processes each distinct user once per definition. Phi-use resolution still includes
+every matching predecessor, not just the first. LCA idempotence makes repeated identical
+user results redundant. An arena-owned scratch table records visited user identities and
+clears them through the output list before returning. It stores no dominance answers and
+cannot become stale across queries or graph edits. No control-flow optimization or
+register constraint is skipped. The 256-branch regression fails the old arm-inspection
+budget and passes the new traversal, preserving predecessor placement and repeat queries.
+
+Scheduling the same Math input now takes 123 ms, with unchanged arena node counts.
+The remaining graph-volume problem includes global lookup expanded at every identifier.
+`JsGlobalBindingRead` and `JsGlobalTypeofOperand` are now builtins rather than macros:
+their bodies are shared, and the existing evidence/size-gated inliner decides whether
+to specialize them. No new inline threshold or forced noinline policy is introduced.
+The frontend's unary JSL helper respects the declaration's macro/builtin distinction.
+Mutable-realm lookup, TDZ, getter completions and unresolved-typeof semantics are unchanged.
+
+After both changes the Math fixture takes 979 ms of compiler phases; a previously timed-out
+Temporal fixture takes 1,792 ms and then raises ReferenceError because Temporal is absent.
+These are standalone retained-unit measurements, not conformance passes or a new campaign.
+A 64-reference retained lookup budget test compiles in 125 ms (3,751 machine nodes,
+951 blocks); structural ceilings and a one-second coarse wall gate prevent regression.
+The broader hundreds-of-milliseconds target remains open.
+
+## 2026-09-10 — Enclosing captures precede global lexical resolution
+
+Final Simple searches Scope variables from innermost to outermost before creating a lazy loop
+Phi for the selected variable. Our separately lowered function bodies must preserve that name
+precedence even before captured local environments have runtime storage.
+
+Capture discovery walks the child's syntax ancestors and the containing block/loop/switch/catch
+scopes in each ancestor. It excludes sibling blocks, switch discriminants and catch parameters
+outside their catch body. An ordinary hoisted function still owns parameters and local variables;
+only root Script declarations belong to the realm. Reads, writes and named calls check enclosing
+captures before choosing a global binding or restricted singleton. Current-function Scope
+bindings retain precedence over those captures.
+
+This fixes the block-capture wrong-code reproduction below by explicitly refusing the unsupported
+captured environment. It does not implement closures. Syntax tests distinguish positive and
+negative scope membership; compilation tests cover reads, typeof, assignment/update, calls and
+singleton shadows. A native two-Script test confirms that sibling scopes, a switch discriminant,
+finally and a function's own parameter still use their correct supported bindings.
+
+## 2026-09-10 — Retained Scripts share global let/const bindings
+
+Retained Script initializers create root let/const cells in the executing realm. Local and
+block bindings keep Simple's Scope graph inputs. A root lexical initializer writes its cell
+after evaluating and checking its RHS; a later Script or callback reads the same cell. Name
+lookup and typeof consult the declarative record before the global object record.
+
+Assignment resolution produces a stable lexical slot (positive), an object binding (-1), or
+an unresolvable reference (zero). The frontend retains that classification with the environment
+and key before RHS evaluation. Compound and logical assignment reuse it, including after an
+RHS changes the value or global property. JSL performs TDZ/const completion checks at GetValue
+or PutValue; an abrupt RHS precedes PutValue.
+
+Declaration instantiation checks existing lexical bindings and restricted global properties,
+then checks var/function names against existing lexical bindings and their object-record
+admissibility. It creates no bindings before the complete check pass. On success it creates
+uninitialized lexical cells, then functions and vars. Cross-Script conflicts raise the realm's
+intrinsic SyntaxError; restricted singleton names now reach this runtime check in retained mode.
+Retained realm templates include undefined, Infinity and NaN as non-writable, non-enumerable,
+non-configurable own properties. This follows
+[GlobalDeclarationInstantiation](https://tc39.es/ecma262/multipage/ecmascript-language-scripts-and-modules.html#sec-globaldeclarationinstantiation).
+
+Shared image assembly admits let/const declarations. Native tests cover separate source images,
+fresh GC-stressed reruns, callbacks, shadowing, TDZ/typeof, const writes and assignment order.
+Declaration tests check the error identity and absence of new bindings after a conflict.
+A three-image test permits a lexical declaration over an existing configurable property that
+an intervening Script reused for var. Classes/destructuring remain unsupported. Captured
+local/block environments remain unsupported. An audit found that a function created inside a
+block could read a same-named global lexical instead of its captured block binding. Reproduction:
+`build/shared-lexical-block-capture-audit.js`; evidence in the project pad, cell
+`shared-lexical-block-capture-bug`. Capture discovery now refuses that case before global lookup;
+see the enclosing-captures decision above. Closed-program lexical storage remains unchanged.
+Retained compile-cost reduction and campaign verification remain open.
+
+## 2026-09-10 — Global lexical access checks state before touching the value
+
+`JsGlobalLexicalRead` and `JsGlobalLexicalWrite` accept a resolved positive slot in the executing
+realm. Read checks initialization before loading the value. Write checks initialization first,
+then writability; it stores only on the initialized mutable path. Uninitialized access raises
+the intrinsic ReferenceError. An initialized const write raises the intrinsic TypeError even
+in sloppy code, because const declarations create strict immutable bindings. Both operations
+return the existing exception-sentinel completion protocol. The caller must check an RHS
+completion before passing its value to the write helper.
+
+These operations implement the state checks in ECMA-262
+[Declarative Environment Records](https://tc39.es/ecma262/multipage/executable-code-and-execution-contexts.html#sec-declarative-environment-records).
+They do not resolve absent names, create bindings or check declaration conflicts. A typeof
+operand with a resolved lexical binding must use the same read operation, preserving TDZ.
+
+Four native JSL regressions cover TDZ read, TDZ-before-const write, const value preservation
+through allocating errors, and initialized undefined followed by mutable assignment. They
+execute the production helpers and inspect the pending error prototype in a capability realm
+with distinct intrinsic prototype objects, twice per retained image. Source-level declaration,
+name/reference resolution and cross-Script conflict checks remain unfinished; shared source
+assembly still rejects lexical units.
+
+For that declaration integration, use the current
+[GlobalDeclarationInstantiation algorithm](https://tc39.es/ecma262/multipage/ecmascript-language-scripts-and-modules.html#sec-globaldeclarationinstantiation).
+It checks lexical declarations and restricted global properties; it has no historical
+`HasVarDeclaration` check or realm `[[VarDeclaredNames]]` set. Some pinned Test262 comments
+still quote the older algorithm. Do not infer a need for that extra state from those comments:
+the ordinary var/function globals in `script-decl-lex-var.js` are non-configurable properties.
+
+## 2026-09-10 — Language-raised errors use intrinsic prototype identities
+
+`JsThrowTypeError` and `JsThrowRangeError` allocate fresh objects using the executing realm's
+intrinsic prototype identities. They define an own writable/configurable, non-enumerable
+message data property before publishing the error through the pending-exception slot.
+Neither operation reads the mutable global constructor or invokes an inherited message setter.
+This follows the intrinsic error creation and message descriptor rules in
+[ECMA-262 NativeError constructors](https://tc39.es/ecma262/multipage/fundamental-objects.html#sec-nativeerror-constructors).
+The existing ReferenceError helper already uses an intrinsic prototype and omits its message.
+
+A native regression compiles two Scripts into separate cached images. The first replaces both
+global constructors with throwing getters and installs inherited message setters; the second
+triggers null property access and invalid array length errors. It checks prototype identity,
+message descriptors and zero getter/setter effects across two fresh GC-stressed realms.
+This change preserves the existing error-object representation; it does not establish complete
+NativeError branding or constructor conformance. Shared lexical resolution and TDZ/const
+completion integration remain unfinished.
+
+## 2026-09-10 — JSL accesses global lexical cells through checked runtime primitives
+
+Six JSL primitives lower through the ordinary pinned, memory-threaded JsOp and native-call
+backend. They access public realm memory and return conservative value types. They do not
+collect or call JavaScript; table growth uses malloc. Initialize/store inputs must be boxed
+JavaScript values without an exception sentinel. Reads return unknown dynamic values, so
+unboxing still requires a representation guard.
+
+| Primitive | Inputs | Result |
+|---|---|---|
+| `%GlobalLexicalFind` | program key | slot, or zero if absent |
+| `%GlobalLexicalCreate` | program key, writable integer flag 0/1 | new positive slot |
+| `%GlobalLexicalState` | slot | bit 0 initialized, bit 1 writable |
+| `%GlobalLexicalValue` | initialized slot | boxed value |
+| `%GlobalLexicalInitialize` | uninitialized slot, boxed value | boxed value |
+| `%GlobalLexicalStore` | initialized writable slot, boxed value | boxed value |
+
+Keys use the existing KeyRef relocation into the executing program's namespace. The linked
+runtime exports and in-memory symbol resolver use the same storage functions. The create
+adapter validates its full-width integer flag before converting it to Coil Boolean.
+
+Image-fact analysis treats stored objects as escaped and a lexical read's object identity as
+unknown. A regression covers a property write through such a read, preventing stale image
+property facts. Native tests compile JSL probes through optimization and encoding, install
+their images in memory, and repeat execution in fresh GC-stressed realms. They cover mutable
+and immutable cells, state transitions, lookup before/after creation, and a string held by
+a lexical cell across allocation. Checker regressions reject wrong operand types and unchecked
+completions. JSL error-completion helpers and Script parser/declaration integration remain open.
+
+## 2026-09-10 — Global lexical storage belongs to the executing realm
+
+Final Simple's ScopeNode tracks parser variables as graph inputs. It has no native global
+declarative environment. Retained JavaScript Scripts need bindings that survive initializer
+return and remain distinct from properties on the global object.
+
+`RtHeap` owns a program-key-to-slot index and a growable array of global lexical cells. The
+keys use the executing program's remapped string-key namespace. Slots are one-based; lookup
+returns zero for absence. A slot remains stable through array growth and GC, but expires at
+realm destruction. Cached artifacts must not retain slots or pointers from an earlier realm.
+Creation adds an uninitialized cell. Initialization state is separate from the value bits,
+so initialized undefined differs from TDZ. Global let/class cells are writable; const cells
+are immutable. These global lexical bindings are non-deletable.
+
+The Coil API provides checked storage operations. JSL must inspect state and construct TDZ
+ReferenceError or const-write TypeError completions before value access. Duplicate creation,
+reinitialization, invalid slots and unchecked invalid access hard-error as compiler/runtime
+contract violations. These guards do not implement JavaScript exception semantics. Script
+declaration instantiation must perform its conflict checks before creating cells.
+
+The runtime allocates table storage with malloc, without a JavaScript safepoint. Minor and
+major collectors forward initialized cell values as explicit realm roots, then trace their
+children through the ordinary collector. A cell write therefore needs no remembered card.
+GC verification checks the values, and realm teardown frees both table and index. Fresh
+execution starts with no lexical bindings, independently of the retained native images.
+
+The storage layer and JSL primitives are implemented. JSL completions, parser resolution and declaration
+instantiation remain unfinished; shared source assembly continues to reject lexical units.
+The semantic basis is ECMA-262 [Declarative Environment Records](https://tc39.es/ecma262/multipage/executable-code-and-execution-contexts.html#sec-declarative-environment-records).
+
+## 2026-09-10 — Bound call-result predicate searches by SSA availability
+
+Final Simple's `IfNode.idealize` searches the immediate-dominator chain to its root for
+an identical predicate or the source of a nonzero Guard. It records dependencies so later
+rewrites retry the search. Our retained Script compilation introduces many call-result
+exception tests; searching their full prefixes accumulates quadratic dependency storage.
+
+The search now follows one nonconstant data-input chain to a pinned definition. This
+extends the initial direct CallEnd-result cutoff to composite predicates, primitive results
+and Phis. Simple's GCM earliest-placement rule supplies the reasoning: a value cannot be
+used before its inputs exist. Any one input boundary is sufficient; finding the deepest
+would improve the bound but is not necessary for correctness. Phi traversal stops at its
+Region, never its backedges. Cast traversal ignores the guard control and follows its
+source, preserving the existing guarded-source matching rule. Every traversed value is
+watched for rewrites. No availability result is cached across graph mutations.
+
+We still search the interval between the current If and the definition, including both
+arms of earlier tests, and register the visited boundary dependency before stopping.
+This cutoff uses a value definition, with no depth budget or skipped optimization based
+on graph size. A cyclic unpinned input chain is an invariant error, not a search bailout.
+
+Regressions cover direct and composite 512-call chains without prefix dependencies,
+repeated tests on both arms, cyclic Phi inputs, guarded-source folding, and projection
+rewiring that requeues the watcher and changes its transitive definition boundary.
+
+## 2026-09-10 — Test262 workers use retained source and host caches
+
+Each persistent worker owns a source cache with capacity 32 for Script artifacts and 32 for
+sequence hosts. It acquires the variant as one unit and the ordered harness sources as another,
+preserving Script boundaries. The program API executes all harness initializers before the
+variant and creates a fresh realm for each request. Parse negatives keep their separate parser
+protocol and never compile the harness. Fatal compiler/runtime exits replace the worker and
+discard its native cache; ordinary JavaScript throws preserve the worker and cache.
+
+Compilation order is independent of evaluation order. The first 1,000-file cached campaign
+compiled the harness first and took 425.343 seconds, with 169 passing files and two compile
+timeouts. Unsupported test compilation often discarded a newly compiled harness when its worker
+exited. The worker now compiles the variant first, then acquires the harness. This preserves
+harness-first evaluation while avoiding harness compilation for variants that cannot compile.
+The same sample with variant-first compilation took 238.563 seconds with the same 169 passing
+files. It reported eight compile timeouts instead of two: six Temporal variants now reach
+expensive test compilation before their unsupported harness. Pass/fail counts stayed 322/360;
+unsupported fell from 1,215 to 1,199 and compiler errors rose from 28 to 38. Neither run had a
+crash or harness error. This improves the first cached integration but remains slower than the
+earlier 101.511-second closed-program measurement; retained compile cost remains open.
+
+Phase packets report source/host cache hits and misses as cumulative counters within one worker.
+Successful captures sample compiler-region reservation before scratch reset. The metrics retain
+worker-start counts to identify replacement boundaries; fatal compilation may stop before its
+reservation peak or completed cache work reaches the supervisor. A worker regression proves a
+repeated request hits both source artifacts and the host, and changed harness bytes miss the
+source cache while reusing the host.
+
+## 2026-09-10 — Own cached Script programs and reuse sequence hosts
+
+`source-program-new` accepts ordered `(handle, script ordinal)` selections from one source cache.
+It checks live leases, retained initializer ordinals and equal JSL snapshots before installing
+providers. It installs each distinct selected artifact once and retains one additional source
+lease per provider. Repeated selections execute the same initializer again. The caller can
+release its acquisitions and selection storage after construction. `source-program-run!` creates
+a fresh realm on each call; `source-program-free!` drops host imports before provider installations
+and source leases. The cache must outlive its programs. Program fields are owned implementation
+state, not independent artifacts for callers to free or mutate.
+
+The source cache also owns a separate bounded LRU of sequence host images, keyed by initializer
+count and worklist seed. Hosts use canonical `script::N` imports with the generic Script ABI;
+the cache validates those bindings on hits and misses. Host compilation does not read JSL or
+source providers. Installation resolves each program's provider addresses and pins their code,
+so programs can share one immutable host image while keeping distinct installations. Installed
+hosts cannot be evicted, and cache teardown checks host installations before freeing anything.
+The configured capacity bounds source and host entry counts separately.
+
+Three regressions cover ordered/repeated selections, two live programs sharing a host image,
+caller-lease release before execution, fresh GC-stressed runs, complete code-registration cleanup,
+empty programs and uncaught status, and rejection of invalid ordinals or mixed dependency
+snapshots. Test262 worker integration and shared lexical environments remain unfinished.
+
+## 2026-09-10 — Own retained Script images in a leased source cache
+
+`source-cache-acquire!` accepts an ordered nonempty list of Script source bytes and a worklist
+seed. It copies the inputs before resetting compiler scratch. Cache keys include source
+boundaries/order, the seed, the production JSL index path and bytes, and each indexed path/source
+pair. Comparison uses exact bytes. The running executable fixes the compiler, target and runtime
+versions; this cache does not persist across processes. It only compiles external-mutation Script
+units, so private whole-program assumptions cannot enter through a cache mode flag.
+
+The cache owns source keys and CodeImages in malloc storage. A hit increments the entry's lease
+count and returns its process-wide monotonic handle. `source-cache-image!` requires a live lease
+and returns a borrowed image for installation; callers must not free or mutate that image.
+Release each acquisition after the last use. Installed artifacts also prevent eviction, even
+after the caller releases its source lease. Cache teardown checks all entries before freeing any.
+
+Capacity bounds the entry count. An LRU miss replaces the oldest unleased, uninstalled entry
+only after successful compilation and capture. If all entries are live, acquisition reports a
+capacity error. A new artifact owns the JSL snapshot used by its compilation. Stale and foreign
+handles receive explicit errors, including after slot reuse; a closed cache rejects access.
+This API is sequential, like the compiler session it owns, and a call resets scratch on a hit
+as well as a miss. It does not invalidate the independent JSL library cache.
+
+Four native regressions cover owned source lifetimes, compiler/JSL-cache resets, fresh GC-stressed
+execution, exact source/order/seed/dependency keys, LRU behavior, and lease/installation/refusal
+paths. The dependency-key regression changes a byte in an owned snapshot to verify rejection;
+it does not modify the production JSL files during tests. Automatic program ownership must still
+check compatible dependency snapshots across its acquired units. Host caching, shared lexical
+environments and Test262 worker integration remain unfinished.
+
+## 2026-09-10 — Compile Script sequence hosts from retained bindings
+
+Callers can pass ordered initializer bindings to `pipeline-script-sequence-image`, install the
+returned host with `image-install-bound`, and run it with the provider installations through
+`image-run-shared-program!`. Host compilation does not parse source or revisit provider graphs.
+It validates named generic Script-entry ABIs, emits the existing aborting sequence helper, and
+uses the compiler's optimizer and backend. Source compilation and host compilation share
+`pipeline-encode-machine!` from selection through export.
+
+The host reports the pending exception through JS-UNCAUGHT and returns status 3, matching the
+source wrapper. It returns status 0 after normal completion, including an empty sequence.
+Returning the boxed exception sentinel from main is insufficient: the platform return adapter
+converts numeric values, while the source wrapper handles exception reporting before returning.
+
+The caller owns bindings through installation and retains provider images/installations while
+the host uses them. Image capture owns host symbol names and bytes; installation pins provider
+code identities. Compiler resets may occur after capture and before installation or execution.
+The cache owner and automatic Script selection/name generation remain separate work, along with
+shared lexical environments and Test262 worker integration.
+
+## 2026-09-10 — Shared Script assembly selects canonical realm objects
+
+`image-run-shared-program!` assembles fresh data copies from installed units. It selects the
+first global and each named intrinsic as canonical, then supplies identity bindings and property
+unions to the runtime boot passes. The private runner keeps its existing isolated-unit behavior.
+Assembly accepts retained Script initializers and native host images without a global root. It
+rejects closed-world Script images and reports unsupported shared lexical environments before
+execution. The callable ABI alone does not authorize sharing a closed-world heap template.
+
+Intrinsic methods in the current function-object representation own prototype objects. Capture
+records those objects under their owning method names in a separate identity namespace. They
+are representation-owned objects, not additional specification intrinsics. Canonicalizing these
+references lets property validation compare the methods' own properties by identity.
+
+External-boundary compilation materializes Object and Function even without local source uses.
+Otherwise two units can encode null and Object.prototype or Function.prototype for the same
+initial prototype link. The property merger must reject that mismatch; it cannot infer whether a
+null prototype means absent compilation demand or intended state. A regression reproduced this
+failure before the foundational-intrinsic change.
+
+Native regressions assemble different intrinsic method subsets, reverse canonical selection,
+reuse installed text in fresh GC-stressed realms, and compare retained data/text snapshots after
+execution. A separate case checks a source function compiled without intrinsic uses from a unit
+that observes its prototype and calls it through Function.prototype.call. High-level source
+orchestration and Test262 harness caching remain unfinished.
+
+## 2026-09-10 — Boot-time property unions preserve canonical object state
+
+`RtProgram.object-property-merges` supplies assembler-authorized source/target pairs after
+identity binding. `rt-unit-merge-object-properties!` validates the complete batch before any
+property mutation or managed allocation. It requires adopted object payload boundaries with
+compatible layouts, equal prototype references and matching extensibility. Duplicate properties
+must agree on attributes and SameValue values, including duplicate additions from other sources
+in the batch. Strings compare by content; object values must have canonical identity already.
+
+The pass walks each source backing store in property insertion order, then defines missing
+properties through `rt-prop-define`. It preserves descriptor attributes without invoking
+accessors. The source snapshots root planned reference values through allocation. The pass
+requires an unstarted, identity-bound realm and finalizes property assembly once, including an
+empty batch. The high-level image runner still supplies an empty batch until source identity
+selection and property-closure assembly connect to this interface.
+
+Backing-store growth may collect during boot, before a generated frame exists. During the
+explicit `assembling-properties` phase, the normal collector uses realm/static roots and the
+helper's explicit roots, with no frame cursor. It rejects a generated map token or caller SP in
+that phase. Forwarding, remembered-set scanning and heap verification use the existing collector
+path. GC stress also applies to boot allocations. The phase ends before Script execution.
+
+Two runtime regressions cover union order, descriptor/reference preservation, equal strings and
+minor/major collection with a 64-byte nursery, plus rejection of conflicting existing/pending
+properties, prototype mismatches, interior addresses and invalid lifecycle calls. These are
+runtime merge tests; independently compiled intrinsic-method assembly remains to be connected
+and verified. The Test262 harness cache is still unfinished.
+
+## 2026-09-10 — Retained initializer sequences stop at the first abrupt completion
+
+`callabi-script-sequence!` accepts an ordered list of retained Script initializer targets with
+the generic callable signature. It emits ordinary calls and branches on each completion. Only
+the normal arm reaches the next initializer; exception arms join an exit with the corresponding
+memory state and exception sentinel. The helper leaves the pending exception untouched. Normal
+completion returns undefined. An empty sequence preserves incoming control and memory without
+an argument-vector allocation; a nonempty sequence shares one empty argument vector.
+
+The native initializer tests now use this helper. Their post-sequence inspector remains outside
+the sequence so tests can examine effects and the pending exception after an expected failure.
+Five new regressions cover first and middle throws, ordered success, empty setup and skipping
+later declarations after an instantiation failure. The exception cases allocate a thrown object
+and reuse installed text across fresh GC-stressed realms.
+
+This is the graph-building helper for source orchestration. The high-level runner and Test262
+cache still need integration. Shared intrinsic assembly must also merge the property sets
+materialized by different units: an identity map alone cannot preserve methods absent from the
+chosen canonical object's template. Object payloads have fixed layouts, while their property
+backing stores carry shapes and descriptors. The assembler must preserve both identities and
+the union of those initial properties before evaluating Scripts.
+
+## 2026-09-10 — Retained Scripts create object-record declarations at execution
+
+Reusable Script units no longer precreate source var/function properties in the heap template.
+Their retained initializers check the executing global before creating bindings. The parser
+selects the last function declaration for each name, checks those names in reverse declaration
+order, checks vars, then defines the selected functions in source order and creates var bindings.
+A failed check returns an abrupt completion before the declaration writes or Script body.
+
+JSL checks own-property descriptors and extensibility. Function creation replaces configurable
+accessors with writable, enumerable, non-configurable data properties without invoking their
+setters. It preserves the attributes of an admissible non-configurable data property. Var
+creation preserves existing own values and attributes; a new binding starts as undefined.
+Both use the shared property descriptor validator and completion handling. These operations
+follow the ordinary object-record parts of [GlobalDeclarationInstantiation](https://tc39.es/ecma262/multipage/ecmascript-language-scripts-and-modules.html#sec-globaldeclarationinstantiation)
+and [CreateGlobalFunctionBinding](https://tc39.es/ecma262/multipage/executable-code-and-execution-contexts.html#sec-createglobalfunctionbinding).
+
+The syntactic may-throw pass includes external Script roots, including declaration-only bodies.
+Boundary mode is available during that pass; retained-unit mode is selected after syntax
+collection. Seven native regressions cover declaration timing, descriptor rules, duplicate
+function order and failure before mutation, reusing installed code across GC-stressed realms.
+The test host checks completion and invokes an inspector after an expected failure to verify
+the unchanged state and TypeError. That inspector is test orchestration, not Script evaluation.
+
+This supersedes the object-record declaration gaps below for retained Script units. Closed
+programs retain their existing static setup. Cross-unit lexical records and conflict checks,
+shared intrinsic assembly, a source runner that stops on abrupt completion, and owned harness
+cache integration remain required. The Test262 runner still recompiles its harness per variant.
+
+## 2026-09-10 — Var initializers retain the assignment reference
+
+`SsVar` initializer lowering now resolves the name before evaluating the initializer and
+uses the same retained reference as assignment expressions. At the external-mutation boundary,
+PutValue honors current setters and property attributes. A throwing RHS bypasses the store.
+Declarations without an initializer do not assign. Local bindings keep Scope assignment.
+
+The may-throw walk accounts for the implicit PutValue as well as the initializer expression.
+Three native regressions cover an allocating RHS with a global setter, strict and sloppy
+read-only globals, and an abrupt RHS. The tests reuse installed initializers in fresh
+GC-stressed realms. This follows VariableDeclaration evaluation in ECMA-262 14.3.2.1.
+
+This supersedes the initializer gap below; `lower-store-name!` is gone. Script declaration
+creation remains separate: function instantiation still uses `lower-global-store!`, and the
+heap template still precreates var slots. General source assembly must implement declaration
+instantiation, shared intrinsic identities and initializer-abort handling before harness
+cache integration can use these units.
+
+## 2026-09-10 — Assignment retains its global environment reference across the RHS
+
+At the external-mutation boundary, `lower-ref-prepare!` resolves nonlocal object-record names
+before the assignment RHS. `SyntaxRef` retains the boxed environment object, key identity and
+runtime HasBinding result. Keeps preserve those nodes through RHS control flow and collecting
+calls; release balances them after PutValue. Local bindings and restricted globals keep their
+existing precedence. Nonlocal lexical references still refuse rather than fall through to the
+object record.
+
+JSL consumes the retained reference. A strict unresolvable write raises ReferenceError even if
+the RHS created the property. For a resolved environment reference, strict SetMutableBinding
+also checks whether the property still exists. Set then honors current descriptors and setters;
+sloppy unresolvable writes use ordinary Set on the retained global object. Setter exceptions
+propagate through the parser's completion handling. Assignment expressions keep their RHS value.
+
+Compound assignment, logical assignment and prefix/postfix update use the same retained
+reference for GetValue and PutValue. The read checks the saved resolution before reading the
+current binding. No source parser identity or unit-local property ordinal survives as a runtime
+binding decision.
+
+Six native regressions cover declared/imported setters, sloppy property creation and attributes,
+strict unresolved writes whose RHS creates the property, an intrinsic name absent from the
+executing realm, strict/sloppy read-only writes and compound/logical/postfix updates. Each helper
+reuses installed code across different callers and fresh GC-stressed realms.
+
+This covers assignment and update expressions at the external boundary. `SsVar` initializers
+still use `lower-store-name!`, and Script function instantiation still uses `lower-global-store!`.
+Their declaration/reference lifecycle must join the source assembler rather than inherit raw
+slot writes. Global lexical records, intrinsic assembly, initializer-abort orchestration and
+owned harness cache integration remain unfinished. Closed-program assignments retain their
+existing lowering.
+
+## 2026-09-10 — Declared external globals use environment reads too
+
+The external-mutation boundary now routes `lower-global-load` through the same JSL binding read
+as an unknown object-record name. A source declaration does not prove that a configurable
+property still contains data: another Script can install an accessor. Reading the accessor's
+storage word would expose its getter/setter pair as a JavaScript value and skip its effects.
+The JSL path calls the getter and propagates its completion.
+
+At this boundary, `typeof` resolves object-record names at execution even when the compilation
+knows their declarations or intrinsic names. An absent property yields undefined; an existing
+getter can throw. Scope bindings, lexical/TDZ checks and restricted globals retain precedence.
+The closed-program own-slot path and its earlier-Script diagnostics remain unchanged.
+
+Four native regressions cover getter results, throwing getters under reads and `typeof`, and
+a declared intrinsic absent from the executing global. The tests reuse installed text across
+fresh GC-stressed realms with different caller-supplied values.
+
+Writes remain separate work. `SyntaxRef` currently records local-versus-nonlocal resolution,
+but no runtime global-binding presence before the right-hand side. A correct assignment path
+must preserve that reference classification across RHS effects, then apply environment or
+unresolvable-reference PutValue semantics. Testing presence only after the RHS would be wrong.
+Global lexical records, declaration lifecycle, intrinsic assembly and harness cache integration
+remain unfinished.
+
+## 2026-09-10 — External source reads resolve object-record bindings at execution
+
+At the external-mutation boundary, a name absent from the unit's declarations and local scopes
+uses `JsGlobalObjectBindingRead`. JSL checks the executing global object's property chain before
+reading the value. An absent binding raises a catchable ReferenceError; an accessor can return
+an abrupt completion. `typeof` uses a runtime property read for these names, so another unit's
+property can affect the result and a getter exception still propagates.
+
+The parser consumes both operations through its completion handling. Its early may-throw filter
+conservatively includes name expressions at the external boundary because it has no lowering
+Scope there. Return types remain authoritative and can eliminate checks after local resolution.
+
+External Script compilation materializes ReferenceError. The language-created error uses the
+intrinsic prototype identity, without reading the mutable global constructor or its `prototype`
+property. It has no own message, which the specification permits for an implicit ReferenceError.
+Realm assembly must bind this intrinsic identity along with the other unit-local identities.
+
+This is the object-environment path. Cross-unit lexical environments and TDZ, unresolved writes,
+and automatic declaration/intrinsic assembly remain required. Closed-program unresolved names
+retain their existing refusal behavior. The Test262 harness cache is not integrated yet.
+
+## 2026-09-10 — Resolved realm bindings update code maps and template references together
+
+`RtProgram.object-bindings` carries assembler-resolved source/target payload addresses for one
+fresh realm. After image adoption, `rt-unit-bind-objects!` validates the batch and applies the
+same terminal mapping to per-unit object-address arrays, boxed reference words listed by the
+heap images, and the published global root. The runtime preserves reference tags. It borrows
+the binding input for the call and retains no pointer to that input.
+
+Validation requires exact adopted payload boundaries, equal payload sizes, GC metadata and
+shapes. It rejects duplicate sources, self-bindings, chains and cycles. Distinct payloads in one
+source image must remain distinct after mapping, including objects that have no code-map entry.
+The runtime completes these checks before rewriting maps or fields. Region-range membership
+alone cannot establish a valid binding target, so validation constructs an exact payload index.
+
+Binding belongs to boot, before managed allocation or generated-code execution. Finalization
+also occurs for an empty batch. A finalized realm rejects rebinding and additional image
+adoption. The caller retains the adopted regions until realm teardown; their immovable payloads
+remain GC roots after canonical references point across images.
+
+The runtime checks storage invariants. The source assembler must still prove semantic permission
+to bind objects, including external-mutation assumptions, compatible intrinsic definitions and
+declaration lifecycle. The high-level native image runner currently supplies an empty batch.
+Automatic intrinsic resolution and source-unit assembly remain unfinished.
+
+## 2026-09-10 — Static object identity uses realm-owned address maps
+
+StaticRef machine code selects a unit's object-address map through X28, then loads the payload
+address for its local object ordinal. It no longer adds a baked payload offset to a unit base.
+The sequence still occupies 36 bytes and uses X16 as scratch. The installer retains its existing
+slot relocation and validates each local ordinal against the owned image's entry count. Native
+ABI descriptor version 4 includes the object-map heap-context contract.
+
+After validating and adopting an image, the runtime walks its payload boundaries and constructs
+the map. The realm owns these arrays and frees them at teardown. Mapped payloads belong to
+immovable static root regions; the map does not keep a separate movable reference. Both linked
+slot zero and installed code slots use this path. Unit bases remain available for image ownership
+and adoption checks.
+
+Source image capture also retains global and intrinsic object identities: specification names,
+data payload offsets and callable flags. This covers registered prototypes and namespace objects,
+plus materialized intrinsic functions. The image owns the names across compiler reset. Capture
+rejects duplicate identities, invalid object layouts and changes to live installations.
+
+The runtime initially constructs one-to-one local maps. Realm assembly still needs to resolve
+shared intrinsic identities and relocate references stored inside heap templates to the same
+chosen objects. Merely redirecting code references would leave template references inconsistent.
+Any future alias map must also preserve distinct local object identities and the optimization
+contract under which the unit was compiled. The owned names alone do not authorize aliasing a
+closed-world image or certify a retained callable body.
+
+## 2026-09-10 — Reusable Script code reads the executing realm's global root
+
+For reusable Script units, both frontend global access and JSL `%GlobalObject` lower to a
+memory-dependent load of `RtHeap.global-object`. An embedding host chooses that root before
+invoking the unit. The compiler keeps the unit's global template as layout data, but does not
+use its address as proof of the executing realm's global identity.
+
+`heap-global-entry` continues to identify the layout object. `heap-global-reference-entry`
+reports whether lowering may use a static reference; shared-global mode returns the existing
+absent-entry marker and lowering emits the runtime-root load. The parser configures this mode
+before lowering and the heap reset clears it. Closed-program compilation retains static global
+references. The external-mutation boundary still governs property and call optimization.
+
+The native regression binds a global from a second code image, invokes the retained Script
+initializer and calls a retained source reader. The reader checks named globals, non-strict
+`this` and the function declaration installed by the initializer. Two independent callers supply
+42 and 99; each runs in two fresh realms under GC stress. An earlier version reproduced the
+wrong result from unit-local global references.
+
+This contract does not yet provide automatic source-unit realm assembly. The runtime still
+rejects competing published global roots. Shared intrinsic identities and declaration creation
+at Script instantiation remain required before the assembler can compose source units.
+
+## 2026-09-10 — Reusable Script units retain generic initialization entries
+
+`pipeline-encode-script-unit!` compiles Script sources with an external-mutation boundary and
+retains one generic callable adapter per Script root. Callers need no named function export to
+retain top-level setup code. The adapters use the existing five-argument JavaScript ABI and
+return a boxed completion. The optimizer keeps their unknown-caller paths; the source bodies
+remain private implementation details behind those adapters.
+
+`pipeline-capture-script-image` resolves each initializer to an owned text-symbol index before
+compiler scratch reset. `image-script-initializer-binding` exports that entry from a live
+installation. Capture and binding validate the serialized ABI without constructing compiler
+types. Closed-program images retain an absent initializer marker and cannot supply that binding.
+
+In Script-unit mode, the first Script installs its function declarations during initialization,
+as subsequent Scripts do. Its initial global function properties contain undefined. Ordinary
+closed-program capture retains its existing first-Script image initialization. Var properties
+still exist in the image; this change does not implement per-Script declaration creation or a
+shared lexical environment across source units.
+
+The native regression calls two retained initializers in order, then reads their shared state.
+It repeats execution in a fresh realm with the same installed text and forced collection. The
+embedding caller still owns sequencing and completion handling. Program-level exception-abort
+orchestration, cross-unit global/intrinsic identity and the Test262 native harness cache remain
+unfinished.
+
+## 2026-09-09 — AOT images can execute in memory; compiler scratch is generation-owned
+
+`pipeline-encode-sources!` runs the same closed-world optimization and native backend as object
+export. `CodeImage` copies final text, heap templates, shapes, stack maps and relocation records
+out of compiler scratch. It contains no graph/type/shape-table pointers. The Darwin/AArch64
+installer resolves runtime imports directly to Coil functions, emits checked branch veneers,
+applies data references, protects executable writes and invalidates the instruction cache. This
+is eager AOT compilation into memory, not speculative execution or a dynamic JavaScript compiler.
+No per-program external linker or executable launch participates in this path. The existing
+object/link path remains available.
+
+The runtime accepts an explicit program descriptor; file-backed executions keep section lookup.
+An installation retains executable text and immutable metadata across executions. Each execution
+copies writable image templates into its realm and binds them through the unit-base table (the
+2026-09-10 decision below supersedes the initial single-use installation). Realm teardown releases
+both generations, metadata and runtime shapes; the embedding owner then frees data copies.
+Uncaught JavaScript completion ends the Script sequence
+and returns status 3 to the embedding host, while the ordinary executable still exits 3. The
+immutable image can be installed again. One realm is active per worker; runtime singleton state
+is not thread-safe.
+
+Compiler singleton payloads and allocations live behind a generation-scoped allocator. Capturing
+an image transfers ownership by copying; resetting the generation then reclaims all graph,
+frontend and backend scratch. Static accessor slots contain only an epoch and payload pointer.
+All compiler state must use that boundary; runtime and explicitly owned artifacts must not.
+
+The reusable JSL library cache owns immutable parsed forms in a separate region. Its exact key
+is the index path/content/order plus every source's content. Successful checking can be reused
+because checking depends only on that full table and the current executable's rules. Interned
+types, graph nodes, global facts, function indices and optimization results are rebuilt for each
+closed program. Test262 supervisors prime the cache before fork, so replacement workers inherit
+it too. This does **not** implement separately compiled native harness units: those still need
+a stable cross-unit source-call ABI and conservative optimization/effect contracts. No specialized
+whole-program graph is reused under another test's assumptions.
+
+Persistent Test262 workers isolate fatal compiler errors and native crashes. Success and ordinary
+JavaScript throws reuse the process; fatal refusals require a forked replacement, not a compiler
+exec or link. Transmission, compilation/installation and execution are deadline-bound; retained
+output is bounded. Expected runtime exception identity is still unimplemented and cannot produce
+a negative-test pass from status 3 alone. The initial installer is Darwin/AArch64, process-local,
+with checked 64 MiB text/veneer and ADRP reach limits, not a portable serialized artifact format.
+
 ## 2026-09-09 — Property attributes live in the shape tree; accessors are pairs
 
 The object model had one kind of property: a writable, enumerable, configurable data slot.
@@ -954,6 +1962,10 @@ Simple's ordinary empty-mask and pressure splitters.
 
 ## 2026-09-07 — Function values are heap objects over a uniform boxed ABI with a finite target set
 
+The 2026-09-10 stable callable-entry decision below supersedes this section's single-entry,
+program-wide-slot rule for function-object code words. The object layout and finite-target
+contract remain in force.
+
 Simple's function literal is a `FunPtrNode` constant: a raw code address typed by its signature and
 function index, callable through `Call` and linkable because the pointer's type names a finite set
 of functions (chapter 18, `func()` and `TFPARM`). JavaScript functions are also objects with
@@ -980,6 +1992,522 @@ Calling a non-callable value is a TypeError; until exceptions exist the guard's 
 the runtime `aot_rt_throw_type_error` entry, which hard-errors. Captured variables are not admitted yet: a
 nested function referring to an enclosing function's binding refuses by name, because capture is
 by reference and needs the environment cells `node/closure.coil` describes.
+
+## 2026-09-10 — Function objects publish a stable callable entry
+
+We separate the function-object entry from the optimized local entry. Reusing compiled code
+across programs requires a calling convention whose shape does not depend on the importing
+program's maximum formal count. `aot.codegen.callabi` defines version 1 with five arguments:
+boxed callee, boxed receiver, boxed `new.target`, nonnegative raw argument count, and a managed
+argument-vector pointer. The entry returns the existing boxed completion, including the exception
+sentinel. On AArch64 these arguments occupy X0 through X4 and the completion returns in X0;
+the existing JavaScript call contract supplies stack alignment, register kills and the X28 heap
+context. Ordinary Call/Fun/Parm nodes carry memory and control across the boundary.
+
+The caller evaluates actuals in source order, then allocates and initializes one boxed word per
+actual in a compiler-owned vector. An empty vector has one initialized undefined word and count
+zero. The collector scans the vector with the runtime's elements descriptor. JavaScript cannot
+observe it as an Array or mutate it through properties. A formal read tests its index against the
+actual count, returns undefined on the missing path, and retains bounds-check control on the load.
+Supplied undefined still contributes to the count. Extra actuals remain in the vector.
+
+For current source bodies, we emit a callable adapter that reads the declared formals and forwards
+receiver, new.target and values to the local boxed-slot entry. The adapter pads unused local slots
+with undefined. Function objects name the adapter's distinct function identity; known direct
+calls can name the local entry. The optimizer can inline or specialize the local body under its
+callers without changing the public calling convention. Source indirect calls and JSL
+`%CallFunction` both use the stable entry. Script execution roots remain internal functions.
+
+This ABI change does not establish a reusable compilation-unit contract by itself. The current
+driver still closes the finite adapter target set over one composed program and recompiles its
+graphs. Cached native units must additionally preserve conservative external effects, resolve
+their executable closure, remap unit-local identities, and register runtime metadata across units.
+We must not publish code optimized under a previous program's closed-world facts as generic code.
+
+## 2026-09-10 — Declare imported functions separately from local bodies
+
+We reserve compilation-local function identities for imports in a declaration table beside the
+local Fun-owner table. An identity cannot name both. A declaration owns its symbol spelling and
+declared signature in compiler scratch; reset discards that namespace. OP-EXTERN carries the
+exact function-pointer type without a local Fun edge. Graph copying preserves the declaration
+identity. This follows final Simple's CodeGen external-function map and ExternNode.
+
+An imported call remains an ordinary Call/CallEnd. Following Simple's CallEnd, a declared external
+target contributes reachable control, conservative public-memory effects and its declared return
+type. Mixed local/imported target sets include that contribution and cannot inline the local
+Return as though it were the sole target. A missing undeclared target keeps unresolved-call
+behavior. These declarations do not authorize execution before program assembly resolves them.
+
+The initial import contract permits allocation, exceptions and callbacks, plus arbitrary access
+to realm state. The image-facts analysis treats imported results as unknown and arguments as
+escaping, including mixed target sets. We have no unit-private image visibility contract yet, so
+an unsummarized import invalidates image property, prototype and descriptor proofs even with no
+object arguments. Adding a narrower effect summary requires evidence for those access limits.
+
+ARM64 selection and object-symbol assembly preserve imported identities in call, address and
+function-object code-word relocations. They must not substitute a dead-local-function trap for a
+declared import. The memory installer still needs owned named imports/exports and program binding;
+these low-level declarations alone do not establish a reusable JavaScript unit or harness cache.
+
+## 2026-09-10 — Bind owned native images before installation
+
+CodeImage owns text/data definition names and import names alongside its byte buffers and
+relocations. Capture no longer resolves undefined symbols to process addresses. A callable-unit
+capture has no host entry; process-entry capture still requires main. The installer resolves
+imports for each installation, leaving the artifact's bytes and symbolic records unchanged.
+
+A binding names one caller import and a text export from an installed provider. Export lookup
+rejects missing or ambiguous names. Before allocating executable memory, import resolution rejects
+duplicate or unused bindings, stale provider identities, addresses outside the provider's text,
+and attempts to override a runtime symbol. Declared unit imports require explicit provider bindings;
+only compiler-emitted runtime imports resolve through the runtime's symbol table. Existing BL veneers
+and checked address relocations apply to unit imports.
+
+Each installed caller pins its providers in the runtime code registry. Uninstallation refuses
+while another installation imports that range. Releasing a caller releases its pins. CodeImage
+tracks live installations and refuses free until they reach zero, so registered metadata remains
+valid. Callers must retain the CodeImage descriptor at a stable address until uninstallation;
+InstalledImage borrows that descriptor. Binding spellings need remain valid only during install.
+The descriptor's installation count is mutable ownership bookkeeping; artifact content is immutable.
+
+The native test compiles one generic argument-reader unit, destroys compiler scratch, then compiles
+and runs two caller images against that retained installation. It covers extra and missing arguments
+and moving collections across the image boundary. The provider uses the runtime's fixed elements
+layout and has no realm-specific static objects. This does not prove general JavaScript unit-data
+composition. Unit ABI fingerprints, generic callback closure, shape/key and realm-data bindings,
+reusable IR artifacts, and harness cache integration remain required before publishing that feature.
+
+## 2026-09-10 — Check native import representations without arena identities
+
+Each text definition and declared unit import in CodeImage owns a native ABI descriptor. Selection
+retains the function signature until capture converts it to bytes. The descriptor contains no
+interned type IDs: an eight-byte AOTCABI magic, little-endian version/convention/arity words, then
+one representation byte for the return and each argument. Version 2 fixes this Darwin/AArch64
+register/stack convention, heap register, realm-unit table and value/GC representation contract. Changes to those
+contracts require a version bump.
+
+We distinguish integers, floating-point values, boxed values that may reference the heap, boxed
+scalars, managed pointers, host pointers and code pointers. Unknown representations cannot bind.
+The loader validates version, length and arity before comparing slots. A provider may return a
+boxed scalar to a caller expecting a general boxed value; a scalar-box argument may enter a
+general boxed parameter. The reverse directions could hide references from GC and are rejected.
+Other representation classes must match. The host-entry wrapper has a distinct convention and
+cannot satisfy an ordinary generated-code import.
+
+Binding checks happen before executable allocation and provider pinning. A declaration name has
+one signature within a compiler generation; conflicting declarations fail at registration.
+Declared unit imports cannot fall back to a runtime symbol of the same spelling. This preserves
+the separation between generated calls and the runtime's fixed host boundary.
+
+This descriptor checks native transport and root representation. It does not prove nominal types,
+integer ranges, dynamic tag refinements, semantic effect summaries, or generic callback closure.
+Those belong to the reusable IR/unit contract. The stable JavaScript entry remains the generic
+count/vector ABI; publishing harness code still requires that contract and fresh realm bindings.
+
+## 2026-09-10 — Installed code qualifies GC maps and owns a registered PC range
+
+We keep stack-map IDs local to a compiled image. A collecting call passes a 64-bit token whose
+low 32 bits identify the local map and whose high 31 bits identify an installation. Installation
+identity zero selects the ordinary linked-executable path. Positive identities increase without
+reuse; the runtime rejects exhaustion before a token could become negative or collide.
+
+The AArch64 encoder reserves a four-instruction MOVZ/MOVK sequence for this token and records its
+offset, register and local ID beside the instruction bytes. Object export uses identity zero.
+The memory installer checks the sequence and map record, then patches its private executable
+copy with the installation identity. This fixed width preserves instruction layout and stack-map
+return PCs. The compiler-owned CodeImage and its map records remain immutable.
+
+The runtime code registry borrows an installation's text range and immutable maps until
+unregistration. Registration checks map bounds, duplicate local IDs, local-ID width and return-PC
+extent, and rejects overlapping text ranges. We allow registry changes only between realms; live
+frames and function objects therefore cannot lose their code. Realm teardown preserves the code
+registry, while image uninstallation unregisters before unmapping. Removing the last range frees
+the registry's list storage without recycling its identity counter.
+
+The collector resolves the first frame through the qualified token. It resolves callers by their
+actual return PCs across registered ranges, using one cursor implementation for root tracing and
+before/after verification. A PC in registered code without a matching map is an error, not an
+implicit end of the stack. The linked-executable and explicit single-table test paths remain
+available. Frame sizes must advance the walk; recursion depth has no fixed limit.
+
+These rules establish code-metadata ownership across images. They do not yet assemble JavaScript
+units into one realm: static-image roots, shape/key bindings, unit imports/effects, and reusable
+IR/native artifacts still need the compilation-unit implementation.
+
+## 2026-09-10 — Retain static roots from each realm data image
+
+A realm owns a registry of borrowed static data regions. Adoption appends a region rather than
+replacing the previous image. The collector scans all registered regions during minor and major
+collections, and the reference verifier recognizes references into any registered region. Each
+region retains its own entry-table offset and byte extent. Generated-code heap-field offsets
+remain unchanged; the registry replaces fields beyond the generated-code portion of RtHeap.
+
+The data owner must supply fresh writable bytes and retain them through realm teardown. Adoption
+rejects an inactive realm, overlapping regions (including repeat adoption), invalid section bounds,
+and a second image that would publish a global root. Bounds checks precede relocation writes.
+Supplementary units must bind the realm's existing global rather than publish another one.
+
+Heap reset and realm destruction share the release path for heap spaces, card metadata and the
+static-region registry. Neither operation frees borrowed image bytes. Reset clears global and
+exception roots along with the registry; destruction also releases shapes and program metadata.
+Installed code remains registered across realm destruction.
+
+Tests retain two copies of one unrelocated template through minor and major collection, cover
+boxed and raw roots plus cross-image references, and repeat with fresh copies in another realm.
+These images share shape identities. General unit assembly must still remap independently compiled
+shape/key identities and provide per-unit data bindings to retained native code. This registry does
+not by itself make source harness compilation reusable.
+
+## 2026-09-10 — Retained text resolves static data through realm unit bindings
+
+Amendment, 2026-09-10: the object-address-map decision above supersedes the base-plus-offset
+StaticRef sequence described here. Installation slots and per-realm data ownership remain.
+
+StaticRef selection now loads a unit base through X28 and adds the image-relative payload offset.
+Function addresses keep Simple's ADRP/ADD form. Static references use a fixed 36-byte sequence:
+load the realm's base table, materialize a 32-bit installation slot in X16, load that table entry,
+materialize the 64-bit payload offset, and add it. Selection declares X16 as scratch. The encoder
+finalizes heap layout before emission and records slot relocations apart from instruction bytes.
+
+Linked executables use slot zero. The memory installer assigns positive slots through the code
+registry, checks the reserved MOVZ/MOVK sequence and patches its private text copy once. An
+installation keeps its slot until unregistration. Freed slots can serve later installations;
+code identities still increase without reuse. A realm allocates its table through the highest
+live slot, so sequential test installation does not grow the table with total campaign count.
+Native ABI descriptor version 2 includes this new heap-context contract.
+
+InstalledImage owns no writable data mapping. image-instantiate-data copies the immutable template
+and resolves its code words against retained installations. image-run-program! checks the complete
+import closure, rejects duplicate installations and creates fresh data copies. Runtime boot adopts
+the primary image and supplementary images into their assigned slots. The collector retains them
+as static roots. After return, realm teardown drops bindings and roots before the loader frees the
+copies. Executable bytes, provider pins and code identities remain unchanged across executions.
+
+The program runner currently requires identical shape/key namespaces across its units. Mismatched
+namespaces hard-error until the compilation-unit assembler remaps them; source units must not
+claim compatibility from native calling conventions alone. Units may share one global root, and
+supplementary units cannot publish a competing global. General source initialization records,
+semantic import contracts, callback closure and reusable IR/cache integration remain unfinished.
+
+Native tests compile a mutable provider once, discard compiler scratch, and run separate callers
+against that retained installation. A first call reads 42 and writes 99; a second call in the same
+realm reads 99. Repeated executions restore 42 before the first call. Coverage also includes moving
+GC, omitted/extra arguments, missing/duplicate program members and reuse of a freed binding slot.
+
+## 2026-09-10 — Unit shape assembly owns canonical identities and local maps
+
+`cu-shapes-compose` accepts immutable shape blobs in unit order and returns an owned shape blob
+plus one local-to-program key/shape map per input. It interns key bytes and maps parent rows before
+children. Canonical rows include parent, key, offset, field count, attributes and flags. Equal
+property sets do not imply equal layouts: `{x,y}` and `{y,x}` retain their distinct offsets.
+The shared root has identity 1; reserved string and elements shapes keep their runtime identities.
+Input order determines program IDs, and repeated assembly of the same inputs produces the same
+bytes. The result owns its names and maps outside the compiler generation allocator.
+
+The assembler validates blob extents, reserved rows, key bounds, parent ordering and transition
+layout before admitting metadata. Non-extensible markers preserve the parent's fields and cannot
+introduce keys. `cu-remap-static-shapes!` validates headers and shape references before changing
+shape words in a fresh image copy. It leaves reference/code fixups and global-root words unchanged;
+their existing readers retain responsibility for validating them. Templates remain immutable.
+
+This artifact does not authorize mismatched native namespaces yet. Generated key constants and
+allocation shapes must carry symbolic identity through optimization and consume the unit maps.
+The native runner retains its identical-namespace guard until that path is implemented and tested.
+Source dependency resolution and reusable ideal-IR linking remain named hard errors.
+
+## 2026-09-10 — Symbolic metadata IDs are payload, not integer constants
+
+`KeyRef` and `ShapeRef` carry a unit-local ID in their node payload. Their integer type describes
+an unknown runtime word. It must not describe the local ID: a consumer could fold that integer
+before program assembly even if the reference node itself refused constant folding. Reserved
+string and elements shapes keep their process-wide constant words.
+
+GVN compares kind and local ID in the current compiler namespace. Graph copying retains both, and
+debug labels print the kind and ID. Constructors reject invalid IDs and unsupported kinds.
+Property analysis reads `keyref-local` to recover identity evidence without an integer singleton.
+Image-fact analysis recognizes these references as non-object values and uses symbolic keys to
+record precise writes. It retains the existing numeric-operand contract for current producers.
+
+Tests cover ordinary integers with the same value, key/shape namespace collisions, arithmetic and
+equality consumers through SCCP, mixed identity/integer Phis, graph copying and precise write facts.
+The initial IR step left native selection unimplemented; the binding implementation below supplies
+that path. The frontend migration remains unfinished, and the native runner's identical-namespace
+check remains in force.
+
+## 2026-09-10 — Retained text reads realm-bound key and shape maps
+
+Native ABI version 3 adds slot-indexed key and shape map pointers to RtHeap. KeyRef and ShapeRef
+select a 28-byte sequence: load the relevant table through X28, select the installation slot,
+materialize the 32-bit local index and load its mapped word. X16 is scratch. Installation patches
+the slot once; no canonical program ID enters retained text.
+
+EncUnitSite now distinguishes data, key and shape references and records their local identities.
+The installer checks namespace bounds and the reserved slot instruction words. Root-only units
+use the implicit two-row namespace and need no shape blob. Metadata references need no data image.
+The code registry retains the source namespace counts so runtime binding can reject short maps
+before generated code indexes them.
+
+RtProgram and its supplementary descriptors borrow explicit key/shape maps through realm teardown.
+Runtime binding checks map coverage, invalid/root entries and canonical bounds before publishing
+either pointer. A slot cannot be rebound within a realm. Programs that supply neither map use
+realm-owned identity arrays, shared across their same-namespace units; supplying only one map is
+an error. Heap release frees the slot tables and default arrays, clears their pointers, and leaves
+borrowed assembly maps untouched. Metadata-only supplementary units still receive bindings.
+
+A native test compiles and installs one metadata-reading entry, frees compiler scratch, then runs
+it against two different owned assemblies and returns to the first. Results follow each assembly's
+maps; text bytes remain unchanged. Tests also cover missing coverage, invalid identities, duplicate
+binding, inactive realms and a root-only image with no static data.
+
+That test exposed a graph-leaf entry bug: the prologue called rt-heap-state without saving LR.
+Simple's FunARM emits no such bootstrap call. Our frame finalizer now counts a process entry as
+non-leaf even when the ideal graph has no calls, preserving LR on both entry and return paths.
+An exact-instruction regression checks the reserved LR/X28 slots.
+
+At this milestone frontend/JSL key producers and allocation-shape immediates still needed migration.
+The key-producer migration below handles the former. General native program assembly keeps
+rejecting differing namespace blobs until allocation references use the maps too.
+Source initialization, semantic import/callback closure and reusable IR/cache integration remain
+unfinished.
+
+## 2026-09-10 — Source property keys use symbolic native references
+
+Parser lowering now creates KeyRef operands for named property operations, object-literal
+definitions, constructor/prototype accesses and unresolved globals. JSL `%PropertyKey` produces
+the same node. Property expansion preserves symbolic identity when it falls back to runtime
+operations. Field offsets and attributes remain integer constants: assembly preserves their
+layout meaning, while it remaps key identities.
+
+JSL's named-property fast paths recover the local key through keyref-local, not through an integer
+singleton type. Runtime keys keep the generic path. Image-fact analysis follows the same rule and
+no longer accepts a numeric constant as evidence of a unit-local name. This prevents folding from
+depending on a key ID that another assembly assigns to a different property.
+
+Integer-mode EQ and NE compare two symbolic keys by local identity, including before GVN. We
+require assembly to preserve key equality; runtime binding rejects maps that alias two local
+keys. We cannot infer numeric ordering from those identities or compare them to an integer
+literal at compile time. Floating comparisons and shape references retain their existing rules.
+This restores lowering-time folding of JSL's named-key branches without exposing local IDs as
+integer constants. The unchanged two-Script graph-size budget covers the regression.
+
+Regression tests distinguish `%PropertyKey` from an integer with the same local value, retain
+precise writes for symbolic keys and conservative writes for numeric key words, and compile a
+Script mixing computed and named access. That Script retains a native key relocation and runs
+twice after compiler scratch is discarded.
+
+The allocation migration below handles the remaining shape operands. The source-key change does
+not cache JavaScript harness code or establish source initialization/import closure.
+
+## 2026-09-10 — Allocation headers use realm-mapped shape identities
+
+Ordinary New shapes use the same seven-instruction map lookup as ShapeRef, on both the nursery
+fast path and the collecting slow path. Reserved string and elements shapes keep their fixed
+runtime words. Instruction sizing includes both lookups before branch and stack-map layout.
+
+The fast path keeps its allocation header address in X16, writes the mapped shape through X15,
+and uses X17 as lookup scratch. The slow path writes its shape argument to X1 with X16 scratch.
+Both scratch registers belong to the call kill set. EncUnitSite records the slot register; the
+installer validates that register against the two reserved MOV words before patching. Invalid
+registers, X28 and register/instruction mismatches fail before execution.
+
+A folded load of a fresh allocation's shape header now returns ShapeRef rather than a numeric
+local ID. We preserve Simple's private allocation and memory rules; its calloc-based NewARM has
+no runtime shape header. The symbolic identity describes our runtime's additional metadata.
+
+Native tests load the actual header through bulk memory, withholding the dedicated shape alias
+that permits folding. They install once, discard compiler scratch, execute with two assemblies
+that assign different shape IDs, and return to the first assembly. Fast and forced-collection
+executions must observe the mapped ID without any change to installed text. Encoder tests check
+both scratch registers, updated stack-map offsets, and fixed reserved-shape handling.
+
+The native program assembly entry below integrates these paths. Source initialization records,
+semantic import/callback closure and reusable IR/cache integration remain unfinished.
+
+## 2026-09-10 — Native program assembly binds independently compiled namespaces
+
+`image-run-program!` validates the installed import closure and duplicate identities before
+assembling shape blobs in the supplied unit order. It copies each unit's static data, resolves
+code words and remaps shape headers in those fresh copies. The primary image may occupy any
+position in the unit list; its data and maps come from that position, not from an assumed first
+slot. Units with no static bytes still receive identity maps.
+
+The runtime borrows the canonical shape blob, per-unit maps, data copies and descriptors through
+execution. Teardown releases realm bindings and static roots before the runner frees the copies
+and assembly. Installed text, provider pins and artifact templates remain intact for the next
+realm. This replaces the runner's identical-namespace guard. Existing checks still reject missing
+or duplicate installations and competing global images.
+
+A native regression compiles a provider with named properties and callers with a different key
+and shape namespace. It discards compiler scratch, runs the retained provider through each
+caller, and reverses assembly order without reinstalling either unit. One call reads 42 and
+writes 99; two calls in the same realm observe the mutation. Fresh realms restore 42. The test
+checks immutable provider data/text and forces collection with reference verification enabled.
+
+This entry assembles native transport and realm data. It does not authorize whole-program facts
+across source units. Source declaration/initialization records, semantic import/effect and
+callback closure, and reusable source IR/native-cache integration remain required for harness
+reuse. The Test262 runner still recompiles its JavaScript harness per variant.
+
+## 2026-09-10 — Script declaration plans separate source identity from realm bindings
+
+The parser builds one declaration plan per Script. Global collection, initial-image function
+installation and later-Script function initialization consume that plan instead of rescanning
+the body for declarations. Top-level functions keep source order, including duplicates; var
+names include nested statement declarations but exclude nested function bodies. Lexical names
+keep let, const and class kinds. A syntactic `this.name` write has a separate effect kind, so
+retaining its name cannot turn its assignment into a hoisted declaration.
+
+Function references in a plan are contiguous Script-local declaration ordinals. The parser keeps
+a separate generation-local ordinal-to-SyntaxFun table for lowering. `CuScriptDeclarations`
+captures strictness, entry kinds and ordinals, with owned copies of the names and entry storage.
+It contains no graph node, realm key, compiler function index or source-buffer pointer. Capture
+rejects invalid kinds, noncontiguous function ordinals and ordinals on nonfunction entries.
+
+The ownership test overwrites and frees its input buffer, resets compiler scratch, parses another
+program and then checks both retained Script plans. It also checks independent strictness,
+duplicate function ordering and exclusion of nested lexicals/function-local vars. Existing
+multi-Script execution continues to test the production consumers.
+
+These records describe declarations and candidate global-property writes. They do not retain
+executable bodies, implement cross-Script lexical environments/TDZ, or authorize reuse of
+whole-program facts. Binding the records to retained function objects, source initialization
+entry points, semantic import/effect and callback closure, and owned reusable IR/native-cache
+integration remain required for harness reuse.
+
+## 2026-09-10 — Native Script bindings use image payload offsets
+
+The source-to-memory pipeline captures Script declaration plans beside `CodeImage`. Each Script
+has an ordinal-indexed table of function-object payload offsets in that image's data template.
+The pipeline resolves SyntaxFun and heap-entry identities after encoding; the image owns copies
+of declarations, names and offset tables. Memory-run and the Test262 memory worker use this capture
+path before resetting compiler scratch. Image destruction frees the Script records too.
+
+Capture checks the binding count, payload extent/alignment, data symbol and code-slot relocation.
+A code-slot target may be local text or an import. The existing object writer uses the invariant
+trap import when whole-program optimization removes an unreachable function body. We preserve
+that relocation: an object binding proves neither body availability nor an open caller set.
+The native tests retain duplicate declarations and independent Script strictness after compiler
+reset, run the image in fresh realms, and reject missing/out-of-range/interior bindings. An unused
+function test checks that its retained object still names the invariant trap.
+
+This capture remains a description of one compiled closed world. Source initialization entry
+points, shared global/lexical environments, retained callable-body contracts and semantic effect/
+callback closure remain required before harness code can serve a different compilation.
+
+## 2026-09-10 — Explicit source callable roots retain generic adapter callers
+
+`pipeline-encode-sources-with-roots!` accepts Script/declaration-ordinal roots. It resolves them
+after source lowering and before pessimistic iteration or caller closure. The default source
+pipeline supplies an empty root list, preserving its existing closed-world behavior.
+
+For a selected declaration, the parser marks its generic JavaScript adapter as escaping and keeps
+its unknown-caller Start hook. The adapter therefore accepts the generic callee/this/new.target/
+count/vector ABI without specializing to callers in the current compilation. The source body's
+program-local ABI remains private: caller closure drops that body's hook, and the adapter's call
+supplies the conservative argument values. Duplicate root requests are idempotent. Unknown
+Script/ordinal requests and requests after caller closure hard-error. Parser reset clears roots.
+
+Final Simple's FunNode keeps unknown-caller hooks for escaped function identities, skips those
+hooks when deleting dead call paths, and declines ordinary Region collapse while callers remain
+unknown. We apply that boundary to explicit source adapters, separately from function-pointer
+materialization inside a closed world. The existing post-Opto retention rule keeps the adapter
+and its reachable body code.
+
+The native test compiles an uncalled source function once, captures its image, resets compiler
+scratch, then installs two independent native callers. Thirteen arguments return argument 13;
+one argument returns undefined. Both callers run twice in fresh realms against the same provider
+installation. The function's image code relocation names emitted text rather than the invariant
+trap. Parser tests cover hook selection, duplicate requests, reset and invalid/late requests.
+
+Callable roots establish entry liveness and generic argument handling. They do not establish a
+reusable JavaScript compilation unit: shared source environments, initialization entry points,
+global mutation/import contracts, callbacks from other units and owned reusable IR/cache
+integration remain unfinished. The Test262 harness cache is not enabled by this API.
+
+## 2026-09-10 — Incoming callable roots impose an external mutation boundary
+
+The source pipeline sets an external-mutation boundary when its callable-root list is nonempty.
+It installs the boundary before syntax exception analysis and lowering. Under that boundary,
+source reassignment analysis cannot justify a direct global-function call; the parser loads the
+current global value instead. Its may-throw filter also treats those calls as potentially throwing,
+since an outside write can replace the original target. Parser reset restores closed-world mode.
+Adding a callable root after closed-world lowering hard-errors: setting the boundary after that
+lowering cannot undo direct calls or exception decisions already embedded in the graph.
+
+Image analysis seeds unknown-owner writes, prototype writes and descriptor changes, and marks
+the image entries escaped and mutable. The pipeline repeats this seed on each analysis round.
+This shares the existing conservative boundary for unsummarized outgoing imports. We have no
+unit-private image visibility contract yet, so we cannot exempt an image object from outside
+mutation based on the current source set alone. Default closed-world compilation keeps its
+precise analysis and direct-global-call proofs.
+
+The native regression compiles a source reader whose global begins undefined and has no writes
+in its compilation. Two independent caller images write 42 and 99 to that global before calling
+the retained reader. Both execute twice with fresh realms and the same provider installation.
+Analysis tests check mutation marks without local stores and after recomputation. Parser tests
+check the direct-call boundary and reset; the initial version exposed the may-throw assumption
+described above, which now follows the same boundary.
+
+This removes one class of stale proofs. The source image still owns its global object, and its
+callback target type still enumerates local adapters. Shared global/lexical binding, source
+initialization entry points, cross-unit callback/import closure and reusable IR/native harness
+cache integration remain unfinished.
+
+## 2026-09-10 — Function-pointer types include an opaque external target class
+
+`TFunPtr` carries an external-target membership coordinate alongside its known function-index
+set. This coordinate follows the same union, intersection and mixed-side difference rules as
+the concrete set; duality preserves stored membership and flips the lattice side. An inhabited
+external pointer is not a singleton even if it has one known local target. Text output marks it
+with `+external`. The known-target enumeration excludes the opaque class.
+
+At the external-mutation source boundary, function-object code loads admit known local adapters
+and an opaque target with the generic JavaScript signature. Normal closed-world loads retain
+their finite type. We allocate no fake function index or unresolved symbol for a future callback.
+The existing indirect machine call executes the loaded address.
+
+Final Simple's CallEnd gives declared imports reachable control, public-memory bottom and their
+declared result without a local Return edge. An opaque callback contributes that same state.
+Known local targets still link, but their Returns cannot narrow away the opaque branch. The
+inliner defers while that branch remains possible, and image analysis applies external escape
+and mutation effects even when no named import exists. Undeclared concrete targets still refuse;
+an opaque class does not hide missing finite dependencies.
+
+Tests check dual involution, meet commutativity/associativity and absorption across open/closed
+types and their duals. Mixed local/opaque CallEnd tests preserve declared state through optimistic
+reset and refuse local-only inlining. Image analysis tests apply external effects without a symbol
+declaration. A retained source function calls callbacks from two independent native compilations,
+returns 42 and 99, and repeats both executions in fresh realms under GC stress and verification.
+
+The opaque callback mechanism removes the local-only target assumption. Shared source global/
+lexical binding and initialization, program-level source import/ownership contracts, and owned
+reusable IR/native harness cache integration remain unfinished.
+
+## 2026-09-10 — Materialized function objects retain external generic callers
+
+At an external source boundary, caller closure retains the generic adapter hook for a materialized
+function object, even without an explicit Script declaration root. This covers hoisted objects
+and function expressions created during execution. The private source body still receives its
+arguments through normal graph callers; ordinary closed-world compilation keeps its existing
+hook removal and specialization behavior.
+
+Final Simple's Start receives escaped function identities from Stop memory, while public fields
+remain externally callable independently of the current memory approximation. Here the external
+mutation contract has no unit-private object visibility proof, so we retain materialized adapters
+conservatively. Restricting retention to named roots would lose functions returned from a factory
+or published in an object property. Pointer materialization already marks these adapters escaping;
+caller closure now uses the same source fact at the external boundary.
+
+The native regression first reached `aot_rt_trap_invariant` when a separately compiled caller
+invoked a function returned by a retained source factory. With the hook retained, two independent
+callers pass 42 and 99 and receive those values. A second regression fetches the function through
+a returned object's `run` property. Both modes run twice per caller against one provider
+installation, after compiler reset, with GC stress and verification. A parser test checks implicit
+function-expression retention and restoration of closed-world behavior after reset.
+
+This establishes conservative body retention for materialized source functions. Shared global/
+lexical and intrinsic binding, Script initialization entry points and the reusable source/native
+cache remain unfinished. Unsupported source constructs continue to refuse compilation.
 
 ## 2026-09-07 — Tokens have a spelling and a StringValue, and the grammar reads only the spelling
 

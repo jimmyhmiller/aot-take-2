@@ -16,6 +16,7 @@
 ;; arguments by the caller's incoming count, and give CallEnd the identical outgoing kill range.
 ;;
 (module aot.node.cpus.arm64)
+(import "aot.util.arena" :use [compiler-allocator compiler-state CompilerStateSlot])
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
 (import "coil.arraylist" :use *)
@@ -138,6 +139,7 @@
   (let [op (n-op n)]
     (if (= op OP-FUN)
         (let [selected (arm64-call-alloc n true false 0 0)]
+          (set! (.signature (arm64-call-node selected)) (fun-sig n))
           (arm64-call-set-symbol! selected (fun-name n))
           (if (and (= (fun-name n) "main")
                    (ty-dyn? (ty-tuple-at (fun-sig n) 0)))
@@ -202,10 +204,11 @@
                                                 (match (arena-function fidx)
                                                   (Some [fun] (fun-name fun))
                                                   (None []
-                                                        (do
-                                                          (panic-i "arm64-call-select: direct target has no registered owner"
-                                                                   fidx)
-                                                          ""))))
+                                                    (match (arena-external-function fidx)
+                                                      (Some [decl] (let [d decl] (.name d)))
+                                                      (None []
+                                                        (do (panic-i "arm64-call-select: undeclared direct target" fidx)
+                                                            ""))))))
                         (arm64-call-drop-target! selected))
                       (arm64-call-set-input-mask! selected
                                                   (- (n-nins n) 1)
@@ -300,7 +303,7 @@
     ;; The runtime returns the first payload byte in X0.
     (arm64-call-set-input-mask! selected 1 (mask-of ARM-X0))
     (arm64-call-set-projection-mask! selected 0 (mask-of ARM-X0))
-    (arm64-call-set-kill-mask! selected (arm64-js-kill-mask))
+    (arm64-call-set-kill-mask! selected (arm64-caller-save))
     (arm64-call-set-alloc-shape! selected shape)
     (if (and (ty-int? bytes-ty) (ty-constant? bytes-ty))
         (arm64-call-set-alloc-bytes! selected (ty-int-lo bytes-ty))
@@ -322,7 +325,9 @@
                                             (mask-stack ARM-MAX-REG))
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
-    (arm64-call-set-kill-mask! selected (arm64-js-kill-mask))
+    ;; No machine instruction clobbers scalar registers. The allocator separately constrains
+    ;; live movable references to the stack homes used by the collector.
+    (arm64-call-set-kill-mask! selected (mask-empty))
     selected))
 
 (defn arm64-barrier-select [(n (dyn NodeOps))] (-> (dyn NodeOps))
@@ -355,20 +360,27 @@
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
     (arm64-call-set-projection-mask! selected 2 (mask-of ARM-X0))
-    (arm64-call-set-kill-mask! selected (arm64-js-kill-mask))
+    (arm64-call-set-kill-mask! selected (arm64-caller-save))
     ;; String capabilities allocate strings and take the string shape; a property store allocates
     ;; a backing store whose shape the runtime's transition tree decides.
     (arm64-call-set-jsop! selected
                           prim
                           (- (n-nins n) JSOP-ARG0)
                           (if (and transitioning
-                                   (not (jsop-touches-properties? prim)))
+                                   (not (jsop-touches-public-memory? prim)))
                               SHAPE-STRING
                               0)
                           (if transitioning (n-nid selected) 0)
                           transitioning)
     (arm64-call-set-symbol! selected
-                            (case prim JS-STRING-LEN
+                            (case prim
+                                  JS-GLOBAL-LEXICAL-FIND "aot_rt_global_lexical_find"
+                                  JS-GLOBAL-LEXICAL-CREATE "aot_rt_global_lexical_create"
+                                  JS-GLOBAL-LEXICAL-STATE "aot_rt_global_lexical_state"
+                                  JS-GLOBAL-LEXICAL-VALUE "aot_rt_global_lexical_value"
+                                  JS-GLOBAL-LEXICAL-INITIALIZE "aot_rt_global_lexical_initialize"
+                                  JS-GLOBAL-LEXICAL-STORE "aot_rt_global_lexical_store"
+                                  JS-STRING-LEN
                                   "aot_rt_string_length" JS-STRING-CONCAT
                                   "aot_rt_string_concat" JS-STRING-CHARCODE
                                   "aot_rt_string_code_unit" JS-STRING-EQ
@@ -426,14 +438,17 @@
                                       "")))
     selected))
 
-;; An image entry is the address of its payload: ADRP/ADD against the entry's local symbol,
-;; exactly a FunPtr's form with no Fun.
+;; Final Simple's TFPARM records an internal/external relocation and emits ADRP/ADD (eight bytes)
+;; for a function address. Code addresses keep that form. Our static data instead belongs to the
+;; current realm: load this installation's base through X28, then add the image-relative payload
+;; offset. The installation slot is a typed relocation; neither a compiler ID nor a realm address
+;; enters reusable text. X16 is explicit scratch, and the fixed size survives slot relocation.
 (defn arm64-staticref-select [(n (dyn NodeOps))] (-> (dyn NodeOps))
   (let [selected
           (arm64-scalar-make n
                              OP-STATICREF
-                             ARM64-FORM-FUNPTR
-                             -1
+                             ARM64-FORM-UNITDATA
+                             (staticref-entry n)
                              ARM64-CLASS-NONE
                              ARM64-CLASS-GPR
                              0
@@ -443,7 +458,15 @@
               (break 0)
               (do (arm64-scalar-drop-last-input! selected) (continue))))
     (arm64-scalar-set-symbol! selected (heap-symbol (staticref-entry n)))
-    (arm64-scalar-set-size! selected 8)
+    (arm64-scalar-set-kill-mask! selected (mask-of 16))
+    (arm64-scalar-set-size! selected 36)
+    selected))
+
+(defn arm64-unitref-select [(n (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [selected (arm64-scalar-make n (n-op n) ARM64-FORM-UNITIDENTITY (unitref-local n)
+                                   ARM64-CLASS-NONE ARM64-CLASS-GPR 0 false true)]
+    (arm64-scalar-set-kill-mask! selected (mask-of 16))
+    (arm64-scalar-set-size! selected 28)
     selected))
 
 (defn arm64-install-hooks! [] (-> i64)
@@ -453,6 +476,7 @@
     ;; queried by dominance, scheduling, allocation, or encoding.
     (set-selected-cfg-ext! (primitive/fnptr-of arm64-call-cfg-hook))
     (set-selected-machine-hook! (primitive/fnptr-of arm64-mach-hook))
+    (set-machine-cfg-merge-hook! (primitive/fnptr-of arm64-cfg-merge?))
     (set-selected-gc-root-mask! (mask-stack ARM-MAX-REG))
     (set-selected-split-hook! (primitive/fnptr-of arm64-split-factory))
     (set-selected-layout-hook! (primitive/fnptr-of arm64-layout-jump)
@@ -480,6 +504,21 @@
 
 ;; A FunPtr constant that survives to selection is used as a VALUE (a direct call drops its
 ;; target). Simple's arm port materializes it as ADRP/ADD relocated against the function symbol.
+(defn arm64-external-select [(n (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [t (n-ty n)]
+    (if (not (and (ty-funptr? t) (ty-funptr-single? t)))
+        (panic "arm64-external-select: expected exact function identity") 0)
+    (let [fidx (ty-funptr-the-fidx t)
+          decl (match (arena-external-function fidx)
+                   (Some [d] d)
+                   (None [] (do (panic "arm64-external-select: undeclared function")
+                                (primitive/zeroed ExternalFunction))))
+          selected (arm64-scalar-make n OP-EXTERN ARM64-FORM-FUNPTR fidx
+                                      ARM64-CLASS-NONE ARM64-CLASS-GPR 0 false true)]
+      (arm64-scalar-set-symbol! selected (.name decl))
+      (arm64-scalar-set-size! selected 8)
+      selected)))
+
 (defn arm64-funptr-select [(n (dyn NodeOps))] (-> (dyn NodeOps))
   (let [t (n-ty n)]
     (if (not (and (ty-funptr? t) (ty-funptr-single? t)))
@@ -565,10 +604,10 @@
                                                true)]
                       (arm64-scalar-set-size! selected 4)
                       selected)
-                    (if (= op OP-FUNPTR)
-                        (arm64-funptr-select n)
-                        (if (= op OP-STATICREF)
-                            (arm64-staticref-select n)
+                    (if (or (= op OP-FUNPTR) (= op OP-EXTERN))
+                        (if (= op OP-EXTERN) (arm64-external-select n) (arm64-funptr-select n))
+                        (if (or (= op OP-STATICREF) (= op OP-KEYREF) (= op OP-SHAPEREF))
+                            (if (= op OP-STATICREF) (arm64-staticref-select n) (arm64-unitref-select n))
                             (if (or (= op OP-LOAD) (= op OP-STORE))
                                 (arm64-mem-select n)
                                 (if (= op OP-NEW)
@@ -709,6 +748,13 @@
    (seen (ArrayList bool))])
 
 (defn arm64-select--node! [(n (dyn NodeOps)) (state (ptr Arm64SelectState))] (-> (dyn NodeOps))
+  (let [prior (.current (node-origins))]
+    (set! (.current (node-origins)) (.origin (hdr n)))
+    (let [answer (arm64-select--node-inner! n state)]
+      (n-origin-leave! prior)
+      answer)))
+
+(defn arm64-select--node-inner! [(n (dyn NodeOps)) (state (ptr Arm64SelectState))] (-> (dyn NodeOps))
   (let [id (n-nid n)]
     ;; Multi-node expansions create machine nodes with no ideal-map slot.  They are already
     ;; selected, but their inputs may still be ideal.  Walk those inputs in place, matching final
@@ -799,7 +845,7 @@
 
 (defn arm64-select-graph [(root (dyn NodeOps))] (-> (dyn NodeOps))
   (let [old-limit (+ (arena-node-count) 1)
-        a (alloc/malloc-allocator)
+        a (compiler-allocator)
         state
           (alloc/unwrap-ptr [Arm64SelectState]
                             (alloc/create [Arm64SelectState] a))
@@ -838,14 +884,12 @@
 (defn arm64-callee-save [] (-> (ptr RegMask))
   (mask-or (mask-range ARM-X19 27) (mask-range ARM-D8 ARM-D15)))
 
-;; What a JavaScript call, allocation, runtime primitive or safepoint kills: every register. JS
-;; frames preserve nothing (docs/DECISIONS.md, the compile-time architecture), so a value live
-;; across one reaches a stack slot through ordinary splitting and the stack map reads slots only.
-;; `arm64-caller-save` keeps the AAPCS64 meaning for the one C boundary, the process-entry wrapper.
+;; JavaScript calls retain an all-volatile ABI. Coil runtime calls use arm64-caller-save;
+;; the allocator constrains GC roots to stack homes independently of these hardware clobbers.
 (defstruct Arm64JsKillMask [(mask (ptr RegMask)) (built bool)])
 
 (defn arm64-js-kill-mask [] (-> (ptr RegMask))
-  (let [t (primitive/alloc-static Arm64JsKillMask)]
+  (let [t (compiler-state [Arm64JsKillMask] (primitive/alloc-static CompilerStateSlot))]
     (if (.built t)
         (.mask t)
         (do
@@ -961,7 +1005,7 @@
 (defstruct Arm64Machine [])
 
 (defn arm64-machine [] (-> (ptr Arm64Machine))
-  (primitive/alloc-static Arm64Machine))
+  (compiler-state [Arm64Machine] (primitive/alloc-static CompilerStateSlot)))
 
 (defn arm64-reg-name [(reg i64)] (-> (slice u8))
   (case reg 0

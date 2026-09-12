@@ -1,0 +1,431 @@
+;; Persistent in-memory Test262 execution. The parent owns deadlines and bounded output; a worker
+;; compiles and executes many requests and is replaced after a fatal compiler/runtime failure.
+;; There is no Simple equivalent. Source planning and verdict policy remain in test262-policy.
+(module aot.tools.test262-memory)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.io" :as io)
+(import "coil.fs" :as fs)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.time" :as time)
+(import "coil.selectors" :as selectors)
+(import "aot.util.panic" :use *)
+(import "aot.util.arena" :use [compiler-session-reset! compiler-region])
+(import "aot.node.boot" :use [boot!])
+(import "aot.jsl.reader" :use [jsl-load-library! jsl-library JSL-COMPILER-INDEX])
+(import "aot.jsl.check" :use [jsl-check-unit])
+(import "aot.parse.parser" :use [parse-syntax-program-mode!])
+(import "aot.codegen.sourcecache" :use *)
+(import "aot.tools.test262-policy" :use *)
+(import "aot.tools.test262-metadata" :use *)
+
+(extern signal :cc c [i32 (ptr i8)] (-> (ptr i8)))
+
+(const MEMORY-STAGE-COMPILE 1)
+(const MEMORY-STAGE-INSTALL 2)
+(const MEMORY-STAGE-RUN 3)
+(const MEMORY-DONE 4)
+(const MEMORY-OUTPUT-LIMIT 65536)
+(const MEMORY-SOURCE-LIMIT 67108864)
+(const MEMORY-WNOHANG 1)
+(const MEMORY-SIGKILL 9)
+(const MEMORY-EINTR 4)
+(const MEMORY-EAGAIN 35)
+
+(defstruct MemoryPacket [(kind i64) (value i64) (instant i64) (reserved i64)
+                         (cache-hits i64) (cache-misses i64) (host-hits i64) (host-misses i64)])
+(defstruct MemoryWorker
+  [(pid i32) (request i32) (reply i32) (out i32) (err i32)
+   (starts i64) (compile-ns i64) (install-ns i64) (run-ns i64) (reserved i64)
+   (cache-hits i64) (cache-misses i64) (host-hits i64) (host-misses i64)])
+
+(defn memory-source-cache [] (-> (ptr SourceCache))
+  (primitive/alloc-static SourceCache))
+
+(defn memory-worker [] (-> (ptr MemoryWorker))
+  (primitive/alloc-static MemoryWorker))
+
+(defn memory-now [] (-> i64)
+  (try (let [t (try-or! (time/monotonic-now) (panic "test262 memory: clock failed"))]
+         (+ (* (.sec t) 1000000000) (.nsec t)))))
+
+(defn memory-seconds [(name (ptr i8)) (default i64)] (-> i64)
+  (let [raw (os/getenv name)]
+    (if (= (primitive/cast i64 raw) 0) default
+        (match (str-parse-int (cstr->str raw))
+          (Some [n] (if (and (> n 0) (< n 86400)) n default)) (None [] default)))))
+
+;; Request transmission is deadline-bound too. A stopped or prematurely dead worker must not
+;; strand its supervisor before the compilation monitor even starts.
+(defn memory-request-write! [(fd i32) (bytes (ptr i8)) (count i64) (deadline i64)] (-> bool)
+  (let [(mut done) 0]
+    (loop (if (>= (load done) count) (break true)
+              (do
+                (if (> (memory-now) deadline) (break false) 0)
+                (let [n (primitive/cast i64 (io/write fd (primitive/index bytes (load done))
+                                                    (primitive/cast isize (- count (load done)))))]
+                  (if (> n 0) (set! (mut done) (+ (load done) n))
+                      (if (and (< n 0) (= (os/os-errno) MEMORY-EINTR)) 0
+                          (if (and (< n 0) (= (os/os-errno) MEMORY-EAGAIN))
+                              (match (selectors/wait-fd-for fd (selectors/interest-writable)
+                                        (time/Duration :sec 0 :nsec 10000000))
+                                (Ok [_] 0) (Err [e] (match e (selectors/Timeout [] 0) (_ (break false)))))
+                              (break false)))))
+                (continue))))))
+
+(defn memory-request-word! [(fd i32) (value i64) (deadline i64)] (-> bool)
+  (let [p (primitive/alloc-stack i64)]
+    (set! p value)
+    (memory-request-write! fd (primitive/cast (ptr i8) p) 8 deadline)))
+
+(defn memory-request-source! [(fd i32) (bytes (slice u8)) (deadline i64)] (-> bool)
+  (and (<= (len bytes) MEMORY-SOURCE-LIMIT)
+       (memory-request-word! fd (len bytes) deadline)
+       (memory-request-write! fd (primitive/cast (ptr i8) (slice-data bytes)) (len bytes) deadline)))
+
+(defn memory-request! [(fd i32) (harness (ArrayList (slice u8))) (source (slice u8))
+                      (parse-only bool) (deadline i64)] (-> bool)
+  (let [a (alloc/malloc-allocator) (mut ok) true]
+    (set! (mut ok) (and (memory-request-word! fd (if parse-only 1 0) deadline)
+                       (memory-request-word! fd (if parse-only 1 (+ (len harness) 1)) deadline)))
+    (if parse-only 0
+        (al-for [path harness]
+          (if (load ok)
+              (let [bytes (try (try-or! (fs/read-file a path) (do (panic "test262 memory: missing harness") "")))]
+                (set! (mut ok) (memory-request-source! fd bytes deadline))
+                (alloc/free [u8] a bytes))
+              0)))
+    (and (load ok) (memory-request-source! fd source deadline))))
+
+(defn memory-write-all! [(fd i32) (bytes (ptr i8)) (count i64)] (-> i64)
+  (let [(mut done) 0]
+    (loop (if (>= (load done) count) (break 0)
+              (let [n (primitive/cast i64 (io/write fd (primitive/index bytes (load done))
+                                                     (primitive/cast isize (- count (load done)))))]
+                (if (> n 0) (set! (mut done) (+ (load done) n))
+                    (if (and (< n 0) (= (os/os-errno) MEMORY-EINTR)) 0
+                        (panic "test262 memory: request pipe write failed")))
+                (continue))))))
+
+(defn memory-read-all! [(fd i32) (bytes (ptr i8)) (count i64)] (-> bool)
+  (let [(mut done) 0]
+    (loop (if (>= (load done) count) (break true)
+              (let [n (primitive/cast i64 (io/read fd (primitive/index bytes (load done))
+                                                    (primitive/cast isize (- count (load done)))))]
+                (if (> n 0) (set! (mut done) (+ (load done) n))
+                    (if (and (< n 0) (= (os/os-errno) MEMORY-EINTR)) 0
+                        (if (and (= n 0) (= (load done) 0)) (break false)
+                            (panic "test262 memory: truncated request"))))
+                (continue))))))
+
+(defn memory-send-word! [(fd i32) (word i64)] (-> i64)
+  (let [p (primitive/alloc-stack i64)]
+    (set! p word)
+    (memory-write-all! fd (primitive/cast (ptr i8) p) 8)))
+
+(defn memory-receive-word! [(fd i32)] (-> i64)
+  (let [p (primitive/alloc-stack i64)]
+    (if (not (memory-read-all! fd (primitive/cast (ptr i8) p) 8))
+        (panic "test262 memory: missing request word") 0)
+    (load p)))
+
+(defn memory-send-packet! [(fd i32) (kind i64) (value i64)] (-> i64)
+  (let [p (primitive/alloc-stack MemoryPacket) cache (memory-source-cache)]
+    (set! p (MemoryPacket :kind kind :value value :instant (memory-now)
+                         :reserved (if (> (.scratch-peak cache) (.reserved (compiler-region)))
+                                       (.scratch-peak cache) (.reserved (compiler-region)))
+                         :cache-hits (.hits cache) :cache-misses (.misses cache)
+                         :host-hits (.host-hits cache) :host-misses (.host-misses cache)))
+    (memory-write-all! fd (primitive/cast (ptr i8) p) (primitive/sizeof MemoryPacket))))
+
+(defn memory-receive-source! [(fd i32)] (-> (slice u8))
+  (let [size (memory-receive-word! fd)]
+    (if (or (< size 0) (> size MEMORY-SOURCE-LIMIT)) (panic "test262 memory: invalid source size") 0)
+    (let [bytes (match (alloc/alloc [u8] (alloc/malloc-allocator) size)
+                  (Some [s] s) (None [] (do (panic "test262 memory: source allocation failed") "")))]
+      (if (not (memory-read-all! fd (primitive/cast (ptr i8) (slice-data bytes)) size))
+          (panic "test262 memory: missing source") 0)
+      bytes)))
+
+(defn memory-child-case! [(request i32) (reply i32) (parse-only bool)] (-> i64)
+  (let [a (alloc/malloc-allocator) count (memory-receive-word! request)
+        (mut sources) (al-new [(slice u8)] a) (mut i) 0]
+    (if (or (<= count 0) (> count 4096)) (panic "test262 memory: invalid source count") 0)
+    (loop (if (>= (load i) count) (break 0)
+              (do (push! [(slice u8)] (mut sources) (memory-receive-source! request))
+                  (set! (mut i) (+ (load i) 1)) (continue))))
+    (compiler-session-reset!)
+    (set! (.scratch-peak (memory-source-cache)) 0)
+    (memory-send-packet! reply MEMORY-STAGE-COMPILE 0)
+    (if parse-only
+        (do
+          (if (!= count 1) (panic "test262 memory: parse-negative request contains harness") 0)
+          (boot! 1)
+          (parse-syntax-program-mode! (get (load sources) 0) true true)
+          (memory-send-packet! reply MEMORY-DONE 0))
+        (let [cache (memory-source-cache)
+              (mut group) (al-new [(slice u8)] a)
+              (mut handles) (al-new [i64] a)
+              (mut selections) (al-new [SourceScriptSelection] a)]
+          ;; Compilation order is independent of Script evaluation order. Compile the variant
+          ;; first so a fatal frontend refusal does not discard a newly compiled harness.
+          (push! [(slice u8)] (mut group) (get (load sources) (- count 1)))
+          (let [test-handle (source-cache-acquire! cache (load group) 1)]
+          (push! [i64] (mut handles) test-handle)
+          (memory-send-packet! reply MEMORY-STAGE-COMPILE 0)
+          (al-clear! (mut group))
+          ;; Cache the ordered harness bundle separately from the variant. Source boundaries and
+          ;; directive prologues stay intact; no provider is evaluated before program assembly.
+          (set! (mut i) 0)
+          (loop (if (>= (load i) (- count 1)) (break 0)
+                    (do (push! [(slice u8)] (mut group) (get (load sources) (load i)))
+                        (set! (mut i) (+ (load i) 1)) (continue))))
+          (if (> (len (load group)) 0)
+              (let [handle (source-cache-acquire! cache (load group) 1)]
+                (push! [i64] (mut handles) handle)
+                (set! (mut i) 0)
+                (loop (if (>= (load i) (len (load group))) (break 0)
+                          (do (push! [SourceScriptSelection] (mut selections)
+                                (SourceScriptSelection :handle handle :script (load i)))
+                              (set! (mut i) (+ (load i) 1)) (continue))))) 0)
+          (push! [SourceScriptSelection] (mut selections) (SourceScriptSelection :handle test-handle :script 0))
+          (memory-send-packet! reply MEMORY-STAGE-INSTALL 0)
+          (let [program (source-program-new cache (load selections) 1)]
+          (al-for [handle (load handles)] (source-cache-release! cache handle))
+          (memory-send-packet! reply MEMORY-STAGE-RUN 0)
+          (let [answer (source-program-run! program)]
+            (source-program-free! program)
+            (memory-send-packet! reply MEMORY-DONE answer)))
+          (al-free! (mut group)) (al-free! (mut handles)) (al-free! (mut selections)))))
+    (al-for [source (load sources)] (alloc/free [u8] a source))
+    (al-free! (mut sources))
+    (compiler-session-reset!)
+    0))
+
+(defn memory-child-loop! [(request i32) (reply i32)] (-> i64)
+  (set! (memory-source-cache) (source-cache-new-shared 32))
+  (let [kind (primitive/alloc-stack i64)]
+    (loop (if (memory-read-all! request (primitive/cast (ptr i8) kind) 8)
+              (do (memory-child-case! request reply (!= (load kind) 0)) (continue))
+              (break 0))))
+  (source-cache-free! (memory-source-cache))
+  (os/_exit 0)
+  0)
+
+;; Warm immutable library data in the supervisor, so replacement workers inherit it as well.
+;; Scratch/checker allocations are reclaimed before fork; no mutable graph state is shared.
+(defn memory-prime-library! [] (-> i64)
+  (compiler-session-reset!)
+  (let [units (jsl-load-library! JSL-COMPILER-INDEX) (mut unit) 1]
+    (loop (if (or (.checked (jsl-library)) (> (load unit) units)) (break 0)
+              (do (jsl-check-unit (load unit)) (set! (mut unit) (+ (load unit) 1)) (continue))))
+    (set! (.checked (jsl-library)) true))
+  (compiler-session-reset!))
+
+(defn memory-start! [] (-> i64)
+  (let [w (memory-worker)]
+    (if (> (.pid w) (primitive/cast i32 0))
+        (let [status (primitive/alloc-stack i32)
+              got (os/waitpid (.pid w) status (primitive/cast i32 MEMORY-WNOHANG))]
+          (if (= got (.pid w)) (memory-close-worker! true) 0))
+        0)
+    (if (> (.pid w) (primitive/cast i32 0)) 0
+        (let [req (primitive/alloc-stack (array i32 2))
+              reply (primitive/alloc-stack (array i32 2))
+              out (primitive/alloc-stack (array i32 2))
+              err (primitive/alloc-stack (array i32 2))]
+          (memory-prime-library!)
+          (if (or (!= (os/pipe (primitive/index req 0)) (primitive/cast i32 0))
+                  (!= (os/pipe (primitive/index reply 0)) (primitive/cast i32 0))
+                  (!= (os/pipe (primitive/index out 0)) (primitive/cast i32 0))
+                  (!= (os/pipe (primitive/index err 0)) (primitive/cast i32 0)))
+              (panic "test262 memory: pipe creation failed") 0)
+          ;; A closed request pipe is an I/O failure, never a signal that kills the coordinator.
+          (signal 13 (primitive/cast (ptr i8) 1))
+          (let [pid (os/fork)]
+            (if (< pid (primitive/cast i32 0)) (panic "test262 memory: fork failed") 0)
+            (if (= pid (primitive/cast i32 0))
+                (do
+                  (if (!= (os/setpgid 0 0) (primitive/cast i32 0))
+                      (panic "test262 memory: worker process group failed") 0)
+                  (os/close (load (primitive/index req 1)))
+                  (os/close (load (primitive/index reply 0)))
+                  (os/close (load (primitive/index out 0)))
+                  (os/close (load (primitive/index err 0)))
+                  (if (or (< (os/dup2 (load (primitive/index out 1)) 1) (primitive/cast i32 0))
+                          (< (os/dup2 (load (primitive/index err 1)) 2) (primitive/cast i32 0)))
+                      (panic "test262 memory: worker output redirection failed") 0)
+                  (os/close (load (primitive/index out 1)))
+                  (os/close (load (primitive/index err 1)))
+                  (memory-child-loop! (load (primitive/index req 0)) (load (primitive/index reply 1))))
+                (do
+                  (os/close (load (primitive/index req 0)))
+                  (os/close (load (primitive/index reply 1)))
+                  (os/close (load (primitive/index out 1)))
+                  (os/close (load (primitive/index err 1)))
+                  (set! (.pid w) pid)
+                  (set! (.request w) (load (primitive/index req 1)))
+                  (set! (.reply w) (load (primitive/index reply 0)))
+                  (set! (.out w) (load (primitive/index out 0)))
+                  (set! (.err w) (load (primitive/index err 0)))
+                  (set! (.starts w) (+ (.starts w) 1))
+                  (if (or (< (os/fcntl (.request w) 4 4) (primitive/cast i32 0))
+                          (< (os/fcntl (.reply w) 4 4) (primitive/cast i32 0))
+                          (< (os/fcntl (.out w) 4 4) (primitive/cast i32 0))
+                          (< (os/fcntl (.err w) 4 4) (primitive/cast i32 0)))
+                      (panic "test262 memory: nonblocking pipe setup failed") 0))))))))
+
+(defn memory-close-worker! [(reaped bool)] (-> i64)
+  (let [w (memory-worker) status (primitive/alloc-stack i32)]
+    (if (> (.pid w) (primitive/cast i32 0))
+        (do
+          (if reaped 0
+              (do
+                (os/kill (- (primitive/cast i32 0) (.pid w)) (primitive/cast i32 MEMORY-SIGKILL))
+                ;; Also cover teardown before the child has established its process group.
+                (os/kill (.pid w) (primitive/cast i32 MEMORY-SIGKILL))
+                (loop (let [got (os/waitpid (.pid w) status 0)]
+                        (if (= got (.pid w)) (break 0)
+                            (if (and (< got (primitive/cast i32 0)) (= (os/os-errno) MEMORY-EINTR))
+                                (continue) (panic "test262 memory: cannot reap worker")))))))
+          (os/close (.request w)) (os/close (.reply w))
+          (os/close (.out w)) (os/close (.err w))
+          (set! (.pid w) 0)
+          0)
+        0)))
+
+;; Drain even after reaching the retention bound, so a verbose child cannot block on a full pipe.
+(defn memory-drain! [(fd i32) (out (mut (ArrayList u8))) (limit i64)] (-> bool)
+  (let [scratch (primitive/alloc-stack (array u8 4096)) (mut overflow) false]
+    (loop (let [n (primitive/cast i64 (io/read fd (primitive/cast (ptr i8) scratch) 4096))]
+            (if (> n 0)
+                (let [(mut i) 0]
+                  (loop (if (>= (load i) n) (break 0)
+                            (do
+                              (if (< (len (load out)) limit)
+                                  (push! [u8] (mut out) (load (primitive/index scratch (load i))))
+                                  (set! (mut overflow) true))
+                              (set! (mut i) (+ (load i) 1)) (continue))))
+                  (continue))
+                (if (or (= n 0) (= (os/os-errno) MEMORY-EAGAIN)) (break (load overflow))
+                    (if (= (os/os-errno) MEMORY-EINTR) (continue)
+                        (panic "test262 memory: pipe read failed"))))))))
+
+(defn memory-artifact! [(prefix (slice u8)) (suffix (slice u8)) (bytes (slice u8))] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        path (match (str-concat a prefix suffix) (Some [p] p) (None [] (do (panic "test262 memory: path allocation") "")))]
+    (try (try-or! (fs/write-file a path bytes) (panic "test262 memory: cannot write artifact")))
+    (alloc/free [u8] a path)
+    0))
+
+(defn memory-execute! [(harness (ArrayList (slice u8))) (source (slice u8))
+                       (prefix (slice u8)) (meta Test262Metadata)] (-> i64)
+  (memory-start!)
+  (let [w (memory-worker) a (alloc/malloc-allocator)
+        parse-only (and (.negative meta) (= (.negative-phase meta) "parse"))
+        (mut output) (al-new [u8] a) (mut errors) (al-new [u8] a)
+        (mut replies) (al-new [u8] a) (mut consumed) 0
+        (mut truncated) false (mut reaped) false (mut finished) false
+        (mut verdict) T262-HARNESS-ERROR (mut stage) MEMORY-STAGE-COMPILE
+        (mut since) (memory-now) status (primitive/alloc-stack i32)
+        compile-budget (* (memory-seconds c"AOT_T262_COMPILE_SECONDS" 30) 1000000000)
+        run-budget (* (memory-seconds c"AOT_T262_RUN_SECONDS" 15) 1000000000)
+        polls (primitive/alloc-stack (array selectors/Watch 3))]
+    (set! (.compile-ns w) 0) (set! (.install-ns w) 0) (set! (.run-ns w) 0) (set! (.reserved w) 0)
+    (set! (.cache-hits w) 0) (set! (.cache-misses w) 0) (set! (.host-hits w) 0) (set! (.host-misses w) 0)
+    (let [sent (memory-request! (.request w) harness source parse-only (+ (load since) compile-budget))]
+    (set! (primitive/index polls 0) (selectors/watch (.reply w) (selectors/interest-readable) 0))
+    (set! (primitive/index polls 1) (selectors/watch (.out w) (selectors/interest-readable) 1))
+    (set! (primitive/index polls 2) (selectors/watch (.err w) (selectors/interest-readable) 2))
+    (loop
+      (if (not sent)
+          (do
+            (set! (mut verdict) (if (> (memory-now) (+ (load since) compile-budget)) T262-TIMEOUT T262-HARNESS-ERROR))
+            (let [message "test262 memory: request transmission failed\n" (mut i) 0]
+              (loop (if (>= (load i) (len message)) (break 0)
+                        (do (push! [u8] (mut errors) (get message (load i)))
+                            (set! (mut i) (+ (load i) 1)) (continue)))))
+            (break 0)) 0)
+      (if (memory-drain! (.out w) (mut output) MEMORY-OUTPUT-LIMIT) (set! (mut truncated) true) 0)
+      (if (memory-drain! (.err w) (mut errors) MEMORY-OUTPUT-LIMIT) (set! (mut truncated) true) 0)
+      (if (memory-drain! (.reply w) (mut replies) 1024) (panic "test262 memory: reply overflow") 0)
+      (loop (if (> (+ (load consumed) (primitive/sizeof MemoryPacket)) (len (load replies))) (break 0)
+                (let [p (primitive/cast (ptr MemoryPacket) (primitive/index (slice-data (al-slice (load replies))) (load consumed)))]
+                  (case (load stage)
+                    MEMORY-STAGE-COMPILE (set! (.compile-ns w) (+ (.compile-ns w) (- (.instant p) (load since))))
+                    MEMORY-STAGE-INSTALL (set! (.install-ns w) (+ (.install-ns w) (- (.instant p) (load since))))
+                    MEMORY-STAGE-RUN (set! (.run-ns w) (+ (.run-ns w) (- (.instant p) (load since))))
+                    (panic "test262 memory: invalid stage"))
+                  (if (> (.reserved p) (.reserved w)) (set! (.reserved w) (.reserved p)) 0)
+                  (set! (.cache-hits w) (.cache-hits p)) (set! (.cache-misses w) (.cache-misses p))
+                  (set! (.host-hits w) (.host-hits p)) (set! (.host-misses w) (.host-misses p))
+                  (set! (mut since) (.instant p))
+                  (if (= (.kind p) MEMORY-DONE)
+                      (do
+                        (set! (mut verdict) (if (= (.value p) 0) (t262-verdict meta (Normal 0 false)) T262-FAIL))
+                        (set! (mut finished) true))
+                      (set! (mut stage) (.kind p)))
+                  (set! (mut consumed) (+ (load consumed) (primitive/sizeof MemoryPacket)))
+                  (continue))))
+      (if (load finished) (break 0) 0)
+      (if (load reaped)
+          (let [raw (primitive/cast i64 (load status)) code (primitive/ishr raw 8)]
+            (set! (mut verdict)
+                  (if (!= (& raw 127) 0) T262-CRASH
+                      (if (and parse-only (= code EXIT-SYNTAX) (= (al-slice (load output)) PARSE-SYNTAX-RECORD))
+                          (t262-verdict meta (JsException "parse" "SyntaxError"))
+                          (if (= code EXIT-UNIMPLEMENTED)
+                              (if (= (load stage) MEMORY-STAGE-RUN) T262-FAIL T262-UNSUPPORTED)
+                              T262-COMPILER-ERROR))))
+            (break 0))
+          0)
+      (let [got (os/waitpid (.pid w) status (primitive/cast i32 MEMORY-WNOHANG))]
+        (if (= got (.pid w))
+            (do
+              (set! (mut reaped) true)
+              ;; Drain the final stage packet and BOTH output streams on the next iteration
+              ;; before classifying the exit; EOF can arrive after our first drain this turn.
+              (continue))
+            (if (and (< got (primitive/cast i32 0)) (!= (os/os-errno) MEMORY-EINTR))
+                (panic "test262 memory: waitpid failed") 0)))
+      (if (> (- (memory-now) (load since))
+             (if (= (load stage) MEMORY-STAGE-RUN) run-budget compile-budget))
+          (do (set! (mut verdict) T262-TIMEOUT) (break 0)) 0)
+      (if (load truncated) (do (set! (mut verdict) T262-HARNESS-ERROR) (break 0)) 0)
+      (match (selectors/wait-many-for a (slice-new [selectors/Watch] (primitive/index polls 0) 3)
+                                      (time/Duration :sec 0 :nsec 10000000))
+        (Ok [_] 0)
+        (Err [error] (match error (selectors/Timeout [] 0)
+                                 (_ (panic "test262 memory: poll failed")))))
+      (continue)))
+    (if (memory-drain! (.out w) (mut output) MEMORY-OUTPUT-LIMIT) (set! (mut truncated) true) 0)
+    (if (memory-drain! (.err w) (mut errors) MEMORY-OUTPUT-LIMIT) (set! (mut truncated) true) 0)
+    (if (not (load finished))
+        (let [elapsed (- (memory-now) (load since))]
+          (case (load stage)
+            MEMORY-STAGE-COMPILE (set! (.compile-ns w) (+ (.compile-ns w) elapsed))
+            MEMORY-STAGE-INSTALL (set! (.install-ns w) (+ (.install-ns w) elapsed))
+            MEMORY-STAGE-RUN (set! (.run-ns w) (+ (.run-ns w) elapsed))
+            (panic "test262 memory: invalid terminal stage")))
+        0)
+    (if (or (not (load finished)) (load truncated)) (memory-close-worker! (load reaped)) 0)
+    (if (load truncated) (set! (mut verdict) T262-HARNESS-ERROR) 0)
+    (memory-artifact! prefix ".memory.stdout" (al-slice (load output)))
+    (memory-artifact! prefix ".memory.stderr" (al-slice (load errors)))
+    (let [(mut metrics) (sb-new a)]
+      (sb-push-i64! (mut metrics) (.compile-ns w)) (sb-push-str! (mut metrics) "\t")
+      (sb-push-i64! (mut metrics) (.install-ns w)) (sb-push-str! (mut metrics) "\t")
+      (sb-push-i64! (mut metrics) (.run-ns w)) (sb-push-str! (mut metrics) "\t")
+      (sb-push-i64! (mut metrics) (.reserved w)) (sb-push-str! (mut metrics) "\t")
+      (sb-push-i64! (mut metrics) (.starts w)) (sb-push-str! (mut metrics) "\t")
+      (sb-push-i64! (mut metrics) (.cache-hits w)) (sb-push-str! (mut metrics) "\t")
+      (sb-push-i64! (mut metrics) (.cache-misses w)) (sb-push-str! (mut metrics) "\t")
+      (sb-push-i64! (mut metrics) (.host-hits w)) (sb-push-str! (mut metrics) "\t")
+      (sb-push-i64! (mut metrics) (.host-misses w)) (sb-push-str! (mut metrics) "\n")
+      (memory-artifact! prefix ".memory.metrics" (sb-str (load metrics)))
+      (sb-free! (mut metrics)))
+    (al-free! (mut output)) (al-free! (mut errors)) (al-free! (mut replies))
+    (load verdict)))

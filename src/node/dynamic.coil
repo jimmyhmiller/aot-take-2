@@ -30,6 +30,7 @@
 ;; object/string/symbol representations wait on their corresponding lattice and runtime families.
 ;; ============================================================================
 (module aot.node.dynamic)
+(import "aot.util.arena" :use [compiler-allocator compiler-state CompilerStateSlot])
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
 (import "coil.arraylist" :use *)
@@ -37,7 +38,8 @@
 (import "aot.node.node" :use *)
 (import "aot.node.constant" :use *)
 (import "aot.heap" :use *)
-(import "aot.rt.number" :use [number-from-bits])
+(import "aot.rt.number" :use [number-from-bits number-bits])
+(import "aot.shape" :use [SHAPE-ELEMENTS])
 (import "aot.node.arith" :use *)
 (import "aot.node.control" :use *)
 (import "aot.type.type" :use *)
@@ -101,6 +103,9 @@
 ;; harness-sized program, a fifth of the graph and a heap object per evaluation.
 (defstruct StaticRefNode [(hdr NodeHdr) (entry i64) (rep i64)])
 
+;; Internal managed payload, deliberately outside the JavaScript tag representations.
+(const STATICREF-ARGUMENT-VECTOR -1)
+
 (defn staticref-node [(n (dyn NodeOps))] (-> (ptr StaticRefNode))
   (if (!= (n-op n) OP-STATICREF)
       (do
@@ -116,6 +121,8 @@
 
 ;; The raw pointer type of an image entry under representation `rep`.
 (defn staticref-raw-ty [(rep i64)] (-> i64)
+  (if (= rep STATICREF-ARGUMENT-VECTOR)
+      (ty-memptr false (ty-struct "$aot.ArgumentVector"))
   (if (= rep REP-STRING)
       (raw-string-ty)
       (if (= rep REP-FUNCTION)
@@ -125,7 +132,7 @@
               (do
                 (panic-i "staticref-raw-ty: representation is not a heap reference"
                          rep)
-                TY-BOT)))))
+                TY-BOT))))))
 
 (impl NodeOps StaticRefNode
   (hdr [(self (ptr StaticRefNode))]
@@ -159,7 +166,7 @@
 ;; The address of image entry `entry` as a raw `rep` pointer, peepholed: an equal reference already
 ;; in the graph is returned instead.
 (defn staticref-make [(entry i64) (rep i64)] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [StaticRefNode] (alloc/create [StaticRefNode] a))
         dn (primitive/make-dyn NodeOps p)]
     (if (or (< entry 0) (>= entry (heap-count)))
@@ -173,6 +180,8 @@
         (panic-i "staticref-make: an object reference to a string entry" entry)
         0)
     (set! (.entry p) entry)
+    (if (and (= rep STATICREF-ARGUMENT-VECTOR) (!= (heap-entry-shape entry) SHAPE-ELEMENTS))
+        (panic "staticref-make: argument vector must have elements shape") 0)
     (set! (.rep p) rep)
     (n-init! dn OP-STATICREF)
     (n-set-ty! dn (staticref-raw-ty rep))
@@ -284,6 +293,8 @@
 
 ;; Which tag does this raw type box to?
 (defn box-tag-of [(t i64)] (-> i64)
+  (if (and (ty-memptr? t) (= (ty-memptr-struct t) (ty-struct "$aot.ArgumentVector")))
+      0
   (if (ty-int? t)
       TAG-INT
       (if (ty-flt? t)
@@ -299,7 +310,30 @@
               ;; Anything else is not a raw representation we can box. Refuse rather than guess a
               ;; tag: a wrong tag is a value that reads back as the wrong type, which nothing
               ;; downstream would catch.
-              0))))
+              0)))))
+
+;; Exact image encoding of an existing boxed constant. No evaluation, allocation of JS objects,
+;; or identity substitution: static references retain their image entry and relocation kind.
+(defstruct BoxedImageWord [(word i64) (kind i64)])
+(defn boxed-image-word [(n (dyn NodeOps))] (-> (Option BoxedImageWord))
+  (if (!= (n-op n) OP-BOX) (None [BoxedImageWord])
+    (let [rep (box-rep n) raw (n-in! n 1) t (n-ty raw)]
+      (if (and (= (n-op raw) OP-STATICREF)
+               (or (= rep REP-STRING) (= rep REP-OBJECT) (= rep REP-FUNCTION)))
+          (Some (BoxedImageWord :word (heap-ref-word (staticref-rep-prefix rep) (staticref-entry raw))
+                                :kind HEAP-WORD-REF))
+      (if (or (= rep REP-NULL) (= rep REP-UNDEFINED))
+          (Some (BoxedImageWord :word (if (= rep REP-NULL) DYNAMIC-NULL-WORD DYNAMIC-UNDEFINED-WORD)
+                                :kind HEAP-WORD-CONST))
+      (if (and (ty-int? t) (ty-constant? t) (or (= rep REP-INT) (= rep REP-BOOL)))
+          (Some (BoxedImageWord :word (primitive/ior
+                  (primitive/ishl (if (= rep REP-INT) DYNAMIC-PREFIX-INT DYNAMIC-PREFIX-BOOL) 48)
+                  (primitive/iand (ty-int-lo t) 0xffffffffffff)) :kind HEAP-WORD-CONST))
+      (if (and (= rep REP-DOUBLE) (ty-flt? t) (ty-constant? t))
+          (let [v (ty-flt-value t)]
+            (Some (BoxedImageWord :word (if (primitive/fcmp-eq v v) (number-bits v) 0x7ff8000000000000)
+                                  :kind HEAP-WORD-CONST)))
+          (None [BoxedImageWord]))))))))
 
 (defn box-compute-ty [(t i64)] (-> i64)
   (if (ty-high? t)
@@ -346,7 +380,7 @@
 (defn box-make-rep-at [(ctrl (Option (dyn NodeOps)))
                        (v (dyn NodeOps))
                        (rep i64)] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [BoxNode] (alloc/create [BoxNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.rep p) rep)
@@ -517,7 +551,7 @@
               (None [(dyn NodeOps)]))))))
 
 (defn unbox-make [(v (dyn NodeOps)) (rep i64)] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [UnboxNode] (alloc/create [UnboxNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.rep p) rep)
@@ -588,7 +622,7 @@
   (hash-extra [(self (ptr TypeTestNode))] (-> i64) (+ 211 (.tags self))))
 
 (defn typetest-make [(v (dyn NodeOps)) (tags i64)] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [TypeTestNode] (alloc/create [TypeTestNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.tags p) tags)
@@ -677,7 +711,7 @@
   (hash-extra [(self (ptr CastNode))] (-> i64) (+ 223 (.cast-ty self))))
 
 (defn cast-make [(ctrl (dyn NodeOps)) (v (dyn NodeOps)) (t i64)] (-> (dyn NodeOps))
-  (let [a (alloc/malloc-allocator)
+  (let [a (compiler-allocator)
         p (alloc/unwrap-ptr [CastNode] (alloc/create [CastNode] a))
         d (primitive/make-dyn NodeOps p)]
     (set! (.cast-ty p) t)

@@ -1,0 +1,1120 @@
+;; Native memory execution must agree with the ordinary source-entry ABI and survive moving GC.
+
+(module aot.tests.image)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.assert" :use *)
+(import "coil.fs" :as fs)
+(import "coil.reader" :as rd)
+(import "coil.os" :as os)
+(import "aot.util.panic" :use [EXIT-PANIC])
+(import "aot.codegen.compunit" :use [CuScriptDecl CU-SCRIPT-FUNCTION])
+(import "aot.jsl.reader" :use *)
+(import "aot.jsl.lower" :use *)
+(import "aot.node.boot" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.memory" :use [ALIAS-BULK load-make])
+(import "aot.node.gc" :use [heapstate-make])
+(import "aot.rt.abi" :use [RT-HEAP-OFFSET-EXCEPTION-VALUE])
+(import "aot.node.dynamic" :use [DYNAMIC-NULL-WORD])
+(import "aot.node.property" :use [property-expand-all!])
+(import "aot.heap" :use [heap-add-object! heap-set-intrinsic!])
+(import "aot.codegen.gcmeta" :use [gc-lower-barriers-from!])
+(import "aot.type.type" :use *)
+(import "aot.codegen.codegen" :use *)
+(import "aot.codegen.iterpeeps" :use *)
+(import "aot.codegen.opto" :use *)
+(import "aot.codegen.typecheck" :use *)
+(import "aot.codegen.looptree" :use *)
+(import "aot.codegen.pipeline" :use *)
+(import "aot.codegen.sourcecache" :use *)
+(import "aot.codegen.image" :use *)
+(import "aot.codegen.encoding" :use *)
+(import "aot.shape" :use [shape-key-intern ALIAS-EXCEPTION-VALUE])
+(import "aot.rt.rt" :use [rt-code-count rt-code-find rt-code-unit-slot])
+(import "aot.util.arena" :use [compiler-session-reset! compiler-region])
+
+(extern setenv :cc c [(ptr i8) (ptr i8) i32] (-> i32))
+
+(defn image-test-jsl-verify [(body JslExprResult) (library bool)] (-> JslExprResult)
+  (if library
+      (let [(mut args) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))]
+        (push! [(dyn NodeOps)] (mut args) (.value body))
+        (push! [(dyn NodeOps)] (mut args)
+               (load-make (.ctrl body) (.mem body) (heapstate-make)
+                          (con-int RT-HEAP-OFFSET-EXCEPTION-VALUE)
+                          ALIAS-EXCEPTION-VALUE (ty-dyn TAG-ANY)))
+        (let [verified (jsl-lower-macro-values "Verify" (load args) (.ctrl body) (.mem body))]
+          (al-free! (mut args)) verified))
+      body))
+
+;; A JSL-only frontend for native capability tests. It uses the ordinary optimizer, backend,
+;; image installation and realm lifecycle, without exposing test-only syntax to JavaScript.
+(defn image-test-jsl! [(source (slice u8)) (seed i64) (expected i64) (library bool)] (-> i64)
+  (let [im (primitive/alloc-stack CodeImage) loaded (primitive/alloc-stack InstalledImage)]
+    (compiler-session-reset!) (boot! seed) (code-reset! seed)
+    (jsl-reset!) (jsl-lower-reset!) (code-enter-phase! PHASE-PARSE)
+    (if library
+        (do
+          ;; This capability realm needs intrinsic identities but no source constructors or
+          ;; global object. Execute the production error helpers over distinct prototype objects.
+          (heap-set-intrinsic! "ReferenceError.prototype" (heap-add-object! DYNAMIC-NULL-WORD))
+          (heap-set-intrinsic! "TypeError.prototype" (heap-add-object! DYNAMIC-NULL-WORD))
+          (jsl-lower-index! "jsl/compiler/index") 0)
+        0)
+    (jsl-lower-unit! (jsl-read-source! source "native-primitive-test.jsl"))
+    (let [start (start-make (ty-int-bot)) stop (stop-make)
+          main (fun-make start (ty-tuple-of2 (ty-dyn TAG-COMPLETION) (ty-int-bot)) "main")
+          (mut args) (al-new [(dyn NodeOps)] (alloc/malloc-allocator))
+          body (image-test-jsl-verify
+                 (jsl-lower-macro-values "Probe" (load args) main (con-make (ty-mem ALIAS-BULK TY-BOT)))
+                 library)
+          ret (return-make (.ctrl body) (Some (.mem body)) (.value body)
+                           (None [(dyn NodeOps)]) (Some main))]
+      (fun-set-ret! main ret) (stop-add-return! stop ret) (n-keep! start)
+      (jsl-define-pending!)
+      (code-enter-phase! PHASE-ITER) (jsl-prepare-opto!) (iter-seed-connected! stop) (iter-run!)
+      (code-enter-phase! PHASE-OPTO) (jsl-close-world!) (opto-run!)
+      (iter-seed-all!) (iter-run!) (property-expand-all!) (iter-seed-all!) (iter-run!)
+      (jsl-finish-opto! stop)
+      (code-enter-phase! PHASE-TYPECHECK) (typecheck-run! stop)
+      (code-enter-phase! PHASE-LOOPTREE) (looptree-build! start stop)
+      (code-enter-phase! PHASE-SERIALIZE) (gc-lower-barriers-from! stop)
+      (code-enter-phase! PHASE-UNLINK) (fun-prepare-codegen! main start)
+      (jsl-prepare-codegen! start) (call-unlink-all!)
+      (n-unkeep! start) (pipeline-encode-machine! stop) (set! im (image-capture))
+      (al-free! (mut args)))
+    (compiler-session-reset!)
+    (set! loaded (image-install im))
+    (assert-eq (image-run! im loaded) expected)
+    (assert-eq (image-run! im loaded) expected)
+    (image-uninstall! loaded) (image-free! im) 0))
+
+(defn image-test-jsl-primitive! [(source (slice u8)) (seed i64) (expected i64)] (-> i64)
+  (image-test-jsl! source seed expected false))
+
+(deftest lexical_tdz_read_raises_the_intrinsic_reference_error_in_native_code
+  (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+  (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+  (image-test-jsl!
+    "(macro Probe :transitioning true :throws true :params [] :ret dyn
+       (let [(slot (%GlobalLexicalCreate (%PropertyKey \"tdz\") 1))]
+         (JsGlobalLexicalRead slot)))
+     (macro Verify :params [(result dyn) (error dyn)] :ret dyn
+       (if (%IsException result)
+         (if (%IsObjectLike error)
+           (if (JsStrictEqualValue (%GetObjectPrototype (%UnboxObjectLike error))
+                                  (%IntrinsicPrototype \"ReferenceError.prototype\"))
+               (%Box 42) (%Box 1)) (%Box 2)) (%Box 3)))"
+    1 42 true))
+
+(deftest lexical_tdz_write_checks_initialization_before_const_writability
+  (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+  (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+  (image-test-jsl!
+    "(macro Probe :transitioning true :throws true :params [] :ret dyn
+       (let [(slot (%GlobalLexicalCreate (%PropertyKey \"tdz\") 0))]
+         (JsGlobalLexicalWrite slot (%Box (%StringFromCharCode 65)))))
+     (macro Verify :params [(result dyn) (error dyn)] :ret dyn
+       (if (%IsException result)
+         (if (%IsObjectLike error)
+           (if (JsStrictEqualValue (%GetObjectPrototype (%UnboxObjectLike error))
+                                  (%IntrinsicPrototype \"ReferenceError.prototype\"))
+               (%Box 42) (%Box 1)) (%Box 2)) (%Box 3)))"
+    17 42 true))
+
+(deftest lexical_const_write_raises_type_error_and_preserves_the_initialized_value
+  (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+  (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+  (image-test-jsl!
+    "(macro Probe :transitioning true :throws true :params [] :ret dyn
+       (let [(slot (%GlobalLexicalCreate (%PropertyKey \"constant\") 0))
+             (initialized (%GlobalLexicalInitialize slot (%Box (%StringFromCharCode 65))))]
+         (JsGlobalLexicalWrite slot (%Box (%StringFromCharCode 66)))))
+     (macro Verify :params [(result dyn) (error dyn)] :ret dyn
+       (if (%IsException result)
+         (if (%IsObjectLike error)
+           (if (JsStrictEqualValue (%GetObjectPrototype (%UnboxObjectLike error))
+                                  (%IntrinsicPrototype \"TypeError.prototype\"))
+             (let [(saved (%GlobalLexicalValue (%GlobalLexicalFind (%PropertyKey \"constant\"))))]
+               (if (%IsString saved)
+                 (if (%Eq (%StringCharCode (%UnboxString saved) 0) 65) (%Box 42) (%Box 4))
+                 (%Box 5)))
+             (%Box 1)) (%Box 2)) (%Box 3)))"
+    31 42 true))
+
+(deftest lexical_initialized_undefined_and_mutable_writes_use_normal_completions
+  (image-test-jsl!
+    "(macro Probe :transitioning true :throws true :params [] :ret dyn
+       (let [(slot (%GlobalLexicalCreate (%PropertyKey \"mutable\") 1))
+             (initialized (%GlobalLexicalInitialize slot (%Undefined)))
+             (before (JsGlobalLexicalRead slot))]
+         (if (%IsException before) before
+           (if (%IsUndefined before)
+             (let [(stored (JsGlobalLexicalWrite slot (%Box 42)))]
+               (if (%IsException stored) stored (JsGlobalLexicalRead slot)))
+             (%Box 1)))))
+     (macro Verify :params [(result dyn) (error dyn)] :ret dyn
+       (if (%IsException result) (%Box 2) result))"
+    43 42 true))
+
+(deftest lexical_primitives_execute_in_memory_with_fresh_realms_and_gc_roots
+  (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+  (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+  (let [source "(macro Probe :transitioning true :params [] :ret dyn
+    (let [(key (%PropertyKey \"shared\"))
+          (before (%GlobalLexicalFind key))
+          (slot (%GlobalLexicalCreate key 1))
+          (state (%GlobalLexicalState slot))
+          (initialized (%GlobalLexicalInitialize slot (%Box (%StringFromCharCode 65))))
+          (allocation (%StringFromCharCode 66))
+          (saved (%GlobalLexicalValue slot))
+          (other (%StringCharCode allocation 0))
+          (stored (%GlobalLexicalStore slot (%Box 42)))
+          (found (%GlobalLexicalFind key))]
+      (if (%Eq before 0)
+        (if (%Eq state 2)
+          (if (%Eq found slot)
+            (if (%IsString saved)
+              (if (%Eq (%StringCharCode (%UnboxString saved) 0) 65)
+                (if (%Eq other 66)
+                  (if (%Eq (%GlobalLexicalState slot) 3) (%GlobalLexicalValue slot) (%Box 6))
+                  (%Box 5)) (%Box 4)) (%Box 7)) (%Box 3)) (%Box 2)) (%Box 1))))"]
+    (image-test-jsl-primitive! source 1 42)
+    (image-test-jsl-primitive! source 17 42))
+  (image-test-jsl-primitive!
+    "(macro Probe :params [] :ret dyn
+       (let [(slot (%GlobalLexicalCreate (%PropertyKey \"constant\") 0))
+             (before (%GlobalLexicalState slot))
+             (initialized (%GlobalLexicalInitialize slot (%Box 42)))]
+         (if (%Eq before 0)
+           (if (%Eq (%GlobalLexicalState slot) 1) (%GlobalLexicalValue slot) (%Box 2))
+           (%Box 1))))"
+    31 42))
+
+(defn image-test-source! [(source (slice u8)) (script bool) (expected i64)] (-> i64)
+  (let [(mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))
+        im (primitive/alloc-stack CodeImage)
+        loaded (primitive/alloc-stack InstalledImage)]
+    (push! [(slice u8)] (mut sources) source)
+    (compiler-session-reset!)
+    (pipeline-encode-sources! (load sources) 1 script)
+    (set! im (image-capture))
+    (compiler-session-reset!)
+    (assert-eq (.reserved (compiler-region)) 0)
+    ;; Reinstall the same immutable artifact twice: the data image must be fresh both times.
+    (set! loaded (image-install im))
+    (assert-eq (image-run! im loaded) expected)
+    ;; Retain exactly the same text and installation identity across fresh realm instances.
+    (assert-eq (image-run! im loaded) expected)
+    (image-uninstall! loaded)
+    (set! loaded (image-install im))
+    (assert-eq (image-run! im loaded) expected)
+    (image-uninstall! loaded)
+    (image-free! im)
+    (al-free! (mut sources))
+    0))
+
+(deftest memory-function-entry
+  (image-test-source! "function main() { return 42; }" false 42))
+
+(deftest fixed_literal_backing_preserves_order_duplicates_prototype_and_gc
+  (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+  (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+  (image-test-source!
+    "var effects = 0;
+     function value(n) { effects = effects * 10 + n; return {n: n}; }
+     var proto = {inherited: 42};
+     var o = {a: value(1), __proto__: proto, b: value(2), a: value(3), c: value(4)};
+     if (effects !== 1234 || o.a.n !== 3 || o.b.n !== 2 || o.c.n !== 4) throw 1;
+     if (Object.getPrototypeOf(o) !== proto || o.inherited !== 42) throw 2;
+     var keys = Object.keys(o);
+     if (keys.length !== 3 || keys[0] !== 'a' || keys[1] !== 'b' || keys[2] !== 'c') throw 3;
+     var again = {a: value(5), b: value(6)};
+     if (again === o || again.a === o.a || o.a.n !== 3 || again.b.n !== 6) throw 4;
+     var ignored = {a: 1, __proto__: 7, b: 2};
+     if (Object.getPrototypeOf(ignored) !== Object.prototype || ignored.b !== 2) throw 5;"
+    true 0))
+
+(deftest fixed_literal_backing_stops_on_abrupt_completion
+  (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+  (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+  (image-test-source!
+    "var effects = 0; var result = 17;
+     function value(n) { effects = effects * 10 + n; return {n: n}; }
+     function fail() { effects = effects * 10 + 2; throw 91; }
+     var caught = 0;
+     try { result = {a: value(1), b: fail(), c: value(3)}; }
+     catch (e) { if (e !== 91) throw 1; caught = 1; }
+     if (effects !== 12 || result !== 17 || caught !== 1) throw 2;"
+    true 0))
+
+(deftest source_program_owns_provider_leases_and_runs_ordered_repeated_selections_in_fresh_realms
+  (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+  (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+  (let [cache (primitive/alloc-stack SourceCache)
+        (mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))
+        (mut selections) (al-new [SourceScriptSelection] (alloc/malloc-allocator))
+        before (rt-code-count)]
+    (set! cache (source-cache-new 2))
+    (push! [(slice u8)] (mut sources) "var state = {answer:0};")
+    (push! [(slice u8)] (mut sources) "state.answer++;")
+    (let [harness (source-cache-acquire! cache (load sources) 1)]
+      (al-clear! (mut sources))
+      (push! [(slice u8)] (mut sources) "if (state.answer !== 2) throw 7;")
+      (let [test (source-cache-acquire! cache (load sources) 1)]
+        (push! [SourceScriptSelection] (mut selections) (SourceScriptSelection :handle harness :script 0))
+        (push! [SourceScriptSelection] (mut selections) (SourceScriptSelection :handle harness :script 1))
+        (push! [SourceScriptSelection] (mut selections) (SourceScriptSelection :handle harness :script 1))
+        (push! [SourceScriptSelection] (mut selections) (SourceScriptSelection :handle test :script 0))
+        (let [first (source-program-new cache (load selections) 1)
+              second (source-program-new cache (load selections) 1)]
+          (assert-eq (.host first) (.host second))
+          (assert-eq (.host-hits cache) 1) (assert-eq (.host-misses cache) 1)
+          (assert-eq (.installations (.host first)) 2)
+          (assert-eq (len (.providers first)) 2)
+          (assert-eq (.leases (source-cache-entry! cache harness)) 3)
+          (source-cache-release! cache harness) (source-cache-release! cache test)
+          (al-free! (mut sources)) (al-free! (mut selections))
+          (compiler-session-reset!) (jsl-library-clear!)
+          (assert-eq (source-program-run! first) 0)
+          (assert-eq (source-program-run! first) 0)
+          (source-program-free! first)
+          (assert-eq (.leases (source-cache-entry! cache harness)) 1)
+          (assert-eq (source-program-run! second) 0)
+          (source-program-free! second)
+          (assert-eq (.leases (source-cache-entry! cache harness)) 0)
+          (assert-eq (.installations (.image (source-cache-entry! cache harness))) 0))))
+    (source-cache-free! cache)
+    (assert-eq (rt-code-count) before)))
+
+(deftest source_program_accepts_empty_execution_and_preserves_uncaught_status
+  (let [cache (primitive/alloc-stack SourceCache)
+        (mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))
+        (mut selections) (al-new [SourceScriptSelection] (alloc/malloc-allocator))]
+    (set! cache (source-cache-new 1))
+    (let [empty (source-program-new cache (load selections) 1)]
+      (assert-eq (source-program-run! empty) 0) (source-program-free! empty))
+    (push! [(slice u8)] (mut sources) "throw {answer:42};")
+    (let [handle (source-cache-acquire! cache (load sources) 1)]
+      (push! [SourceScriptSelection] (mut selections) (SourceScriptSelection :handle handle :script 0))
+      (let [program (source-program-new cache (load selections) 1)]
+        (source-cache-release! cache handle)
+        (assert-eq (source-program-run! program) 3)
+        (assert-eq (source-program-run! program) 3)
+        (source-program-free! program)))
+    (source-cache-free! cache) (al-free! (mut sources)) (al-free! (mut selections))))
+
+(defn image-test-program-refuses! [(cache (ptr SourceCache)) (selections (ArrayList SourceScriptSelection))] (-> i64)
+  (let [pid (os/fork) status (primitive/alloc-stack i32)]
+    (assert (>= pid 0))
+    (if (= pid 0)
+        (do (source-program-new cache selections 1) (os/_exit 0) 0)
+        (do (assert-eq (os/waitpid pid status 0) pid)
+            (assert-eq (& (primitive/cast i64 (load status)) 127) 0)
+            (assert-eq (primitive/ishr (primitive/cast i64 (load status)) 8) EXIT-PANIC) 0))))
+
+(deftest source_program_rejects_invalid_selections_and_mixed_dependency_snapshots
+  (let [cache (primitive/alloc-stack SourceCache)
+        (mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))
+        (mut selections) (al-new [SourceScriptSelection] (alloc/malloc-allocator))]
+    (set! cache (source-cache-new 2))
+    (push! [(slice u8)] (mut sources) "var answer = 42;")
+    (let [first (source-cache-acquire! cache (load sources) 1)
+          second (source-cache-acquire! cache (load sources) 2)]
+      (push! [SourceScriptSelection] (mut selections) (SourceScriptSelection :handle first :script -1))
+      (image-test-program-refuses! cache (load selections))
+      (al-clear! (mut selections))
+      (push! [SourceScriptSelection] (mut selections) (SourceScriptSelection :handle first :script 1))
+      (image-test-program-refuses! cache (load selections))
+      (al-clear! (mut selections))
+      (push! [SourceScriptSelection] (mut selections) (SourceScriptSelection :handle first :script 0))
+      (push! [SourceScriptSelection] (mut selections) (SourceScriptSelection :handle second :script 0))
+      (let [entry (source-cache-entry! cache second) bytes (get (.library entry) 3)
+            first-byte (primitive/index (alloc/alloc-slice-data bytes) 0)]
+        (set! first-byte (primitive/cast u8 (if (= (load first-byte) (primitive/cast u8 32)) 33 32))))
+      (image-test-program-refuses! cache (load selections))
+      (assert-eq (.leases (source-cache-entry! cache first)) 1)
+      (source-cache-release! cache first) (source-cache-release! cache second))
+    (source-cache-free! cache) (al-free! (mut sources)) (al-free! (mut selections))))
+
+(defn image-test-cached-script-run! [(im (ptr CodeImage))] (-> i64)
+  (let [provider (primitive/alloc-stack InstalledImage) host (primitive/alloc-stack CodeImage)
+        loaded (primitive/alloc-stack InstalledImage)
+        (mut bindings) (al-new [ImageBinding] (alloc/malloc-allocator))
+        (mut units) (al-new [(ptr InstalledImage)] (alloc/malloc-allocator))]
+    (set! provider (image-install im))
+    (push! [ImageBinding] (mut bindings) (image-script-initializer-binding im provider 0 "cache::initialize"))
+    (set! host (pipeline-script-sequence-image (load bindings) 1)) (compiler-session-reset!)
+    (set! loaded (image-install-bound host (load bindings)))
+    (push! [(ptr InstalledImage)] (mut units) loaded)
+    (push! [(ptr InstalledImage)] (mut units) provider)
+    (assert-eq (image-run-shared-program! loaded (load units)) 0)
+    (assert-eq (image-run-shared-program! loaded (load units)) 0)
+    (image-uninstall! loaded) (image-free! host) (image-uninstall! provider)
+    (al-free! (mut bindings)) (al-free! (mut units)) 0))
+
+(defn image-test-independent-script-list! [(scripts (ArrayList (slice u8)))] (-> i64)
+  (let [cache (primitive/alloc-stack SourceCache)
+        (mut source) (al-new [(slice u8)] (alloc/malloc-allocator))
+        (mut selections) (al-new [SourceScriptSelection] (alloc/malloc-allocator))
+        (mut seed) 1]
+    (set! cache (source-cache-new (len scripts)))
+    (al-for [script scripts]
+      (al-clear! (mut source)) (push! [(slice u8)] (mut source) script)
+      (let [handle (source-cache-acquire! cache (load source) (load seed))]
+        (push! [SourceScriptSelection] (mut selections) (SourceScriptSelection :handle handle :script 0)))
+      (set! (mut seed) (+ (load seed) 16)))
+    (let [program (source-program-new cache (load selections) 1)]
+      (al-for [selection (load selections)]
+        (let [s selection] (source-cache-release! cache (.handle s))))
+      (assert-eq (source-program-run! program) 0)
+      (assert-eq (source-program-run! program) 0)
+      (source-program-free! program))
+    (source-cache-free! cache) (al-free! (mut source)) (al-free! (mut selections)) 0))
+
+(defn image-test-independent-scripts! [(first (slice u8)) (second (slice u8))] (-> i64)
+  (let [(mut scripts) (al-new [(slice u8)] (alloc/malloc-allocator))]
+    (push! [(slice u8)] (mut scripts) first) (push! [(slice u8)] (mut scripts) second)
+    (image-test-independent-script-list! (load scripts)) (al-free! (mut scripts)) 0))
+
+(deftest retained_lexical_bindings_survive_initializers_and_shadow_global_properties
+  (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+  (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+  (image-test-independent-scripts!
+    "this.shared = 91; let shared = {value: 1}; const fixed = 42;
+     function readShared() { return shared.value; }
+     function changeShared(v) { shared = v; }
+     { let shared = 17; if (shared !== 17) throw 1; }
+     if (readShared() !== 1 || this.shared !== 91) throw 2;"
+    "if (shared.value !== 1 || fixed !== 42 || this.shared !== 91) throw 3;
+     changeShared({value: 42});
+     if (readShared() !== 42 || shared.value !== 42) throw 4;
+     shared.value += 1;
+     if (readShared() !== 43 || typeof shared !== 'object') throw 5;"))
+
+(deftest retained_lexical_tdz_typeof_and_const_assignments_are_catchable
+  (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+  (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+  (image-test-independent-scripts!
+    "var checks = 0;
+     try { typeof later; } catch (e) { if (!(e instanceof ReferenceError)) throw 1; checks += 1; }
+     try { later = 12; } catch (e) { if (!(e instanceof ReferenceError)) throw 2; checks += 1; }
+     let later;
+     if (later !== undefined) throw 3;
+     const fixed = 42;
+     function getLater() { return later; }
+     if (checks !== 2) throw 4;"
+    "var effects = 0;
+     function rhs() { effects += 1; return {value: 9}; }
+     try { fixed = rhs(); } catch (e) { if (!(e instanceof TypeError)) throw 5; checks += 1; }
+     if (effects !== 1 || fixed !== 42 || checks !== 3) throw 6;
+     later = rhs();
+     if (getLater().value !== 9 || effects !== 2) throw 7;
+     later.value++;
+     if (getLater().value !== 10) throw 8;"))
+
+(deftest retained_lexical_references_keep_their_slot_across_rhs_and_short_circuit_effects
+  (image-test-independent-scripts!
+    "let shared = 1; let empty; const fixed = 42; var effects = 0;
+     function rhs() { effects += 1; shared = 10; this.shared = 99; return 2; }
+     function fail() { effects += 1; throw 7; }"
+    "shared += rhs();
+     if (shared !== 3 || this.shared !== 99 || effects !== 1) throw 1;
+     shared ||= fail(); fixed ||= fail();
+     empty ??= {value: 42};
+     if (empty.value !== 42 || effects !== 1) throw 2;
+     var old = shared++;
+     if (old !== 3 || shared !== 4) throw 3;
+     try { fixed = fail(); } catch (e) { if (e !== 7) throw 4; }
+     if (fixed !== 42 || effects !== 2) throw 5;"))
+
+(deftest retained_global_lexicals_are_not_captured_from_sibling_or_excluded_scopes
+  (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+  (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+  (image-test-independent-scripts!
+    "let shared = 42; var own; var fromSwitch; var fromFinally;
+     { let shared = 7; own = function(shared) { shared += 1; return shared; }; }
+     function read() { return shared; }
+     switch (fromSwitch = function() { return shared; }) { case 0: let shared = 0; }
+     try { throw 0; } catch (shared) {} finally { fromFinally = function() { return shared; }; }"
+    "if (read() !== 42 || fromSwitch() !== 42 || fromFinally() !== 42 || own(41) !== 42) throw 1;"))
+
+(deftest retained_lexical_declarations_can_shadow_configurable_global_var_properties
+  (let [(mut scripts) (al-new [(slice u8)] (alloc/malloc-allocator))]
+    (push! [(slice u8)] (mut scripts)
+    "Object.defineProperty(this, 'shared', {value: 1, writable: true, configurable: true});")
+    (push! [(slice u8)] (mut scripts) "var shared;")
+    (push! [(slice u8)] (mut scripts)
+    "let shared = 42; if (shared !== 42 || this.shared !== 1) throw 1;
+     var names = ['undefined', 'Infinity', 'NaN'];
+     var i = 0;
+     while (i < names.length) {
+       var d = Object.getOwnPropertyDescriptor(this, names[i]);
+       if (d.writable || d.enumerable || d.configurable) throw 2;
+       i += 1;
+     }
+     if (this.undefined !== undefined || this.Infinity !== Infinity || this.NaN === this.NaN) throw 3;")
+    (image-test-independent-script-list! (load scripts)) (al-free! (mut scripts))))
+
+(deftest shared_jsl_snapshots_are_exact_and_unused_providers_are_bounded
+  (let [a (alloc/malloc-allocator) cache (primitive/alloc-stack SourceCache)
+        (mut source) (al-new [(slice u8)] a)]
+    (set! cache (source-cache-new-shared 1))
+    (push! [(slice u8)] (mut source) "var x = 1;")
+    (let [first (source-cache-acquire! cache (load source) 1)]
+      (source-cache-release! cache first))
+    (al-clear! (mut source)) (push! [(slice u8)] (mut source) "var x = 2;")
+    (let [second (source-cache-acquire! cache (load source) 1)]
+      (source-cache-release! cache second))
+    (assert-eq (.library-misses cache) 1) (assert-eq (.library-hits cache) 1)
+    ;; Simulate an old dependency snapshot without editing production JSL on disk.
+    (let [library (get (.libraries cache) 0) bytes (get (.library library) 3)
+          first-byte (primitive/index (alloc/alloc-slice-data bytes) 0)]
+      (set! first-byte (primitive/cast u8 (if (= (load first-byte) (primitive/cast u8 32)) 33 32))))
+    (al-clear! (mut source)) (push! [(slice u8)] (mut source) "var x = 3;")
+    (let [third (source-cache-acquire! cache (load source) 1)]
+      (source-cache-release! cache third))
+    (assert-eq (.library-misses cache) 2)
+    (let [fourth (source-cache-acquire! cache (load source) 2)]
+      (source-cache-release! cache fourth))
+    (assert-eq (.library-misses cache) 3)
+    (assert-eq (len (.libraries cache)) 2)
+    (source-cache-free! cache) (al-free! (mut source))))
+
+(deftest shared_jsl_provider_is_compiled_once_and_rebound_to_fresh_realms
+  (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+  (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+  (let [a (alloc/malloc-allocator) cache (primitive/alloc-stack SourceCache)
+        (mut source) (al-new [(slice u8)] a)
+        (mut selections) (al-new [SourceScriptSelection] a)]
+    (set! cache (source-cache-new-shared 2))
+    (push! [(slice u8)] (mut source)
+      "function read(o) { return o.x; } function write(o,v) { o.x = v; }
+       var effects = 0; var o = {};
+       Object.defineProperty(o, 'x', {get: function() { return this.y; },
+         set: function(v) { effects += 1; this.y = v; }});")
+    (let [first (source-cache-acquire! cache (load source) 1)]
+      (al-clear! (mut source))
+      (push! [(slice u8)] (mut source)
+        "write(o, 42); if (read(o) !== 42 || effects !== 1) throw 1;
+         var caught = 0; try { read(null); } catch (e) {
+           if (Object.getPrototypeOf(e) !== TypeError.prototype) throw 2; caught = 1;
+         } if (caught !== 1) throw 3;
+         function primitiveValue(x) { return x.valueOf(); }
+         if (primitiveValue('str') !== 'str') throw 4;
+         if (primitiveValue(101) !== 101) throw 5;
+         if (primitiveValue(true) !== true) throw 6;")
+      (let [second (source-cache-acquire! cache (load source) 1)]
+        (assert-eq (.library-misses cache) 1)
+        (assert-eq (.library-hits cache) 1)
+        (al-for [library (.libraries cache)]
+          (let [(mut exports) 0]
+            (al-for [symbol (.symbols (.image library))]
+              (let [s symbol]
+                (if (and (= (.segment s) IMAGE-SYM-TEXT)
+                         (or (= (.name s) "JsGetNamed") (= (.name s) "JsDefineOwnNamed")))
+                    (do (assert (> (len (.abi s)) 0)) (set! (mut exports) (+ (load exports) 1))) 0)))
+            (assert-eq (load exports) 2)))
+        (al-for [entry (.entries cache)]
+          (al-for [symbol (.symbols (.image entry))]
+            (let [s symbol]
+              (if (or (= (.name s) "JsGetNamed") (= (.name s) "JsDefineOwnNamed"))
+                  (do (assert-eq (.segment s) IMAGE-SYM-IMPORT) (assert (> (len (.abi s)) 0))) 0))))
+        (push! [SourceScriptSelection] (mut selections) (SourceScriptSelection :handle first :script 0))
+        (push! [SourceScriptSelection] (mut selections) (SourceScriptSelection :handle second :script 0))
+        (let [program (source-program-new cache (load selections) 1)]
+          (source-cache-release! cache first) (source-cache-release! cache second)
+          (assert-eq (source-program-run! program) 0)
+          (assert-eq (source-program-run! program) 0)
+          (source-program-free! program))))
+    (source-cache-free! cache) (al-free! (mut source)) (al-free! (mut selections))))
+
+(deftest script_const_ssa_preserves_realm_visibility_tdz_rhs_effects_and_shadowing
+  (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+  (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+  (image-test-independent-scripts!
+    "var effects = 0; const held = {x: 41};
+     function readHeld() { return held; }
+     function mutateHeld() { effects += 1; held.x += 1; }
+     mutateHeld();
+     if (held.x !== 42 || readHeld() !== held) throw 1;
+     var caught = 0;
+     try { held = (effects += 10, {}); } catch (e) {
+       if (Object.getPrototypeOf(e) !== TypeError.prototype) throw 2; caught += 1;
+     }
+     if (effects !== 11 || held.x !== 42 || caught !== 1) throw 3;
+     { let held = 8; held = 9; if (held !== 9) throw 4; }
+     try { later; } catch (e) {
+       if (Object.getPrototypeOf(e) !== ReferenceError.prototype) throw 5; caught += 1;
+     }
+     const later = 7;
+     if (later !== 7 || caught !== 2) throw 6;"
+    "if (held.x !== 42 || readHeld() !== held || later !== 7) throw 7;
+     mutateHeld(); if (held.x !== 43 || effects !== 12) throw 8;"))
+
+(deftest stable_script_slots_reload_mutable_values_and_preserve_later_script_shadowing
+  (image-test-independent-scripts!
+    "var slotEffects = 0;
+     function readLaterSlot() { return laterSlot; }
+     function mutateSlot() { mutableSlot = {value: 42}; slotEffects += 1; }
+     let mutableSlot = {value: 1};
+     mutateSlot();
+     if (mutableSlot.value !== 42 || slotEffects !== 1) throw 1;
+     var slotCaught = 0;
+     try { slotTdz = (slotEffects += 10, 2); } catch (e) {
+       if (Object.getPrototypeOf(e) !== ReferenceError.prototype) throw 2;
+       slotCaught += 1;
+     }
+     let slotTdz = 7;
+     if (slotTdz !== 7 || slotEffects !== 11 || slotCaught !== 1) throw 3;"
+    "let laterSlot = 93;
+     if (readLaterSlot() !== 93 || mutableSlot.value !== 42) throw 4;
+     mutableSlot = {value: 99};
+     if (mutableSlot.value !== 99) throw 5;"))
+
+(deftest constant_overflow_payloads_preserve_values_relocations_and_fresh_realms
+  (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+  (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+  (image-test-independent-scripts!
+    "function tail(a,b,c,s,n,z,t,f,u,v) {
+       var pressure = {x: s};
+       if (pressure.x !== 'tail' || n !== 1.5 || 1/z !== -Infinity || t !== true || f !== false
+           || u !== undefined || v !== null) throw 1;
+       return s;
+     }"
+    "if (tail(1,2,3,'tail',1.5,-0,true,false,undefined,null) !== 'tail') throw 2;
+     if (tail(4,5,6,'tail',1.5,-0,true,false,undefined,null) !== 'tail') throw 3;"))
+
+(deftest callable_dispatch_preserves_lookup_argument_order_and_abrupt_completion
+  (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+  (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+  (image-test-independent-scripts!
+    "var effects = 0; var target = {};
+     Object.defineProperty(target, 'f', {get: function() { effects = effects * 10 + 1; return 7; }});
+     function arg(n) { effects = effects * 10 + n; return n; }
+     function fail() { effects = effects * 10 + 3; throw 91; }
+     function invoke(o) { return o.f(arg(2), arg(3), arg(4), arg(5)); }
+     function interrupted(o) { return o.f(arg(2), fail(), arg(4), arg(5)); }"
+    "var caught = 0;
+     try { invoke(target); } catch (e) {
+       if (Object.getPrototypeOf(e) !== TypeError.prototype) throw 1; caught += 1;
+     }
+     if (effects !== 12345 || caught !== 1) throw 2;
+     effects = 0;
+     try { interrupted(target); } catch (e) { if (e !== 91) throw 3; caught += 1; }
+     if (effects !== 123 || caught !== 2) throw 4;"))
+
+(deftest retained_named_reads_preserve_getter_effects_receivers_and_abrupt_completion
+  (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+  (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+  (image-test-independent-scripts!
+    "function read(o) { return o.x; }
+     var effects = 0;
+     var proto = {};
+     Object.defineProperty(proto, 'x', {get: function() {
+       effects += 1; this.y = effects; return this;
+     }, configurable: true});
+     var a = Object.create(proto); var b = {x: 19};"
+    "if (read(a) !== a || a.y !== 1 || effects !== 1) throw 1;
+     if (read(b) !== 19 || effects !== 1) throw 2;
+     Object.defineProperty(proto, 'x', {get: function() { effects += 1; throw 73; }, configurable: true});
+     var caught = 0;
+     try { read(a); throw 3; } catch (e) { if (e !== 73) throw 4; caught += 1; }
+     try { read(null); } catch (e) { if (Object.getPrototypeOf(e) !== TypeError.prototype) throw 5; caught += 1; }
+     try { read(undefined); } catch (e) { if (Object.getPrototypeOf(e) !== TypeError.prototype) throw 6; caught += 1; }
+     if (caught !== 3 || effects !== 2) throw 7;
+     if ('abc'.length !== 3 || [1, 2].length !== 2) throw 8;"))
+
+(deftest retained_implicit_errors_ignore_replaced_global_constructors_and_inherited_setters
+  (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+  (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+  (image-test-independent-scripts!
+    "var typeProto = TypeError.prototype; var rangeProto = RangeError.prototype;
+     var effects = 0;
+     Object.defineProperty(typeProto, 'message', {set: function(v) { effects += 1; }, configurable: true});
+     Object.defineProperty(rangeProto, 'message', {set: function(v) { effects += 1; }, configurable: true});
+     Object.defineProperty(this, 'TypeError', {get: function() { effects += 1; throw 91; }, configurable: true});
+     Object.defineProperty(this, 'RangeError', {get: function() { effects += 1; throw 92; }, configurable: true});"
+    "var caught = 0;
+     try { null.x; } catch (e) {
+       if (Object.getPrototypeOf(e) !== typeProto) throw 1;
+       var d = Object.getOwnPropertyDescriptor(e, 'message');
+       if (typeof d.value !== 'string' || d.enumerable || !d.writable || !d.configurable) throw 2;
+       caught += 1;
+     }
+     var a = [];
+     try { a.length = -1; } catch (e) {
+       if (Object.getPrototypeOf(e) !== rangeProto) throw 3;
+       var d = Object.getOwnPropertyDescriptor(e, 'message');
+       if (typeof d.value !== 'string' || d.enumerable || !d.writable || !d.configurable) throw 4;
+       caught += 1;
+     }
+     if (caught !== 2 || effects !== 0) throw 5;"))
+
+(deftest source_cache_owns_inputs_and_reuses_native_images_after_compiler_and_library_resets
+  (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+  (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+  (let [cache (primitive/alloc-stack SourceCache)
+        (mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))
+        source (image-copy "var state = {answer:1}; state.answer += 41; if (state.answer !== 42) throw 7;")]
+    (set! cache (source-cache-new 2))
+    (push! [(slice u8)] (mut sources) source)
+    (let [first (source-cache-acquire! cache (load sources) 1)
+          im (source-cache-image! cache first) snapshot (image-copy (.text im))]
+      (alloc/free [u8] (alloc/malloc-allocator) source)
+      (al-clear! (mut sources))
+      (push! [(slice u8)] (mut sources)
+        "var state = {answer:1}; state.answer += 41; if (state.answer !== 42) throw 7;")
+      (jsl-library-clear!) (compiler-session-reset!)
+      (let [second (source-cache-acquire! cache (load sources) 1)]
+        (assert-eq first second)
+        (assert-eq (.hits cache) 1) (assert-eq (.misses cache) 1)
+        (assert-eq (.leases (source-cache-entry! cache first)) 2)
+        (assert-eq (.reserved (compiler-region)) 0)
+        (image-test-cached-script-run! (source-cache-image! cache second))
+        (assert-eq (.text im) snapshot)
+        (source-cache-release! cache first) (source-cache-release! cache second))
+      (alloc/free [u8] (alloc/malloc-allocator) snapshot))
+    (source-cache-free! cache) (al-free! (mut sources))))
+
+(deftest source_cache_keys_include_source_boundaries_order_seed_and_exact_library_bytes
+  (let [cache (primitive/alloc-stack SourceCache)
+        (mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))]
+    (set! cache (source-cache-new 8))
+    (push! [(slice u8)] (mut sources) "var a = 1;")
+    (push! [(slice u8)] (mut sources) "var b = 2;")
+    (let [first (source-cache-acquire! cache (load sources) 1)]
+      (source-cache-release! cache first)
+      (let [seeded (source-cache-acquire! cache (load sources) 2)]
+        (assert (!= first seeded)) (source-cache-release! cache seeded))
+      (al-clear! (mut sources))
+      (push! [(slice u8)] (mut sources) "var b = 2;")
+      (push! [(slice u8)] (mut sources) "var a = 1;")
+      (let [reordered (source-cache-acquire! cache (load sources) 1)]
+        (assert (!= first reordered)) (source-cache-release! cache reordered))
+      (al-clear! (mut sources))
+      (push! [(slice u8)] (mut sources) "var a = 1;var b = 2;")
+      (let [joined (source-cache-acquire! cache (load sources) 1)]
+        (assert (!= first joined)) (source-cache-release! cache joined))
+      (al-clear! (mut sources))
+      (push! [(slice u8)] (mut sources) "var a = 1;")
+      (push! [(slice u8)] (mut sources) "var b = 2;")
+      ;; Change one owned dependency byte, keeping paths, lengths and source keys identical.
+      ;; A stale dependency snapshot must miss even if the production library has not changed.
+      (let [entry (source-cache-entry! cache first) bytes (get (.library entry) 3)]
+        (let [first-byte (primitive/index (alloc/alloc-slice-data bytes) 0)]
+          (set! first-byte (primitive/cast u8 (if (= (load first-byte) (primitive/cast u8 32)) 33 32)))))
+      (let [changed (source-cache-acquire! cache (load sources) 1)]
+        (assert (!= first changed)) (source-cache-release! cache changed))
+      (assert-eq (.hits cache) 0) (assert-eq (.misses cache) 5))
+    (source-cache-free! cache) (al-free! (mut sources))))
+
+(const CACHE-REFUSE-FREE 1)
+(const CACHE-REFUSE-ACQUIRE 2)
+(const CACHE-REFUSE-IMAGE 3)
+(const CACHE-REFUSE-RELEASE 4)
+
+(defn image-test-cache-refuses! [(cache (ptr SourceCache)) (handle i64) (mode i64)] (-> i64)
+  (let [pid (os/fork) status (primitive/alloc-stack i32)]
+    (assert (>= pid 0))
+    (if (= pid 0)
+        (let [(mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))]
+          (push! [(slice u8)] (mut sources) "var different = 7;")
+          (case mode
+            CACHE-REFUSE-FREE (source-cache-free! cache)
+            CACHE-REFUSE-ACQUIRE (source-cache-acquire! cache (load sources) 9)
+            CACHE-REFUSE-IMAGE (do (source-cache-image! cache handle) 0)
+            CACHE-REFUSE-RELEASE (source-cache-release! cache handle)
+            (do (assert false) 0))
+          (os/_exit 0) 0)
+        (do (assert-eq (os/waitpid pid status 0) pid)
+            (assert-eq (& (primitive/cast i64 (load status)) 127) 0)
+            (assert-eq (primitive/ishr (primitive/cast i64 (load status)) 8) EXIT-PANIC) 0))))
+
+(deftest source_cache_refuses_live_teardown_overcapacity_stale_and_foreign_handles
+  (let [cache (primitive/alloc-stack SourceCache) other (primitive/alloc-stack SourceCache)
+        installed (primitive/alloc-stack InstalledImage)
+        (mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))]
+    (set! cache (source-cache-new 1)) (set! other (source-cache-new 1))
+    (push! [(slice u8)] (mut sources) "var answer = 42;")
+    (let [first (source-cache-acquire! cache (load sources) 1)]
+      (image-test-cache-refuses! cache first CACHE-REFUSE-FREE)
+      (image-test-cache-refuses! cache first CACHE-REFUSE-ACQUIRE)
+      (set! installed (image-install (source-cache-image! cache first)))
+      (source-cache-release! cache first)
+      (image-test-cache-refuses! cache first CACHE-REFUSE-IMAGE)
+      (image-test-cache-refuses! cache first CACHE-REFUSE-RELEASE)
+      (image-test-cache-refuses! cache first CACHE-REFUSE-FREE)
+      (image-test-cache-refuses! cache first CACHE-REFUSE-ACQUIRE)
+      (image-uninstall! installed)
+      (let [second (source-cache-acquire! cache (load sources) 2)
+            foreign (source-cache-acquire! other (load sources) 2)]
+        (image-test-cache-refuses! cache first CACHE-REFUSE-IMAGE)
+        (image-test-cache-refuses! cache foreign CACHE-REFUSE-IMAGE)
+        (source-cache-release! cache second) (source-cache-release! other foreign)))
+    (source-cache-free! cache) (source-cache-free! other)
+    (image-test-cache-refuses! cache 0 CACHE-REFUSE-FREE)
+    (al-free! (mut sources))))
+
+(deftest source_cache_lru_keeps_leased_artifacts_and_evicts_only_unused_entries
+  (let [cache (primitive/alloc-stack SourceCache)
+        (mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))]
+    (set! cache (source-cache-new 2))
+    (push! [(slice u8)] (mut sources) "var answer = 42;")
+    (let [pinned (source-cache-acquire! cache (load sources) 1)
+          older (source-cache-acquire! cache (load sources) 2)]
+      (source-cache-release! cache older)
+      (let [newer (source-cache-acquire! cache (load sources) 3)]
+        (assert (!= newer older)) (source-cache-release! cache newer)
+        (assert-eq (.evictions cache) 1)
+        (assert-eq (len (.entries cache)) 2)
+        (let [hit (source-cache-acquire! cache (load sources) 1)]
+          (assert-eq hit pinned) (source-cache-release! cache hit))
+        (source-cache-release! cache pinned)
+        (let [fourth (source-cache-acquire! cache (load sources) 4)]
+          (source-cache-release! cache fourth)
+          (assert-eq (.evictions cache) 2)
+          (assert-eq (.hits cache) 1))))
+    (source-cache-free! cache) (al-free! (mut sources))))
+
+(deftest source_image_owns_global_constructor_and_prototype_identities_across_compilations
+  (let [(mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))
+        im (primitive/alloc-stack CodeImage)
+        (mut global) 0 (mut constructor) 0 (mut prototype) 0]
+    (push! [(slice u8)] (mut sources) "var a = []; var b = Object.create(null);")
+    (compiler-session-reset!)
+    (pipeline-encode-script-unit! (load sources) 1)
+    (set! im (pipeline-capture-script-image))
+    (al-clear! (mut sources))
+    (push! [(slice u8)] (mut sources) "var unrelated = Math.PI;")
+    (compiler-session-reset!)
+    (pipeline-encode-script-unit! (load sources) 2)
+    (compiler-session-reset!)
+    (al-free! (mut sources))
+    (al-for [object (.realm-objects im)]
+      (let [o object]
+        (assert (> (.offset o) 0))
+        (if (= (.kind o) IMAGE-REALM-GLOBAL)
+            (do (assert-eq (.name o) "") (assert (not (.callable o)))
+                (set! (mut global) (+ (load global) 1)))
+            (if (= (.kind o) IMAGE-REALM-OWNED-PROTOTYPE)
+                (do (assert (not (.callable o))) (assert (> (len (.name o)) 0)))
+              (do (assert-eq (.kind o) IMAGE-REALM-INTRINSIC)
+                (if (or (= (.name o) "Object") (= (.name o) "Array"))
+                    (do (assert (.callable o)) (set! (mut constructor) (+ (load constructor) 1))) 0)
+                (if (or (= (.name o) "Object.prototype") (= (.name o) "Array.prototype"))
+                    (do (assert (not (.callable o))) (set! (mut prototype) (+ (load prototype) 1))) 0))))))
+    (assert-eq (load global) 1)
+    (assert-eq (load constructor) 2)
+    (assert-eq (load prototype) 2)
+    (image-free! im)
+    (assert-eq (len (.realm-objects im)) 0)))
+
+(defn image-test-realm-object-refuses [(im (ptr CodeImage)) (kind i64) (name (slice u8))
+                                      (offset i64) (callable bool)] (-> i64)
+  (let [pid (os/fork) status (primitive/alloc-stack i32)]
+    (assert (>= pid 0))
+    (if (= pid 0)
+        (do (image-add-realm-object! im kind name offset callable) (os/_exit 0) 0)
+        (do (assert-eq (os/waitpid pid status 0) pid)
+            (assert-eq (& (primitive/cast i64 (load status)) 127) 0)
+            (assert-eq (primitive/ishr (primitive/cast i64 (load status)) 8) EXIT-PANIC) 0))))
+
+(deftest source_image_realm_identities_reject_duplicates_and_nonobject_offsets
+  (let [(mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))
+        im (primitive/alloc-stack CodeImage) loaded (primitive/alloc-stack InstalledImage)]
+    (push! [(slice u8)] (mut sources) "var value = 42;")
+    (compiler-session-reset!)
+    (pipeline-encode-script-unit! (load sources) 1)
+    (set! im (pipeline-capture-script-image))
+    (compiler-session-reset!)
+    (al-free! (mut sources))
+    (let [global (get (.realm-objects im) 0) offset (.offset global)]
+      (image-test-realm-object-refuses im IMAGE-REALM-GLOBAL "" offset false)
+      (image-test-realm-object-refuses im IMAGE-REALM-INTRINSIC "" offset false)
+      (image-test-realm-object-refuses im IMAGE-REALM-INTRINSIC "missing" (+ offset 8) false)
+      (image-test-realm-object-refuses im IMAGE-REALM-INTRINSIC "missing" -1 false)
+      (image-test-realm-object-refuses im IMAGE-REALM-INTRINSIC "missing" offset true)
+      (set! loaded (image-install im))
+      (image-test-realm-object-refuses im IMAGE-REALM-INTRINSIC "late" offset false)
+      (image-uninstall! loaded))
+    (image-free! im)))
+
+(deftest script_unit_retains_setup_without_named_function_roots
+  (let [(mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))
+        im (primitive/alloc-stack CodeImage) loaded (primitive/alloc-stack InstalledImage)]
+    (push! [(slice u8)] (mut sources) "var state = 1; state = state + 41; if (state !== 42) throw 1;")
+    (compiler-session-reset!)
+    (pipeline-encode-script-unit! (load sources) 1)
+    (set! im (pipeline-capture-script-image))
+    (compiler-session-reset!)
+    (al-free! (mut sources))
+    (assert-eq (len (.scripts im)) 1)
+    (let [script (get (.scripts im) 0)]
+      (assert-eq (len (.functions script)) 0)
+      (assert (>= (.initializer script) 0)))
+    (set! loaded (image-install im))
+    (let [binding (image-script-initializer-binding im loaded 0 "setup::initialize")]
+      (assert-eq (.provider binding) (.code-id loaded))
+      (assert (image-abi-script-entry? (.abi binding))))
+    (assert-eq (image-run! im loaded) 0)
+    (assert-eq (image-run! im loaded) 0)
+    (image-uninstall! loaded) (image-free! im)))
+
+(deftest source_image_binds_script_local_declarations_to_owned_function_payloads
+  (let [(mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))
+        im (primitive/alloc-stack CodeImage) loaded (primitive/alloc-stack InstalledImage)]
+    (push! [(slice u8)] (mut sources)
+           "'use strict'; function f() { return 1; } function f() { return 42; }
+            if (f() !== 42) throw 1;")
+    (push! [(slice u8)] (mut sources)
+           "function g() { return 7; } if (g() !== 7 || f() !== 42) throw 2;")
+    (compiler-session-reset!)
+    (pipeline-encode-sources! (load sources) 1 true)
+    (set! im (pipeline-capture-script-image))
+    (compiler-session-reset!)
+    (al-free! (mut sources))
+    (assert-eq (len (.scripts im)) 2)
+    (let [first (get (.scripts im) 0) second (get (.scripts im) 1)
+          first-decls (.declarations first) second-decls (.declarations second)
+          f (get (.entries first-decls) 1) g (get (.entries second-decls) 0)]
+      (assert (.strict first-decls)) (assert (not (.strict second-decls)))
+      (assert-eq (.initializer first) -1) (assert-eq (.initializer second) -1)
+      (assert-eq (.name f) "f") (assert-eq (.function-ordinal f) 1)
+      (assert-eq (.name g) "g") (assert-eq (.function-ordinal g) 0)
+      (assert-eq (len (.functions first)) 2) (assert-eq (len (.functions second)) 1)
+      (assert-ne (get (.functions first) 0) (get (.functions first) 1))
+      (assert-ne (get (.functions first) 0) (get (.functions second) 0)))
+    (set! loaded (image-install im))
+    (assert-eq (image-run! im loaded) 0)
+    (assert-eq (image-run! im loaded) 0)
+    (image-uninstall! loaded) (image-free! im)
+    (assert-eq (len (.scripts im)) 0)))
+
+(defn image-test-script-binding-refuses [(im (ptr CodeImage)) (offset i64) (include bool)] (-> i64)
+  (let [pid (os/fork) status (primitive/alloc-stack i32)]
+    (assert (>= pid 0))
+    (if (= pid 0)
+        (let [(mut entries) (al-new [CuScriptDecl] (alloc/malloc-allocator))
+              (mut offsets) (al-new [i64] (alloc/malloc-allocator))]
+          (push! [CuScriptDecl] (mut entries)
+                 (CuScriptDecl :name "f" :kind CU-SCRIPT-FUNCTION :function-ordinal 0))
+          (if include (push! [i64] (mut offsets) offset) 0)
+          (image-add-script! im false (load entries) (load offsets))
+          (os/_exit 0) 0)
+        (do (assert-eq (os/waitpid pid status 0) pid)
+            (assert-eq (& (primitive/cast i64 (load status)) 127) 0)
+            (assert-eq (primitive/ishr (primitive/cast i64 (load status)) 8) EXIT-PANIC) 0))))
+
+(deftest source_image_rejects_missing_and_nonfunction_declaration_bindings
+  (let [(mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))
+        im (primitive/alloc-stack CodeImage)]
+    (push! [(slice u8)] (mut sources) "function f() { return 42; } var ordinary = {};")
+    (compiler-session-reset!)
+    (pipeline-encode-sources! (load sources) 1 true)
+    (set! im (pipeline-capture-script-image))
+    (compiler-session-reset!)
+    (let [script (get (.scripts im) 0) offset (get (.functions script) 0) (mut trapped) false]
+      (al-for [fixup (.code-fixups im)]
+        (let [f fixup]
+          (if (= (.offset f) (+ offset 16))
+              (let [symbol (get (.symbols im) (.symbol f))]
+                (set! (mut trapped) (and (= (.segment symbol) IMAGE-SYM-IMPORT)
+                                         (= (.name symbol) "aot_rt_trap_invariant")))) 0)))
+      (assert (load trapped))
+      (image-test-script-binding-refuses im offset false)
+      (image-test-script-binding-refuses im (+ offset 8) true)
+      (image-test-script-binding-refuses im (len (.data im)) true)
+      (image-test-script-binding-refuses im -1 true))
+    (image-free! im) (al-free! (mut sources))))
+
+(deftest source_property_keys_reach_native_identity_relocations_and_survive_compiler_reset
+  (let [(mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))
+        im (primitive/alloc-stack CodeImage) loaded (primitive/alloc-stack InstalledImage)
+        (mut found) false]
+    (push! [(slice u8)] (mut sources)
+           "function put(o, k, v) { o[k] = v; }
+            var o = {}; put(o, 'answer', 42);
+            if (o.answer !== 42) throw 1;
+            o.answer = 99; if (o['answer'] !== 99) throw 2;")
+    (compiler-session-reset!)
+    (pipeline-encode-sources! (load sources) 1 true)
+    (set! im (image-capture))
+    (let [key (shape-key-intern "answer")]
+      (al-for [site (.unit-sites im)]
+        (let [s site]
+          (if (and (= (.kind s) ENC-UNIT-KEY) (= (.local-id s) key))
+              (set! (mut found) true) 0))))
+    (assert (load found))
+    (compiler-session-reset!)
+    (set! loaded (image-install im))
+    (assert-eq (image-run! im loaded) 0)
+    (assert-eq (image-run! im loaded) 0)
+    (image-uninstall! loaded) (image-free! im)
+    (al-free! (mut sources))))
+
+(deftest simultaneously-installed-images-have-independent-map-identities
+         (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+         (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+         (let [(mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))
+               im (primitive/alloc-stack CodeImage)
+               first (primitive/alloc-stack InstalledImage)
+               second (primitive/alloc-stack InstalledImage)]
+           (push! [(slice u8)]
+                  (mut sources)
+                  "var value = { answer: 42 }; if (value.answer !== 42) throw 1;")
+           (compiler-session-reset!)
+           (pipeline-encode-sources! (load sources) 1 true)
+           (set! im (image-capture))
+           (assert (> (len (.map-sites im)) 0))
+           (compiler-session-reset!)
+           (assert-eq (rt-code-count) 0)
+           (set! first (image-install im))
+           (set! second (image-install im))
+           (assert-ne (.code-id first) (.code-id second))
+           (assert-eq (rt-code-count) 2)
+           (assert-eq (image-run! im second) 0)
+           (assert-eq (rt-code-count) 2)
+           (assert-eq (image-run! im first) 0)
+           (let [old-id (.code-id first)
+                 old-slot (rt-code-unit-slot (.code-id first))]
+             (image-uninstall! first)
+             (assert (match (rt-code-find old-id)
+                       (None [] true)
+                       (Some [_] false)))
+             (set! first (image-install im))
+             (assert-ne (.code-id first) old-id)
+             (assert-eq (rt-code-unit-slot (.code-id first)) old-slot)
+             (assert-eq (image-run! im first) 0)
+             (image-uninstall! first))
+           (assert-eq (rt-code-count) 1)
+           (image-uninstall! second)
+           (assert-eq (rt-code-count) 0)
+           (image-free! im)
+           (al-free! (mut sources))))
+
+(deftest memory-callable-adapters-preserve-arity-receiver-and-managed-values
+         (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+         (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+         (image-test-source! "var receiver = { value: 17 };
+     receiver.method = function(a,b,c,d,e,f,g,h,i,j,k,l,m) {
+       'use strict';
+       var allocation = { value: 1 };
+       if (this !== receiver || new.target !== undefined) throw 1;
+       if (a.value !== 25 || m !== undefined || allocation.value !== 1) throw 2;
+       return this.value + a.value;
+     };
+     if (receiver.method({ value: 25 }) !== 42) throw 3;
+     var selected = function(a,b,c,d,e,f,g,h,i,j,k,l,m) { return m.value; };
+     if (selected(0,0,0,0,0,0,0,0,0,0,0,0,{ value: 42 }) !== 42) throw 4;
+     function callback_noInline(value) { var garbage = {}; return value.value; }
+     var mapped = [{ value: 42 }].map(callback_noInline);
+     if (mapped[0] !== 42) throw 5;"
+                             true
+                             0))
+
+(deftest memory-realm-and-gc
+         (assert-eq (setenv c"AOT_RT_GC_STRESS" c"1" 1) (primitive/cast i32 0))
+         (assert-eq (setenv c"AOT_RT_GC_VERIFY" c"1" 1) (primitive/cast i32 0))
+         (image-test-source! "var x = { value: 17 }; function make() { return { value: x.value + 1 }; } var y = make(); if (y.value !== 18) throw 1;"
+                             true
+                             0))
+
+(deftest memory-relocation-words
+         (assert-eq (image-relocate-word ENC-FIXUP-A64-BL26
+                                         0x94000000
+                                         0x1000
+                                         0x1004)
+                    0x94000001)
+         (assert-eq (image-relocate-word ENC-FIXUP-A64-BL26
+                                         0x94000000
+                                         0x1004
+                                         0x1000)
+                    0x97ffffff)
+         (assert-eq (image-relocate-word ENC-FIXUP-A64-PAGE21
+                                         0x90000000
+                                         0x1000
+                                         0x2000)
+                    0xb0000000)
+         (assert-eq (image-relocate-word ENC-FIXUP-A64-PAGE21
+                                         0x90000000
+                                         0x2000
+                                         0x1000)
+                    0xf0ffffe0)
+         (assert-eq (image-relocate-word ENC-FIXUP-A64-PAGEOFF12
+                                         0x91000000
+                                         0
+                                         0x1234)
+                    0x9108d000))
+
+(deftest memory-library-cache-owns-forms-and-invalidates-content
+         (let [a (alloc/malloc-allocator)
+               path "/tmp/aot-image-library-cache.jsl"
+               index "/tmp/aot-image-library-cache.index"]
+           (assert (try (let [_
+                                (try-or! (fs/write-file a
+                                                        index
+                                                        "/tmp/aot-image-library-cache.jsl\n")
+                                         false)]
+                          true)))
+           (assert (try (let [_
+                                (try-or! (fs/write-file a
+                                                        path
+                                                        "(builtin First :params [] :ret int 1)")
+                                         false)]
+                          true)))
+           (compiler-session-reset!)
+           (jsl-library-clear!)
+           (assert-eq (jsl-load-library! index) 1)
+           (assert-eq (.misses (jsl-library)) 1)
+           (let [form (jsl-form 1 0)]
+             (compiler-session-reset!)
+             (assert-eq (jsl-load-library! index) 1)
+             (assert-eq (.hits (jsl-library)) 1)
+             (assert-eq (primitive/cast i64 form)
+                        (primitive/cast i64 (jsl-form 1 0))))
+           ;; Same length, different bytes: neither timestamps nor file size may validate a cache hit.
+           (set! (.checked (jsl-library)) true)
+           (assert (try (let [_
+                                (try-or! (fs/write-file a
+                                                        path
+                                                        "(builtin Other :params [] :ret int 2)")
+                                         false)]
+                          true)))
+           (compiler-session-reset!)
+           (assert-eq (jsl-load-library! index) 1)
+           (assert-eq (.misses (jsl-library)) 2)
+           (assert (not (.checked (jsl-library))))
+           (assert-eq (rd/sexp-sym (rd/sexp-nth (jsl-form 1 0) 1)) "Other")
+           (assert (try (let [_
+                                (try-or! (fs/write-file a
+                                                        index
+                                                        "# reordered index trivia\n/tmp/aot-image-library-cache.jsl\n")
+                                         false)]
+                          true)))
+           (assert-eq (jsl-load-library! index) 1)
+           (assert-eq (.misses (jsl-library)) 3)
+           (jsl-library-clear!)
+           (assert-eq (.reserved (jsl-library-region)) 0)))
+
+(deftest memory-exception-does-not-evaluate-later-scripts
+         (let [(mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))
+               im (primitive/alloc-stack CodeImage)
+               loaded (primitive/alloc-stack InstalledImage)]
+           (push! [(slice u8)] (mut sources) "throw 1;")
+           ;; If this Script runs, it times out instead of returning the original abrupt completion.
+           (push! [(slice u8)] (mut sources) "while (true) {}")
+           (compiler-session-reset!)
+           (pipeline-encode-sources! (load sources) 1 true)
+           (set! im (image-capture))
+           (compiler-session-reset!)
+           (set! loaded (image-install im))
+           (assert-eq (image-run! im loaded) 3)
+           (image-uninstall! loaded)
+           (image-free! im)
+           (al-free! (mut sources))))

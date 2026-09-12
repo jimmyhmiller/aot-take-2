@@ -1,5 +1,116 @@
 # Test262 conformance campaign
 
+## In-memory campaigns
+
+Build once, then run an exact, evenly distributed 1,000-file sample (use a new output directory):
+
+```
+coil build tools/test262.coil -o build/aot-test262-memory
+AOT_T262_LIMIT=1000 AOT_T262_JOBS=4 build/aot-test262-memory run-memory /Users/jimmyhmiller/Documents/Code/open-source/test262 build/test262-memory-1000
+```
+
+This eagerly compiles native code and relocates/executes it in memory. There is no per-case
+compiler launch, object file, external linker or executable launch. Each shard has a persistent
+worker with fresh compiler scratch and runtime realm per request. Fatal compiler exits/signals
+cause replacement by fork. The supervisor retains a content-validated, parsed-and-checked JSL
+library for workers to inherit. Each worker also owns bounded caches of retained Script images
+and sequence hosts, plus a compiled provider for explicit JSL boundaries (`:noinline` and
+`:specialize`). Different source compilations reuse that provider's machine code; ordinary
+optimizable JSL definitions remain local. The provider includes intrinsic identities independent
+of any one test's syntax. Artifact reuse does not reuse mutable realm state or an installed
+mapping across SourcePrograms. It compiles the test unit before acquiring the ordered harness bundle, then
+executes harness Scripts before the test in a fresh shared realm. Cache keys include exact source
+bytes/boundaries, seed and JSL dependencies. Fatal worker replacement discards its native cache.
+Shared global let/const bindings include TDZ, const-write completions and runtime declaration
+checks. Captured local/block environments and other compiler gaps remain; this integration does
+not establish complete Test262 semantics or a speedup over the earlier closed-program runner.
+
+The engine currently requires Darwin/AArch64. `AOT_T262_COMPILE_SECONDS` defaults to 30 for
+transmission and compile/install stages; `AOT_T262_RUN_SECONDS` defaults to 15. Output retention
+is 64 KiB per stream; overflow cannot pass. Normal JavaScript throws return to the worker, but
+typed runtime negative-test matching remains unimplemented. Parse-negative tests retain the
+exit-73 plus exact SyntaxError-record contract and do not compile harness code.
+
+`AOT_T262_LIMIT` selects exactly that many files across the pinned, sorted inventory; it cannot
+be combined with `AOT_T262_SAMPLE` other than 1. All required variants count, including unsupported
+plans. `summary.txt` records the engine, executable hashes, limit, wall time and verdict counts.
+Each attempted memory variant retains `.memory.stdout`, `.memory.stderr` and `.memory.metrics`;
+metrics are TSV: compile/transmission ns, assembly/install ns (including a host-cache miss), run
+ns, observed compiler-region reserved-byte peak, cumulative worker starts within its shard,
+source-cache hits, source-cache misses, host-cache hits, host-cache misses. Cache counters are
+cumulative within the current worker and reset on replacement; use worker starts to distinguish
+lifetimes. Scratch sampling occurs at phase reports and successful cache captures, so a fatal
+compile can end before its peak is reported. Campaign exit 1 means not all files passed.
+
+For direct native-memory Script execution outside Test262:
+
+```
+coil run tools/memory-run.coil -- HARNESS.js TEST.js
+```
+
+Add `--retained` after `--` to compile each input as an independent retained Script unit,
+then assemble and execute them in input order in one fresh realm:
+
+```
+coil run tools/memory-run.coil -- --retained HARNESS.js TEST.js
+```
+
+This exercises the public source-cache/program API. The default compiles the inputs together
+as a closed program. Set `AOT_TIME=1` to print per-phase compilation timings for either mode.
+
+The runner itself is built normally once. In-memory AOT does not enable JavaScript `eval`,
+`new Function`, or imports of unknown source at runtime.
+
+### Cached harness measurement, 2026-09-10
+
+Sparse named-write facts and grouped loop layout reduced the observed campaign time
+to **54.351 seconds** with four workers. `results.tsv` matches the 56.841-second
+run below byte-for-byte. Evidence: `build/test262-sparse-facts-grouped-layout-1000`,
+executable git-blob `0c335bc56b1e04b50487780dc65d8d1c45e9c3c5`. The run overlapped
+build/regression checks. The full compiler gate passed 843/843 tests.
+
+After body-local copying and sparse GC liveness words, the same campaign took
+**56.841 seconds** with four workers. Its `results.tsv` matches the 60.142-second
+run below byte-for-byte. Evidence: `build/test262-sparse-copy-gc-verified-1000`,
+executable git-blob `dec1d6006e3e2bfa6db42e916ba040bc290634b2`. This campaign
+overlapped regression/build checks. The final compiler gate passed 840/840 tests.
+
+With sparse stack-map recording, linear graph verification and indexed GCM
+dominators, the same 1,000-file / 1,927-variant sample took **60.142 seconds** with
+four workers. Its complete `results.tsv` matches the 76.138-second campaign below:
+170 passing files and zero timeouts/crashes/harness errors/not-run. Evidence:
+`build/test262-linear-indexed-1000-20260910`, executable git-blob
+`2aa3137749978d6430b5e4bba7d8fc86074f66e4`. The new run overlapped build/regression
+checks, so this is an observed campaign time rather than an isolated benchmark.
+
+After transitive predicate-availability bounds, distinct-user scheduling and shared global
+lookup bodies, the same sample took **76.138 seconds**. It passed the same 170 files as
+the preceding shared-lexical run, which took 301.375 seconds. Variants: 324 pass, 370 fail,
+1,195 unsupported, 38 compiler errors, zero timeouts/crashes/harness errors/not-run.
+The complete verdict comparison has ten changes: former timeouts now report unsupported.
+Deadlines stayed unchanged. Evidence: `build/test262-distinct-users-global-read-1000-20260910`,
+executable git-blob `700afe2649c541a7ebb4a086672db75b99c8a344`.
+
+Among the 540 requests reaching installation, compile/transmission time had median 100.811 ms,
+p90 797.279 ms and maximum 1,621.982 ms. Across all 1,714 attempted memory requests, including
+compiler refusals, thirteen exceeded one second and the maximum was 5,825.597 ms. A request
+can include test and harness compilation; these are not per-source compiler timings.
+This campaign predates the subsequent encoder ownership-cache improvement. The target of
+hundreds of milliseconds per compilation remains open.
+
+The exact 1,000-file sample (1,927 variants, four workers) took 238.563 seconds with retained
+source/host caching and variant-first compilation. It passed 169 files: 322 passing variants,
+360 failures, 1,199 unsupported, 38 compiler errors and eight compile timeouts. Crashes, harness
+errors and not-run counts were zero. Evidence: `build/test262-cached-test-first-1000-20260910`,
+binary fingerprint `0b8bb83450bcd9d3a43821c61d0ac7e46bd7ece3`.
+
+The first cached run, compiling the harness first, took 425.343 seconds with the same 169 passing
+files and two compile timeouts (`build/test262-cached-harness-1000-20260910`). Reordering compilation
+cut that run's time by 44%, while preserving harness-first evaluation. It remains slower than
+the earlier 101.511-second closed-program run. The eight timeouts cover both modes of three large
+Temporal tests and `language/expressions/property-accessors/S11.2.1_A4_T8.js`; retained compilation
+cost remains unfinished. These measurements predate shared global let/const support.
+
 ## Fixed denominator
 
 Suite: tc39/test262, revision `419d3e0a2273ba01a3bfcbec423f2801425b8e93`.

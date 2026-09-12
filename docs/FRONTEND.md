@@ -7,6 +7,12 @@ contract, not a claim that every listed operation is executable. Logical operato
 `JsNullish`, `JsLogicalNot`, and `JsVoid`; Boolean/null literals use JSL singleton macros. The
 frontend constructs short-circuit Scope/control/memory merges while JSL supplies predicates.
 
+Named reads use the `JsGetNamed` builtin, including member-call and constructor-prototype
+lookup. Parsing retains a call with its memory and completion edges. The builtin's
+`:specialize` tag predicates let the optimizer lower its checked JSL source with proven
+arguments; unknown receivers keep the shared call. This policy removes impossible branches
+before constructing their graphs. It does not grant types or add deoptimization.
+
 `compile-script` and `run-script` select JavaScript Script grammar and execute top-level code.
 They do not call a source function named `main` or reinterpret expression completion as an exit
 code. The existing `compile`/`run` commands retain the function-entry convention and optional

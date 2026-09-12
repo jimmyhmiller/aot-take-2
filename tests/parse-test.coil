@@ -7,7 +7,7 @@
 (import "coil.assert" :use *)
 (import "coil.os" :as os)
 (import "coil.primitive" :as primitive)
-(import "coil.slice" :use [subslice])
+(import "coil.slice" :use [subslice slice-data])
 (import "aot.util.panic" :use *)
 (import "aot.node.boot" :use *)
 (import "aot.node.node" :use *)
@@ -18,13 +18,160 @@
 (import "aot.node.dynamic" :use *)
 (import "aot.node.memory" :use *)
 (import "aot.shape" :use *)
+(import "aot.heap" :use [heap-global-entry heap-global-reference-entry])
 (import "aot.codegen.iterpeeps" :use *)
+(import "aot.codegen.callabi" :use *)
+(import "aot.codegen.compunit" :use *)
+(import "aot.util.arena" :use [compiler-session-reset!])
 (import "aot.codegen.opto" :use *)
 (import "aot.codegen.pipeline" :use *)
 (import "aot.verify" :use *)
 (import "aot.type.type" :use *)
 (import "aot.parse.parser" :use *)
 (import "aot.jsl.lower" :use *)
+
+(deftest reusable_script_global_binding_is_separate_from_layout_and_resets
+  (let [(mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))]
+    (push! [(slice u8)] (mut sources) "var value = 42;")
+    (boot! 1)
+    (parse-program-sources-config (load sources) true true true)
+    (assert (>= (heap-global-entry) 0))
+    (assert-eq (heap-global-reference-entry) -1)
+    (boot! 2)
+    (parse-program-sources (load sources) true)
+    (assert (>= (heap-global-entry) 0))
+    (assert-eq (heap-global-reference-entry) (heap-global-entry))
+    (al-free! (mut sources))))
+
+(deftest incoming_mutation_boundary_disables_direct_global_calls_before_lowering_and_resets
+  (let [(mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))]
+    (push! [(slice u8)] (mut sources) "function f(x) { return x; } function g() { return f(42); }")
+    (boot! 1)
+    (parse-program-sources-with-boundary (load sources) true true)
+    (set! (.current-fun (parser-state)) (get (.scripts (parser-state)) 0))
+    (assert-eq (syntax-global-direct-fun (syntax-global-index "f")) -1)
+    (assert (.external-mutation (parser-state)))
+    (boot! 2)
+    (parse-program-sources (load sources) true)
+    (set! (.current-fun (parser-state)) (get (.scripts (parser-state)) 0))
+    (assert (>= (syntax-global-direct-fun (syntax-global-index "f")) 0))
+    (assert (not (.external-mutation (parser-state))))
+    (al-free! (mut sources))))
+
+(defn parser-test-parse-open-script! [(source (slice u8))] (-> (dyn NodeOps))
+  (let [(mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))]
+    (push! [(slice u8)] (mut sources) source)
+    (let [stop (parse-program-sources-with-boundary (load sources) true true)]
+      (al-free! (mut sources))
+      stop)))
+
+(deftest source_callable_roots_preserve_only_generic_hooks_and_reset_with_the_parser
+  (compiler-session-reset!)
+  (boot! 1)
+  (parser-test-parse-open-script! "function f(x) { return x; }")
+  (parser-add-callable-root! 0 0)
+  (parser-add-callable-root! 0 0)
+  (assert-eq (len (.callable-roots (parser-state))) 1)
+  (parser-close-world!)
+  (let [f (syntax-fun-at (syntax-script-declared-function 0 0))]
+    (assert (not (fun-unknown-callers? (parser-node (.fun-nid f)))))
+    (assert (fun-unknown-callers? (parser-node (.adapter-nid f))))
+    (assert (fun-escapes? (parser-node (.adapter-nid f)))))
+  (boot! 2)
+  (parse-script "function replacement(x) { return x; }")
+  (assert-eq (len (.callable-roots (parser-state))) 0)
+  (parser-close-world!)
+  (let [f (syntax-fun-at (syntax-script-declared-function 0 0))]
+    (assert (not (fun-unknown-callers? (parser-node (.adapter-nid f)))))))
+
+(deftest external_boundary_retains_materialized_function_expressions_without_named_roots
+  (boot! 1)
+  (parser-test-parse-open-script! "function make() { return function(x) { return x; }; }")
+  (assert-eq (len (.callable-roots (parser-state))) 0)
+  (parser-close-world!)
+  (let [(mut expression) false]
+    (al-for [record (.funs (parser-state))]
+      (let [f record]
+        (if (and (.value-taken f) (!= (.adapter-nid f) 0))
+            (do
+              (assert (fun-unknown-callers? (parser-node (.adapter-nid f))))
+              (assert (not (fun-unknown-callers? (parser-node (.fun-nid f)))))
+              (if (not (.hoisted f)) (set! (mut expression) true) 0)) 0)))
+    (assert (load expression)))
+  (boot! 2)
+  (parse-script "function make() { return function(x) { return x; }; }")
+  (parser-close-world!)
+  (al-for [record (.funs (parser-state))]
+    (let [f record]
+      (if (!= (.adapter-nid f) 0)
+          (assert (not (fun-unknown-callers? (parser-node (.adapter-nid f))))) 0))))
+
+(defn parser-test-callable-root-refuses [(script i64) (ordinal i64) (late bool) (boundary bool)] (-> i64)
+  (let [pid (os/fork) status (primitive/alloc-stack i32)]
+    (assert (>= pid 0))
+    (if (= pid 0)
+        (do
+          (boot! 1)
+          (if boundary (parser-test-parse-open-script! "function f(x) { return x; }")
+                       (parse-script "function f(x) { return x; }"))
+          (if late (parser-close-world!) 0)
+          (parser-add-callable-root! script ordinal)
+          (os/_exit 0) 0)
+        (do (assert-eq (os/waitpid pid status 0) pid)
+            (assert-eq (& (primitive/cast i64 (load status)) 127) 0)
+            (assert-eq (primitive/ishr (primitive/cast i64 (load status)) 8) EXIT-PANIC) 0))))
+
+(deftest source_callable_roots_reject_unknown_declarations_and_late_changes
+  (parser-test-callable-root-refuses -1 0 false true)
+  (parser-test-callable-root-refuses 0 1 false true)
+  (parser-test-callable-root-refuses 0 0 true true)
+  (parser-test-callable-root-refuses 0 0 false false))
+
+(deftest script_declaration_plans_preserve_local_identity_and_own_names_after_reset
+  (let [a (alloc/malloc-allocator) first (primitive/alloc-stack CuScriptDeclarations)
+        second (primitive/alloc-stack CuScriptDeclarations)
+        (mut input) (al-new [u8] a)
+        (mut sources) (al-new [(slice u8)] a)]
+    (boot! 1)
+    (let [source "'use strict'; function f() {} var x; function f() {} let l; const c = 1;
+                  class C {} { let inner; var v; } function outer() { var hidden; } this.visible = 1;"]
+      (al-extend! [u8] (mut input) (slice-data source) (len source)))
+    (push! [(slice u8)] (mut sources) (al-slice (load input)))
+    (push! [(slice u8)] (mut sources) "function g() {} var later;")
+    (parse-syntax-scripts! (load sources) true true)
+    (assert (> (syntax-script-declared-function 1 0) 0))
+    (set! first (parser-capture-script-declarations 0))
+    (set! second (parser-capture-script-declarations 1))
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (len (load input))) (break 0)
+                (do (set! (mut input) (load i) (primitive/cast u8 120))
+                    (set! (mut i) (+ (load i) 1)) (continue)))))
+    (al-free! (mut sources))
+    (al-free! (mut input))
+    (compiler-session-reset!)
+    (parse-syntax-program-mode! "function replacement() {}" true true)
+    (assert (.strict first))
+    (assert (not (.strict second)))
+    (assert-eq (len (.entries first)) 9)
+    (assert-eq (len (.entries second)) 2)
+    (let [f0 (get (.entries first) 0) f1 (get (.entries first) 1) outer (get (.entries first) 2)
+          x (get (.entries first) 3) v (get (.entries first) 4)
+          l (get (.entries first) 5) c (get (.entries first) 6) cls (get (.entries first) 7)
+          effect (get (.entries first) 8) g (get (.entries second) 0)]
+      (assert-eq (.name f0) "f") (assert-eq (.name f1) "f")
+      (assert-eq (.function-ordinal f0) 0) (assert-eq (.function-ordinal f1) 1)
+      (assert-eq (.kind f0) CU-SCRIPT-FUNCTION)
+      (assert-eq (.name outer) "outer") (assert-eq (.function-ordinal outer) 2)
+      (assert-eq (.name x) "x") (assert-eq (.kind x) CU-SCRIPT-VAR)
+      (assert-eq (.name v) "v") (assert-eq (.kind v) CU-SCRIPT-VAR)
+      (assert-eq (.name l) "l") (assert-eq (.kind l) CU-SCRIPT-LET)
+      (assert-eq (.name c) "c") (assert-eq (.kind c) CU-SCRIPT-CONST)
+      (assert-eq (.name cls) "C") (assert-eq (.kind cls) CU-SCRIPT-CLASS)
+      (assert-eq (.name effect) "visible") (assert-eq (.kind effect) CU-SCRIPT-PROPERTY-WRITE)
+      (assert-eq (.function-ordinal effect) -1)
+      (assert-eq (.name g) "g") (assert-eq (.function-ordinal g) 0))
+    (cu-script-declarations-free! first) (cu-script-declarations-free! second)
+    (assert-eq (len (.entries first)) 0)))
 
 ;; Name the case before the assertion fires: a deftest holds dozens of sources, and the assertion
 ;; line alone does not say which one disagreed.
@@ -54,6 +201,70 @@
 (defn parser-test-lowers [(source (slice u8)) (script-mode bool)] (-> i64)
   (parser-test-refuses source script-mode 0))
 
+(defn parser-test-capture! [(source (slice u8)) (name (slice u8)) (expected bool)] (-> i64)
+  (boot! 1)
+  (parse-syntax-program-mode! source true true)
+  (let [(mut i) 0 (mut checked) 0]
+    (al-for [entry (.funs (parser-state))]
+      (let [f entry]
+        (if (= (.name f) "child")
+            (do (assert-eq (syntax-enclosing-binding? (load i) name) expected)
+                (set! (mut checked) (+ (load checked) 1)) 0)
+            0))
+      (set! (mut i) (+ (load i) 1)))
+    (assert-eq (load checked) 1)) 0)
+
+(deftest capture_resolution_includes_only_enclosing_lexical_scopes
+  (parser-test-capture! "let x; { let x; function child() {} }" "x" true)
+  (parser-test-capture! "let x; { let x; } function child() {}" "x" false)
+  (parser-test-capture! "let x; { let x; } { function child() {} }" "x" false)
+  (parser-test-capture! "function outer(x) { function child() {} }" "x" true)
+  (parser-test-capture! "function outer() { var x; function child() {} }" "x" true)
+  (parser-test-capture! "function outer() { let x; function child() {} }" "x" true)
+  (parser-test-capture! "let x; function outer() { function child() {} }" "x" false)
+  (parser-test-capture! "{ let x; function outer() { function child() {} } }" "x" true))
+
+(deftest capture_resolution_distinguishes_loop_switch_and_catch_environments
+  (parser-test-capture! "for (let x = 0; x < 1; x++) { function child() {} }" "x" true)
+  (parser-test-capture! "for (let x of []) { function child() {} }" "x" true)
+  (parser-test-capture! "for (let x = function child() {}; false;) {}" "x" true)
+  (parser-test-capture! "switch (0) { case 0: function child() {} break; case 1: let x; }" "x" true)
+  (parser-test-capture! "switch (function child() {}) { case 0: let x; }" "x" false)
+  (parser-test-capture! "try {} catch (x) { function child() {} }" "x" true)
+  (parser-test-capture! "try { function child() {} } catch (x) {}" "x" false)
+  (parser-test-capture! "try {} catch (x) {} finally { function child() {} }" "x" false))
+
+(defn parser-test-retained-capture-refuses! [(source (slice u8))] (-> i64)
+  (let [pid (os/fork) status (primitive/alloc-stack i32)]
+    (assert (>= pid 0))
+    (if (= pid 0)
+        (let [(mut sources) (al-new [(slice u8)] (alloc/malloc-allocator))]
+          (push! [(slice u8)] (mut sources) source)
+          (boot! 1) (parse-program-sources-config (load sources) true true true)
+          (os/_exit 0) 0)
+        (do
+          (assert-eq (os/waitpid pid status 0) pid)
+          (assert-eq (& (primitive/cast i64 (load status)) 127) 0)
+          (assert-eq (primitive/ishr (primitive/cast i64 (load status)) 8) EXIT-UNIMPLEMENTED) 0))))
+
+(deftest captured_names_never_fall_through_to_realm_reads_writes_or_calls
+  (parser-test-retained-capture-refuses!
+    "let x = 1; var callback; { let x = 2; callback = function() { return x; }; } callback();")
+  (parser-test-retained-capture-refuses!
+    "var x = 1; function outer(x) { return function() { return x; }; } outer(2)();")
+  (parser-test-retained-capture-refuses!
+    "let x = 1; { let x = 2; var callback = function() { return typeof x; }; } callback();")
+  (parser-test-retained-capture-refuses!
+    "let x = 1; { let x = 2; var callback = function() { x = 3; }; } callback();")
+  (parser-test-retained-capture-refuses!
+    "let x = 1; { let x = 2; var callback = function() { x++; }; } callback();")
+  (parser-test-retained-capture-refuses!
+    "function x() {} { let x = function() {}; var callback = function() { return x(); }; } callback();")
+  (parser-test-retained-capture-refuses!
+    "{ let undefined = 2; var callback = function() { return undefined; }; } callback();")
+  (parser-test-retained-capture-refuses!
+    "{ let Infinity = 2; var callback = function() { Infinity = 3; }; } callback();"))
+
 ;; Source calls use the shared ABI `[ret this new.target slot…]`: `this` is argument 0 and
 ;; `new.target` argument 1, so source formal `i` is ABI argument `i + 2`, and every call carries the
 ;; program-wide slot count.
@@ -62,6 +273,28 @@
 
 (defn parser-test-abi-nargs [] (-> i64)
   (+ 2 (parser-abi-slots)))
+
+(defn parser-test-stable-callable [(source (slice u8)) (local-slots i64)] (-> i64)
+  (boot! 1)
+  (parse-program source)
+  (let [f (syntax-fun-at (syntax-find-fun "f"))
+        local (parser-node (.fun-nid f))
+        adapter (parser-node (.adapter-nid f))]
+    (assert-ne (.fidx f) (.adapter-fidx f))
+    (assert (not (n-same? local adapter)))
+    (assert-eq (ty-tuple-len (fun-sig local)) (+ 3 local-slots))
+    (assert-eq (fun-sig adapter) (callabi-signature))
+    (assert-eq (ty-funptr-sig (parser-value-funptr-ty)) (callabi-signature))
+    (match (arena-function (.adapter-fidx f))
+      (Some [registered] (assert (n-same? registered adapter)))
+      (None [] (assert false))))
+  0)
+
+(deftest callable_entries_do_not_depend_on_unrelated_function_arities
+  (parser-test-stable-callable "function f(x) { return x; } function main() { return f(42); }" 1)
+  (parser-test-stable-callable
+    "function f(x) { return x; } function unrelated(a,b,c,d,e,f,g,h,i,j,k,l,m) { return m; }
+     function main() { return f(42); }" 13))
 
 (defn parser-test-syntax-result [(source (slice u8)) (expected i64)] (-> i64)
   (let [pid (os/fork) status (primitive/alloc-stack i32)]
@@ -291,9 +524,9 @@
                sub-ret (parser-test-return-named stop "sub")
                main-ret (parser-test-return-named stop "main")]
            (assert-eq (n-op stop) OP-STOP)
-           ;; Both source definitions plus the compiler-owned process-entry wrapper are visible
+           ;; Both source definitions, their callable adapters and the process-entry wrapper are visible
            ;; until the compilation-unit lifetime pass detaches internal Returns.
-           (assert-eq (n-nins stop) 3)
+           (assert-eq (n-nins stop) 5)
            (assert-eq (n-op (n-in! sub-ret RETURN-VALUE)) OP-PROJ)
            (assert-eq (n-op (parser-test-value-source (n-in! main-ret RETURN-VALUE))) OP-PROJ)
            (let [end (n-in! (parser-test-value-source (n-in! main-ret RETURN-VALUE)) 0)
@@ -333,10 +566,13 @@
                  (match (fun-ret wrapper)
                    (Some [ret] ret)
                    (None [] (unreachable-node)))
-               wrapper-end (n-in! (n-in! wrapper-ret RETURN-VALUE) 0)
+               wrapper-value (n-in! wrapper-ret RETURN-VALUE)
+               wrapper-end (n-in! (n-in! wrapper-value 2) 0)
                wrapper-call (n-in! wrapper-end 0)]
            (assert-eq (fun-name source-fun) (parser-internal-main-name))
            (assert-eq (fun-name wrapper) "main")
+           (assert-eq (n-op wrapper-value) OP-PHI)
+           (assert-eq (parser-test-boxed-int (n-in! wrapper-value 1)) (ty-int-con 3))
            (assert (ty-dyn? (ty-tuple-at (fun-sig source-fun) 0)))
            (assert-eq (n-op (n-in! source-ret RETURN-VALUE)) OP-BOX)
            ;; An ordinary source call and the process wrapper both target the boxed source ABI.
@@ -395,7 +631,7 @@
            (assert-eq (get (strconst-units literal) 1) 0xe9)
            (assert-eq (verify-all) VERR-OK)))
 
-(deftest parsed_named_member_reads_expand_the_production_jsl_property_macro
+(deftest parsed_named_member_reads_retain_the_jsl_semantic_call_boundary
          (boot! 88)
          (let [stop
                  (parse-program "function read(object) { return object.value; }
@@ -411,10 +647,13 @@
            (assert-eq (n-ty completion) (ty-dyn TAG-COMPLETION))
            (assert-eq (n-op narrowed) OP-CAST)
            (assert-eq (n-ty narrowed) (ty-dyn TAG-ANY))
-           (assert-eq (n-op value) OP-PHI)
-           ;; Macro expansion creates no semantic call boundary; its guards, backing-store load,
-           ;; shape dispatch, and undefined fallback are ordinary nodes in the source function.
-           (assert-eq (n-op (phi-region value)) OP-REGION)
+           (assert-eq (n-op value) OP-PROJ)
+           (let [end (n-in! value 0) c (n-in! end 0)]
+             (assert-eq (n-op end) OP-CALLEND)
+             (assert-eq (n-op c) OP-CALL)
+             (assert-eq (call-nargs c) 2)
+             (assert-eq (fun-name (n-in! (call-fptr c) 0)) "JsGetNamed")
+             (assert-eq (keyref-local (call-arg c 1)) (shape-key-intern "value")))
            (assert-eq (verify-all) VERR-OK)))
 
 (deftest object_literals_define_ordered_properties_through_jsl_and_fold_named_reads
@@ -607,7 +846,7 @@
                  (match (fun-ret (parser-entry-fun))
                    (Some [ret] ret)
                    (None [] (unreachable-node)))
-               wrapper-end (n-in! (n-in! wrapper-ret RETURN-VALUE) 0)
+               wrapper-end (n-in! (n-in! (n-in! wrapper-ret RETURN-VALUE) 2) 0)
                wrapper-call (n-in! wrapper-end 0)]
            (assert-eq (parser-entry-arity) 3)
            (assert-eq (call-nargs wrapper-call) (parser-test-abi-nargs))
