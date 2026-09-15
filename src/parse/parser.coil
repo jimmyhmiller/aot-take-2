@@ -122,7 +122,7 @@
 (import "aot.shape" :use *)
 (import "aot.heap" :use *)
 (import "aot.jsl.lower" :use *)
-(import "aot.jsl.reader" :use [jsl-noinline? jsl-definition-form jsl-form-macro? jsl-load-library!])
+(import "aot.jsl.reader" :use [jsl-noinline? jsl-definition-form jsl-form-macro? jsl-load-library! jsl-throws?])
 (import "aot.jsl.decls" :use *)
 (import "aot.parse.lexer" :use *)
 (import "aot.parse.tstype" :use *)
@@ -5940,10 +5940,26 @@
 ;; JavaScript numeric operators are semantic calls for every admitted Number representation.
 ;; Values cross the dynamic boundary into JSL; specialization may expose raw integer or binary64
 ;; arithmetic, while mixed number/undefined flow retains the guarded generic path.
+;; The JSL entry a source operator lowers to: the operators that can meet an object (and so call
+;; user code through ToPrimitive) have operator definitions over their numeric cores
+;; (jsl/compiler/toprimitive.jsl); every other name is its own entry.
+(defn lower-operator-entry [(name (slice u8))] (-> (slice u8))
+  (if (= name "JsAdd") "JsAddOperator"
+      (if (= name "JsSub") "JsSubOperator"
+          (if (= name "JsMul") "JsMulOperator"
+              (if (= name "JsDiv") "JsDivOperator"
+                  (if (= name "JsLt") "JsLtOperator"
+                      (if (= name "JsGt") "JsGtOperator"
+                          (if (= name "JsLe") "JsLeOperator"
+                              (if (= name "JsGe") "JsGeOperator"
+                                  (if (= name "JsNegate") "JsNegateOperator"
+                                      (if (= name "JsPositive") "JsPositiveOperator" name)))))))))))
+
 (defn lower-js-binary [(lhs (dyn NodeOps))
                        (rhs (dyn NodeOps))
-                       (name (slice u8))] (-> (dyn NodeOps))
-  (let [target (jsl-call-target name)
+                       (source-name (slice u8))] (-> (dyn NodeOps))
+  (let [name (lower-operator-entry source-name)
+        target (jsl-call-target name)
         scope (parser-node (.current-scope (parser-state)))
         c
           (call-make-with-mem (parser-node (.current-ctrl (parser-state)))
@@ -5961,13 +5977,16 @@
       (let [ctrl (cproj-make end RETURN-CTRL "js-binary.ctrl")]
         (parser-set-current-ctrl! ctrl))
       (scope-set-mem! scope (proj-make end RETURN-MEM "js-binary.mem"))
-      (proj-make end RETURN-VALUE "js-binary.value"))))
+      ;; An operator that can call user code (ToPrimitive) completes abruptly: test its result.
+      (let [value (proj-make end RETURN-VALUE "js-binary.value")]
+        (if (jsl-throws? name) (lower-completion! value) value)))))
 
 ;; Source predicates cross the same semantic boundary as arithmetic. JSL handles both numeric
 ;; representations, signed zero, and NaN; its raw Boolean result is the compiler-internal predicate
 ;; expected by If and never escapes as a source-language value.
-(defn lower-js-unary [(value (dyn NodeOps)) (name (slice u8))] (-> (dyn NodeOps))
-  (let [target (jsl-call-target name)
+(defn lower-js-unary [(value (dyn NodeOps)) (source-name (slice u8))] (-> (dyn NodeOps))
+  (let [name (lower-operator-entry source-name)
+        target (jsl-call-target name)
         scope (parser-node (.current-scope (parser-state)))
         c
           (call-make-with-mem (parser-node (.current-ctrl (parser-state)))
@@ -5980,7 +5999,9 @@
       (let [ctrl (cproj-make end RETURN-CTRL "js-truthy.ctrl")]
         (parser-set-current-ctrl! ctrl))
       (scope-set-mem! scope (proj-make end RETURN-MEM "js-truthy.mem"))
-      (proj-make end RETURN-VALUE "js-truthy.value"))))
+      ;; An operator that can call user code (ToPrimitive) completes abruptly: test its result.
+      (let [value (proj-make end RETURN-VALUE "js-truthy.value")]
+        (if (jsl-throws? name) (lower-completion! value) value)))))
 
 (defn lower-js-truthy [(value (dyn NodeOps))] (-> (dyn NodeOps))
   (lower-js-unary value "JsTruthy"))
@@ -6473,11 +6494,9 @@
       (let [right (lower-syntax-expr right-id)
             result (lower-js-binary left right name)]
         (n-unkeep! left)
-        ;; `instanceof` throws a TypeError for a non-callable right operand, `in` for a non-object
-        ;; one: their results are completions (nothing to test when the operand's type proved it).
-        (if (or (= name "JsInstanceof") (= name "JsIn"))
-            (lower-completion! result)
-            result)))))
+        ;; `lower-js-binary` tests the completion of every operator that can throw (`instanceof`,
+        ;; `in`, and the ToPrimitive arms of arithmetic and comparison).
+        result))))
 
 (defn lower-conditional [(condition-id i64) (yes-id i64) (no-id i64)] (-> (dyn NodeOps))
   (let [condition (lower-js-truthy (lower-syntax-expr condition-id))
@@ -8952,10 +8971,13 @@
       ;; by its JSL entry point (a campaign found the source spelling compared here: the filter
       ;; then cleared every function whose only throw was an `instanceof`).
       (SxBinary [op left right]
-                (if (and (not protected)
-                         (or (= op "JsInstanceof") (= op "JsIn")))
+                (if (and (not protected) (syntax-operator-may-throw? op))
                     (set! direct true)
                     0))
+      ;; A unary, update or compound operator whose JSL can throw (ToPrimitive calls user code).
+      (SxUnary [op operand] (if (and (not protected) (syntax-operator-may-throw? op)) (set! direct true) 0))
+      (SxUpdate [op prefix target] (if protected 0 (set! direct true)))
+      (SxCompoundAssign [op target value] (if (and (not protected) (syntax-operator-may-throw? op)) (set! direct true) 0))
       ;; A strict write to `undefined`, `NaN` or `Infinity` is a TypeError; sloppy code ignores it,
       ;; but the filter does not know the function's strictness here and stays conservative.
       (SxAssign [target value]
@@ -9284,14 +9306,24 @@
 ;; The flattened declarations (`jsl-intrinsic-table`). Reading them loads the JSL library, which
 ;; `parse-program-sources-config` then lowers without loading it again.
 (defn intrinsic-table [] (-> (ArrayList Intrinsic))
+  (do
+    (parser-load-jsl!)
+    (jsl-intrinsic-table)))
+
+;; Load the production JSL library once per compilation; lowering then uses it without reloading.
+(defn parser-load-jsl! [] (-> i64)
   (let [p (parser-state)]
     (if (.jsl-loaded p)
         0
         (do
           (jsl-load-library! JSL-COMPILER-INDEX)
           (set! (.jsl-loaded p) true)
-          0))
-    (jsl-intrinsic-table)))
+          0))))
+
+;; May the JSL definition an operator lowers to complete abruptly? The syntactic may-throw filter asks
+;; before any graph exists, so it loads the library if collection has not.
+(defn syntax-operator-may-throw? [(op (slice u8))] (-> bool)
+  (do (parser-load-jsl!) (jsl-throws? (lower-operator-entry op))))
 
 (defn intrinsic-index [(table (ArrayList Intrinsic)) (name (slice u8))] (-> i64)
   (let [(mut i) 0

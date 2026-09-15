@@ -55,6 +55,15 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-15 — ToPrimitive
+
+Objects convert to primitives through `valueOf`/`toString` in every operator, the string and Math
+functions, the number globals, `Number()`, `String()`, Error messages, `join` and computed member keys
+(docs/DECISIONS.md, ToPrimitive). Missing: @ (no symbols); an object key in the reflective
+Object functions (`hasOwnProperty`, `defineProperty`, `getOwnPropertyDescriptor`, `in`), in array
+index arguments (`at`, `slice`, `length` writes, `Array(len)`) and in `Number.prototype.toString`'s
+radix, which still refuse through the primitive-only conversions by name.
+
 ### 2026-09-15 — bind and the arguments object
 
 `Function.prototype.bind` (call and construct through the bound function, `length`, `name`) and the

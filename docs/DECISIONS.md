@@ -1,5 +1,44 @@
 # Decisions
 
+## 2026-09-15 — ToPrimitive, and the operators that can call user code
+
+Every conversion of an object to a primitive was a runtime refusal (`%TrapToPrimitive`), so `"x" +
+String(o)`, `o + 1`, `Math.abs(o)` and `[o].join()` stopped the program. The upstream harness
+builds its messages that way (`"… " + String(desc)`), so every `verifyProperty` failed before its
+first check.
+
+**ToPrimitive is JSL** (`jsl/compiler/toprimitive.jsl`): OrdinaryToPrimitive over `%CallFunction`,
+`valueOf` then `toString` for the number and default hints and the other way round for the string
+hint, the first callable one whose result is not an object, else a TypeError. @@toPrimitive waits
+for symbols. `JsToStringValue` and `JsToNumberValue` are ToString and ToNumber of any value, as
+completions.
+
+**The source operators are their own definitions over the numeric cores.** `JsAdd`, `JsSub`,
+`JsMul`, `JsDiv`, `JsLt` and the rest stay what they were — total conversions over primitives, the
+smallest production JSL the lowering machinery is tested against. The frontend lowers `+`, `-`,
+`*`, `/`, the four relational comparisons and unary `-` and `+` (and the ToNumeric of `++` and `--`)
+to operator entries instead (`lower-operator-entry`): `JsAddOperator` and its siblings test for an
+object operand and, only then, ToPrimitive both operands in order and apply the core to the
+primitives (`JsBinaryOnPrimitives`, `JsUnaryOnPrimitive`); otherwise they are the core. They are
+`:throws` and `:transitioning`, the frontend tests the completion of every operator whose entry
+throws (`lower-js-binary`, `lower-js-unary`), and where the operands' types exclude objects — every
+integer loop, every literal — the object arm folds away and the test with it. The syntactic
+may-throw filter asks the same question of each operator's entry (`syntax-operator-may-throw?`),
+loading the library first when a function-entry program has not.
+
+The string methods and `concat`/`fromCharCode` convert an object argument the same way: the receiver
+checked, each argument ToPrimitive'd with the hint of the conversion the method applies to it, and
+the method run again over primitives — spec-equivalent, since ToString(o) is
+ToString(ToPrimitive(o, string)) and ToNumber likewise (`JsStringOnPrimitives`,
+`JsVariadicOnPrimitives`). The Math functions, `isNaN`, `isFinite`, `parseInt`, `parseFloat`,
+`Number()`, `String()`, the Error constructors' message and `Array.prototype.join` convert with the
+completion forms directly. A computed member `o[k]` with an object key takes ToObject of the base
+first, then ToPropertyKey's ToPrimitive (`JsKeyedOnPrimitiveKey`).
+
+Found on the way: the relational operators compared two strings as Numbers; the operator entries
+compare two primitive strings by code units (IsLessThan step 3, `JsRelationalOrder`). And `new Error(m)` defined `message` enumerable; CreateNonEnumerableDataPropertyOrThrow
+makes it writable and configurable only.
+
 ## 2026-09-15 — Built-in closures, Function.prototype.bind and the arguments object
 
 `propertyHelper.js` binds `Function.prototype.call` at load and reads `arguments.length` in

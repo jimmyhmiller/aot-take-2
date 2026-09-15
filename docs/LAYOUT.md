@@ -159,7 +159,9 @@ aot-take-2/
 │           ; delete.jsl the delete operator and [[Delete]] over every represented kind,
 │           ; enumerate.jsl own string keys, getOwnPropertyNames and for-in enumeration,
 │           ; bound.jsl Function.prototype.bind and bound functions (built-in closures),
-│           ; arguments.jsl the arguments object
+│           ; arguments.jsl the arguments object,
+│           ; toprimitive.jsl ToPrimitive, the source operators over the numeric cores, and the object
+│           ;   arms of the string methods and computed member keys
 │       function/ array-buffer/ data-view/ typed-array/
 ├── src/
 │   ├── main.coil            ; CLI driver: compile, emit, run, dump; `AOT_SEED=N` compiles under a test's arena seed
