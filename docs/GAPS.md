@@ -99,7 +99,7 @@ top-level straight-line statements.)
 Property access on undefined/null, calls on non-callables, `instanceof` with a non-callable right
 operand and strict writes to non-writable globals throw TypeError objects. Missing: an operator's
 TypeError (`Symbol` in ToString/ToNumber) is checked only at the next call or member site, not
-right after the operator; `new` on a non-constructor; the runtime's remaining traps (ToPrimitive,
+right after the operator; the runtime's remaining traps (ToPrimitive,
 ToObject) are still hard refusals, not exceptions; error messages are ours, not any engine's;
 `Error.prototype.toString` (an uncaught exception's report renders the value — an Error's name and message, a string, a number — in the runtime, `rt-render-value!`, not through the library).
 
@@ -117,8 +117,7 @@ name (a runtime refusal in both modes).
 `parseFloat` exist as intrinsics (docs/DECISIONS.md, standard globals; arrays; Math and the number
 globals) when a program names them. `Math.max`, `Math.min` and `Math.hypot` see four arguments at
 most and read an `undefined` argument as absent (`Math.max(1, undefined)` is 1, not NaN); every
-built-in non-constructor function carries a `prototype` object it should not (§10.2.4) and `new`
-does not refuse it; built-in functions have their specification `length` and `name`, declared in
+[[Construct]] is a flag word on function objects: `new` refuses a built-in non-constructor, an arrow or a method with a TypeError after evaluating its arguments, and only constructors carry `prototype` (docs/DECISIONS.md, [[Construct]]); a function or array assigned as a `prototype` refuses by name (the prototype word is typed null or ordinary object); built-in functions have their specification `length` and `name`, declared in
 `jsl/compiler/intrinsics.jsl` (docs/DECISIONS.md, intrinsic declarations). Missing: every other global
 (`JSON`, `Symbol`, `Date`, `RegExp`, `Reflect`, …, still refused by name at run time); prototype
 methods other than `Array.prototype`'s (`Object.prototype.toString`/`hasOwnProperty`,
@@ -288,7 +287,7 @@ not yet folded to its compile-time id; an array index key takes the element path
 regression of this class; `iter-peeps!` and `iter-run!` panic with a trace of recent rewrites or
 inlined sites instead of spinning; `property-expand-all!` panics if the shape universe grows.
 
-Constructors and chains: `new` on a non-callable reads `prototype` before it tests callability, so `new undefined` reports `Cannot read properties of undefined` where the specification's EvaluateNew reports `X is not a constructor` (the type is right, the text is not); class
+Constructors and chains: GetPrototypeFromConstructor's fallback is %Object.prototype% only when the realm materialized `Object` (null otherwise, pending the materialization analysis); class
 constructors, bound functions and `Symbol.hasInstance` are unimplemented (`new.target` is an
 argument slot and executes in non-arrow functions: docs/DECISIONS.md, new.target);
 `instanceof` on a non-callable right operand traps as a TypeError. A function DECLARATION nested

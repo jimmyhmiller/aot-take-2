@@ -1,5 +1,28 @@
 # Decisions
 
+## 2026-09-15 — [[Construct]] is a flag word on function objects, and `new` is JSL
+
+A function object's payload gains a raw flags word after its environment (`OFFSET-FUNCTION-FLAGS`,
+40-byte payload, alias `ALIAS-FUNCTION-FLAGS`). `FUNCTION-FLAG-CONSTRUCTOR` is [[Construct]];
+`FUNCTION-FLAG-BASE-CONSTRUCTOR` marks an ECMAScript function whose caller creates `this`
+(§10.2.2), which a built-in constructor lacks because it creates its result from NewTarget
+(§10.3.2). MakeConstructor sets both for a non-generator, non-async function declaration or
+expression; arrows, methods and accessors get neither; a built-in has [[Construct]] exactly when its
+JSL declaration is `:constructor`. Only functions with [[Construct]] get a `prototype` object, so
+built-in methods and global functions no longer carry one, and the image's per-method
+`IMAGE-REALM-OWNED-PROTOTYPE` records are gone. The word is a small integer with no reference
+prefix, so the collector's boxed-word test leaves it alone, and it needs no relocation.
+
+`new` was Coil in `lower-new`, which read `F.prototype` before evaluating the arguments and never
+checked IsConstructor. It now evaluates F and every argument, then calls `JsConstructReceiver`
+(JSL): a value without [[Construct]] is the TypeError; a base constructor's receiver is
+`JsOrdinaryCreateFromConstructor(F, %Object.prototype%)`, whose GetPrototypeFromConstructor falls
+back when `prototype` is not an object; a built-in's receiver is undefined. `JsIntrinsicError`
+creates its object from NewTarget with its own `prototype` as the default. JSL reads the flags
+through `%FunctionFlags`, a field load on a proven function. A function or array used as a
+[[Prototype]] refuses by name (`%TrapNonOrdinaryPrototype`) instead of leaving the object
+unlinked, because the prototype word is typed null or ordinary object.
+
 ## 2026-09-15 — The intrinsic surface is JSL `(intrinsic ...)` declarations
 
 The realm's standard globals were a Coil table in the parser (`intrinsic-table`), with Error
@@ -25,9 +48,9 @@ The move itself preserved the realm exactly (an identical test262 results.tsv). 
 gave every built-in function its `length` (a required `:length`, distinct from the slot count:
 `Array.prototype.push` has length 1 and four slots) and `name`, defined in that order and
 configurable only (CreateBuiltinFunction), and a built-in constructor's `prototype` lost its
-writable bit. Still open: global functions and methods carry a `prototype` object and are not
-refused by `new`, source functions have no `name` or `length`, and which intrinsics exist is
-decided by the names in the source.
+writable bit. Still open: source functions have no `name` or `length`, and which intrinsics exist
+is decided by the names in the source. (Non-constructor built-ins lost their `prototype` with the
+[[Construct]] flag, above.)
 
 ## 2026-09-15 — Non-constant float arithmetic is typed F64, not the operands' meet
 
