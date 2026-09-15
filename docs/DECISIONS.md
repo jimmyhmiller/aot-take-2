@@ -1,5 +1,30 @@
 # Decisions
 
+## 2026-09-15 — The intrinsic surface is JSL `(intrinsic ...)` declarations
+
+The realm's standard globals were a Coil table in the parser (`intrinsic-table`), with Error
+prototype fields and Math constants as Coil setup routines and every property's attributes
+written inline. That was a hand-built replacement for the declaration format `jsl/intrinsics.jsl`
+already used. It now lives in `jsl/compiler/intrinsics.jsl` as `(intrinsic %Name% ...)` forms,
+read by `src/jsl/decls.coil` and proved by the checker. Each form gives a `:constructor`,
+`:function` or `:namespace` root, an optional `:parent`, and `method`/`data` rows. Every row
+states its target, value and `:writable`/`:enumerable`/`:configurable` attributes; an absent
+attribute is false. The parser only flattens the declarations and lays them out.
+
+A function's argument-slot count is not declared: it is the builtin's parameter count after the
+receiver prefix (three for a constructor or global function, one for a method), so declaration
+and body cannot disagree. The checker refuses by name an undefined or macro body, a non-`dyn`
+parameter, a missing receiver prefix, a duplicate root or property, and a parent not declared
+earlier as a constructor. Number values are decimal strings read by StringToNumber, because JSL
+has no float literal.
+
+Syntax collection needs the declarations before any graph exists, so reading them loads the
+JSL library, and the compile then lowers that loaded library without reading it again.
+
+This move preserves the realm exactly, including its known gaps: global functions still get a
+`prototype` object, functions still have no `name` or `length`, and which intrinsics exist is
+still decided by the names in the source. Those are the next changes, made in the declarations.
+
 ## 2026-09-15 — Non-constant float arithmetic is typed F64, not the operands' meet
 
 Simple's `ArithNode.compute` types two non-constant float operands as `t1.meet(t2)`. Our F32 means

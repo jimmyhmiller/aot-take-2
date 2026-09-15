@@ -147,6 +147,7 @@ aot-take-2/
 │       └── compiler/{add,sub,mul,increment-int-or-identity,logical,…,array,string-methods,
 │           ;          function-methods,object-methods,number-methods,math,array-generic}.jsl
 │           ; the production index (`compiler/index`): every operation the frontend lowers to,
+│           ; intrinsics.jsl the standard globals' bodies and the realm's (intrinsic …) declarations,
 │           ; built on demand per compile; array.jsl is the Array intrinsic and its methods,
 │           ; string-methods.jsl String.prototype and String.fromCharCode over primitive strings,
 │           ; function-methods.jsl Function.prototype.call/apply (and the Function constructor's
@@ -238,7 +239,7 @@ aot-take-2/
 │   │   ├── prims.coil       ; the primitive table
 │   │   ├── check.coil       ; the checker — refuses BY NAME what it cannot lower
 │   │   ├── lower.coil       ; JSL → ideal graph, and the transition check over it
-│   │   └── decls.coil       ; (intrinsic …), (internal-slot …), (slot-list …)
+│   │   └── decls.coil       ; (intrinsic …) read and flattened into the realm surface; (internal-slot …), (slot-list …) still stubs
 │   │
 │   ├── rt/                  ; the runtime, in Coil, built as its own object (Coil.toml `runtime`)
 │   │   ├── number.coil      ; Number conversions shared by compiler and runtime: exact radix integers, `strtod` decimals, StringToNumber, parseInt/parseFloat, the NaN-box word; the libm-backed Math table

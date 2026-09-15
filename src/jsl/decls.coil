@@ -1,11 +1,38 @@
 ;; The JSL declaration forms that are not plain definitions.
 
 ;;
-;; `(intrinsic %Name% ...)` declares one published global-object root and expands into one
-;; demand-loadable builtin per property, so a program that never mentions `DataView` never
-;; initialises it. This is a DECLARATION-LEVEL MACRO, and it exists to replace what would otherwise
-;; be a JSON manifest plus a generator — which CLAUDE.md's second rule forbids and which
-;; `jsl/intrinsics.jsl` says in its own header it replaced.
+;; `(intrinsic %Name% ...)` declares one published global-object root: the global binding, the
+;; object it names, and every property CreateIntrinsics gives that object and its `prototype`.
+;; This is a DECLARATION-LEVEL FORM, and it exists to replace what would otherwise be a table in
+;; the compiler: which intrinsics exist, which JSL builtin is each function's body, what their
+;; prototype chains are, and every property's value and attributes are JSL source, where the
+;; checker sees them next to the definitions they name.
+;;
+;;   (intrinsic %TypeError% :constructor JsIntrinsicError :parent %Error%
+;;              :writable true :configurable true
+;;     (data "name" :target prototype :value (string "TypeError") :writable true :configurable true)
+;;     (method "isArray" :closure JsArrayIsArray :writable true :configurable true))
+;;
+;; The root is exactly one of `:constructor BUILTIN` (a function object with a `prototype`
+;; object; its body receives this, new.target, the constructor's own function object, then the
+;; arguments), `:function BUILTIN` (a global function; same body shape) or `:namespace true` (an
+;; ordinary object, `Math`). `:parent %Other%` heads the prototype object's chain with the other
+;; constructor's prototype instead of %Object.prototype%. The root's attribute keywords are the
+;; global object property's attributes.
+;;
+;; A row is `(method KEY :closure BUILTIN ...)` — a built-in function whose body receives this,
+;; then the arguments — or `(data KEY :value VALUE ...)` with VALUE `(string "text")` or
+;; `(number "decimal")` (JSL has no float literal; the decimal is read by StringToNumber, which
+;; rounds exactly as a JavaScript source literal does). `:target prototype` places the row on the
+;; root's `prototype` object; without it the row is on the root itself. `:writable`,
+;; `:enumerable` and `:configurable` are each absent (false) or `true`, as a property descriptor's
+;; fields default in ECMA-262 §6.2.6.
+;;
+;; A function's argument-slot count is not declared: it is the number of parameters its builtin
+;; takes after the fixed receiver prefix, so the declaration cannot disagree with the body.
+;;
+;; The declaration order is the realm's materialization order, which is observable in function
+;; indices and object layouts, so it is part of the format like `jsl/compiler/index` order.
 ;;
 ;; `(internal-slot ...)` and `(slot-list ...)` pin the specification's internal-slot lists to
 ;; concrete object layouts. A layout must name its creation operation and match the exact
@@ -16,12 +43,390 @@
 ;; which is what lets a JSL definition ask "does this object use the ordinary [[Get]]" — the
 ;; question every fast path in the object model turns on.
 ;;
-;; SCAFFOLD: signatures are final; bodies hard-error. Filled in at S5.
+;; SCAFFOLD: the slot-list and internal-method readers hard-error. Filled in at S5.
 (module aot.jsl.decls)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.reader" :as rd)
+(import "coil.slice" :use *)
+(import "coil.str" :use [sb-new sb-push-str! sb-str])
 (import "aot.util.panic" :use *)
+(import "aot.jsl.reader" :use *)
+(import "aot.rt.number" :use [number-string-to-number number-word])
+(import "aot.shape" :use [SHAPE-ATTR-WRITABLE SHAPE-ATTR-ENUMERABLE SHAPE-ATTR-CONFIGURABLE])
 
-(defn jsl-read-intrinsic! [(form i64)] (-> i64)
-  (do (unimplemented "jsl-read-intrinsic!" "S5 — src/jsl/decls.coil") 0))
+;; A function object with a `prototype` object: `Object`, `Error`, `Array`.
+(const JSL-INTRINSIC-CONSTRUCTOR 0)
+
+;; A global function that is not a constructor: `parseInt`.
+(const JSL-INTRINSIC-FUNCTION 1)
+
+;; An ordinary object bound as a global: `Math`.
+(const JSL-INTRINSIC-NAMESPACE 2)
+
+;; A row's value is a built-in function over a JSL builtin.
+(const JSL-INTRINSIC-METHOD 0)
+
+;; A row's value is a string or number.
+(const JSL-INTRINSIC-DATA 1)
+
+;; The row is a property of the root object.
+(const JSL-INTRINSIC-TARGET-ROOT 0)
+
+;; The row is a property of the root's `prototype` object.
+(const JSL-INTRINSIC-TARGET-PROTOTYPE 1)
+
+(const JSL-INTRINSIC-VALUE-NONE 0)
+(const JSL-INTRINSIC-VALUE-STRING 1)
+(const JSL-INTRINSIC-VALUE-NUMBER 2)
+
+(defstruct JslIntrinsicProp
+  [(kind i64)
+   (key (slice u8))
+   (target i64)
+   (closure (slice u8))  ; a method's builtin, or ""
+   (value-kind i64)
+   (text (slice u8))  ; a string value's bytes, or ""
+   (bits i64)  ; a number value's canonical NaN-box word (`number-word`)
+   (attrs i64)  ; SHAPE-ATTR-* bits
+   (lo i64)
+   (hi i64)])
+
+(defstruct JslIntrinsic
+  [(name (slice u8))  ; the global binding's name, without the `%` delimiters
+   (kind i64)
+   (builtin (slice u8))  ; a constructor's or function's body, or ""
+   (parent (slice u8))  ; a constructor whose prototype heads this one's prototype chain, or ""
+   (attrs i64)  ; the global binding's SHAPE-ATTR-* bits
+   (props (ArrayList JslIntrinsicProp))
+   (lo i64)
+   (hi i64)])
+
+(defn jsl-form-intrinsic? [(form (ptr rd/Sexp))] (-> bool)
+  (and (rd/sexp-list? form)
+       (> (rd/sexp-count form) 1)
+       (rd/sexp-sym-is (rd/sexp-nth form 0) "intrinsic")))
+
+(defn jsl-decl-fail [(what (slice u8)) (x (ptr rd/Sexp))] (-> i64)
+  (do (panic-i2 what (.lo x) (.hi x)) 0))
+
+;; `%Name%` → `Name`.
+(defn jsl-intrinsic-root-name [(x (ptr rd/Sexp))] (-> (slice u8))
+  (if (not (rd/sexp-sym? x))
+      (do (jsl-decl-fail "jsl-read-intrinsic!: an intrinsic root is a %Name% symbol" x) "")
+      (let [s (rd/sexp-sym x)]
+        (if (or (< (len s) 3)
+                (!= (get s 0) (primitive/cast u8 37))
+                (!= (get s (- (len s) 1)) (primitive/cast u8 37)))
+            (do (jsl-decl-fail "jsl-read-intrinsic!: an intrinsic root is a %Name% symbol" x) "")
+            (subslice [u8] s 1 (- (len s) 1))))))
+
+;; The attribute keyword a `true` value sets, or 0 for a keyword that is not an attribute.
+(defn jsl-intrinsic-attr-bit [(key (slice u8))] (-> i64)
+  (if (= key "writable")
+      SHAPE-ATTR-WRITABLE
+      (if (= key "enumerable")
+          SHAPE-ATTR-ENUMERABLE
+          (if (= key "configurable") SHAPE-ATTR-CONFIGURABLE 0))))
+
+(defn jsl-intrinsic-true [(x (ptr rd/Sexp))] (-> bool)
+  (if (rd/sexp-sym-is x "true")
+      true
+      (do (jsl-decl-fail "jsl-read-intrinsic!: an attribute is absent or `true`" x) false)))
+
+;; `(string "text")` or `(number "decimal")` into a row.
+(defn jsl-intrinsic-read-value! [(prop (mut JslIntrinsicProp)) (x (ptr rd/Sexp))] (-> i64)
+  (if (not (and (rd/sexp-list? x)
+                (= (rd/sexp-count x) 2)
+                (rd/sexp-sym? (rd/sexp-nth x 0))
+                (rd/sexp-str? (rd/sexp-nth x 1))))
+      (jsl-decl-fail "jsl-read-intrinsic!: a data value is (string \"...\") or (number \"...\")" x)
+      (let [text (rd/sexp-str (rd/sexp-nth x 1))]
+        (if (rd/sexp-sym-is (rd/sexp-nth x 0) "string")
+            (do
+              (set! (.value-kind prop) JSL-INTRINSIC-VALUE-STRING)
+              (set! (.text prop) text)
+              0)
+            (if (rd/sexp-sym-is (rd/sexp-nth x 0) "number")
+                (do
+                  (set! (.value-kind prop) JSL-INTRINSIC-VALUE-NUMBER)
+                  (set! (.bits prop) (number-word (number-string-to-number text)))
+                  0)
+                (jsl-decl-fail "jsl-read-intrinsic!: a data value is (string \"...\") or (number \"...\")" x))))))
+
+(defn jsl-intrinsic-read-prop [(row (ptr rd/Sexp))] (-> JslIntrinsicProp)
+  (let [(mut prop) (primitive/zeroed JslIntrinsicProp)
+        (mut i) 2]
+    (set! (.lo (mut prop)) (.lo row))
+    (set! (.hi (mut prop)) (.hi row))
+    (if (not (and (rd/sexp-list? row)
+                  (>= (rd/sexp-count row) 2)
+                  (rd/sexp-sym? (rd/sexp-nth row 0))
+                  (rd/sexp-str? (rd/sexp-nth row 1))))
+        (jsl-decl-fail "jsl-read-intrinsic!: a row is (method \"key\" ...) or (data \"key\" ...)" row)
+        0)
+    (set! (.key (mut prop)) (rd/sexp-str (rd/sexp-nth row 1)))
+    (if (rd/sexp-sym-is (rd/sexp-nth row 0) "method")
+        (set! (.kind (mut prop)) JSL-INTRINSIC-METHOD)
+        (if (rd/sexp-sym-is (rd/sexp-nth row 0) "data")
+            (set! (.kind (mut prop)) JSL-INTRINSIC-DATA)
+            (jsl-decl-fail "jsl-read-intrinsic!: a row is (method \"key\" ...) or (data \"key\" ...)" row)))
+    (loop (if (>= (load i) (rd/sexp-count row))
+              (break 0)
+              (let [k (rd/sexp-nth row (load i))]
+                (if (not (and (rd/sexp-kw? k) (< (+ (load i) 1) (rd/sexp-count row))))
+                    (jsl-decl-fail "jsl-read-intrinsic!: a row option is a :keyword and its value" k)
+                    0)
+                (let [key (rd/sexp-kw k)
+                      v (rd/sexp-nth row (+ (load i) 1))
+                      bit (jsl-intrinsic-attr-bit key)]
+                  (if (> bit 0)
+                      (if (jsl-intrinsic-true v)
+                          (if (!= (& (.attrs prop) bit) 0)
+                              (jsl-decl-fail "jsl-read-intrinsic!: a repeated attribute" k)
+                              (set! (.attrs (mut prop)) (+ (.attrs prop) bit)))
+                          0)
+                      (if (= key "target")
+                          (if (rd/sexp-sym-is v "prototype")
+                              (set! (.target (mut prop)) JSL-INTRINSIC-TARGET-PROTOTYPE)
+                              (jsl-decl-fail "jsl-read-intrinsic!: a row's :target is prototype" v))
+                          (if (= key "closure")
+                              (if (and (= (.kind prop) JSL-INTRINSIC-METHOD) (rd/sexp-sym? v))
+                                  (set! (.closure (mut prop)) (rd/sexp-sym v))
+                                  (jsl-decl-fail "jsl-read-intrinsic!: :closure names a method's builtin" v))
+                              (if (= key "value")
+                                  (if (= (.kind prop) JSL-INTRINSIC-DATA)
+                                      (jsl-intrinsic-read-value! (mut prop) v)
+                                      (jsl-decl-fail "jsl-read-intrinsic!: a method has no :value" v))
+                                  (jsl-decl-fail "jsl-read-intrinsic!: unknown row option" k))))))
+                (set! (mut i) (+ (load i) 2))
+                (continue))))
+    (if (and (= (.kind prop) JSL-INTRINSIC-METHOD) (= (.closure prop) ""))
+        (jsl-decl-fail "jsl-read-intrinsic!: a method row requires :closure" row)
+        0)
+    (if (and (= (.kind prop) JSL-INTRINSIC-DATA)
+             (= (.value-kind prop) JSL-INTRINSIC-VALUE-NONE))
+        (jsl-decl-fail "jsl-read-intrinsic!: a data row requires :value" row)
+        0)
+    (load prop)))
+
+;; Read one `(intrinsic ...)` form. A malformed declaration is a hard error naming its span; the
+;; checker (`jsl-check-intrinsic-form`) then proves every builtin it names exists with the body
+;; shape its position requires.
+(defn jsl-read-intrinsic [(a (dyn alloc/Allocator)) (form (ptr rd/Sexp))] (-> JslIntrinsic)
+  (let [(mut decl) (primitive/zeroed JslIntrinsic)
+        (mut i) 2
+        (mut roots) 0]
+    (if (not (jsl-form-intrinsic? form))
+        (jsl-decl-fail "jsl-read-intrinsic!: not an intrinsic declaration" form)
+        0)
+    (set! (.lo (mut decl)) (.lo form))
+    (set! (.hi (mut decl)) (.hi form))
+    (set! (.name (mut decl)) (jsl-intrinsic-root-name (rd/sexp-nth form 1)))
+    (set! (.builtin (mut decl)) "")
+    (set! (.parent (mut decl)) "")
+    (set! (.props (mut decl)) (al-new [JslIntrinsicProp] a))
+    (loop (if (>= (load i) (rd/sexp-count form))
+              (break 0)
+              (let [x (rd/sexp-nth form (load i))]
+                (if (rd/sexp-list? x)
+                    (do
+                      (push! [JslIntrinsicProp] (mut (.props (mut decl))) (jsl-intrinsic-read-prop x))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))
+                    (do
+                      (if (or (> (len (.props decl)) 0)
+                              (not (rd/sexp-kw? x))
+                              (>= (+ (load i) 1) (rd/sexp-count form)))
+                          (jsl-decl-fail "jsl-read-intrinsic!: root options are :keyword value pairs before the rows" x)
+                          0)
+                      (let [key (rd/sexp-kw x)
+                            v (rd/sexp-nth form (+ (load i) 1))
+                            bit (jsl-intrinsic-attr-bit key)]
+                        (if (> bit 0)
+                            (if (jsl-intrinsic-true v)
+                                (if (!= (& (.attrs decl) bit) 0)
+                                    (jsl-decl-fail "jsl-read-intrinsic!: a repeated attribute" x)
+                                    (set! (.attrs (mut decl)) (+ (.attrs decl) bit)))
+                                0)
+                            (if (or (= key "constructor") (= key "function"))
+                                (if (rd/sexp-sym? v)
+                                    (do
+                                      (set! (mut roots) (+ (load roots) 1))
+                                      (set! (.builtin (mut decl)) (rd/sexp-sym v))
+                                      (set! (.kind (mut decl))
+                                            (if (= key "constructor")
+                                                JSL-INTRINSIC-CONSTRUCTOR
+                                                JSL-INTRINSIC-FUNCTION))
+                                      0)
+                                    (jsl-decl-fail "jsl-read-intrinsic!: :constructor and :function name a builtin" v))
+                                (if (= key "namespace")
+                                    (if (jsl-intrinsic-true v)
+                                        (do
+                                          (set! (mut roots) (+ (load roots) 1))
+                                          (set! (.kind (mut decl)) JSL-INTRINSIC-NAMESPACE)
+                                          0)
+                                        0)
+                                    (if (= key "parent")
+                                        (set! (.parent (mut decl)) (jsl-intrinsic-root-name v))
+                                        (jsl-decl-fail "jsl-read-intrinsic!: unknown intrinsic option" x))))))
+                      (set! (mut i) (+ (load i) 2))
+                      (continue))))))
+    (if (!= (load roots) 1)
+        (jsl-decl-fail "jsl-read-intrinsic!: exactly one of :constructor, :function or :namespace" form)
+        0)
+    (if (and (!= (.parent decl) "") (!= (.kind decl) JSL-INTRINSIC-CONSTRUCTOR))
+        (jsl-decl-fail "jsl-read-intrinsic!: only a constructor has a :parent" form)
+        0)
+    (al-for [p (.props decl)]
+            (let [prop p]
+              (if (and (= (.target prop) JSL-INTRINSIC-TARGET-PROTOTYPE)
+                       (!= (.kind decl) JSL-INTRINSIC-CONSTRUCTOR))
+                  (jsl-decl-fail "jsl-read-intrinsic!: only a constructor has a prototype object" form)
+                  0)))
+    (load decl)))
+
+;; Every intrinsic declaration of the loaded library, in index and file order.
+(defn jsl-intrinsics [(a (dyn alloc/Allocator))] (-> (ArrayList JslIntrinsic))
+  (let [(mut out) (al-new [JslIntrinsic] a)
+        (mut unit) 1]
+    (loop (if (> (load unit) (jsl-unit-count))
+              (break 0)
+              (let [(mut i) 0]
+                (loop (if (>= (load i) (jsl-form-count (load unit)))
+                          (break 0)
+                          (let [form (jsl-form (load unit) (load i))]
+                            (if (jsl-form-intrinsic? form)
+                                (push! [JslIntrinsic] (mut out) (jsl-read-intrinsic a form))
+                                0)
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (set! (mut unit) (+ (load unit) 1))
+                (continue))))
+    (if (= (len (load out)) 0)
+        (panic "jsl-intrinsics: the loaded JSL library declares no intrinsics")
+        0)
+    (load out)))
+
+;; ---------------------------------------------------------------------------
+;; The flattened realm surface: one row per root object and per method, which is what the frontend
+;; materializes and lays out.
+
+;; A constructor or global function: a global binding. Its body receives (this, new.target, its own
+;; function object, args...).
+(const INTRINSIC-TARGET-GLOBAL 0)
+
+;; A method of the owner's `prototype` object. Its body receives (this, args...).
+(const INTRINSIC-TARGET-PROTOTYPE 1)
+
+;; A static method of the owner's own function object. Its body receives (this, args...).
+(const INTRINSIC-TARGET-CONSTRUCTOR 2)
+
+;; A namespace object (`Math`), or a method of one (`Math.sqrt`, whose body receives (this,
+;; args...)).
+(const INTRINSIC-TARGET-NAMESPACE 3)
+
+(defstruct Intrinsic
+  [(name (slice u8))  ; a root's global name, or `Owner.prototype.key` / `Owner.key`
+   (kind i64)  ; JSL-INTRINSIC-CONSTRUCTOR / -FUNCTION / -NAMESPACE of the declaration
+   (builtin (slice u8))
+   (arity i64)  ; argument slots: the builtin's parameters after its receiver prefix
+   (parent (slice u8))  ; a constructor whose prototype heads this one's prototype chain, or ""
+   (attrs i64)  ; the property's attributes: the global binding, or the method on its carrier
+   (data (ArrayList JslIntrinsicProp))  ; a root's data rows, in declaration order
+   (owner (slice u8))  ; a method: the root whose object carries it, or "" for a root
+   (prop (slice u8))  ; a method: its property name
+   (target i64)])  ; a method: which of the owner's objects carries it
+
+;; Argument slots of an intrinsic body: its declared parameters after the fixed receiver prefix
+;; (the checker proved the prefix is present).
+(defn intrinsic-slots [(builtin (slice u8)) (prefix i64)] (-> i64)
+  (let [params (jsl-definition-arity builtin)]
+    (if (< params prefix)
+        (do (panic "intrinsic-slots: an intrinsic body lacks its receiver parameters") 0)
+        (- params prefix))))
+
+(defn intrinsic-root [(a (dyn alloc/Allocator)) (decl JslIntrinsic)] (-> Intrinsic)
+  (let [(mut data) (al-new [JslIntrinsicProp] a)]
+    (al-for [row (.props decl)]
+            (let [prop row]
+              (if (= (.kind prop) JSL-INTRINSIC-DATA)
+                  (push! [JslIntrinsicProp] (mut data) prop)
+                  0)))
+    (Intrinsic
+      :name (.name decl)
+      :kind (.kind decl)
+      :builtin (.builtin decl)
+      :arity (if (= (.kind decl) JSL-INTRINSIC-NAMESPACE)
+                 0
+                 (intrinsic-slots (.builtin decl) 3))
+      :parent (.parent decl)
+      :attrs (.attrs decl)
+      :data (load data)
+      :owner ""
+      :prop ""
+      :target (if (= (.kind decl) JSL-INTRINSIC-NAMESPACE)
+                  INTRINSIC-TARGET-NAMESPACE
+                  INTRINSIC-TARGET-GLOBAL))))
+
+(defn intrinsic-method [(a (dyn alloc/Allocator)) (decl JslIntrinsic) (row JslIntrinsicProp)] (-> Intrinsic)
+  (let [target
+          (if (= (.target row) JSL-INTRINSIC-TARGET-PROTOTYPE)
+              INTRINSIC-TARGET-PROTOTYPE
+              (if (= (.kind decl) JSL-INTRINSIC-NAMESPACE)
+                  INTRINSIC-TARGET-NAMESPACE
+                  INTRINSIC-TARGET-CONSTRUCTOR))
+        (mut b) (sb-new a)]
+    (if (= (.kind decl) JSL-INTRINSIC-FUNCTION)
+        (panic "intrinsic-method: a global function declares no methods")
+        0)
+    (sb-push-str! (mut b) (.name decl))
+    (sb-push-str! (mut b)
+                  (if (= target INTRINSIC-TARGET-PROTOTYPE) ".prototype." "."))
+    (sb-push-str! (mut b) (.key row))
+    (Intrinsic
+      :name (sb-str (load b))
+      :kind (.kind decl)
+      :builtin (.closure row)
+      :arity (intrinsic-slots (.closure row) 1)
+      :parent ""
+      :attrs (.attrs row)
+      :data (al-new [JslIntrinsicProp] a)
+      :owner (.name decl)
+      :prop (.key row)
+      :target target)))
+
+(defstruct JslIntrinsicTable [(entries (ArrayList Intrinsic)) (epoch i64) (ready bool)])
+
+(defn jsl-intrinsic-table-cell [] (-> (ptr JslIntrinsicTable))
+  (primitive/alloc-static JslIntrinsicTable))
+
+;; The production library's flattened intrinsic rows. They depend only on the library's forms, so
+;; they are built once per library build, in the library's region, and reused by every compile
+;; until that region is cleared (its epoch moves on a rebuild or `jsl-library-clear!`).
+(defn jsl-intrinsic-table [] (-> (ArrayList Intrinsic))
+  (let [cell (jsl-intrinsic-table-cell)
+        region (jsl-library-region)]
+    (if (not (.loaded (jsl-library)))
+        (panic "jsl-intrinsic-table: the production JSL library is not loaded")
+        0)
+    (if (and (.ready cell) (= (.epoch cell) (.epoch region)))
+        (.entries cell)
+        (let [a (primitive/make-dyn alloc/Allocator region)
+              (mut out) (al-new [Intrinsic] a)]
+          (al-for [d (jsl-intrinsics a)]
+                  (let [decl d]
+                    (push! [Intrinsic] (mut out) (intrinsic-root a decl))
+                    (al-for [row (.props decl)]
+                            (let [prop row]
+                              (if (= (.kind prop) JSL-INTRINSIC-METHOD)
+                                  (push! [Intrinsic] (mut out) (intrinsic-method a decl prop))
+                                  0)))))
+          (set! (.entries cell) (load out))
+          (set! (.epoch cell) (.epoch region))
+          (set! (.ready cell) true)
+          (load out)))))
 
 (defn jsl-read-slot-list! [(form i64)] (-> i64)
   (do (unimplemented "jsl-read-slot-list!" "S5 — src/jsl/decls.coil") 0))
