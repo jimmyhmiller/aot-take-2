@@ -1,5 +1,28 @@
 # Decisions
 
+## 2026-09-15 — Remainder, exponent, bitwise and loose equality operators; template substitutions
+
+`%`, `**`, `&`, `|`, `^`, `~`, `<<`, `>>`, `>>>`, `==` and `!=` were admitted syntax that refused by JSL
+entry name, and a template with a substitution refused as "template substitutions (ToString)".
+
+**The Number operations are the runtime's.** Number::remainder, Number::exponentiate and the
+bitwise and shift operators over ToInt32 and ToUint32 are `aot.rt.number` operations reached through
+the existing `%MathBinary` and `%MathUnary` tables (MATH-OP-REMAINDER, BITAND … USHR, BITNOT):
+remainder is C `fmod` after the specification's NaN, infinity and zero cases, since `fmod` is the
+truncating remainder whose sign is the dividend's; ToInt32 truncates and reduces modulo 2^32. This
+deliberately does not reuse the compiler's internal i64 bit and shift nodes, whose semantics differ
+(docs/GAPS.md); an int32-typed inline lowering is a later optimization, not a semantic change.
+The JSL entries (`JsMod` … `JsUshr`, `JsBitNot`) convert object operands through ToPrimitive first,
+as the other source operators do.
+
+**IsLooselyEqual is JSL** (`JsLooselyEqual`): two objects by identity; undefined and null equal each
+other and nothing else; an object against a primitive through ToPrimitive with the default hint; a
+Boolean as its Number; a Number against a String as Numbers; a Symbol only itself.
+
+**A template's substitutions are ToString'd in order** (`lower-template`, `JsTemplateAppend`): the
+first cooked string, then each substitution's value converted at once — through ToPrimitive with the
+string hint for an object — and the next cooked string. The may-throw filter counts a substitution.
+
 ## 2026-09-15 — ToPrimitive, and the operators that can call user code
 
 Every conversion of an object to a primitive was a runtime refusal (`%TrapToPrimitive`), so `"x" +

@@ -55,6 +55,12 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-15 — Remainder, exponent, bitwise and loose equality; template substitutions
+
+`%`, `**`, the bitwise and shift operators, `==`, `!=` and template substitutions execute
+(docs/DECISIONS.md). Missing: BigInt operands (no BigInt); an int32-typed inline lowering of the
+bitwise operators, which today are one runtime call each; tagged templates.
+
 ### 2026-09-15 — ToPrimitive
 
 Objects convert to primitives through `valueOf`/`toString` in every operator, the string and Math
