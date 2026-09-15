@@ -1,5 +1,23 @@
 # Decisions
 
+## 2026-09-15 — Object literal methods and accessors
+
+`{ m() {} }`, `{ get x() {} }` and `{ set x(v) {} }` refused as "object methods and accessors".
+
+**A method is a function value without [[Construct]].** Method, getter and setter records are
+admitted as function values like expressions and arrows (`syntax-fun-value-admitted?`): the same
+Fun, adapter and function object, with no flags word bit and so no `prototype`. `super` inside one
+still refuses where it is written, since a home object is the class slice's concern; class elements
+stay unlowered until classes exist.
+
+**Definitions keep source order.** A method is a data definition of its function object, like
+`key: value`. An accessor is `JsDefineLiteralAccessor` (`jsl/compiler/literal.jsl`): an enumerable,
+configurable accessor over `JsAccessorPair`, which keeps the other half of an accessor the key
+already holds, applied by the define path `Object.defineProperty` uses. A data definition of a key an
+earlier accessor defined replaces it through a full data define (`JsDefineLiteralData`). The fixed
+literal layout (`lower-object-literal-layout`) plans data slots only up to the first accessor, so
+every later key is added after it at run time and insertion order is the definitions' order.
+
 ## 2026-09-15 — Remainder, exponent, bitwise and loose equality operators; template substitutions
 
 `%`, `**`, `&`, `|`, `^`, `~`, `<<`, `>>`, `>>>`, `==` and `!=` were admitted syntax that refused by JSL

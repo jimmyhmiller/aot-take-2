@@ -55,6 +55,11 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-15 — Object literal methods and accessors
+
+Methods, getters and setters in object literals execute (docs/DECISIONS.md). Missing: `super` in a
+method (home objects), computed keys, generator and async methods, and a method's `name`.
+
 ### 2026-09-15 — Remainder, exponent, bitwise and loose equality; template substitutions
 
 `%`, `**`, the bitwise and shift operators, `==`, `!=` and template substitutions execute

@@ -161,7 +161,8 @@ aot-take-2/
 │           ; bound.jsl Function.prototype.bind and bound functions (built-in closures),
 │           ; arguments.jsl the arguments object,
 │           ; toprimitive.jsl ToPrimitive, the source operators over the numeric cores, and the object
-│           ;   arms of the string methods and computed member keys
+│           ;   arms of the string methods and computed member keys,
+│           ; literal.jsl object literal accessor and replacing data definitions
 │       function/ array-buffer/ data-view/ typed-array/
 ├── src/
 │   ├── main.coil            ; CLI driver: compile, emit, run, dump; `AOT_SEED=N` compiles under a test's arena seed
