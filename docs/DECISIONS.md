@@ -21,9 +21,13 @@ has no float literal.
 Syntax collection needs the declarations before any graph exists, so reading them loads the
 JSL library, and the compile then lowers that loaded library without reading it again.
 
-This move preserves the realm exactly, including its known gaps: global functions still get a
-`prototype` object, functions still have no `name` or `length`, and which intrinsics exist is
-still decided by the names in the source. Those are the next changes, made in the declarations.
+The move itself preserved the realm exactly (an identical test262 results.tsv). Declarations then
+gave every built-in function its `length` (a required `:length`, distinct from the slot count:
+`Array.prototype.push` has length 1 and four slots) and `name`, defined in that order and
+configurable only (CreateBuiltinFunction), and a built-in constructor's `prototype` lost its
+writable bit. Still open: global functions and methods carry a `prototype` object and are not
+refused by `new`, source functions have no `name` or `length`, and which intrinsics exist is
+decided by the names in the source.
 
 ## 2026-09-15 — Non-constant float arithmetic is typed F64, not the operands' meet
 

@@ -117,7 +117,9 @@ name (a runtime refusal in both modes).
 `parseFloat` exist as intrinsics (docs/DECISIONS.md, standard globals; arrays; Math and the number
 globals) when a program names them. `Math.max`, `Math.min` and `Math.hypot` see four arguments at
 most and read an `undefined` argument as absent (`Math.max(1, undefined)` is 1, not NaN); every
-built-in function carries a `prototype` object it should not (§10.2.4). Missing: every other global
+built-in non-constructor function carries a `prototype` object it should not (§10.2.4) and `new`
+does not refuse it; built-in functions have their specification `length` and `name`, declared in
+`jsl/compiler/intrinsics.jsl` (docs/DECISIONS.md, intrinsic declarations). Missing: every other global
 (`JSON`, `Symbol`, `Date`, `RegExp`, `Reflect`, …, still refused by name at run time); prototype
 methods other than `Array.prototype`'s (`Object.prototype.toString`/`hasOwnProperty`,
 `Error.prototype.toString`, `String.prototype.*`) — the intrinsic table carries methods now, so
@@ -136,7 +138,7 @@ an array's indices first), `Object.prototype.hasOwnProperty`/`toString`/`valueOf
 `propertyIsEnumerable`, `Number.prototype.toString([radix])`/`valueOf` and
 `Boolean.prototype.toString`/`valueOf` execute (docs/DECISIONS.md, function objects). Missing:
 `Function.prototype.bind` (a bound function is a closure), `Function.prototype.toString`, `name`
-and `length` on functions, `arguments`; property descriptors — `Object.defineProperty`,
+and `length` on source functions (built-ins have them), `arguments`; property descriptors — `Object.defineProperty`,
 `defineProperties`, `getOwnPropertyDescriptor(s)`, `getOwnPropertyNames`, `freeze`/`seal`/
 `preventExtensions` and their `is*` queries — since properties have no attributes yet (the
 campaign's largest remaining bucket, 177 sampled cases); `Object.assign`, `entries`, `values`,
