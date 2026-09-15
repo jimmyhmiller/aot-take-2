@@ -117,7 +117,7 @@ name (a runtime refusal in both modes).
 `parseFloat` exist as intrinsics (docs/DECISIONS.md, standard globals; arrays; Math and the number
 globals) when a program names them. `Math.max`, `Math.min` and `Math.hypot` see four arguments at
 most and read an `undefined` argument as absent (`Math.max(1, undefined)` is 1, not NaN); every
-[[Construct]] is a flag word on function objects: `new` refuses a built-in non-constructor, an arrow or a method with a TypeError after evaluating its arguments, and only constructors carry `prototype` (docs/DECISIONS.md, [[Construct]]); a function or array assigned as a `prototype` refuses by name (the prototype word is typed null or ordinary object); built-in functions have their specification `length` and `name`, declared in
+[[Construct]] is a flag word on function objects: `new` refuses a built-in non-constructor, an arrow or a method with a TypeError after evaluating its arguments, and only constructors carry `prototype` (docs/DECISIONS.md, [[Construct]]); built-in functions have their specification `length` and `name`, declared in
 `jsl/compiler/intrinsics.jsl` (docs/DECISIONS.md, intrinsic declarations). Missing: every other global
 (`JSON`, `Symbol`, `Date`, `RegExp`, `Reflect`, …, still refused by name at run time); prototype
 methods other than `Array.prototype`'s (`Object.prototype.toString`/`hasOwnProperty`,

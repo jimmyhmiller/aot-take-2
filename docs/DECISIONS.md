@@ -1,5 +1,20 @@
 # Decisions
 
+## 2026-09-15 — A function or an array may be a [[Prototype]]; the JSL answers exotic holders
+
+The prototype word is typed null or object-like (object, function, array) in the checker, the JSL
+lowering and the JsOp result types. Before, a function or array prototype left the object unlinked.
+Functions need nothing more: their own properties are ordinary shape properties. An Array's
+`length` and elements are own properties that no shape records (§10.4.2). So the runtime's
+ordinary chain walks (`rt-prop-chain-holder`, `rt-prop-get`, `rt-prop-set`) stop at an Array exotic
+prototype whatever the key, as a holder or as the slow-path sentinel. The JSL answers it:
+`JsGetFromHolder` reads `length` or a present element and otherwise continues the walk from the
+array's prototype; `JsSetViaHolder` completes OrdinarySet from the first holder (an inherited
+writable data property, exotic or not, is shadowed by CreateDataProperty on the receiver); and
+`JsHasNamedOnChain` answers `in`. `%KeyArrayIndex` (runtime `aot_rt_key_array_index`) says whether a
+key's name is an array index. It is not folded, because only these out-of-line paths ask it, and
+only after an Array test on the holder.
+
 ## 2026-09-15 — [[Construct]] is a flag word on function objects, and `new` is JSL
 
 A function object's payload gains a raw flags word after its environment (`OFFSET-FUNCTION-FLAGS`,
@@ -19,9 +34,7 @@ checked IsConstructor. It now evaluates F and every argument, then calls `JsCons
 `JsOrdinaryCreateFromConstructor(F, %Object.prototype%)`, whose GetPrototypeFromConstructor falls
 back when `prototype` is not an object; a built-in's receiver is undefined. `JsIntrinsicError`
 creates its object from NewTarget with its own `prototype` as the default. JSL reads the flags
-through `%FunctionFlags`, a field load on a proven function. A function or array used as a
-[[Prototype]] refuses by name (`%TrapNonOrdinaryPrototype`) instead of leaving the object
-unlinked, because the prototype word is typed null or ordinary object.
+through `%FunctionFlags`, a field load on a proven function.
 
 ## 2026-09-15 — The intrinsic surface is JSL `(intrinsic ...)` declarations
 
