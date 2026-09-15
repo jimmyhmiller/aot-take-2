@@ -1,5 +1,15 @@
 # Decisions
 
+## 2026-09-15 — Non-constant float arithmetic is typed F64, not the operands' meet
+
+Simple's `ArithNode.compute` types two non-constant float operands as `t1.meet(t2)`. Our F32 means
+every value round-trips through binary32, and that says nothing about a binary64 sum, difference,
+product or quotient. The meet was also non-monotone against constant folding. `Phi(561, 1e9)` is
+F32 and the Mul over it was typed F32; once the Phis folded, the product 5.61e11 fell outside F32
+and `n-set-ty!` panicked. A full test262 campaign hit exactly this, and RoundF32 over such a Mul
+would have been removed. Add, Sub, Mul and Div now fold two constants and otherwise produce F64
+(`src/node/arith.coil` header; `tests/peephole-test.coil`).
+
 ## 2026-09-12 — Input-slot scheduling facts, memory wait groups, and stack-required splits
 
 Local scheduling computes register-mask intersections and remote-use/definition flags in a
