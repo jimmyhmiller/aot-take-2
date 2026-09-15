@@ -155,7 +155,9 @@ aot-take-2/
 │           ; number-methods.jsl Number.prototype and Boolean.prototype,
 │           ; math.jsl the Math object and isNaN/isFinite/parseInt/parseFloat,
 │           ; array-generic.jsl the array-like arms of the callback and search methods, and `in`
-│           ; call.jsl shared dynamic-call dispatch over the checked callable ABI
+│           ; call.jsl shared dynamic-call dispatch over the checked callable ABI,
+│           ; delete.jsl the delete operator and [[Delete]] over every represented kind,
+│           ; enumerate.jsl own string keys, getOwnPropertyNames and for-in enumeration
 │       function/ array-buffer/ data-view/ typed-array/
 ├── src/
 │   ├── main.coil            ; CLI driver: compile, emit, run, dump; `AOT_SEED=N` compiles under a test's arena seed

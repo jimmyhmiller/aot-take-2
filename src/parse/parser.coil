@@ -7527,6 +7527,101 @@
 ;; a compound RHS, and PutValue after the JSL arithmetic call. Reacquire the current Scope after
 ;; each expression: a conditional/short-circuit RHS can replace it. Keeps protect reference/value
 ;; nodes across that replacement.
+;; The delete operator (§13.5.1.2), one JSL entry per form of the operand, which keeps its Reference
+;; through parentheses: a property Reference is ToObject and [[Delete]] with the site's strictness
+;; (`JsDeleteNamed`, `JsDeleteKeyed`); a name is DeleteBinding on the environment that resolves it
+;; (strict code rejects `delete name` early); anything else is evaluated and is true.
+(defn lower-delete [(operand i64)] (-> (dyn NodeOps))
+  (let [target (syntax-ungroup-id operand)
+        strict (if (syntax-fun-strict (.current-fun (parser-state))) 1 0)]
+    (match (syntax-node target)
+      (SxMember [owner name optional]
+                (if optional
+                    (do
+                      (unimplemented "optional chaining" "docs/GAPS.md — nullish short-circuit chains")
+                      (unreachable-node))
+                    (let [base (lower-syntax-expr owner)]
+                      (lower-delete-call "JsDeleteNamed" base (keyref-make (shape-key-intern name)) strict))))
+      (SxIndex [owner key optional]
+               (if optional
+                   (do
+                     (unimplemented "optional chaining" "docs/GAPS.md — nullish short-circuit chains")
+                     (unreachable-node))
+                   (let [base (lower-syntax-expr owner)]
+                     (n-keep! base)
+                     (let [k (lower-syntax-expr key)]
+                       (n-unkeep! base)
+                       (lower-delete-call "JsDeleteKeyed" base k strict)))))
+      (SxPrivateMember [owner name optional]
+                       (do
+                         (unimplemented "private class members" "docs/GAPS.md — classes")
+                         (unreachable-node)))
+      (SxName [name] (lower-delete-name name))
+      (_ (do (lower-syntax-expr operand) (lower-singleton "JsTrue"))))))
+
+(defn lower-delete-call [(entry (slice u8))
+                         (base (dyn NodeOps))
+                         (key (dyn NodeOps))
+                         (strict i64)] (-> (dyn NodeOps))
+  (let [scope (parser-node (.current-scope (parser-state)))
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (push! [(dyn NodeOps)] (mut args) base)
+    (push! [(dyn NodeOps)] (mut args) key)
+    (push! [(dyn NodeOps)] (mut args) (con-int strict))
+    (let [r (lower-jsl-call-values entry (load args))]
+      (al-free! [(dyn NodeOps)] (mut args))
+      (parser-set-current-ctrl! (.ctrl r))
+      (scope-set-mem! scope (.mem r))
+      (lower-completion! (.value r)))))
+
+;; `delete name` in sloppy code. A function's or a block's binding, an enclosing function's, a
+;; Script's lexical binding and the global `undefined`, `NaN` and `Infinity` are never deletable,
+;; and nothing is evaluated. A retained unit resolves the name in the executing realm first
+;; (`JsGlobalReferenceDelete`). A closed program deletes from its global object — a declared var or
+;; function refuses there, being non-configurable, and an unresolvable name answers true — except an
+;; intrinsic's binding, whose reads this compilation folds to the intrinsic itself.
+(defn lower-delete-name [(name (slice u8))] (-> (dyn NodeOps))
+  (let [p (parser-state)]
+    (if (and (= name "arguments") (not (syntax-script-root? (.current-fun p))))
+        (unimplemented "implicit arguments object binding" "docs/GAPS.md — function objects")
+        0)
+    (if (or (>= (scope-find (parser-node (.current-scope p)) name) 0)
+            (syntax-enclosing-binding? (.current-fun p) name)
+            (syntax-script-binding? name)
+            (syntax-restricted-global? name))
+        (lower-singleton "JsFalse")
+        (if (.external-mutation p)
+            (let [(mut ref) (primitive/zeroed SyntaxRef)]
+              (lower-ref-name-prepare! (mut ref) name)
+              (lower-delete-global-reference (load ref)))
+            (if (and (< (syntax-global-index name) 0)
+                     (>= (syntax-find-fun name) 0)
+                     (syntax-intrinsic-fun? (syntax-find-fun name)))
+                (do
+                  (unimplemented "delete of an intrinsic's global binding in a closed program"
+                                 "docs/GAPS.md — property deletion")
+                  (unreachable-node))
+                (lower-delete-call "JsDeleteNamed"
+                                   (lower-global-object)
+                                   (keyref-make (shape-key-intern name))
+                                   0))))))
+
+(defn lower-delete-global-reference [(ref SyntaxRef)] (-> (dyn NodeOps))
+  (let [scope (parser-node (.current-scope (parser-state)))
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (push! [(dyn NodeOps)] (mut args) (parser-node (.owner-nid ref)))
+    (push! [(dyn NodeOps)] (mut args) (parser-node (.key-nid ref)))
+    (push! [(dyn NodeOps)] (mut args) (parser-node (.resolved-nid ref)))
+    (let [r (jsl-lower-macro-values "JsGlobalReferenceDelete" (load args) (scope-ctrl scope) (scope-mem scope))]
+      (al-free! [(dyn NodeOps)] (mut args))
+      (parser-set-current-ctrl! (.ctrl r))
+      (scope-set-mem! scope (.mem r))
+      (let [value (lower-completion! (.value r))]
+        (n-keep! value)
+        (lower-ref-release! ref)
+        (n-unkeep! value)
+        value))))
+
 (defn lower-assignment [(op (slice u8)) (target i64) (value-id i64)] (-> (dyn NodeOps))
   (let [compound (!= op "")
         ref (lower-ref-prepare! target)
@@ -7726,11 +7821,7 @@
                                              (lower-typeof-operand operand)
                                              (lower-syntax-expr operand))
                                          op)))
-              (SxDelete [operand]
-                        (do
-                          (unimplemented "delete operator"
-                                         "docs/GAPS.md — property deletion")
-                          (unreachable-node)))
+              (SxDelete [operand] (lower-delete operand))
               (SxUpdate [op prefix target] (lower-update op prefix target))
               (SxBinary [op left right] (lower-syntax-binary left right op))
               (SxAnd [left right]
@@ -8251,6 +8342,141 @@
       (scope-pop! (parser-node (.current-scope (parser-state))))
       terminated)))
 
+;; A JSL definition applied to already-lowered values, macro or builtin, threaded through the Scope.
+(defn lower-jsl-values [(name (slice u8)) (values (ArrayList (dyn NodeOps)))] (-> (dyn NodeOps))
+  (let [scope (parser-node (.current-scope (parser-state)))
+        r (match (jsl-definition-form name)
+            (None [] (do (panic "lower-jsl-values: unknown JSL definition")
+                         (jsl-expr-result (unreachable-node) (scope-ctrl scope) (scope-mem scope))))
+            (Some [form]
+                  (if (jsl-form-macro? form)
+                      (jsl-lower-macro-values name values (scope-ctrl scope) (scope-mem scope))
+                      (lower-jsl-call-values name values))))]
+    (parser-set-current-ctrl! (.ctrl r))
+    (scope-set-mem! scope (.mem r))
+    (.value r)))
+
+(defn lower-jsl-values2 [(name (slice u8)) (a (dyn NodeOps)) (b (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [(mut values) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (push! [(dyn NodeOps)] (mut values) a)
+    (push! [(dyn NodeOps)] (mut values) b)
+    (let [v (lower-jsl-values name (load values))]
+      (al-free! [(dyn NodeOps)] (mut values))
+      v)))
+
+(defn lower-jsl-values3 [(name (slice u8)) (a (dyn NodeOps)) (b (dyn NodeOps)) (c (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [(mut values) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (push! [(dyn NodeOps)] (mut values) a)
+    (push! [(dyn NodeOps)] (mut values) b)
+    (push! [(dyn NodeOps)] (mut values) c)
+    (let [v (lower-jsl-values name (load values))]
+      (al-free! [(dyn NodeOps)] (mut values))
+      v)))
+
+;; The compiler-only Scope names a for-in loop carries across its iterations; the dot keeps them out
+;; of every IdentifierName, and an inner loop's names shadow an outer loop's in its own level.
+(const FOR-IN-OBJECT "$aot$.for-in.object")
+
+(const FOR-IN-KEYS "$aot$.for-in.keys")
+
+(const FOR-IN-CURSOR "$aot$.for-in.cursor")
+
+;; `for (head in right) body` (§14.7.5.6 ForIn/OfHeadEvaluation, §14.7.5.7 ForIn/OfBodyEvaluation).
+;; The head's lexical names are in their temporal dead zone while `right` evaluates; undefined and
+;; null enumerate nothing; otherwise JSL lists the enumerable string keys once, when the loop starts
+;; (`JsForInKeys`, EnumerateObjectProperties), and each iteration skips a key the object no longer
+;; has (`JsForInNext`), binds the key and runs the body. The loop itself is Simple's: a loop head,
+;; a predicate, the body on true, continues closed, the backedge. A `let` or `const` head is a fresh
+;; binding per iteration, a `var` or an expression head a PutValue through its Reference.
+(defn lower-for-in [(head ForInit) (right i64) (body i64)] (-> i64)
+  (do
+    (scope-push! (parser-node (.current-scope (parser-state))))
+    (match head
+      (ForInitDecl [stmt]
+                   (match (syntax-stmt-node stmt)
+                     (SsLet [name init final annotation] (lower-instantiate-lexical-stmt! stmt))
+                     ;; Annex B.3.5: a sloppy `var` head may carry an initializer, assigned first.
+                     (SsVar [name init annotation] (lower-syntax-statement stmt))
+                     (_ (unimplemented "destructuring for-in/of heads" "docs/GAPS.md — destructuring"))))
+      (ForInitPattern [pattern]
+                      (unimplemented "destructuring for-in/of heads" "docs/GAPS.md — destructuring"))
+      (_ 0))
+    (let [object (lower-syntax-expr right)]
+      (n-keep! object)
+      (scope-pop! (parser-node (.current-scope (parser-state))))
+      (let [keys (lower-completion! (lower-jsl-unary-value "JsForInKeys" object))
+            scope (parser-node (.current-scope (parser-state)))]
+        (n-keep! keys)
+        (scope-push! scope)
+        (scope-define! scope FOR-IN-OBJECT (ty-dyn TAG-ANY) false object)
+        (scope-define! scope FOR-IN-KEYS (ty-dyn TAG-ANY) false keys)
+        (scope-define! scope FOR-IN-CURSOR (ty-dyn TAG-ANY) false (lower-singleton "JsForInFirst"))
+        (n-unkeep! keys)
+        (n-unkeep! object)
+        (let [entry (lower-loop-head!)
+              next (lower-jsl-values3 "JsForInNext"
+                                      (lower-for-in-slot FOR-IN-OBJECT)
+                                      (lower-for-in-slot FOR-IN-KEYS)
+                                      (lower-for-in-slot FOR-IN-CURSOR))]
+          (n-keep! next)
+          (let [condition (lower-js-truthy (lower-jsl-unary-value "JsForInHasKey" next))
+                condition-scope (parser-node (.current-scope (parser-state)))
+                iff (if-make (scope-ctrl condition-scope) condition)
+                arms (if-arms! iff)]
+            (scope-set-ctrl! condition-scope (arms-false arms))
+            (let [exit-scope (scope-dup condition-scope false)]
+              (parser-push-jump! exit-scope JUMP-LOOP)
+              (scope-set-ctrl! condition-scope (arms-true arms))
+              (set! (.current-ctrl (parser-state)) (n-nid (arms-true arms)))
+              (let [key (lower-jsl-values2 "JsForInKeyAt" (lower-for-in-slot FOR-IN-KEYS) next)]
+                (n-keep! key)
+                (scope-update! (parser-node (.current-scope (parser-state)))
+                               FOR-IN-CURSOR
+                               (lower-jsl-unary-value "JsForInAfter" next))
+                (n-unkeep! next)
+                (scope-push! (parser-node (.current-scope (parser-state))))
+                (lower-for-in-bind! head key)
+                (n-unkeep! key)
+                (let [terminated (lower-syntax-statement body)]
+                  ;; The iteration's binding ends with the body; a continue already left it (its Scope
+                  ;; is cut to the loop's depth), and continues rejoin before the backedge with the
+                  ;; cursor already past this key.
+                  (scope-pop! (parser-node (.current-scope (parser-state))))
+                  (parser-close-continues! terminated)
+                  (scope-end-loop! entry (parser-node (.current-scope (parser-state))) exit-scope)
+                  (parser-pop-jump!)
+                  (n-unkeep! entry)
+                  (parser-use-scope! exit-scope)
+                  (scope-pop! (parser-node (.current-scope (parser-state))))
+                  0)))))))))
+
+(defn lower-for-in-slot [(name (slice u8))] (-> (dyn NodeOps))
+  (match (scope-lookup (parser-node (.current-scope (parser-state))) name)
+    (Some [v] v)
+    (None [] (do (broken "lower-for-in-slot: loop state is not in scope") (unreachable-node)))))
+
+;; The iteration's key reaches the head: a fresh lexical binding, or PutValue through the var's or the
+;; expression's Reference, evaluated anew each iteration (§14.7.5.7 steps 6.g-6.i).
+(defn lower-for-in-bind! [(head ForInit) (key (dyn NodeOps))] (-> i64)
+  (match head
+    (ForInitDecl [stmt]
+                 (match (syntax-stmt-node stmt)
+                   (SsLet [name init final annotation]
+                          (scope-define! (parser-node (.current-scope (parser-state))) name (ty-dyn TAG-ANY) final key))
+                   (SsVar [name init annotation]
+                          (let [(mut ref) (primitive/zeroed SyntaxRef)]
+                            (lower-ref-name-prepare! (mut ref) name)
+                            (lower-ref-put! (load ref) key)
+                            (lower-ref-release! (load ref))
+                            0))
+                   (_ (unimplemented "destructuring for-in/of heads" "docs/GAPS.md — destructuring"))))
+    (ForInitExpr [target]
+                 (let [ref (lower-ref-prepare! target)]
+                   (lower-ref-put! ref key)
+                   (lower-ref-release! ref)
+                   0))
+    (_ (unimplemented "destructuring for-in/of heads" "docs/GAPS.md — destructuring"))))
+
 ;; A label on a loop or switch names that statement's jump target; the labels accumulate until
 ;; the target is pushed. Any other labelled statement is a break-only block target.
 (defn syntax-stmt-takes-labels? [(id i64)] (-> bool)
@@ -8342,12 +8568,12 @@
     (SsDoWhile [body condition] (lower-do-while body condition))
     (SsFor [init test update body] (lower-for init test update body))
     (SsForIn [head of right body awaited]
-             (unimplemented (if awaited
-                                "for-await-of asynchronous iteration"
-                                (if of
-                                    "for-of iteration protocol"
-                                    "for-in property enumeration"))
-                            "docs/GAPS.md — iteration statements"))
+             (if (or awaited of)
+                 (unimplemented (if awaited
+                                    "for-await-of asynchronous iteration"
+                                    "for-of iteration protocol")
+                                "docs/GAPS.md — iteration statements")
+                 (lower-for-in head right body)))
     (SsLabeled [label body] (lower-labeled label body))
     (SsThrow [value] (lower-throw value))
     (SsTry [body catch-param catch-body finally-body]
@@ -8683,6 +8909,8 @@
                                   (push! [i64] (mut edges) idx))))
                     (_ (set! direct true)))))
       (SxNew [callee args] (if protected 0 (set! direct true)))
+      ;; A delete throws on an undefined or null base and, in strict code, when [[Delete]] refuses.
+      (SxDelete [operand] (if protected 0 (set! direct true)))
       ;; A property access on undefined or null is a TypeError.
       (SxMember [owner name optional] (if protected 0 (set! direct true)))
       (SxIndex [owner key optional] (if protected 0 (set! direct true)))
@@ -8763,17 +8991,29 @@
                                               (mut direct)
                                               (mut edges)))
                (None [] 0))))
-    (_ (let [(mut kids) (al-new [i64] (compiler-allocator))
-             (mut exprs) (al-new [i64] (compiler-allocator))]
-         (syntax-stmt-exprs! id (mut exprs))
-         (al-for [e (load exprs)]
-                 (syntax-throw-walk-expr! e protected (mut direct) (mut edges)))
-         (syntax-stmt-children! id (mut kids))
-         (al-for [k (load kids)]
-                 (syntax-throw-walk-stmt! k protected (mut direct) (mut edges)))
-         (al-free! [i64] (mut exprs))
-         (al-free! [i64] (mut kids))
-         0))))
+    ;; A for-in head's PutValue, per iteration, is not an expression child: in a retained unit a var
+    ;; head is an environment write that can throw.
+    (SsForIn [head of right body awaited]
+             (do
+               (if (and (not protected) (.external-mutation (parser-state))) (set! direct true) 0)
+               (syntax-throw-walk-parts! id protected (mut direct) (mut edges))))
+    (_ (syntax-throw-walk-parts! id protected (mut direct) (mut edges)))))
+
+(defn syntax-throw-walk-parts! [(id i64)
+                                (protected bool)
+                                (direct (mut bool))
+                                (edges (mut (ArrayList i64)))] (-> i64)
+  (let [(mut kids) (al-new [i64] (compiler-allocator))
+        (mut exprs) (al-new [i64] (compiler-allocator))]
+    (syntax-stmt-exprs! id (mut exprs))
+    (al-for [e (load exprs)]
+            (syntax-throw-walk-expr! e protected (mut direct) (mut edges)))
+    (syntax-stmt-children! id (mut kids))
+    (al-for [k (load kids)]
+            (syntax-throw-walk-stmt! k protected (mut direct) (mut edges)))
+    (al-free! [i64] (mut exprs))
+    (al-free! [i64] (mut kids))
+    0))
 
 (defn syntax-compute-may-throw! [] (-> i64)
   (let [p (parser-state)

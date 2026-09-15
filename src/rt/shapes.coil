@@ -28,8 +28,15 @@
 ;;       name bytes
 ;;
 ;; Attributes ride on the edge that introduces a field (aot.shape): a key with different
-;; attributes is a different shape. A marker row (key zero) adds no field and carries the
-;; non-extensible flag, which every descendant inherits.
+;; attributes is a different shape. A marker row (key zero, offset -1) adds no field and carries
+;; the non-extensible flag, which every descendant inherits.
+;;
+;; [[Delete]] is a runtime-only edge. A hole row (key zero, a real offset) occupies the deleted
+;; field's word and names no key, so every other field keeps the offset its introducing edge fixed:
+;; the image-object folds of aot.node.property read and write fixed offsets under closed-world
+;; facts, and a delete of one key must not move another. Holes with no field after them are
+;; dropped, so deleting the newest property returns to the parent layout and an add/delete loop
+;; on one key does not grow the object. The compiler never makes a hole, so the blob has none.
 (module aot.rt.shapes)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
@@ -194,7 +201,8 @@
         (shapes-static-field shape 1)
         (get (.key s) (- shape (.static-count s))))))
 
-;; The byte offset of the field the edge into `shape` introduced; -1 for a marker row.
+;; The byte offset of the field the edge into `shape` introduced; -1 for a marker row. A hole row
+;; keeps the offset of the word it holds.
 (defn shapes-offset [(shape i64)] (-> i64)
   (let [s (rt-shapes)]
     (shapes-check! shape "shapes-offset: invalid shape")
@@ -349,6 +357,14 @@
                 (push! [i64] (mut (.flags s)) (shapes-flags shape))
                 count))))))
 
+;; A marker row: no key and no field.
+(defn shapes-marker? [(shape i64)] (-> bool)
+  (and (= (shapes-key shape) 0) (< (shapes-offset shape) 0)))
+
+;; A hole row: no key, but the word of a deleted field.
+(defn shapes-hole? [(shape i64)] (-> bool)
+  (and (!= shape SHAPES-ROOT) (and (= (shapes-key shape) 0) (>= (shapes-offset shape) 0))))
+
 ;; [[PreventExtensions]]: the marker child of `shape`, memoised.
 (defn shapes-prevent-extensions [(shape i64)] (-> i64)
   (do
@@ -363,7 +379,7 @@
                     (break 0)
                     (do
                       (if (and (= (shapes-parent (load child)) shape)
-                               (and (= (shapes-key (load child)) 0)
+                               (and (shapes-marker? (load child))
                                     (!= (& (shapes-flags (load child)) SHAPES-FLAG-NONEXTENSIBLE) 0)))
                           (set! (mut found) (load child))
                           (set! (mut child) (+ (load child) 1)))
@@ -379,25 +395,95 @@
                 (push! [i64] (mut (.flags s)) (| (shapes-flags shape) SHAPES-FLAG-NONEXTENSIBLE))
                 count))))))
 
-;; The shape with `shape`'s fields, order and flags, except that `key` carries `attrs`: the
-;; layout is unchanged, so an object's backing store keeps its words and takes the new shape id.
-(defn shapes-reshape-attrs [(shape i64) (key i64) (attrs i64)] (-> i64)
-  (let [(mut rows) (al-new [i64] (alloc/malloc-allocator))
+;; The hole child of `shape`, memoised: the next word is occupied and names no key. The parent's
+;; extensibility is inherited, as every edge inherits it.
+(defn shapes-add-hole [(shape i64)] (-> i64)
+  (do
+    (shapes-check! shape "shapes-add-hole: invalid shape")
+    (let [s (rt-shapes)
+          count (shapes-count)
+          (mut child) (+ SHAPES-ROOT 1)
+          (mut found) 0]
+      (loop (if (or (>= (load child) count) (!= (load found) 0))
+                (break 0)
+                (do
+                  (if (and (= (shapes-parent (load child)) shape) (shapes-hole? (load child)))
+                      (set! (mut found) (load child))
+                      (set! (mut child) (+ (load child) 1)))
+                  (continue))))
+      (if (!= (load found) 0)
+          (load found)
+          (let [fields (shapes-field-count shape)]
+            (push! [i64] (mut (.parent s)) shape)
+            (push! [i64] (mut (.key s)) 0)
+            (push! [i64] (mut (.offset s)) (* fields SHAPES-WORD-BYTES))
+            (push! [i64] (mut (.field-count s)) (+ fields 1))
+            (push! [i64] (mut (.attrs s)) 0)
+            (push! [i64] (mut (.flags s)) (shapes-flags shape))
+            count)))))
+
+;; The rows from the root's child to `shape`, oldest first.
+(defn shapes-rows-oldest-first [(shape i64)] (-> (ArrayList i64))
+  (let [(mut newest) (al-new [i64] (alloc/malloc-allocator))
+        (mut rows) (al-new [i64] (alloc/malloc-allocator))
         (mut s) shape]
-    (if (= (shapes-find-row shape key) 0) (panic "shapes-reshape-attrs: key is not in shape") 0)
     (loop (if (= (load s) SHAPES-ROOT)
               (break 0)
-              (do (push! [i64] (mut rows) (load s)) (set! (mut s) (shapes-parent (load s))) (continue))))
-    (let [(mut i) (- (len (load rows)) 1)
-          (mut cur) SHAPES-ROOT]
+              (do (push! [i64] (mut newest) (load s)) (set! (mut s) (shapes-parent (load s))) (continue))))
+    (let [(mut i) (- (len (load newest)) 1)]
       (loop (if (< (load i) 0)
                 (break 0)
-                (let [row (get (load rows) (load i))
-                      k (shapes-key row)]
-                  (if (= k 0)
-                      (set! (mut cur) (shapes-prevent-extensions (load cur)))
-                      (set! (mut cur) (shapes-transition-attrs (load cur) k (if (= k key) attrs (shapes-attrs row)))))
-                  (set! (mut i) (- (load i) 1))
-                  (continue))))
-      (al-free! [i64] (mut rows))
-      (load cur))))
+                (do (push! [i64] (mut rows) (get (load newest) (load i))) (set! (mut i) (- (load i) 1)) (continue)))))
+    (al-free! [i64] (mut newest))
+    (load rows)))
+
+;; Replay `row` onto `cur`: a field with `attrs`, a hole, or the non-extensible marker.
+(defn shapes-replay-row [(cur i64) (row i64) (attrs i64)] (-> i64)
+  (if (shapes-marker? row)
+      (shapes-prevent-extensions cur)
+      (if (shapes-hole? row)
+          (shapes-add-hole cur)
+          (shapes-transition-attrs cur (shapes-key row) attrs))))
+
+;; The shape with `shape`'s fields, holes, order and flags, except that `key` carries `attrs`: the
+;; layout is unchanged, so an object's backing store keeps its words and takes the new shape id.
+(defn shapes-reshape-attrs [(shape i64) (key i64) (attrs i64)] (-> i64)
+  (let [(mut rows) (shapes-rows-oldest-first shape)
+        (mut cur) SHAPES-ROOT]
+    (if (= (shapes-find-row shape key) 0) (panic "shapes-reshape-attrs: key is not in shape") 0)
+    (al-for [row (load rows)]
+            (set! (mut cur)
+                  (shapes-replay-row (load cur) row (if (= (shapes-key row) key) attrs (shapes-attrs row)))))
+    (al-free! [i64] (mut rows))
+    (load cur)))
+
+;; The shape `shape` becomes when `key` is deleted: the key's row replayed as a hole, every other
+;; row as it was, and the holes no field follows dropped (a marker after them is kept). Every
+;; remaining field keeps its offset; the field count may shrink.
+(defn shapes-delete [(shape i64) (key i64)] (-> i64)
+  (let [target (shapes-find-row shape key)
+        (mut rows) (shapes-rows-oldest-first shape)
+        (mut last-field) -1
+        (mut i) 0
+        (mut cur) SHAPES-ROOT]
+    (if (= target 0) (panic-i "shapes-delete: key is not in shape" key) 0)
+    ;; The newest row that still holds a field once the key is gone.
+    (loop (if (>= (load i) (len (load rows)))
+              (break 0)
+              (let [row (get (load rows) (load i))]
+                (if (and (!= row target) (> (shapes-key row) 0)) (set! (mut last-field) (load i)) 0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (set! (mut i) 0)
+    (loop (if (>= (load i) (len (load rows)))
+              (break 0)
+              (let [row (get (load rows) (load i))]
+                (if (shapes-marker? row)
+                    (set! (mut cur) (shapes-prevent-extensions (load cur)))
+                    (if (or (= row target) (shapes-hole? row))
+                        (if (< (load i) (load last-field)) (set! (mut cur) (shapes-add-hole (load cur))) 0)
+                        (set! (mut cur) (shapes-transition-attrs (load cur) (shapes-key row) (shapes-attrs row)))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (al-free! [i64] (mut rows))
+    (load cur)))

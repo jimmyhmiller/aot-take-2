@@ -1,5 +1,70 @@
 # Decisions
 
+## 2026-09-15 — delete and for-in
+
+`delete` and `for-in` refused by name, and between them gated about 4,400 test262 files: the
+upstream `propertyHelper.js` harness, which `verifyProperty` needs, deletes a property to test
+configurability and enumerates with `for-in` to test enumerability.
+
+**[[Delete]] leaves a hole row.** An object's layout is a path in the shape tree, and every field
+has the offset its introducing edge fixed (docs/DECISIONS.md, property attributes live in the shape
+tree). The image-object folds of `aot.node.property` read and write those offsets without a shape
+check under the closed-world facts, so a delete that compacted the store would move fields that
+compiled code still addresses. So OrdinaryDelete (`rt-prop-delete`, `%PropDelete`) replays the
+object's path with the deleted field's row replaced by a *hole* — a runtime-only row with key zero
+and a real offset, memoised per parent like any edge (`shapes-add-hole`, `shapes-delete`) — clears
+the word, and moves the store to the new shape id. Every other field keeps its word. Holes that no
+field follows are dropped, so deleting the newest property returns to its parent's layout and an
+add/delete loop on one key does not grow the object; a marker row (preventExtensions) survives the
+replay. The compiler never makes a hole, so the `__aot_shapes` blob is unchanged. V8 answers the
+same question with dictionary mode; we do not have one, and an object whose middle properties are
+repeatedly deleted and re-added grows its layout (docs/GAPS.md).
+
+Arrays answer their own kinds: an element is configurable and becomes a hole (`%ArrayDeleteIndex`,
+`rt-array-delete`), `length` refuses. A primitive base is ToObject without the wrapper: undefined
+and null throw, a string refuses its `length` and in-range indices, every other key and every other
+primitive answers true. The operator is JSL (`jsl/compiler/delete.jsl`): `JsDeleteNamed` and
+`JsDeleteKeyed` (ToObject before ToPropertyKey) pass the site's strictness, and a refusal is a
+TypeError only in strict code. A name is DeleteBinding: a function's, block's, enclosing function's
+or Script lexical binding, and `undefined`/`NaN`/`Infinity`, answer false without evaluating
+anything; a retained unit resolves the Reference first (`JsGlobalReferenceDelete`: declarative
+false, object record [[Delete]] on the global object, unresolvable true); a closed program deletes
+from its global object, where a declared var or function refuses by being non-configurable. The
+one refusal is a closed program deleting an intrinsic's global binding, whose reads this
+compilation folds to the intrinsic itself.
+
+The previous `JsArrayDeleteSlot` made a hole by truncating the length to the index and restoring
+it, which emptied every later element too; `reverse` and `shift` over holes lost elements. It is
+now the element delete.
+
+**A delete is a store to the image analysis.** It marks the pair it touches (a runtime key: the
+owner's every key) and sets `facts-deletes?`. With it set, a written key's shape-derived answers —
+presence (`HAS`, a holder on the chain), its fixed offset, its attributes — stop folding, exactly as
+`facts-descriptors?` already stopped the attribute answers (`facts-layout-unknown?`). A
+never-written key still folds: no delete touched it, and hole rows keep its offset. The external
+mutation boundary of a retained unit sets the flag with the others.
+
+**for-in lists its keys when the loop starts.** `JsForInKeys` is EnumerateObjectProperties over
+the chain: each object's own string keys in OrdinaryOwnPropertyKeys order (an array's present
+indices, `length`, its named keys; a string's indices and `length`), each name once — a name met
+on a nearer object shadows it further up, enumerable or not — listing only the enumerable ones.
+Undefined and null enumerate nothing. The own keys come from one new runtime capability,
+`%ObjectOwnNames` (every string key of the shape, non-enumerable included), which also answers
+`Object.getOwnPropertyNames`; `%ObjectKeys` and it now order array-index keys ascending before the
+insertion-ordered rest, as §10.1.11.1 requires (before, an ordinary object's integer keys came
+out in insertion order). The parser lowers the statement as Simple's loop: loop head, predicate,
+body on true, continues closed, backedge. The object, the key list and a cursor are compiler-only
+Scope names (a dot keeps them out of the source namespace), so their loop Phis come from Scope as
+any variable's do. Each iteration asks `JsForInNext` for the first key at or after the cursor the
+object still has ([[HasProperty]]), so a key deleted before it is reached is skipped; the cursor
+moves past the key before the body runs, so every continue carries it. A `let` or `const` head is
+a fresh binding in an iteration level popped before the continues rejoin; a `var` or expression
+head is PutValue through a Reference evaluated each iteration. The head's lexical names are in
+their dead zone while the object expression evaluates.
+
+The may-throw filter learned both constructs: a delete throws on a nullish base and on a strict
+refusal, and a for-in head's per-iteration PutValue can throw in a retained unit.
+
 ## 2026-09-15 — The realm is materialized by demand
 
 Which declared intrinsics a closed program's realm holds was a name scan of the source: a member

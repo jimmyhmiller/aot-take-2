@@ -55,6 +55,19 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-15 — delete, for-in and own string keys
+
+`delete` of a property, an element, a name and any other expression, `for (… in …)` with `var`,
+`let`, `const` and expression heads, `Object.getOwnPropertyNames`, and `Object.keys` in
+OrdinaryOwnPropertyKeys order execute (docs/DECISIONS.md, delete and for-in). Missing: `delete` of
+an optional chain (optional chaining refuses as a whole), of a private member (an early error the
+class slice owns), of a closed program's intrinsic global binding (refused by name: its reads fold
+to the intrinsic), and of `arguments` inside a function (the implicit arguments object refuses); a
+for-in head `let` is one binding per iteration only because nothing captures it yet; destructuring
+for-in heads; symbol keys are neither enumerated nor listed (no symbol keys exist). Deleted fields
+leave hole rows, so an object whose middle properties are deleted and re-added again and again
+grows its layout; no dictionary mode compacts it.
+
 ### 2026-09-07 — Function values over the shared ABI
 
 Function expressions, arrow functions, nested and block-level function declarations (including the
@@ -193,8 +206,7 @@ carries it, so the property and the binding are one word). A property created th
 alias of the global object (`globalThis`, a variable holding it, a function's sloppy `this`)
 transitions the global object at run time and every access keeps working: a Script's global
 accesses are image-object property accesses at fixed offsets (docs/DECISIONS.md, image object
-property reads fold under closed-world facts). Missing: `delete` of a global; the global object's
-own prototype chain.
+property reads fold under closed-world facts). Missing: the global object's own prototype chain.
 
 ### 2026-09-09 — Property descriptors
 
@@ -203,7 +215,7 @@ Data and accessor descriptors, `defineProperty`, `defineProperties`, `getOwnProp
 `isExtensible` work over ordinary objects (docs/DECISIONS.md, property attributes live in the
 shape tree). Missing: accessor syntax in object literals and classes (`{get x() {}}` refuses as
 "object methods and accessors"); `defineProperty` of an array element or `length`, and of a
-string's or function's exotic properties (`name`, `length`); `delete`; `Object.getOwnPropertyNames`,
+string's or function's exotic properties (`name`, `length`);
 `Object.getOwnPropertyDescriptors`, `Object.entries`/`values`, `Reflect`; a `Symbol` key. An
 assignment to a primitive base throws in strict code but the sloppy-mode wrapper-object semantics
 (a property created on a temporary wrapper) are not observable either way.
@@ -219,8 +231,9 @@ preventExtensions is a store in the analysis's sense and sets `facts-descriptors
 stored key's attributes are unknown, every attribute word is typed `int[-2..15]` and every [[Get]]
 may answer the accessor sentinel, so the getter and setter call sites stay live and make every
 function reachable: a program that names `Object.defineProperty` anywhere pays for accessors at
-every unfolded site. A per-key or per-object accessor fact would narrow that; `delete` must register
-the same way when it lands. The facts are rescanned after the optimistic pass folds under them
+every unfolded site. A per-key or per-object accessor fact would narrow that. A delete registers the
+same way (`facts-deletes?`): once one exists, a written key's presence, offset and attributes stop
+folding. The facts are rescanned after the optimistic pass folds under them
 (`pipeline-opto-under-facts!`, at most three rounds), so a fold that depends on a call the first
 round removes lands in the second.
 

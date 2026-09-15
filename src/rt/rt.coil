@@ -3373,6 +3373,40 @@
                       (aot-rt-write-barrier storage word RT-BARRIER-BOXED)
                       0))))))))
 
+;; OrdinaryDelete (§10.1.10.1) of an ordinary object's own named property (`%PropDelete`): 0 when
+;; the object no longer has the property — it had none, or it was configurable and is removed — and
+;; 1 when a non-configurable property refuses. The store keeps its words and takes the shape with a
+;; hole where the field was (`shapes-delete`), so every other field keeps its offset; the freed word
+;; is cleared so it retains nothing. No allocation, so no safepoint.
+(defn rt-prop-delete [(obj i64) (key i64)] (-> i64)
+  (do
+    (rt-heap-boot!)
+    (let [storage (rt-storage-of obj)]
+      (if (= storage 0)
+          0
+          (let [shape (rt-payload-shape storage)
+                row (shapes-find-row shape key)]
+            (if (= row 0)
+                0
+                (if (= (& (shapes-attrs row) SHAPES-ATTR-CONFIGURABLE) 0)
+                    1
+                    (do
+                      (set! (primitive/cast (ptr i64) (+ storage (shapes-offset row)))
+                            RT-DYNAMIC-UNDEFINED-WORD)
+                      (rt-storage-set-shape! storage (shapes-delete shape key))
+                      0))))))))
+
+;; An array element becomes a hole (`%ArrayDeleteIndex`, the element case of an Array's
+;; [[Delete]], §10.4.2): elements are configurable, so it always succeeds; the length is unchanged.
+(defn rt-array-delete [(arr i64) (index i64)] (-> i64)
+  (do
+    (rt-heap-boot!)
+    (if (= (rt-array-has arr index) 1)
+        (set! (primitive/cast (ptr i64) (+ (rt-array-elements arr) (* index 8)))
+              RT-DYNAMIC-HOLE-WORD)
+        0)
+    0))
+
 ;; Non-collecting post-write boundary. An old object that receives a young reference dirties its
 ;; 512-byte address card with the compiler-proven raw/boxed value kind. Minor collection uses the
 ;; parallel object-start table to rescan only objects intersecting dirty cards.
@@ -3770,29 +3804,52 @@
     (rt-heap-boot!)
     (number-array-index-of-name (shapes-key-name key))))
 
-;; The own enumerable property keys of an ordinary object's backing store, innermost transition
-;; last: the shape tree's edges from the root to the object's shape name the keys in insertion
-;; order; marker rows add no key, non-enumerable fields are passed over.
-(defn rt-shape-keys! [(shape i64) (out (mut (ArrayList i64)))] (-> i64)
+;; An ordinary object's own string property keys in OrdinaryOwnPropertyKeys order (§10.1.11.1):
+;; the array-index keys ascending, then the other keys in insertion order — the shape tree's edges
+;; from the root to the object's shape. Marker and hole rows name no key. `all` keeps the
+;; non-enumerable keys too (getOwnPropertyNames, for-in's shadowing); otherwise they are passed over.
+(defn rt-shape-keys! [(shape i64) (out (mut (ArrayList i64))) (all bool)] (-> i64)
   (let [(mut chain) (al-new [i64] (alloc/malloc-allocator))
+        (mut indices) (al-new [i64] (alloc/malloc-allocator))
         (mut s) shape]
     (loop (if (or (= (load s) 0) (= (load s) SHAPES-ROOT))
               (break 0)
               (do
                 (if (and (!= (shapes-key (load s)) 0)
-                         (!= (& (shapes-attrs (load s)) SHAPES-ATTR-ENUMERABLE)
-                             0))
+                         (or all
+                             (!= (& (shapes-attrs (load s)) SHAPES-ATTR-ENUMERABLE)
+                                 0)))
                     (push! [i64] (mut chain) (shapes-key (load s)))
                     0)
                 (set! (mut s) (shapes-parent (load s)))
                 (continue))))
+    ;; The index keys, sorted by insertion into a list kept ascending.
+    (al-for [key (load chain)]
+            (let [index (number-array-index-of-name (shapes-key-name key))]
+              (if (>= index 0)
+                  (let [(mut at) (len (load indices))]
+                    (push! [i64] (mut indices) key)
+                    (loop (if (or (= (load at) 0)
+                                  (<= (number-array-index-of-name (shapes-key-name (get (load indices) (- (load at) 1))))
+                                      index))
+                              (break 0)
+                              (do
+                                (set! (al-elem [i64] (mut indices) (load at)) (get (load indices) (- (load at) 1)))
+                                (set! (mut at) (- (load at) 1))
+                                (continue))))
+                    (set! (al-elem [i64] (mut indices) (load at)) key))
+                  0)))
+    (al-for [key (load indices)] (push! [i64] (mut out) key))
     (let [(mut i) (- (len (load chain)) 1)]
       (loop (if (< (load i) 0)
                 (break 0)
-                (do
-                  (push! [i64] (mut out) (get (load chain) (load i)))
+                (let [key (get (load chain) (load i))]
+                  (if (< (number-array-index-of-name (shapes-key-name key)) 0)
+                      (push! [i64] (mut out) key)
+                      0)
                   (set! (mut i) (- (load i) 1))
                   (continue)))))
+    (al-free! [i64] (mut indices))
     (al-free! [i64] (mut chain))
     0))
 
@@ -3883,15 +3940,22 @@
       (al-free! [i64] (mut units))
       result)))
 
-;; The runtime capability behind `%ObjectKeys`: an ordinary object's own keys as a fresh array of
-;; strings in insertion order, on `proto` (%Array.prototype%, or null without a realm). The array is
-;; rooted across every string allocation and re-read.
+;; The runtime capability behind `%ObjectKeys`: an ordinary object's own enumerable keys as a fresh
+;; array of strings in OrdinaryOwnPropertyKeys order, on `proto` (%Array.prototype%, or null without a
+;; realm). The array is rooted across every string allocation and re-read.
 (defn rt-object-keys [(obj i64) (proto i64) (map-id i64) (caller-sp i64)] (-> i64)
+  (rt-object-key-strings obj proto false map-id caller-sp))
+
+;; `%ObjectOwnNames`: every own string key, the non-enumerable ones included, in the same order.
+(defn rt-object-own-names [(obj i64) (proto i64) (map-id i64) (caller-sp i64)] (-> i64)
+  (rt-object-key-strings obj proto true map-id caller-sp))
+
+(defn rt-object-key-strings [(obj i64) (proto i64) (all bool) (map-id i64) (caller-sp i64)] (-> i64)
   (let [(mut keys) (al-new [i64] (alloc/malloc-allocator))
         storage (rt-storage-of obj)
         arr-root (primitive/alloc-stack i64)]
     (rt-heap-boot!)
-    (if (= storage 0) 0 (rt-shape-keys! (rt-payload-shape storage) (mut keys)))
+    (if (= storage 0) 0 (rt-shape-keys! (rt-payload-shape storage) (mut keys) all))
     (set! arr-root (rt-array-new (len (load keys)) proto map-id caller-sp))
     (let [(mut i) 0]
       (loop (if (>= (load i) (len (load keys)))
@@ -4017,6 +4081,8 @@
         (set! (mut address) (primitive/cast i64 (primitive/cast (ptr u8) (primitive/fnptr-of rt-key-array-index)))) 0)
     (if (= name "aot_rt_object_keys")
         (set! (mut address) (primitive/cast i64 (primitive/cast (ptr u8) (primitive/fnptr-of rt-object-keys)))) 0)
+    (if (= name "aot_rt_object_own_names")
+        (set! (mut address) (primitive/cast i64 (primitive/cast (ptr u8) (primitive/fnptr-of rt-object-own-names)))) 0)
     (if (= name "aot_rt_uncaught")
         (set! (mut address) (primitive/cast i64 (primitive/cast (ptr u8) (primitive/fnptr-of rt-uncaught)))) 0)
     (if (= name "aot_rt_number_to_string")
@@ -4067,6 +4133,10 @@
         (set! (mut address) (primitive/cast i64 (primitive/cast (ptr u8) (primitive/fnptr-of rt-array-load)))) 0)
     (if (= name "aot_rt_array_has")
         (set! (mut address) (primitive/cast i64 (primitive/cast (ptr u8) (primitive/fnptr-of rt-array-has)))) 0)
+    (if (= name "aot_rt_array_delete")
+        (set! (mut address) (primitive/cast i64 (primitive/cast (ptr u8) (primitive/fnptr-of rt-array-delete)))) 0)
+    (if (= name "aot_rt_prop_delete")
+        (set! (mut address) (primitive/cast i64 (primitive/cast (ptr u8) (primitive/fnptr-of rt-prop-delete)))) 0)
     (if (= name "aot_rt_array_store")
         (set! (mut address) (primitive/cast i64 (primitive/cast (ptr u8) (primitive/fnptr-of rt-array-store)))) 0)
     (if (= name "aot_rt_array_set_length")
@@ -4118,6 +4188,7 @@
            "aot_rt_unimplemented_dynamic_code"]
           [rt-key-array-index :as "aot_rt_key_array_index"]
           [rt-object-keys :as "aot_rt_object_keys"]
+          [rt-object-own-names :as "aot_rt_object_own_names"]
           [rt-uncaught :as "aot_rt_uncaught"]
           [rt-number-to-string :as "aot_rt_number_to_string"]
           [rt-intern-key :as "aot_rt_intern_key"]
@@ -4143,6 +4214,8 @@
           [rt-array-new :as "aot_rt_array_new"]
           [rt-array-load :as "aot_rt_array_load"]
           [rt-array-has :as "aot_rt_array_has"]
+          [rt-array-delete :as "aot_rt_array_delete"]
+          [rt-prop-delete :as "aot_rt_prop_delete"]
           [rt-array-store :as "aot_rt_array_store"]
           [rt-array-set-length :as "aot_rt_array_set_length"]
           [rt-array-index-of-string :as "aot_rt_array_index_of_string"]
