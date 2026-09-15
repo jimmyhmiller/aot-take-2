@@ -1,5 +1,23 @@
 # Decisions
 
+## 2026-09-15 — The provider carries the declared surface; clients carry no methods
+
+Separately compiled Script units share one realm, so no unit's view of its own syntax can decide
+which built-in methods the realm needs. The shared runtime-library provider
+(`pipeline-shared-jsl-image`, `JSL-LINK-PROVIDER`) now materializes every declared root and every
+declared method as the realm's canonical identities. Its clients (`JSL-LINK-IMPORT`) materialize
+no methods of their own. A client's method read, named or computed, reaches the canonical object
+through the runtime (external-mutation facts keep an absent key unfolded), and fresh-realm assembly
+no longer unions per-unit method sets. A closed program still decides by the member names it
+spells, until the demand fixpoint replaces that.
+
+The full surface costs about 1.4 s to compile, and a test262 worker is replaced after every fatal
+refusal, which discards its native cache. So the supervisor primes the source cache with the
+compiled provider before forking (`memory-prime-library!`), and every worker inherits a pristine
+provider it never has to rebuild. The supervisor never installs or runs it. On a 40-file sample
+this took per-request compile time from about 96 ms to 35-50 ms, because the old runner rebuilt its
+smaller provider after every replacement.
+
 ## 2026-09-15 — A function or an array may be a [[Prototype]]; the JSL answers exotic holders
 
 The prototype word is typed null or object-like (object, function, array) in the checker, the JSL
