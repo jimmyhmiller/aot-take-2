@@ -55,6 +55,18 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-15 — bind and the arguments object
+
+`Function.prototype.bind` (call and construct through the bound function, `length`, `name`) and the
+arguments object of a sloppy function with simple parameters execute (docs/DECISIONS.md, built-in
+closures). Missing: `length` and `name` on source functions, so a bound source function reports
+length 0 and name "bound "; a mapped arguments object whose aliasing a write could observe (a formal
+assigned, the object escaping, written, deleted or rebound) refuses by name; strict and non-simple
+arguments objects refuse (their `callee` accessor is %ThrowTypeError%, not declared); an arrow's
+`arguments` refuses as a capture; @ on the arguments object and
+`Object.prototype.toString`'s `[object Arguments]` wait for symbols and class tags.
+`Function.prototype.call` and `apply` still admit at most their declared slots.
+
 ### 2026-09-15 — delete, for-in and own string keys
 
 `delete` of a property, an element, a name and any other expression, `for (… in …)` with `var`,
@@ -149,7 +161,7 @@ each is a JSL definition away; wrapper objects (`new String(x)`,
 an array's indices first), `Object.prototype.hasOwnProperty`/`toString`/`valueOf`/`isPrototypeOf`/
 `propertyIsEnumerable`, `Number.prototype.toString([radix])`/`valueOf` and
 `Boolean.prototype.toString`/`valueOf` execute (docs/DECISIONS.md, function objects). Missing:
-`Function.prototype.bind` (a bound function is a closure), `Function.prototype.toString`, `name`
+`Function.prototype.toString`, `name`
 and `length` on source functions (built-ins have them), `arguments`; property descriptors — `Object.defineProperty`,
 `defineProperties`, `getOwnPropertyDescriptor(s)`, `getOwnPropertyNames`, `freeze`/`seal`/
 `preventExtensions` and their `is*` queries — since properties have no attributes yet (the

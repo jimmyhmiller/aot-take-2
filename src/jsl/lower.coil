@@ -162,6 +162,25 @@
       (primitive/call-ptr (.f (jsl-intrinsic-demand)) (slice-data [u8] name) (len name))
       0))
 
+;; `(%MakeClosure "%Entry%" env flags)` allocates a function object whose code is a declared entry
+;; (docs/DECISIONS.md, built-in closures). The frontend owns the entry's record, its function
+;; identity and the value-call pointer type, so it builds the allocation: the hook receives the
+;; entry's name and the control, memory, prototype, env and flags node ids, answers the function value's id and
+;; leaves the memory after the allocation in `.memory`.
+(defstruct JslClosureMaker
+  [(f (fnptr c [(ptr u8) i64 i64 i64 i64 i64 i64] i64)) (installed bool) (memory i64)])
+
+(defn jsl-closure-maker [] (-> (ptr JslClosureMaker))
+  (compiler-state [JslClosureMaker] (primitive/alloc-static CompilerStateSlot)))
+
+(defn jsl-set-closure-maker! [(f (fnptr c [(ptr u8) i64 i64 i64 i64 i64 i64] i64))] (-> i64)
+  (do (set! (.f (jsl-closure-maker)) f)
+      (set! (.installed (jsl-closure-maker)) true)
+      0))
+
+(defn jsl-closure-set-memory! [(nid i64)] (-> i64)
+  (do (set! (.memory (jsl-closure-maker)) nid) 0))
+
 (defn jsl-lower-reset! [] (-> i64)
   (do
     (jsl-graphs-boot!)
@@ -1401,14 +1420,17 @@
                                       (n-unkeep! (.value pred))
                                       (n-unkeep! (.mem pred))
                                       (jsl-expr-result phi region memphi)))))))
-                        (if (or (= name "%CallFunction") (= name "%CallFunctionPacked"))
+                        (if (or (= name "%CallFunction") (= name "%CallFunctionPacked")
+                                (= name "%ArgumentAt") (= name "%ArgumentCountInt") (= name "%ArrayArgumentCount"))
+                            (if (or (= name "%ArgumentAt") (= name "%ArgumentCountInt") (= name "%ArrayArgumentCount"))
+                                (jsl-lower-argument-primitive x params values (mut local-names) (mut local-values) ctrl mem)
                             (jsl-lower-call-function x
                                                      params
                                                      values
                                                      (mut local-names)
                                                      (mut local-values)
                                                      ctrl
-                                                     mem)
+                                                     mem))
                             (if (= name "%PropStoreOwnNamed")
                                 (jsl-lower-property-store-primitive x
                                                                     params
@@ -1453,8 +1475,9 @@
                                                                                      (mut local-values)
                                                                                      ctrl
                                                                                      mem)
-                                                (if (= name
-                                                       "%IntrinsicPrototype")
+                                                (if (or (= name "%MakeClosure") (= name "%IntrinsicPrototype"))
+                                                    (if (= name "%MakeClosure")
+                                                    (jsl-lower-make-closure x params values (mut local-names) (mut local-values) ctrl mem)
                                                     ;; A well-known intrinsic object (`Array.prototype`, …): an image constant in
                                                     ;; a realm that materialized it; null otherwise (docs/DECISIONS.md, strings).
                                                     (jsl-expr-result (if (>= (do (jsl-demand-intrinsic! (rd/sexp-str (rd/sexp-nth x 1)))
@@ -1466,7 +1489,7 @@
                                                                                                    REP-OBJECT))
                                                                          (dyn-null-make))
                                                                      ctrl
-                                                                     mem)
+                                                                     mem))
                                                     (if (= name "%PropertyKey")
                                                         (jsl-expr-result (keyref-make (shape-key-intern (rd/sexp-str (rd/sexp-nth x
                                                                                                                               1))))
@@ -1564,13 +1587,21 @@
                                                                                                    (.ctrl lhs)
                                                                                                    (.mem lhs))
                                                                                   ;; A proven function object's raw FUNCTION-FLAG-* word.
-                                                                                  (if (= name "%FunctionFlags")
-                                                                                      (jsl-expr-result (load-make (.ctrl lhs)
+                                                                                  ;; `%ClosureEnv`: the environment word, a JavaScript value.
+                                                                                  (if (or (= name "%FunctionFlags") (= name "%ClosureEnv"))
+                                                                                      (jsl-expr-result (if (= name "%FunctionFlags")
+                                                                                                           (load-make (.ctrl lhs)
                                                                                                                   (.mem lhs)
                                                                                                                   (n-peephole! (unbox-make (.value lhs) REP-FUNCTION))
                                                                                                                   (con-int OFFSET-FUNCTION-FLAGS)
                                                                                                                   ALIAS-FUNCTION-FLAGS
                                                                                                                   (ty-int-bot))
+                                                                                                           (load-make (.ctrl lhs)
+                                                                                                                  (.mem lhs)
+                                                                                                                  (n-peephole! (unbox-make (.value lhs) REP-FUNCTION))
+                                                                                                                  (con-int OFFSET-FUNCTION-ENV)
+                                                                                                                  ALIAS-FUNCTION-ENV
+                                                                                                                  (ty-dyn TAG-ANY)))
                                                                                                        (.ctrl lhs)
                                                                                                        (.mem lhs))
                                                                                   (if (= name
@@ -2133,3 +2164,58 @@
   ;; The admitted fixture subset contains only pure Box/Unbox/arithmetic operations. As the
   ;; checker admits transitioning primitives, this becomes the graph walk that proves Safepoints.
   (do root 0))
+
+(defn jsl-lower-make-closure [(x (ptr rd/Sexp))
+                              (params (ptr rd/Sexp))
+                              (values (ArrayList (dyn NodeOps)))
+                              (local-names (mut (ArrayList (slice u8))))
+                              (local-values (mut (ArrayList (dyn NodeOps))))
+                              (ctrl (dyn NodeOps))
+                              (mem (dyn NodeOps))] (-> JslExprResult)
+  (let [maker (jsl-closure-maker)]
+    (if (not (.installed maker))
+        (panic "jsl-lower-make-closure: no frontend installed the closure maker (%MakeClosure needs a realm)")
+        0)
+    (let [proto (jsl-lower-expr (rd/sexp-nth x 2) params values (mut local-names) (mut local-values) ctrl mem)]
+      (n-keep! (.value proto))
+      (let [env (jsl-lower-expr (rd/sexp-nth x 3) params values (mut local-names) (mut local-values) (.ctrl proto) (.mem proto))]
+        (n-keep! (.value env))
+        (let [flags (jsl-lower-expr (rd/sexp-nth x 4) params values (mut local-names) (mut local-values) (.ctrl env) (.mem env))
+              name (rd/sexp-str (rd/sexp-nth x 1))]
+          (n-unkeep! (.value env))
+          (n-unkeep! (.value proto))
+          (let [made (primitive/call-ptr (.f maker) (slice-data [u8] name) (len name)
+                                         (n-nid (.ctrl flags)) (n-nid (.mem flags))
+                                         (n-nid (.value proto)) (n-nid (.value env)) (n-nid (.value flags)))]
+            (jsl-expr-result (jsl-node made) (.ctrl flags) (jsl-node (.memory maker)))))))))
+
+;; The callable ABI's arguments as values a body can compute with (aot.codegen.callabi):
+;; `(%ArgumentCountInt count)` is the count itself; `(%ArrayArgumentCount raw)` an array's length as a
+;; count; `(%ArgumentAt vector index)` the overflow actual at `index` (3 or more, below the count the
+;; body tested), one word of the managed vector.
+(defn jsl-lower-argument-primitive [(x (ptr rd/Sexp))
+                                    (params (ptr rd/Sexp))
+                                    (values (ArrayList (dyn NodeOps)))
+                                    (local-names (mut (ArrayList (slice u8))))
+                                    (local-values (mut (ArrayList (dyn NodeOps))))
+                                    (ctrl (dyn NodeOps))
+                                    (mem (dyn NodeOps))] (-> JslExprResult)
+  (let [name (rd/sexp-sym (rd/sexp-nth x 0))
+        first (jsl-lower-expr (rd/sexp-nth x 1) params values (mut local-names) (mut local-values) ctrl mem)]
+    (if (= name "%ArgumentCountInt")
+        first
+        (if (= name "%ArrayArgumentCount")
+            (jsl-expr-result (load-make (.ctrl first) (.mem first) (.value first)
+                                        (con-int OFFSET-ARRAY-LENGTH) ALIAS-ARRAY-LENGTH
+                                        (ty-int-range 0 CALL-ABI-MAX-ARGUMENTS))
+                             (.ctrl first) (.mem first))
+            (do
+              (n-keep! (.value first))
+              (let [index (jsl-lower-expr (rd/sexp-nth x 2) params values (mut local-names) (mut local-values)
+                                          (.ctrl first) (.mem first))
+                    offset (n-peephole! (mul-make (n-peephole! (sub-make (.value index) (con-int CALL-ABI-DIRECT-COUNT)))
+                                                  (con-int 8)))]
+                (n-unkeep! (.value first))
+                (jsl-expr-result (load-make-mode (.ctrl index) (.mem index) (.value first) offset
+                                                 ALIAS-CALL-ARGUMENTS (ty-dyn TAG-ANY) true)
+                                 (.ctrl index) (.mem index))))))))

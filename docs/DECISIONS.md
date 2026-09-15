@@ -1,5 +1,56 @@
 # Decisions
 
+## 2026-09-15 — Built-in closures, Function.prototype.bind and the arguments object
+
+`propertyHelper.js` binds `Function.prototype.call` at load and reads `arguments.length` in
+`verifyProperty`; neither existed, so every test including it failed before its first assertion.
+Both need what a formal-slot built-in cannot have: its own function object, the exact number of
+actuals, and every actual.
+
+**ABI builtins.** A JSL builtin whose parameters are the callable ABI itself — `(callee this
+new.target count vector a0 a1 a2)`, the count and vector by their ABI kinds (`jsl-definition-abi?`)
+— is a function object's code directly. Its record has no local body: `callabi-forwarding-adapter!`
+builds the public entry, forwarding every operand to the builtin, and that entry is the record's
+one function identity (`syntax-fun-forwarding?`, `fidx` = `adapter-fidx`, no local Fun). A method
+row may name such a builtin (`bind`). A body computes with the operands through three primitives
+that are graph nodes, not runtime calls: `%ArgumentCountInt`, `%ArgumentAt` (a load from the managed
+vector, below a count the body tested) and `%ArrayArgumentCount`; and one runtime capability,
+`%ArgumentTail`, copies an array's elements from index 3 into a fresh overflow vector, so
+`(%CallFunctionPacked f this nt (%ArrayArgumentCount a) (%ArgumentTail a) a[0] a[1] a[2])` calls with
+an argument list of any length (`JsCallWithArray`).
+
+**Closures made by the JSL.** `(intrinsic %Name% :entry Builtin)` declares an *entry*: an ABI
+builtin with no global binding and no object. `(%MakeClosure "Name" prototype env flags)` allocates a
+function object whose code is that entry, on the given [[Prototype]], with `env` in the environment
+word Simple's function layout already reserves (docs/DECISIONS.md, function values are heap
+objects) and read back by `%ClosureEnv`. The frontend owns the record, its identity and the
+value-call pointer type, so the JSL lowering asks it to build the allocation
+(`jsl-set-closure-maker!`), and it shares `lower-allocate-function` with source function values; a
+closed program materializes the entry at the first `%MakeClosure` naming it, before the value-call
+type settles, so the entry is in every code word's finite target set.
+
+**bind.** `JsFunctionBind` is BoundFunctionCreate: a closure over `%BoundFunction%` whose environment
+is an internal array `[target, boundThis, boundArgs…]` no program can reach, on the target's own
+[[Prototype]], with [[Construct]] exactly when the target has it, then `length` and `name`.
+`JsBoundFunctionInvoke` calls the target with the bound `this` and the bound arguments before the
+call's own; under `new` it constructs the target with new.target replaced by the target when it was
+the bound function. Source functions still have no own `length` or `name` (docs/GAPS.md), so binding
+one gives `length` 0 and `name` "bound ".
+
+**The arguments object rides in a hidden slot.** A function whose own code names `arguments` (not
+an arrow, not one with a parameter of that name) has one: the local signature gains a slot after the
+formals, its adapter fills the slot by calling `JsCreateArgumentsObject` with the call's own
+operands, and the body binds it to a compiler-only Scope name that `arguments` resolves to after any
+real binding. A direct call to such a function goes through its entry, which is where the call's
+operands exist. A sloppy function with simple parameters must get a *mapped* object whose indices
+alias the formals; that aliasing is observable only through a write, so this compiler builds the
+object once, unaliased, exactly when no write can see the difference: no formal is assigned
+anywhere in the function and every mention of `arguments` is the owner of a property read
+(`syntax-analyze-arguments!`). A formal assigned, the object passed on, called as a receiver,
+written, deleted or rebound refuses by name, as do strict and non-simple parameter lists, whose
+unmapped object's `callee` is the %ThrowTypeError% accessor the realm does not declare yet, and an
+arrow's `arguments`, a capture.
+
 ## 2026-09-15 — delete and for-in
 
 `delete` and `for-in` refused by name, and between them gated about 4,400 test262 files: the
