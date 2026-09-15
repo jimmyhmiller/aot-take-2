@@ -115,7 +115,7 @@ name (a runtime refusal in both modes).
 `Object`, `String`, `Number`, `Boolean`, `Error`, `TypeError`, `RangeError`, `SyntaxError`,
 `ReferenceError`, `EvalError`, `URIError`, `Array`, `Math`, `isNaN`, `isFinite`, `parseInt` and
 `parseFloat` exist as intrinsics (docs/DECISIONS.md, standard globals; arrays; Math and the number
-globals) when a program names them. `Math.max`, `Math.min` and `Math.hypot` see four arguments at
+globals) wherever the program can observe them (docs/DECISIONS.md, the realm is materialized by demand). `Math.max`, `Math.min` and `Math.hypot` see four arguments at
 most and read an `undefined` argument as absent (`Math.max(1, undefined)` is 1, not NaN); every
 [[Construct]] is a flag word on function objects: `new` refuses a built-in non-constructor, an arrow or a method with a TypeError after evaluating its arguments, and only constructors carry `prototype` (docs/DECISIONS.md, [[Construct]]); built-in functions have their specification `length` and `name`, declared in
 `jsl/compiler/intrinsics.jsl` (docs/DECISIONS.md, intrinsic declarations). Missing: every other global
@@ -157,10 +157,7 @@ A primitive string's properties resolve on %String.prototype% (docs/DECISIONS.md
 `ToObject` still refuses by name), `toUpperCase`/`toLowerCase` (Unicode case tables),
 `codePointAt`/`fromCodePoint`/`normalize`, `replace`/`replaceAll`/`match`/`search` (regular
 expressions), `localeCompare`, `substr`, the Symbol.split/RegExp separator forms of `split`,
-`includes`/`startsWith`/`endsWith` rejecting a RegExp argument, a method reached only through a
-computed key the program never spells as a member (`s['charAt']`, `a['push']`: intrinsic methods
-materialize by member name, for every intrinsic, so enumerating a prototype's methods sees only the
-named ones), and the ABI deviations shared with arrays: `concat`/`fromCharCode` stop at the first undefined argument, an explicit `undefined`
+`includes`/`startsWith`/`endsWith` rejecting a RegExp argument, and the ABI deviations shared with arrays: `concat`/`fromCharCode` stop at the first undefined argument, an explicit `undefined`
 position or fill reads as absent, and at most four variadic arguments arrive.
 
 ### 2026-09-09 — Arrays
@@ -287,7 +284,7 @@ not yet folded to its compile-time id; an array index key takes the element path
 regression of this class; `iter-peeps!` and `iter-run!` panic with a trace of recent rewrites or
 inlined sites instead of spinning; `property-expand-all!` panics if the shape universe grows.
 
-Constructors and chains: GetPrototypeFromConstructor's fallback is %Object.prototype% only when the realm materialized `Object` (null otherwise, pending the materialization analysis); class
+Constructors and chains: GetPrototypeFromConstructor's fallback is %Object.prototype%, which a realm with any constructor materializes; class
 constructors, bound functions and `Symbol.hasInstance` are unimplemented (`new.target` is an
 argument slot and executes in non-arrow functions: docs/DECISIONS.md, new.target);
 `instanceof` on a non-callable right operand traps as a TypeError. A function DECLARATION nested

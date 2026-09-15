@@ -269,6 +269,7 @@ aot-take-2/
 │   ├── number-test.coil             ; StringToNumber grammar and the Number word (aot.rt.number)
 │   ├── imagefacts-test.coil         ; the closed-world image facts: named, parameter and runtime-key stores
 │   ├── image-test.coil              ; in-memory relocation, entry ABI, realm isolation and moving GC
+│   ├── library-support.coil         ; the runtime-library provider retained Script units import from, for tests
 │   ├── test262-test.coil            ; metadata, runner policy and accounting regressions
 │   ├── harness.coil                 ; source in → linked binary out → node's answer beside it
 │   ├── bloat-test.coil              ; graph-size budgets: node-count ceilings after optimization

@@ -121,7 +121,9 @@
    (callers (HashMap i64 (ArrayList (dyn NodeOps))))
    (writes (HashMap i64 (ArrayList ImageWritePair)))
    (changed bool)
-   (rounds i64)])
+   (rounds i64)
+   (assume-closed bool)  ; the surface scan: callers are those the closed world will keep
+   (open-funs (HashMap i64 bool))])  ; with `assume-closed`, the Funs whose unknown callers survive closing
 
 (defn imagescan [] (-> (ptr ImageScan))
   (compiler-state [ImageScan] (primitive/alloc-static CompilerStateSlot)))
@@ -139,6 +141,8 @@
     (set! (.writes s) (hm-new [i64 (ArrayList ImageWritePair)] a (i64-keyops)))
     (set! (.changed s) false)
     (set! (.rounds s) 0)
+    (set! (.assume-closed s) false)
+    (set! (.open-funs s) (hm-new [i64 bool] a (i64-keyops)))
     (set! (.trace s) (!= (primitive/cast i64 (os/getenv c"AOT_FACTS_TRACE")) 0))
     (loop (if (> (load i) node-count)
               (break 0)
@@ -148,6 +152,15 @@
                 (push! [i64] (mut (.set-id s)) -1)
                 (set! (mut i) (+ (load i) 1))
                 (continue))))))
+
+;; Whether a Fun has callers outside the analysed program. Once the world closes, exactly the Funs
+;; that kept the unknown-caller hook. The surface scan runs before closing, while every Fun still
+;; has the hook, and asks instead which Funs the closed world will leave open.
+(defn scan--fun-open? [(fun (dyn NodeOps))] (-> bool)
+  (let [s (imagescan)]
+    (if (.assume-closed s)
+        (and (fun-unknown-callers? fun) (hm-contains? (.open-funs s) (n-nid fun)))
+        (fun-unknown-callers? fun))))
 
 (defn scan--note! [(changed bool)] (-> i64)
   (do (if changed (set! (.changed (imagescan)) true) 0) 0))
@@ -696,7 +709,7 @@
                                   os (parm-call-slot owner)
                                   ks (parm-call-slot key)]
                               (if (and (= (n-op fun) OP-FUN)
-                                       (not (fun-unknown-callers? fun))
+                                       (not (scan--fun-open? fun))
                                        (>= os CALL-ARG0)
                                        (>= ks CALL-ARG0))
                                   (match (get (.callers s) (n-nid fun))
@@ -860,12 +873,17 @@
         (if (or (= op OP-BOX) (= op OP-UNBOX) (= op OP-CAST))
             (scan--copy-into! nid (n-nid (n-in! n 1)))
             (if (or (= op OP-PHI) (= op OP-PARM))
-                (let [(mut i) 1]
+                (let [(mut i) 1
+                      ;; A Parm's input 1 is the unknown-caller seed while its Fun keeps the hook;
+                      ;; a Fun the closed world will close contributes only its real callers.
+                      skip-hook (and (= op OP-PARM)
+                                     (fun-unknown-callers? (parm-fun n))
+                                     (not (scan--fun-open? (parm-fun n))))]
                   (loop (if (>= (load i) (n-nins n))
                             (break 0)
                             (do
                               (match (n-in n (load i))
-                                (Some [v] (scan--copy-into! nid (n-nid v)))
+                                (Some [v] (if (and skip-hook (= (load i) 1)) 0 (scan--copy-into! nid (n-nid v))))
                                 (None [] 0))
                               (set! (mut i) (+ (load i) 1))
                               (continue)))))
@@ -1002,7 +1020,7 @@
                     ;; program only through the external caller hook.
                     (match (return-fun n)
                       (Some [fun]
-                            (if (fun-unknown-callers? fun)
+                            (if (scan--fun-open? fun)
                                 (scan--escape-inputs-from! n RETURN-VALUE)
                                 0))
                       (None [] (scan--escape-inputs-from! n RETURN-VALUE)))
@@ -1050,11 +1068,19 @@
 (defn imagefacts-compute! [] (-> i64)
   (imagefacts-compute-with-boundary! false))
 
-(defn imagefacts-compute-with-boundary! [(external-mutation bool)] (-> i64)
+;; The transfer to its least fixpoint over every live node, against freshly begun facts tables.
+(defn scan--run! [(external-mutation bool) (open-funs (Option (ArrayList i64)))] (-> i64)
   (let [count (arena-node-count)
         s (imagescan)]
     (facts-begin! (heap-count) (shape-key-count))
     (scan--reset! count)
+    (match open-funs
+      (Some [open]
+            (do
+              (set! (.assume-closed s) true)
+              (al-for [nid open] (set! (mut (.open-funs s)) nid true))
+              0))
+      (None [] 0))
     (scan--index-callers!)
     (if external-mutation (scan--external-mutation!) 0)
     (scan--compute-protos!)
@@ -1080,6 +1106,263 @@
                             (set! (mut i) (+ (load i) 1))
                             (continue)))))
               (if (.changed s) (continue) (break 0)))))
+    0))
+
+;; ---------------------------------------------------------------------------
+;; Surface demands: what the program can observe of the realm's declared surface
+;;
+;; The realm is materialized by demand (docs/DECISIONS.md, the realm is materialized by demand). A
+;; declared intrinsic property must exist when some operation can observe it, and the operations
+;; that can are exactly the reads and stores of the object model this transfer already follows.
+;; Run the same transfer before the world closes, without publishing facts, and report each
+;; observation as (owner, key):
+;;
+;;   owner  an image entry, or -1 for an owner the transfer could not name (TOP)
+;;   key    a property key id, or -1 for a runtime key or every key
+;;
+;; A named access (PropAccess or an object-model JsOp with a symbolic key) observes its key on each
+;; owner entry; a [[Get]], [[Set]], holder or chain-holder question also observes it on each owner's
+;; prototype chain. A runtime key, and a reflection over an owner (own keys, integrity,
+;; extensibility), observe every key. Keyed JsOps pair owner and key through forwarded formals the
+;; way the write facts do, so a generic body called with (a, "x") and (b, "y") does not observe
+;; `a.y`. A TOP owner stands for every escaped entry. The consumer (aot.parse.parser) maps the
+;; observations to declared rows, materializes them, and scans again until nothing new is observed.
+(defstruct ImageDemand [(owner i64) (key i64)])
+
+(defn scan--demand! [(out (mut (ArrayList ImageDemand))) (owner i64) (key i64)] (-> i64)
+  (do (push! [ImageDemand] (mut out) (ImageDemand :owner owner :key key)) 0))
+
+;; Observations of `key` on every entry `nid` may denote, and on each one's prototype chain when
+;; `chain`; TOP adds the unknown owner.
+(defn scan--demand-owner! [(out (mut (ArrayList ImageDemand))) (nid i64) (key i64) (chain bool)] (-> i64)
+  (let [n (scan--count nid)
+        (mut i) 0]
+    (if (scan--top? nid) (scan--demand! (mut out) -1 key) 0)
+    (loop (if (>= (load i) n)
+              (break 0)
+              (let [entry (scan--entry-at nid (load i))]
+                (scan--demand! (mut out) entry key)
+                (if chain
+                    (let [(mut cur) entry
+                          (mut steps) 0]
+                      (loop (let [target (image-word-object-entry
+                                           (heap-entry-word (load cur) HEAP-OFFSET-PROTOTYPE-WORD)
+                                           (heap-entry-word-kind (load cur) HEAP-OFFSET-PROTOTYPE-WORD))]
+                              (if (or (< target 0) (> (load steps) (heap-count)))
+                                  (break 0)
+                                  (do
+                                    (scan--demand! (mut out) target key)
+                                    (set! (mut cur) target)
+                                    (set! (mut steps) (+ (load steps) 1))
+                                    (continue))))))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))
+
+(defn scan--demand-chain-kind? [(kind i64)] (-> bool)
+  (or (= kind PROP-HOLDER) (= kind PROP-GET) (= kind PROP-SET)))
+
+;; A JsOp that names an owner and a key (argument 0 and 1).
+(defn scan--demand-keyed-jsop? [(prim i64)] (-> bool)
+  (or (= prim JS-PROP-GET-OWN) (= prim JS-PROP-HAS-OWN) (= prim JS-PROP-SET-OWN)
+      (= prim JS-PROP-SET-OWN-ATTRS) (= prim JS-PROP-GET) (= prim JS-PROP-SET)
+      (= prim JS-PROP-ATTRIBUTES) (= prim JS-PROP-DEFINE) (= prim JS-PROP-CHAIN-HOLDER)))
+
+(defn scan--demand-chain-jsop? [(prim i64)] (-> bool)
+  (or (= prim JS-PROP-GET) (= prim JS-PROP-SET) (= prim JS-PROP-CHAIN-HOLDER)))
+
+;; A JsOp that observes every key of its owner (argument 0).
+(defn scan--demand-reflective-jsop? [(prim i64)] (-> bool)
+  (or (= prim JS-OBJECT-KEYS) (= prim JS-OWN-KEY-COUNT) (= prim JS-OWN-KEY-AT)
+      (= prim JS-OBJECT-INTEGRITY) (= prim JS-PREVENT-EXTENSIONS) (= prim JS-IS-EXTENSIBLE)
+      (= prim JS-TEST-INTEGRITY)))
+
+;; The constant property keys a node may carry, for the surface scan: a key crossing a generic body
+;; as a parameter is still the finite set of keys its callers pass. `top` means a computed key.
+(defstruct KeySets [(sets (HashMap i64 (ArrayList i64))) (top (HashMap i64 bool)) (changed bool)])
+
+(defn keys--add! [(k (mut KeySets)) (nid i64) (key i64)] (-> i64)
+  (let [(mut set) (match (get (.sets k) nid)
+                    (Some [xs] xs)
+                    (None [] (al-new [i64] (compiler-allocator))))
+        (mut found) false]
+    (al-for [x (load set)] (if (= x key) (set! (mut found) true) 0))
+    (if (load found)
+        0
+        (do
+          (push! [i64] (mut set) key)
+          (set! (mut (.sets k)) nid (load set))
+          (set! (.changed k) true)
+          0))))
+
+(defn keys--set-top! [(k (mut KeySets)) (nid i64)] (-> i64)
+  (if (hm-contains? (.top k) nid)
+      0
+      (do (set! (mut (.top k)) nid true) (set! (.changed k) true) 0)))
+
+(defn keys--copy! [(k (mut KeySets)) (to i64) (from i64)] (-> i64)
+  (do
+    (if (hm-contains? (.top k) from) (keys--set-top! (mut k) to) 0)
+    (match (get (.sets k) from)
+      (Some [xs] (al-for [x xs] (keys--add! (mut k) to x)))
+      (None [] 0))
+    0))
+
+(defn keys--visit! [(k (mut KeySets)) (n (dyn NodeOps))] (-> i64)
+  (let [nid (n-nid n)
+        op (n-op n)]
+    (if (= op OP-KEYREF)
+        (keys--add! (mut k) nid (keyref-local n))
+        (if (or (= op OP-BOX) (= op OP-UNBOX) (= op OP-CAST))
+            (keys--copy! (mut k) nid (n-nid (n-in! n 1)))
+            (if (or (= op OP-PHI) (= op OP-PARM))
+                (let [(mut i) 1
+                      skip-hook (and (= op OP-PARM)
+                                     (fun-unknown-callers? (parm-fun n))
+                                     (not (scan--fun-open? (parm-fun n))))]
+                  (if (and (= op OP-PARM) (not skip-hook) (fun-unknown-callers? (parm-fun n)))
+                      (keys--set-top! (mut k) nid)
+                      0)
+                  (loop (if (>= (load i) (n-nins n))
+                            (break 0)
+                            (do
+                              (match (n-in n (load i))
+                                (Some [v] (if (and (= op OP-PARM) (= (load i) 1)) 0 (keys--copy! (mut k) nid (n-nid v))))
+                                (None [] 0))
+                              (set! (mut i) (+ (load i) 1))
+                              (continue)))))
+                (if (= op OP-CALL)
+                    ;; The argument keys flow into every target's matching parameter.
+                    (al-for [fnid (scan--call-targets n)]
+                            (match (arena-node fnid)
+                              (Some [fun]
+                                    (let [(mut o) 0]
+                                      (loop (if (>= (load o) (n-nouts fun))
+                                                (break 0)
+                                                (do
+                                                  (match (n-out fun (load o))
+                                                    (Some [p]
+                                                          (if (= (n-op p) OP-PARM)
+                                                              (let [slot (parm-call-slot p)]
+                                                                (if (and (>= slot CALL-ARG0) (< slot (- (n-nins n) 1)))
+                                                                    (keys--copy! (mut k) (n-nid p) (n-nid (n-in! n slot)))
+                                                                    0))
+                                                              0))
+                                                    (None [] 0))
+                                                  (set! (mut o) (+ (load o) 1))
+                                                  (continue))))))
+                              (None [] 0)))
+                    0))))))
+
+(defn keys--compute [] (-> KeySets)
+  (let [(mut k) (primitive/zeroed KeySets)
+        count (arena-node-count)
+        (mut rounds) 0]
+    (set! (.sets (mut k)) (hm-new [i64 (ArrayList i64)] (compiler-allocator) (i64-keyops)))
+    (set! (.top (mut k)) (hm-new [i64 bool] (compiler-allocator) (i64-keyops)))
+    (set! (.changed (mut k)) true)
+    (loop (if (not (.changed k))
+              (break 0)
+              (do
+                (set! (.changed (mut k)) false)
+                (set! (mut rounds) (+ (load rounds) 1))
+                (if (> (load rounds) 10000) (panic "keys--compute: the key fixpoint did not converge") 0)
+                (let [(mut i) 1]
+                  (loop (if (> (load i) count)
+                            (break 0)
+                            (do
+                              (match (arena-node (load i))
+                                (Some [n] (if (n-dead? n) 0 (keys--visit! (mut k) n)))
+                                (None [] 0))
+                              (set! (mut i) (+ (load i) 1))
+                              (continue)))))
+                (continue))))
+    (load k)))
+
+;; The keys an operand may be: its symbolic key, else the constant keys that reach it, else every
+;; key (-1) for a computed one.
+(defn keys--of [(k KeySets) (key (dyn NodeOps))] (-> (ArrayList i64))
+  (let [(mut out) (al-new [i64] (compiler-allocator))
+        id (keyref-local key)]
+    (if (>= id 0)
+        (push! [i64] (mut out) id)
+        (if (or (hm-contains? (.top k) (n-nid key))
+                (match (get (.sets k) (n-nid key)) (Some [xs] false) (None [] true)))
+            (push! [i64] (mut out) -1)
+            (match (get (.sets k) (n-nid key))
+              (Some [xs] (al-for [x xs] (push! [i64] (mut out) x)))
+              (None [] 0))))
+    (load out)))
+
+(defn scan--collect-demands! [(out (mut (ArrayList ImageDemand)))] (-> i64)
+  (let [count (arena-node-count)
+        keys (keys--compute)
+        (mut i) 1]
+    (loop (if (> (load i) count)
+              (break 0)
+              (do
+                (match (arena-node (load i))
+                  (Some [n]
+                        (if (n-dead? n)
+                            0
+                            (let [op (n-op n)]
+                              (if (or (= op OP-PROPLOAD) (= op OP-PROPSTORE))
+                                  (scan--demand-owner! (mut out)
+                                                       (n-nid (n-in! n PROP-OBJECT))
+                                                       (prop-access-key n)
+                                                       (scan--demand-chain-kind? (prop-access-kind n)))
+                                  (if (= op OP-JSOP)
+                                      (let [prim (jsop-prim n)]
+                                        (if (scan--demand-keyed-jsop? prim)
+                                            (al-for [item (scan--write-pairs n)]
+                                                    (let [pair item]
+                                                      (al-for [key (keys--of keys (.key pair))]
+                                                              (scan--demand-owner! (mut out)
+                                                                                   (n-nid (.owner pair))
+                                                                                   key
+                                                                                   (scan--demand-chain-jsop? prim)))))
+                                            (if (scan--demand-reflective-jsop? prim)
+                                                (scan--demand-owner! (mut out) (n-nid (n-in! n JSOP-ARG0)) -1 false)
+                                                0)))
+                                      0)))))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))
+
+;; `open-funs` names the Funs whose unknown callers will survive closing the world (the process entry,
+;; callable roots); every other Fun is analysed with only its program callers, as the closed world
+;; will have it.
+;; Every observation the program's current graphs make of the realm, plus each TOP owner resolved
+;; to the entries that escaped (the transfer's own induction: an unnamed object is an escaped image
+;; object or a non-image object). The facts tables are discarded, never published.
+(defn imagefacts-surface-demands! [(external-mutation bool) (open-funs (ArrayList i64))] (-> (ArrayList ImageDemand))
+  (let [(mut out) (al-new [ImageDemand] (compiler-allocator))]
+    (scan--run! external-mutation (Some open-funs))
+    (scan--collect-demands! (mut out))
+    (let [(mut resolved) (al-new [ImageDemand] (compiler-allocator))]
+      (al-for [item (load out)]
+              (let [d item]
+                (if (>= (.owner d) 0)
+                    (push! [ImageDemand] (mut resolved) d)
+                    (let [(mut e) 0]
+                      (loop (if (>= (load e) (heap-count))
+                                (break 0)
+                                (do
+                                  (if (and (scan--object-entry? (load e)) (facts-escaped? (load e)))
+                                      (push! [ImageDemand] (mut resolved) (ImageDemand :owner (load e) :key (.key d)))
+                                      0)
+                                  (set! (mut e) (+ (load e) 1))
+                                  (continue))))
+                      (push! [ImageDemand] (mut resolved) d)))))
+      (facts-abandon!)
+      (al-free! (mut out))
+      (load resolved))))
+
+(defn imagefacts-compute-with-boundary! [(external-mutation bool)] (-> i64)
+  (let [s (imagescan)]
+    (scan--run! external-mutation (None [(ArrayList i64)]))
     (facts-finish!)
     (if (.trace s)
         (let [n (heap-count)

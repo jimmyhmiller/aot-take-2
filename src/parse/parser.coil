@@ -88,10 +88,12 @@
         [compiler-allocator compiler-state CompilerStateSlot])
 (import "aot.codegen.callabi" :use *)
 (import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :use *)
-(import "coil.hashmap" :use [hm-new hm-contains? hm-put! hm-free!])
-(import "coil.slice" :use [subslice slice-data])
+(import "coil.hashmap" :use [hm-new hm-contains? hm-put! hm-free! i64-keyops])
+(import "aot.node.imagefacts" :use [imagefacts-surface-demands! ImageDemand])
+(import "coil.slice" :use [subslice slice-data slice-new])
 (import "coil.str"
         :use
         [sb-new
@@ -432,6 +434,11 @@
    (namespaces (ArrayList (slice u8)))  ; intrinsic namespace objects the realm materializes (`Math`)
    (namespace-entries (ArrayList i64))  ; their image entries, once the realm is laid out
    (jsl-loaded bool)  ; this compilation already loaded the JSL library
+   (pending-bodies (ArrayList i64))  ; records materialized mid-lowering whose bodies wait for a boundary
+   (lower-start i64)  ; the program Start and Stop once the passes run, for late materialization, or 0
+   (lower-stop i64)
+   (late-funs-cap i64)  ; capacities reserved for late materialization (`parser-reserve-late-materialization!`)
+   (late-exprs-cap i64)
    (propagates bool)  ; the function being lowered emitted a path that returns the exception sentinel  ; the global object's one hidden class: every global added in table order
    (booted bool)])
 
@@ -478,6 +485,9 @@
           (set! (.globals p) (al-new [GlobalBinding] (compiler-allocator)))
           (set! (.namespaces p) (al-new [(slice u8)] (compiler-allocator)))
           (set! (.namespace-entries p) (al-new [i64] (compiler-allocator)))
+          (set! (.pending-bodies p) (al-new [i64] (compiler-allocator)))
+          (set! (.lower-start p) 0)
+          (set! (.lower-stop p) 0)
           (set! (.jsl-loaded p) false)
           (set! (.booted p) true)
           0)
@@ -525,6 +535,9 @@
           (al-clear! [(slice u8)] (mut (.namespaces p)))
           (al-clear! [i64] (mut (.namespace-entries p)))
           (set! (.jsl-loaded p) false)
+          (al-clear! [i64] (mut (.pending-bodies p)))
+          (set! (.lower-start p) 0)
+          (set! (.lower-stop p) 0)
           0))))
 
 (defn parse-fail [(what (slice u8)) (t Token)] (-> i64)
@@ -5555,6 +5568,13 @@
               (if (> (len (.params fun)) (load slots))
                   (set! (mut slots) (len (.params fun)))
                   0)))
+    ;; A realm can materialize any declared intrinsic after this settles (the demand fixpoint), so
+    ;; the slots cover every declared body, not only the ones materialized so far.
+    (if (.script-mode (parser-state))
+        (al-for [row (intrinsic-table)]
+                (let [entry row]
+                  (if (> (.arity entry) (load slots)) (set! (mut slots) (.arity entry)) 0)))
+        0)
     ;; A function returns a completion: its value, or the exception sentinel when it throws. Its
     ;; arguments are `this`, `new.target` (undefined for a call, the constructor for `new`:
     ;; docs/DECISIONS.md, new.target is an argument slot) and the program-wide formal slots.
@@ -5729,7 +5749,18 @@
                     (let [fp (syntax-fun-ptr fun)] (set! (.hoisted fp) true) 0))
     (_ 0)))
 
+;; The function a source name resolves to. A Script's own declaration shadows a declared intrinsic of
+;; the same name, whichever record was reserved first (an intrinsic can be materialized late).
 (defn syntax-find-fun [(name (slice u8))] (-> i64)
+  (let [own (syntax-find-fun-where name false)]
+    (if (>= own 0) own (syntax-find-fun-where name true))))
+
+;; The intrinsic record for a declared root, never a Script declaration that shadows its binding:
+;; %Error% exists, and the language's errors use it, even where a Script declares `function Error`.
+(defn syntax-find-intrinsic-fun [(name (slice u8))] (-> i64)
+  (syntax-find-fun-where name true))
+
+(defn syntax-find-fun-where [(name (slice u8)) (intrinsic bool)] (-> i64)
   ;; Function declarations are hoisted and later declarations replace earlier declarations of the
   ;; same binding. Resolve from the end so calls and the public entry observe that JavaScript rule;
   ;; obsolete bodies then disappear through the ordinary closed-world lifetime protocol.
@@ -5738,7 +5769,8 @@
               (break -1)
               (let [f (syntax-fun-at (load i))]
                 (if (and (= (.name f) name)
-                         (syntax-top-level-declaration? (load i)))
+                         (syntax-top-level-declaration? (load i))
+                         (= (syntax-intrinsic-fun? (load i)) intrinsic))
                     (break (load i))
                     (do (set! (mut i) (- (load i) 1)) (continue))))))))
 
@@ -6240,7 +6272,7 @@
                     (parser-set-current-ctrl! (.ctrl r))
                     (scope-set-mem! scope (.mem r))
                     (.value r))))]
-    (if (>= (heap-intrinsic-entry "Object.prototype") 0)
+    (if (>= (parser-intrinsic-prototype-entry "Object.prototype") 0)
         (let [(mut sargs) (al-new [(dyn NodeOps)] (compiler-allocator))]
           (n-keep! raw)
           (push! [(dyn NodeOps)] (mut sargs) raw)
@@ -6493,7 +6525,7 @@
                   null-value (dyn-null-make)
                   ;; [[Prototype]] is %Function.prototype% when the realm materialized `Function`.
                   function-proto
-                    (if (>= (heap-intrinsic-entry "Function.prototype") 0)
+                    (if (>= (parser-intrinsic-prototype-entry "Function.prototype") 0)
                         (box-make (staticref-make (heap-intrinsic-entry "Function.prototype")
                                                   REP-OBJECT))
                         (dyn-null-make))
@@ -9051,7 +9083,7 @@
                    (.name entry))
             (syntax-global-declare! (.name entry) -1 -1)
             0))
-      (if (>= (syntax-find-fun (.name entry)) 0)
+      (if (>= (syntax-find-intrinsic-fun (.name entry)) 0)
           0
           (let [index
                   (syntax-fun-reserve! (.name entry)
@@ -9109,112 +9141,36 @@
                                           0)))
             (if (intrinsic-method? entry)
                 0
-                (syntax-global-declare! (.name entry) -1 index))
+                ;; A binding a Script function declaration already owns stays that function's.
+                (let [g (syntax-global-index (.name entry))]
+                  (if (and (>= g 0) (>= (.fun (syntax-global-ptr g)) 0))
+                      0
+                      (syntax-global-declare! (.name entry) -1 index))))
             0))))
 
-;; Materialize the intrinsics the program names, with their parents. Runs before the Scripts'
-;; own declarations so a Script redefining `Object` shadows it as JavaScript says it does.
+;; The intrinsics declared during syntax collection, before the Scripts' own declarations so a
+;; Script redefining `Object` shadows it as JavaScript says it does.
+;;
+;; A shared-realm provider, and any other external Script unit that is not a provider's client,
+;; carries the entire declared surface: another unit it cannot see may observe any of it. A closed
+;; program declares the roots its identifiers bind (with their parents) and the ones its image objects
+;; need for their declared [[Prototype]] chains; every other intrinsic materializes by demand while
+;; the program lowers (`parser-settle-realm!`). A provider's client carries the foundational chain
+;; objects and the roots its identifiers bind, never a method (docs/DECISIONS.md, the provider
+;; carries the declared surface).
 (defn syntax-declare-intrinsics! [] (-> i64)
-  (let [table (intrinsic-table)
+  (let [p (parser-state)
+        table (intrinsic-table)
+        mode (.link-mode (jsl-graphs))
+        full (or (= mode JSL-LINK-PROVIDER)
+                 (and (.external-mutation p) (= mode JSL-LINK-LOCAL)))
+        (mut any-root) false
         (mut i) 0]
-    ;; The language itself throws TypeErrors (a call on a non-callable, a property of null), so
-    ;; %TypeError.prototype% exists in every realm.
-    (syntax-declare-intrinsic! (get table (intrinsic-index table "Error")))
-    (syntax-declare-intrinsic! (get table (intrinsic-index table "TypeError")))
-    (if (.external-mutation (parser-state))
-        (do
-          ;; External callers can observe prototype chains absent from this unit's syntax.
-          ;; These foundational objects must exist before the heap template is built: a later
-          ;; unit cannot repair a null [[Prototype]] by merely canonicalizing object identities.
-          (syntax-declare-intrinsic! (get table (intrinsic-index table "Object")))
-          (syntax-declare-intrinsic! (get table (intrinsic-index table "Function")))
-          (syntax-declare-intrinsic! (get table
-                                          (intrinsic-index table "ReferenceError")))
-          (syntax-declare-intrinsic! (get table
-                                          (intrinsic-index table "SyntaxError"))))
-        0)
-    ;; Arrays: an array literal or the name materializes `Array`, with `Object` (whose prototype
-    ;; heads %Array.prototype%'s chain) and `RangeError` (which an invalid length throws).
-    (if (or (syntax-names-identifier? "Array") (syntax-uses-array-literal?))
-        (do
-          (syntax-declare-intrinsic! (get table
-                                          (intrinsic-index table "Object")))
-          (syntax-declare-intrinsic! (get table
-                                          (intrinsic-index table "RangeError")))
-          (syntax-declare-intrinsic! (get table (intrinsic-index table "Array"))))
-        0)
-    ;; Strings: a primitive string's properties resolve on %String.prototype% (docs/DECISIONS.md,
-    ;; strings). The prototype exists when the program names `String` or names one of its methods
-    ;; as a member; closed-world property names decide, as for the other intrinsics (a computed
-    ;; key spelling a method name at run time is the same approximation `this['Error']` makes).
-    ;; Functions: `Function.prototype` is every function object's [[Prototype]] (docs/DECISIONS.md,
-    ;; function objects); it exists when the program names `Function` or one of its methods.
-    (if (or (syntax-names-identifier? "Function")
-            (syntax-names-member? "call")
-            (syntax-names-member? "apply"))
-        (do
-          (syntax-declare-intrinsic! (get table
-                                          (intrinsic-index table "Object")))
-          (syntax-declare-intrinsic! (get table
-                                          (intrinsic-index table "Function"))))
-        0)
-    ;; Numbers and booleans: their prototypes carry `toString` and `valueOf`, which a primitive
-    ;; receiver reaches through %Number.prototype% and %Boolean.prototype%; `Object.prototype` is
-    ;; every chain's end. Named `toString`/`valueOf` materialize all three.
-    (if (or (syntax-names-identifier? "Object")
-            (syntax-names-member? "toString")
-            (syntax-names-member? "valueOf")
-            (syntax-names-member? "hasOwnProperty")
-            (syntax-names-member? "isPrototypeOf")
-            (syntax-names-member? "propertyIsEnumerable"))
-        (syntax-declare-intrinsic! (get table (intrinsic-index table "Object")))
-        0)
-    (if (or (syntax-names-identifier? "Number")
-            (syntax-names-member? "toString")
-            (syntax-names-member? "valueOf"))
-        (do
-          (syntax-declare-intrinsic! (get table
-                                          (intrinsic-index table "Object")))
-          (syntax-declare-intrinsic! (get table
-                                          (intrinsic-index table "Number"))))
-        0)
-    (if (or (syntax-names-identifier? "Boolean")
-            (syntax-names-member? "toString")
-            (syntax-names-member? "valueOf"))
-        (do
-          (syntax-declare-intrinsic! (get table
-                                          (intrinsic-index table "Object")))
-          (syntax-declare-intrinsic! (get table
-                                          (intrinsic-index table "Boolean"))))
-        0)
-    ;; Math: a namespace object on %Object.prototype%.
-    (if (syntax-names-identifier? "Math")
-        (syntax-declare-intrinsic! (get table (intrinsic-index table "Object")))
-        0)
-    (if (or (syntax-names-identifier? "String")
-            (syntax-uses-string-members? table))
-        (do
-          (syntax-declare-intrinsic! (get table
-                                          (intrinsic-index table "Object")))
-          ;; `repeat` is the one String method that throws a RangeError.
-          (if (syntax-names-member? "repeat")
-              (syntax-declare-intrinsic! (get table
-                                              (intrinsic-index table
-                                                               "RangeError")))
-              0)
-          (syntax-declare-intrinsic! (get table
-                                          (intrinsic-index table "String"))))
-        0)
     (loop (if (>= (load i) (len table))
               (break 0)
               (let [entry (get table (load i))]
-                ;; A provider is reused by source units not known yet. Its generic bodies
-                ;; must name real canonical intrinsic identities, never specialize an absent
-                ;; prototype to null based on the empty provider Script. Materialize every
-                ;; admitted constructor/namespace and its parent here, and (below) every method.
                 (if (and (not (intrinsic-method? entry))
-                         (or (= (.link-mode (jsl-graphs)) JSL-LINK-PROVIDER)
-                             (syntax-names-identifier? (.name entry))))
+                         (or full (syntax-names-identifier? (.name entry))))
                     (do
                       (if (!= (.parent entry) "")
                           (let [pi (intrinsic-index table (.parent entry))]
@@ -9222,87 +9178,54 @@
                                 (panic "syntax-declare-intrinsics!: an intrinsic names an unknown parent")
                                 (syntax-declare-intrinsic! (get table pi))))
                           0)
-                      (syntax-declare-intrinsic! entry))
+                      (syntax-declare-intrinsic! entry)
+                      (set! (mut any-root) true)
+                      0)
                     0)
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
-    ;; The methods of a materialized owner. A shared-realm provider carries the entire declared
-    ;; surface as the realm's canonical identities; its clients carry none, so a client's read of a
-    ;; method reaches the canonical object through the runtime (docs/DECISIONS.md, the provider
-    ;; carries the declared surface). A closed program still decides by the member names it spells.
-    (set! (mut i) 0)
-    (loop (if (>= (load i) (len table))
-              (break 0)
-              (let [entry (get table (load i))
-                    mode (.link-mode (jsl-graphs))]
-                (if (and (intrinsic-method? entry)
-                         (!= mode JSL-LINK-IMPORT)
-                         (or (>= (syntax-find-fun (.owner entry)) 0)
-                             (>= (syntax-namespace-index (.owner entry)) 0))
-                         (or (= mode JSL-LINK-PROVIDER)
-                             (syntax-names-member? (.prop entry))))
-                    (syntax-declare-intrinsic! entry)
-                    0)
-                (set! (mut i) (+ (load i) 1))
-                (continue))))
+    ;; Declared chains end at %Object.prototype%, and every function object's [[Prototype]] is
+    ;; %Function.prototype%: a realm with an intrinsic root, a hoisted function in its image, or an
+    ;; external boundary (whose callers observe those chains) has both.
+    (if (or (load any-root) (.external-mutation p) (syntax-has-hoisted-function?))
+        (do
+          (syntax-declare-intrinsic! (get table (intrinsic-index table "Object")))
+          (syntax-declare-intrinsic! (get table (intrinsic-index table "Function")))
+          0)
+        0)
+    (if (and (.external-mutation p) (= mode JSL-LINK-IMPORT))
+        (do
+          ;; A client's language-raised errors must name the canonical prototypes; a later unit
+          ;; cannot repair a null [[Prototype]] by canonicalizing identities.
+          (syntax-declare-intrinsic! (get table (intrinsic-index table "Error")))
+          (syntax-declare-intrinsic! (get table (intrinsic-index table "TypeError")))
+          (syntax-declare-intrinsic! (get table (intrinsic-index table "ReferenceError")))
+          (syntax-declare-intrinsic! (get table (intrinsic-index table "SyntaxError")))
+          0)
+        0)
+    (if full
+        (do
+          (set! (mut i) 0)
+          (loop (if (>= (load i) (len table))
+                    (break 0)
+                    (let [entry (get table (load i))]
+                      (if (intrinsic-method? entry) (syntax-declare-intrinsic! entry) 0)
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          0)
+        0)
     0))
 
-;; Does any expression in the realm read or call a member of this name?
-(defn syntax-names-member? [(name (slice u8))] (-> bool)
+;; Does the realm hold a hoisted source function other than a Script root (an image object)?
+(defn syntax-has-hoisted-function? [] (-> bool)
   (let [(mut i) 0
         (mut found) false]
-    (loop (if (or (>= (load i) (len (.exprs (parser-state)))) (load found))
+    (loop (if (or (load found) (>= (load i) (len (.funs (parser-state)))))
               (break 0)
-              (do
-                (let [x (get (.exprs (parser-state)) (load i))]
-                  (match (.node x)
-                    (SxMember [owner member optional]
-                              (if (= member name) (set! (mut found) true) 0))
-                    (_ 0)))
-                (set! (mut i) (+ (load i) 1))
-                (continue))))
-    (load found)))
-
-;; Does any expression in the realm name a String.prototype method as a member?
-(defn syntax-uses-string-members? [(table (ArrayList Intrinsic))] (-> bool)
-  (let [(mut i) 0
-        (mut found) false]
-    (loop (if (or (>= (load i) (len (.exprs (parser-state)))) (load found))
-              (break 0)
-              (do
-                (let [x (get (.exprs (parser-state)) (load i))]
-                  (match (.node x)
-                    (SxMember [owner name optional]
-                              (let [(mut k) 0]
-                                (loop (if (or (>= (load k) (len table))
-                                              (load found))
-                                          (break 0)
-                                          (let [entry (get table (load k))]
-                                            (if (and (intrinsic-method? entry)
-                                                     (= (.owner entry) "String")
-                                                     (= (.target entry)
-                                                        INTRINSIC-TARGET-PROTOTYPE)
-                                                     (= (.prop entry) name))
-                                                (set! (mut found) true)
-                                                0)
-                                            (set! (mut k) (+ (load k) 1))
-                                            (continue))))))
-                    (_ 0)))
-                (set! (mut i) (+ (load i) 1))
-                (continue))))
-    (load found)))
-
-;; Does any expression in the realm build an array literal?
-(defn syntax-uses-array-literal? [] (-> bool)
-  (let [(mut i) 0
-        (mut found) false]
-    (loop (if (or (>= (load i) (len (.exprs (parser-state)))) (load found))
-              (break 0)
-              (do
-                (let [x (get (.exprs (parser-state)) (load i))]
-                  (match (.node x)
-                    (SxArray [elements] (set! (mut found) true))
-                    (_ 0)))
+              (let [f (syntax-fun-at (load i))]
+                (if (and (.hoisted f) (not (syntax-script-root? (load i))) (not (syntax-intrinsic-fun? (load i))))
+                    (set! (mut found) true)
+                    0)
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
     (load found)))
@@ -9745,8 +9668,14 @@
 ;; A global intrinsic function's binding, with its declared attributes.
 (defn realm-image-root-binding! [(fi i64)] (-> i64)
   (let [f (syntax-fun-at fi)
-        entry (realm-image-intrinsic-entry fi)]
-    (if (intrinsic-method? entry)
+        entry (realm-image-intrinsic-entry fi)
+        g (syntax-global-index (.name f))
+        ;; A closed program's Script function declaration owns the binding (preinstalled below).
+        shadowed (and (not (.script-unit (parser-state)))
+                      (>= g 0)
+                      (let [b (get (.globals (parser-state)) g)]
+                        (and (>= (.fun b) 0) (not (syntax-intrinsic-fun? (.fun b))))))]
+    (if (or (intrinsic-method? entry) shadowed)
         0
         (heap-define-own-attrs! (heap-global-entry)
                                 (.name f)
@@ -9778,7 +9707,7 @@
         (let [carrier
                 (if (= (.target entry) INTRINSIC-TARGET-NAMESPACE)
                     (syntax-namespace-entry (.owner entry))
-                    (let [owner (syntax-fun-at (syntax-find-fun (.owner entry)))]
+                    (let [owner (syntax-fun-at (syntax-find-intrinsic-fun (.owner entry)))]
                       (if (= (.target entry) INTRINSIC-TARGET-PROTOTYPE)
                           (realm-image-prototype-of (.static-entry owner))
                           (.static-entry owner))))]
@@ -9803,7 +9732,7 @@
 ;; With `Function` materialized, every function object in the image has %Function.prototype% as
 ;; its [[Prototype]] (§10.2.3 MakeConstructor / OrdinaryFunctionCreate), including the intrinsics.
 (defn realm-image-link-function-prototypes! [] (-> i64)
-  (let [function-fun (syntax-find-fun "Function")]
+  (let [function-fun (syntax-find-intrinsic-fun "Function")]
     (if (< function-fun 0)
         0
         (let [function-syntax (syntax-fun-at function-fun)
@@ -9825,7 +9754,7 @@
 ;; (ECMA-262 §20.5.3.1, §21.3, §23.1.3.1, MakeConstructor).
 (defn realm-image-link-object-prototypes! [] (-> i64)
   (let [p (parser-state)
-        object-fun (syntax-find-fun "Object")]
+        object-fun (syntax-find-intrinsic-fun "Object")]
     (if (< object-fun 0)
         0
         (let [object-syntax (syntax-fun-at object-fun)
@@ -9909,7 +9838,7 @@
     (realm-image-intrinsic-data! entry fobj proto)
     (if (= (.parent entry) "")
         0
-        (let [pi (syntax-find-fun (.parent entry))]
+        (let [pi (syntax-find-intrinsic-fun (.parent entry))]
           (if (< pi 0)
               (panic "realm-image-constructor-setup!: the parent intrinsic was not declared")
               0)
@@ -10290,6 +10219,271 @@
           (None [] 0))
         0)))
 
+;; Materialize one declared intrinsic once the program's headers exist and before the image facts do:
+;; its record, header, adapter, image objects and properties, in the phase order
+;; `realm-image-build!` uses, with the realm's prototype links refreshed. Its owner (a method's) or
+;; parent (a constructor's) is materialized first. The body waits in `pending-bodies`, because a
+;; demand can arrive in the middle of lowering another body (`parser-lower-pending-bodies!`).
+;; Answers whether anything was added.
+(defn parser-materialize-intrinsic! [(entry Intrinsic)] (-> bool)
+  (let [p (parser-state)
+        table (intrinsic-table)
+        start (parser-node (.lower-start p))
+        stop (parser-node (.lower-stop p))]
+    (if (or (= (.lower-start p) 0) (= (.lower-stop p) 0))
+        (panic "parser-materialize-intrinsic!: the program's passes have not begun")
+        0)
+    (if (or (and (intrinsic-namespace? entry) (>= (syntax-namespace-index (.name entry)) 0))
+            (and (not (intrinsic-namespace? entry)) (>= (syntax-find-intrinsic-fun (.name entry)) 0)))
+        false
+        (do
+          (if (!= (.parent entry) "")
+              (parser-materialize-intrinsic! (get table (intrinsic-index table (.parent entry))))
+              false)
+          (if (intrinsic-method? entry)
+              (parser-materialize-intrinsic! (get table (intrinsic-index table (.owner entry))))
+              false)
+          (syntax-declare-intrinsic! entry)
+          (parser-check-late-reservation!)
+          (if (intrinsic-namespace? entry)
+              (do
+                (realm-image-namespace! (.name entry))
+                (realm-image-link-object-prototypes!)
+                (parser-materialize-chain-roots!)
+                true)
+              (let [fi (- (len (.funs p)) 1)]
+                (syntax-intrinsic-may-throw! fi)
+                (parser-fun-header! fi start)
+                (parser-fun-adapter! fi start stop)
+                (realm-image-function-object! fi)
+                (realm-image-root-binding! fi)
+                (realm-image-method-placement! fi)
+                (realm-image-register-prototype! fi)
+                (realm-image-link-function-prototypes!)
+                (realm-image-link-object-prototypes!)
+                (realm-image-constructor-record-setup! fi)
+                (push! [i64] (mut (.pending-bodies p)) fi)
+                (parser-materialize-chain-roots!)
+                true))))))
+
+;; Late materialization appends records, syntax nodes and global bindings while lowering holds
+;; pointers into those lists (`syntax-fun-ptr` across a lowering that demands an intrinsic). Reserve
+;; room for everything the declared surface can add, so no append reallocates under such a pointer;
+;; `parser-materialize-intrinsic!` refuses to exceed the reservation.
+(defn parser-reserve-late-materialization! [] (-> i64)
+  (let [p (parser-state)
+        table (intrinsic-table)
+        rows (len table)
+        (mut widest) 0]
+    (al-for [r table] (let [row r] (if (> (.arity row) (load widest)) (set! (mut widest) (.arity row)) 0)))
+    (al-reserve! [SyntaxFun] (mut (.funs p)) (+ (len (.funs p)) rows))
+    ;; An intrinsic record adds `this`, `new.target`, its own name, one name per slot and its body.
+    (al-reserve! [SyntaxExpr] (mut (.exprs p)) (+ (len (.exprs p)) (* rows (+ (load widest) 4))))
+    (al-reserve! [GlobalBinding] (mut (.globals p)) (+ (len (.globals p)) rows))
+    (al-reserve! [(slice u8)] (mut (.namespaces p)) (+ (len (.namespaces p)) rows))
+    (set! (.late-exprs-cap p) (al-cap [SyntaxExpr] (.exprs p)))
+    (set! (.late-funs-cap p) (al-cap [SyntaxFun] (.funs p)))
+    0))
+
+(defn parser-check-late-reservation! [] (-> i64)
+  (let [p (parser-state)]
+    (if (or (!= (al-cap [SyntaxFun] (.funs p)) (.late-funs-cap p))
+            (!= (al-cap [SyntaxExpr] (.exprs p)) (.late-exprs-cap p)))
+        (panic "parser-materialize-intrinsic!: late materialization outgrew its reservation (a list reallocated under lowering pointers)")
+        0)))
+
+;; Every declared [[Prototype]] chain ends at %Object.prototype%, and every function object's is
+;; %Function.prototype%: a realm that materialized any intrinsic has both.
+(defn parser-materialize-chain-roots! [] (-> i64)
+  (let [table (intrinsic-table)]
+    (parser-materialize-intrinsic! (get table (intrinsic-index table "Object")))
+    (parser-materialize-intrinsic! (get table (intrinsic-index table "Function")))
+    0))
+
+;; Lower the bodies of records materialized since the last boundary; a body can materialize more.
+(defn parser-lower-pending-bodies! [] (-> i64)
+  (let [p (parser-state)
+        stop (parser-node (.lower-stop p))
+        (mut i) 0]
+    (loop (if (>= (load i) (len (.pending-bodies p)))
+              (break 0)
+              (do
+                (parser-fun-body! (get (.pending-bodies p) (load i)) stop)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (al-clear! [i64] (mut (.pending-bodies p)))
+    (load i)))
+
+;; An intrinsic record's may-throw: its body is one JSL builtin call over its parameters, so the
+;; syntactic walk has no call edges to other records.
+(defn syntax-intrinsic-may-throw! [(fi i64)] (-> i64)
+  (let [f (syntax-fun-ptr fi)
+        (mut direct) false
+        (mut edges) (al-new [i64] (compiler-allocator))]
+    (match (.expression-body f)
+      (Some [e] (syntax-throw-walk-expr! e false (mut direct) (mut edges)))
+      (None [] (panic "syntax-intrinsic-may-throw!: an intrinsic record has no expression body")))
+    (if (> (len (load edges)) 0)
+        (panic "syntax-intrinsic-may-throw!: an intrinsic body calls a source function")
+        0)
+    (set! (.may-throw f) (load direct))
+    (al-free! [i64] (mut edges))
+    0))
+
+;; A well-known intrinsic prototype a lowering names (`Object.prototype` for a literal,
+;; `Function.prototype` for a function object, `%IntrinsicPrototype` in JSL): the reference is a
+;; demand, so the realm materializes its declared constructor first. Its image entry, or -1 where
+;; the program has no realm (function-entry mode) or does not declare the constructor.
+(defn parser-intrinsic-prototype-entry [(name (slice u8))] (-> i64)
+  (do
+    (parser-demand-intrinsic-prototype! name)
+    (heap-intrinsic-entry name)))
+
+(defn parser-demand-intrinsic-prototype! [(name (slice u8))] (-> i64)
+  (let [p (parser-state)
+        suffix ".prototype"]
+    (if (not (.script-mode p))
+        0
+        (if (or (<= (len name) (len suffix))
+                (!= (subslice [u8] name (- (len name) (len suffix)) (len name)) suffix))
+            (panic "parser-demand-intrinsic-prototype!: not a well-known prototype name")
+            (let [table (intrinsic-table)
+                  i (intrinsic-index table (subslice [u8] name 0 (- (len name) (len suffix))))]
+              (if (< i 0)
+                  0
+                  (do
+                    (if (= (.lower-start p) 0)
+                        (panic "parser-demand-intrinsic-prototype!: a prototype was named before the program's passes")
+                        0)
+                    (parser-materialize-intrinsic! (get table i))
+                    0)))))))
+
+;; The JSL lowering's hook (`jsl-set-intrinsic-demand!`).
+(defn parser-jsl-demand-intrinsic [(bytes (ptr u8)) (n i64)] (-> i64)
+  (parser-demand-intrinsic-prototype! (slice-new [u8] bytes n)))
+
+;; ---------------------------------------------------------------------------
+;; The realm is materialized by demand (docs/DECISIONS.md)
+;;
+;; A closed program's realm holds the declared intrinsics the program can observe. Identifier
+;; references to a declared root are bindings resolved during syntax collection; implicit references
+;; (a literal's or a function's prototype, `%IntrinsicPrototype` in JSL) materialize at the reference;
+;; everything else — `o.m`, `o[k]`, `this.Array`, reflection — is observed on the graphs by
+;; `imagefacts-surface-demands!` and materialized here, scan after scan, until a scan observes nothing
+;; new. Only then are the value-call code-word types final.
+
+;; The declared row an observation (owner, key) selects: a root on the global object, or a method
+;; on a materialized carrier (a constructor's function object or `prototype`, or a namespace).
+(defn parser-row-observed? [(row Intrinsic) (d ImageDemand)] (-> bool)
+  (let [key-matches
+          (or (< (.key d) 0)
+              (shape-key-name-eq? (.key d) (if (intrinsic-method? row) (.prop row) (.name row))))]
+    (if (not key-matches)
+        false
+        (if (not (intrinsic-method? row))
+            (= (.owner d) (heap-global-entry))
+            (if (= (.target row) INTRINSIC-TARGET-NAMESPACE)
+                (let [ns (syntax-namespace-index (.owner row))]
+                  (and (>= ns 0)
+                       (< ns (len (.namespace-entries (parser-state))))
+                       (= (.owner d) (get (.namespace-entries (parser-state)) ns))))
+                (let [fi (syntax-find-intrinsic-fun (.owner row))]
+                  (if (< fi 0)
+                      false
+                      (let [f (syntax-fun-at fi)]
+                        (if (< (.static-entry f) 0)
+                            false
+                            (if (= (.target row) INTRINSIC-TARGET-PROTOTYPE)
+                                (and (syntax-intrinsic-constructor? fi)
+                                     (= (.owner d) (realm-image-prototype-of (.static-entry f))))
+                                (= (.owner d) (.static-entry f))))))))))))
+
+;; The Funs `parser-close-world!` will leave with unknown callers: the process entry and every
+;; adapter `parser-adapter-open?` keeps open.
+(defn parser-open-funs [] (-> (ArrayList i64))
+  (let [(mut open) (al-new [i64] (compiler-allocator))
+        (mut fi) 0]
+    (push! [i64] (mut open) (n-nid (parser-entry-fun)))
+    (loop (if (>= (load fi) (len (.funs (parser-state))))
+              (break 0)
+              (let [f (syntax-fun-at (load fi))]
+                (if (and (syntax-fun-lowered? (load fi))
+                         (!= (.adapter-nid f) 0)
+                         (parser-adapter-open? (load fi)))
+                    (push! [i64] (mut open) (.adapter-nid f))
+                    0)
+                (set! (mut fi) (+ (load fi) 1))
+                (continue))))
+    (load open)))
+
+;; One scan: materialize every declared row some observation selects. Answers whether any was added.
+(defn parser-apply-surface-demands! [] (-> bool)
+  (let [demands (imagefacts-surface-demands! (.external-mutation (parser-state)) (parser-open-funs))
+        table (intrinsic-table)
+        (mut seen) (hm-new [i64 bool] (compiler-allocator) (i64-keyops))
+        (mut added) false]
+    (al-for [item demands]
+            (let [d item
+                  ;; Owner and key fit in one word: entries and key ids are far below 2^31.
+                  id (+ (* (+ (.owner d) 1) 2147483648) (+ (.key d) 1))]
+              (if (hm-contains? (load seen) id)
+                  0
+                  (do
+                    (set! (mut seen) id true)
+                    (al-for [r table]
+                            (let [row r]
+                              (if (and (parser-row-observed? row d)
+                                       (parser-materialize-intrinsic! row))
+                                  (do
+                                    ;; `AOT_REALM_TRACE=1` narrates each row the scan materialized and why.
+                                    (if (!= (primitive/cast i64 (os/getenv c"AOT_REALM_TRACE")) 0)
+                                        (do (println "realm: {s} observed as (entry {}, key {})" (.name row) (.owner d) (.key d)) 0)
+                                        0)
+                                    (set! (mut added) true))
+                                  0)))))))
+    (hm-free! (mut seen))
+    (load added)))
+
+;; Lower pending parser bodies and JSL definitions until neither has work: each can demand the other.
+(defn parser-drain-lowering! [] (-> i64)
+  (loop (do
+          (jsl-define-pending!)
+          (if (> (parser-lower-pending-bodies!) 0) (continue) (break 0)))))
+
+;; The fixpoint, then the final value-call type: every function a code word can hold now exists.
+(defn parser-settle-realm! [] (-> i64)
+  (let [p (parser-state)]
+    (parser-drain-lowering!)
+    (if (and (.script-mode p) (parser-realm-by-demand?))
+        (loop (if (parser-apply-surface-demands!)
+                  (do (parser-drain-lowering!) (continue))
+                  (break 0)))
+        0)
+    (let [final (parser-value-funptr-ty)
+          count (arena-node-count)
+          (mut i) 1]
+      (jsl-set-value-call-abi! final)
+      (loop (if (> (load i) count)
+                (break 0)
+                (do
+                  (match (arena-node (load i))
+                    (Some [n]
+                          (if (and (not (n-dead? n))
+                                   (or (= (n-op n) OP-LOAD) (= (n-op n) OP-STORE))
+                                   (= (mem-alias-of-node n) ALIAS-FUNCTION-CODE))
+                              (mem-redeclare-code-word! n final)
+                              0))
+                    (None [] 0))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      0)))
+
+;; A closed program decides its realm by demand. A shared-realm provider carries the declared
+;; surface, its clients carry none of its methods, and any other external Script unit carries the
+;; declared surface too, since another unit it cannot see may observe any of it.
+(defn parser-realm-by-demand? [] (-> bool)
+  (not (.external-mutation (parser-state))))
+
 (defn parse-program-sources-config [(sources (ArrayList (slice u8)))
                                     (script-mode bool)
                                     (external-mutation bool)
@@ -10316,6 +10510,10 @@
     (let [start (start-make (ty-int-bot))
           stop (stop-make)
           (mut fi) 0]
+      (set! (.lower-start (parser-state)) (n-nid start))
+      (set! (.lower-stop (parser-state)) (n-nid stop))
+      (parser-reserve-late-materialization!)
+      (jsl-set-intrinsic-demand! (primitive/fnptr-of parser-jsl-demand-intrinsic))
       ;; Header pass: install all Fun/Parm nodes before lowering any call-bearing body. Hoisted
       ;; top-level declarations and admitted function values are Funs, all over the shared ABI;
       ;; other function forms are refused at their use.
@@ -10332,17 +10530,20 @@
       (if (.script-mode (parser-state)) (realm-image-build!) 0)
       ;; Body pass: ScopeNode is the sole SSA environment. Statements update its ordinary graph
       ;; edges; no post-parse name-resolution or SSA construction pass exists.
+      ;; Only the records that exist now: one materialized while a body lowers waits in
+      ;; `pending-bodies` and is lowered once, by `parser-settle-realm!`.
       (set! (mut fi) 0)
-      (loop (if (>= (load fi) (len (.funs (parser-state))))
+      (let [body-count (len (.funs (parser-state)))]
+      (loop (if (>= (load fi) body-count)
                 (break 0)
-                (do (parser-fun-body! (load fi) stop) (set! (mut fi) (+ (load fi) 1)) (continue))))
+                (do (parser-fun-body! (load fi) stop) (set! (mut fi) (+ (load fi) 1)) (continue)))))
       (parser-install-entry-wrapper! start stop)
       ;; Every semantic call is installed: lower the bodies of the JSL definitions the program
       ;; demanded, and of those they demand, before pessimistic Iter sees the graph. A definition
       ;; nothing reached has no graph (docs/DECISIONS.md, JSL definitions are built on demand).
       ;; A body's `%CallFunction` lowers against the program's value-call ABI, settled now.
       (jsl-set-value-call-abi! (parser-value-funptr-ty))
-      (jsl-define-pending!)
+      (parser-settle-realm!)
       stop)))
 
 (defn parse-program [(src (slice u8))] (-> (dyn NodeOps))

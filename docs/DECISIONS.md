@@ -1,15 +1,63 @@
 # Decisions
 
+## 2026-09-15 — The realm is materialized by demand
+
+Which declared intrinsics a closed program's realm holds was a name scan of the source: a member
+spelled `push` materialized every `push`, `toString` materialized `Object`, `Number` and `Boolean`,
+and a method reached only through a computed key, reflection or an implicit prototype did not exist
+at all. It is now a demand fixpoint over the program's own graphs, in three parts:
+
+- **Identifiers.** A root an identifier names is declared during syntax collection, with its
+  parent. Any root, a hoisted function in the image, or an external boundary also brings `Object`
+  and `Function`, where every declared [[Prototype]] chain ends.
+- **Implicit references.** A literal's `%Object.prototype%`, a function object's
+  `%Function.prototype%`, and `%IntrinsicPrototype` in a JSL body demand their constructor where
+  they are lowered (`parser-demand-intrinsic-prototype!`, the JSL hook `jsl-set-intrinsic-demand!`).
+  The record, header, adapter and image objects are built at once; the body waits in
+  `pending-bodies`, because a demand arrives in the middle of lowering another body.
+- **Observations.** `imagefacts-surface-demands!` runs the image facts transfer before the world
+  closes, without publishing facts, and reports every (owner, key) an object-model read or store
+  can observe. [[Get]], [[Set]] and holder questions include the owner's image prototype chain; a
+  runtime key or a reflection means every key; a TOP owner means every escaped entry.
+  `parser-apply-surface-demands!` maps observations to declared rows (a root on the global object,
+  a method on a materialized carrier), materializes them, drains the lowering queues, and scans
+  again until nothing new is observed (`parser-settle-realm!`).
+
+Two refinements make the scan precise enough to be worth running. It analyses callers as the
+closed world will have them: only the process entry and adapters `parser-adapter-open?` keeps open
+have unknown callers. Otherwise every Return escapes before closing, and pair forwarding refuses
+every generic body. And a key crossing a generic body as a parameter is the finite set of constant
+keys its callers pass (`keys--compute`), not a runtime key. Without these, `f.a = 1` materialized
+the entire declared surface; with them it materializes nothing late.
+
+Materializing late has three consequences:
+
+- The ABI slot count covers every declared body.
+- `.funs`, `.exprs` and `.globals` are reserved up front (`parser-reserve-late-materialization!`),
+  because lowering holds pointers into them across a demand. The first version crashed on a freed
+  `syntax-fun-ptr`, found with Guard Malloc.
+- Value-call code-word Loads and Stores are redeclared to the final function set once the fixpoint
+  settles (`mem-redeclare-code-word!`), before any optimization pass computed from them.
+
+An intrinsic record is found by `syntax-find-intrinsic-fun`, never by the name a Script
+declaration can shadow. `function Error` shadows the global binding but not %Error%, which
+`TypeError`'s chain and the language's own errors still use. Before, a shadowing declaration
+silently became %Error%.
+
 ## 2026-09-15 — The provider carries the declared surface; clients carry no methods
 
 Separately compiled Script units share one realm, so no unit's view of its own syntax can decide
 which built-in methods the realm needs. The shared runtime-library provider
 (`pipeline-shared-jsl-image`, `JSL-LINK-PROVIDER`) now materializes every declared root and every
-declared method as the realm's canonical identities. Its clients (`JSL-LINK-IMPORT`) materialize
-no methods of their own. A client's method read, named or computed, reaches the canonical object
-through the runtime (external-mutation facts keep an absent key unfolded), and fresh-realm assembly
-no longer unions per-unit method sets. A closed program still decides by the member names it
-spells, until the demand fixpoint replaces that.
+declared method as the realm's canonical identities. Every retained Script unit
+(`pipeline-encode-script-unit!`) is its client (`JSL-LINK-IMPORT`): there is no standalone
+retained unit, and the source cache always acquires the provider. A client materializes the
+foundational chain objects and the roots its identifiers bind, never a method; its method reads,
+named or computed, reach the canonical objects through the runtime (external-mutation facts keep an
+absent key unfolded), and fresh-realm assembly never unions per-unit method sets. Tests that
+assemble retained units by hand bind them to the provider (`tests/library-support.coil`). A
+standalone unit carrying the whole surface cost about 3.5 times the machine nodes (17,823 against
+the 5,000-node retained-read budget), which is why no unit carries it but the provider.
 
 The full surface costs about 1.4 s to compile, and a test262 worker is replaced after every fatal
 refusal, which discards its native cache. So the supervisor primes the source cache with the
@@ -79,9 +127,9 @@ The move itself preserved the realm exactly (an identical test262 results.tsv). 
 gave every built-in function its `length` (a required `:length`, distinct from the slot count:
 `Array.prototype.push` has length 1 and four slots) and `name`, defined in that order and
 configurable only (CreateBuiltinFunction), and a built-in constructor's `prototype` lost its
-writable bit. Still open: source functions have no `name` or `length`, and which intrinsics exist
-is decided by the names in the source. (Non-constructor built-ins lost their `prototype` with the
-[[Construct]] flag, above.)
+writable bit. Still open: source functions have no `name` or `length`. (Non-constructor built-ins
+lost their `prototype` with the [[Construct]] flag, and which intrinsics exist is now decided by
+demand, above.)
 
 ## 2026-09-15 — Non-constant float arithmetic is typed F64, not the operands' meet
 
