@@ -26,6 +26,12 @@ definitions and the property-store folds all take a key id rather than a name; r
 transition path from names would have given a Symbol's key a string key of the same label, which is
 exactly what it did until the iterator's slots appeared as ordinary property names.
 
+**Spread is the same walk.** `[0, ...xs, 1]` appends every value the iterable yields, so the literal
+stops using its syntactic index once a spread has run and every later element lands at the array's
+own length. `f(...xs)` builds that array and calls with it (`JsCallWithArray`), which is the path a
+bound function's call already took — a spread makes the argument count a runtime question, and the
+fixed slots cannot carry one.
+
 **%ArrayIteratorPrototype% is a declared object with no global binding** (`:anonymous`), registered
 under the name JSL asks for, and `Array.prototype[@@iterator]` is a method row whose key is a
 well-known Symbol (`:symbol`). `Array.prototype.values` is not declared yet: it must be the same

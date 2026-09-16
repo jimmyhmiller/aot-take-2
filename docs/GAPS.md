@@ -85,9 +85,11 @@ Symbol-keyed properties (a Symbol used as a key refuses), the well-known symbols
 `for-of` executes over any iterable — a user object with @@iterator, and arrays through
 `Array.prototype[@@iterator]` — with `break` and `continue`, and closes the iterator when it leaves
 early (docs/DECISIONS.md, iteration). `console.log`, `console.error` and `globalThis` exist, so a
-program can be watched (docs/DECISIONS.md, the console). Missing: spread and array destructuring,
-which are the same protocol and come next; a string's iterator; `Array.prototype.values`, `keys` and
-`entries`; `for await`; and an object inspector for `console.log`.
+program can be watched (docs/DECISIONS.md, the console). Spread executes in both places it iterates: an array literal (`[0, ...xs, 1]`, where a later element
+lands where the spread left off) and an argument list (`f(...xs)`, `o.m(...xs)`, which becomes a call
+over an argument array). Missing: array destructuring, which is the same protocol; object spread,
+which is CopyDataProperties rather than iteration; a string's iterator; `Array.prototype.values`,
+`keys` and `entries`; `for await`; and an object inspector for `console.log`.
 
 ### 2026-09-16 — Computed property keys
 
