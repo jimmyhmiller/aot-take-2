@@ -1,5 +1,17 @@
 # Decisions
 
+## 2026-09-16 — Well-known symbols
+
+**Each is one image allocation.** `Symbol.iterator` and its twelve siblings are declared as data rows
+whose value form is `(symbol "description")`: the realm image builder makes one Symbol entry per
+declaration, so the value has the identity the specification requires for the program's life, and
+the row's attributes are the specification's — neither writable, enumerable nor configurable.
+
+**Their property key is minted on first use.** A key id belongs to the running program and the image
+is written before it starts, so an image Symbol's key word starts unminted and `rt-symbol-key` fills
+it the first time the Symbol is used as a key. Nothing else changes: the id is then as stable as a
+runtime Symbol's, and the compiler's static key table still holds names only.
+
 ## 2026-09-16 — Symbol keys
 
 **A Symbol's property key is minted with the Symbol.** The shape tree transitions on key ids, and a

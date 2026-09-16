@@ -55,6 +55,14 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-16 — Well-known symbols
+
+The thirteen well-known Symbols exist as values on the `Symbol` constructor, with the right
+identity, description and attributes, and each is usable as a property key (docs/DECISIONS.md,
+well-known symbols). Missing: everything that consults one — the iteration protocol (@@iterator),
+@@toPrimitive in ToPrimitive, @@hasInstance in `instanceof`, @@toStringTag in
+`Object.prototype.toString` — each still behaves as it did before the symbols existed.
+
 ### 2026-09-16 — Symbol keys
 
 A Symbol is a property key: `o[s] = v`, reads, writes, `delete`, and a computed Symbol key in an
