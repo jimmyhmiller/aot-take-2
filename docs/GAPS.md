@@ -80,6 +80,15 @@ TypeError every conversion of a Symbol raises execute (docs/DECISIONS.md, symbol
 Symbol-keyed properties (a Symbol used as a key refuses), the well-known symbols, `Symbol.for` and
 `Symbol.keyFor`, the `description` accessor, and a Symbol wrapper object.
 
+### 2026-09-16 — Script lexical bindings
+
+`let`, `const` and `class` at a Script's top level are realm bindings in a closed program too, so a
+function of the Script reads and writes them, with the dead zone and a `const` write's TypeError
+(docs/DECISIONS.md, a Script's lexical bindings). This is what a program that defines a class at the
+top level and uses it in a function needs. Missing: the same for a *block*'s lexicals captured by a
+nested function, which is the closure gap, and `var`-like globals assigned from a function in a
+closed program.
+
 ### 2026-09-16 — Iteration and output
 
 `for-of` executes over any iterable — a user object with @@iterator, and arrays through

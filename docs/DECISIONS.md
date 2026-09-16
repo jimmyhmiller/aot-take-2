@@ -1,5 +1,21 @@
 # Decisions
 
+## 2026-09-16 — A Script's lexical bindings belong to the realm
+
+`let`, `const` and `class` at a Script's top level were Scope values of the Script's own initializer
+in a closed program, so a function of that Script could not see them: `class C {} function f() { new
+C(); }` refused by name. That is most of what a real program looks like.
+
+**Both unit kinds now do what the reusable one already did**: the Script root creates a realm lexical
+binding for each of them, its declaration initializes that binding, and every read and write names it
+— by slot where the initializer knows it, and by key from a function, which is a runtime lookup that
+raises the dead zone's ReferenceError and a `const` write's TypeError where the specification says.
+The Scope keeps only an initialized `const`'s value, as a cache that its own initialization
+dominates.
+
+The syntactic may-throw filter counts a Script-lexical read, because the dead zone is a real
+completion rather than a compile-time refusal.
+
 ## 2026-09-16 — Iteration
 
 `for-of` refused, and with it spread and array destructuring, because the protocol did not exist.
