@@ -1,5 +1,31 @@
 # Decisions
 
+## 2026-09-16 — Date, and what non-tail recursion costs
+
+A Date is **one number** — milliseconds since the epoch, in an internal slot — and the whole
+calendar is arithmetic over it, exactly as §21.4.1 defines it. The host is asked for two things and
+nothing else: the clock (`%DateNow`) and the local zone's offset (`%LocalTimeZoneOffset`).
+
+**The offset is asked per instant, not once.** A zone with daylight saving has two offsets a year,
+and which one applies depends on the instant being converted, so `localtime_r` is called with the
+second being converted rather than with "now". Local time is `t + offset(t)`, and every local
+accessor is the UTC one over that shifted number. The inverse is approximate where an offset
+changes — a local time inside a spring-forward gap has no instant and one inside the autumn overlap
+has two — which is what every engine does.
+
+Every division floors rather than truncating, because an instant before 1970 is negative and
+truncation toward zero puts it in the wrong day, hour and year. `new Date("1969-07-20T20:17:00")`
+is the test that catches it.
+
+**Non-tail recursion in a JSL definition is a compile-time catastrophe.** `JsDaysBeforeMonth`
+accumulated on the way *back out* of its recursion — the only definition in the file that was not
+tail recursive — and compiling a program that could merely reach it took **over ten minutes of CPU**
+instead of under a second. Rewritten with an accumulator, the same program compiles in 0.85 s. The
+tail-recursive walks beside it (`JsDateDigitsFrom`, `JsYearCorrect`, the month walks) were never a
+problem. Two related shapes cost time the same way and are worth recognizing: a recursive helper
+that calls another helper **twice per level** doubles at every level, and a field accessor that
+recomputes the year search in each of its arms pays for it once per arm.
+
 ## 2026-09-16 — Map and Set
 
 A Map's entries are two arrays under internal slots — the keys and the values at matching indices —

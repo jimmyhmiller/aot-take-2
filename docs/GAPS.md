@@ -560,6 +560,22 @@ group name (ID_Start/ID_Continue tables are not in the compiler) fails closed as
 error. Regex objects still do not lower (`regular expression objects`); the pattern is validated,
 not compiled.
 
+### 2026-09-16 — Date
+
+`Date` executes: construction from now, a time value, an ISO string or calendar parts; the UTC and
+local accessors; `getTimezoneOffset`, `setTime`, `toISOString`, `toJSON`, `toString`,
+`@@toPrimitive`; and `Date.now`/`parse`/`UTC` (docs/DECISIONS.md — Date). Missing: the setters other
+than `setTime`; `getYear`/`setYear` and the other Annex B legacy names; `toLocaleString` and
+anything else locale-aware, which needs ICU data; `toUTCString`'s RFC 7231 shape; milliseconds as a
+constructor argument (the parts stop at seconds); and `Date.parse` of anything but the ISO shape —
+a non-ISO string is an invalid Date rather than a guess, which is what the specification permits.
+
+**A compiler bug is worked around here.** `JsFloorDiv` and `JsFloorMod` are `:noinline` because
+inlining them at a dozen call sites with different constant divisors panics the type analysis:
+`n-set-ty!: monotonicity violated: new type int[4..146097]^2 is not at least as specific as old
+int[4..86400000]^1` — a Phi's type widened instead of narrowing. The workaround keeps the divisor a
+parameter; the bug is real and is the thing to fix.
+
 ### 2026-09-16 — Collections
 
 `Map` and `Set` execute: construction from an iterable, `get`/`set`/`add`/`has`/`delete`/`clear`,

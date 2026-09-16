@@ -173,6 +173,7 @@ aot-take-2/
 │           ; collect.jsl Array.from/of, Object.entries/values/assign, the Number predicates
 │           ; json.jsl JSON.stringify and JSON.parse
 │           ; map-set.jsl Map and Set: entry arrays under internal slots, scanned
+│           ; date.jsl Date: one instant in a slot, and the calendar as arithmetic over it
 │       function/ array-buffer/ data-view/ typed-array/
 ├── src/
 │   ├── main.coil            ; CLI driver: compile, emit, run, dump; `AOT_SEED=N` compiles under a test's arena seed
