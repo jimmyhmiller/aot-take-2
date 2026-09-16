@@ -1,5 +1,32 @@
 # Decisions
 
+## 2026-09-15 — Derived classes: extends and super()
+
+**A body that needs the call itself gets hidden slots.** The slot after a record's formals, which an
+arguments object and a rest parameter already used, is now a list: the call's actuals (or its
+arguments object) and then the function object being called (`JsCallCallee`). A derived constructor
+needs the latter, because `super()` constructs the *running constructor's* [[Prototype]] — the class
+it extends — which is reachable only from the constructor itself (`syntax-fun-hidden-count`,
+`syntax-fun-callee-slot`). A call of such a function goes through its entry, which is the only place
+those operands exist.
+
+**A derived constructor's `this` is a binding.** It has [[Construct]] without the base bit, so the
+receiver `new` creates is undefined and the binding starts uninitialized; `super()` constructs the
+parent with the call's arguments and the running `new.target` (`JsSuperConstruct`) and binds the
+result, and a second `super()` in the same constructor is a ReferenceError, as is reading `this`
+before one (`JsRequireThisInitialized`). A constructor's result is an object it returned, else its
+`this` for a base constructor and, for a derived one, its bound `this` — a returned primitive being
+a TypeError (`JsConstructorResult`). The class with no `constructor` element gets the synthesized
+`constructor(...args) { super(...args); }`, whose body is lowered from those slots directly.
+
+**The heritage links both chains.** `extends` evaluates to a constructor or null: its `prototype`
+heads the class's prototype object, and it heads the constructor itself, so static members are
+inherited (`JsClassHeritagePrototype`, `JsMakeDerivedClassPrototype`). `extends null` gives a
+prototype object with no prototype and leaves the constructor on %Function.prototype%.
+
+`super.x` in a method (its home object), fields, static blocks, computed keys and private names
+still refuse by name.
+
 ## 2026-09-15 — Base classes
 
 `class` refused as "class definitions", which was the largest implementable blocker of the campaign.

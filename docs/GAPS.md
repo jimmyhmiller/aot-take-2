@@ -55,6 +55,12 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-15 — Derived classes
+
+`extends`, `super()` in a constructor, inherited methods and statics, and the synthesized default
+derived constructor execute (docs/DECISIONS.md, derived classes). Missing: `super.x` in a method,
+which needs its home object.
+
 ### 2026-09-15 — Base classes
 
 A class with no heritage — its constructor, methods, accessors, statics, prototype links and the
