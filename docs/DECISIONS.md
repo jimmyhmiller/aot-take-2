@@ -1,5 +1,23 @@
 # Decisions
 
+## 2026-09-16 — Computed property keys
+
+`{[k]: v}` and `class C { [k]() {} }` refused by name. A computed key is an expression evaluated
+where it is written, and its conversion to a property key is the only part that can fail — an object
+key goes through ToPrimitive with the string hint — so that conversion is one definition
+(`JsComputedKeyPrimitive`), and the interning at each definition site cannot throw. The syntactic
+may-throw filter counts a literal with a computed key, as it already counted a class.
+
+**A class evaluates every element's key in element order** (§15.7.14 step 25), which is why the keys
+are computed in one pass that also defines the methods, and kept for the static fields and blocks
+that run afterwards. An instance field's computed key still refuses: it is evaluated once, where the
+class is, and a construction would have to read it back from the class.
+
+**A computed key stops the literal's fixed layout**, as an accessor already did: the shape plan
+covers the keys the compiler knows, and every definition after an unknown one is ordinary. A
+computed `__proto__` is a data property, never the literal's prototype, which follows from the same
+split.
+
 ## 2026-09-16 — Closures: environment records
 
 A nested function that mentioned a binding of the function around it refused by name. Simple has no

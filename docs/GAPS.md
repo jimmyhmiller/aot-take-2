@@ -55,6 +55,12 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-16 — Computed property keys
+
+`{[k]: v}`, `{[k]() {}}`, `{get [k]() {}}` and a class's computed methods, accessors and static
+fields execute (docs/DECISIONS.md, computed property keys). Missing: a computed key on an instance
+field, and keys that are Symbols (there are no Symbols).
+
 ### 2026-09-16 — Closures
 
 A nested function that reads or writes a binding of the function around it executes: parameters,
