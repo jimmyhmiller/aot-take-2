@@ -80,6 +80,15 @@ TypeError every conversion of a Symbol raises execute (docs/DECISIONS.md, symbol
 Symbol-keyed properties (a Symbol used as a key refuses), the well-known symbols, `Symbol.for` and
 `Symbol.keyFor`, the `description` accessor, and a Symbol wrapper object.
 
+### 2026-09-16 — Iteration and output
+
+`for-of` executes over any iterable — a user object with @@iterator, and arrays through
+`Array.prototype[@@iterator]` — with `break` and `continue`, and closes the iterator when it leaves
+early (docs/DECISIONS.md, iteration). `console.log`, `console.error` and `globalThis` exist, so a
+program can be watched (docs/DECISIONS.md, the console). Missing: spread and array destructuring,
+which are the same protocol and come next; a string's iterator; `Array.prototype.values`, `keys` and
+`entries`; `for await`; and an object inspector for `console.log`.
+
 ### 2026-09-16 — Computed property keys
 
 `{[k]: v}`, `{[k]() {}}`, `{get [k]() {}}` and a class's computed methods, accessors and static

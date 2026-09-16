@@ -6182,6 +6182,10 @@
                       (lower-singleton (if (= name "Infinity")
                                            "JsInfinity"
                                            "JsNaN"))
+                  ;; globalThis (§19.1.1) is the realm's global object, which `this` already names
+                  ;; at a Script's top level.
+                  (if (= name "globalThis")
+                      (lower-global-object)
                       (if (>= (syntax-global-index name) 0)
                           (lower-global-load name)
                           (if (>= (syntax-find-fun name) 0)
@@ -6193,7 +6197,7 @@
                                       (lower-completion! (lower-jsl-unary-value "JsGlobalBindingRead"
                                                                                 (keyref-make (shape-key-intern name))))
                                       (lower-jsl-unary-value "JsUnresolvedGlobalRead"
-                                                             (keyref-make (shape-key-intern name)))))))))))))
+                                                             (keyref-make (shape-key-intern name))))))))))))))
 
 (defn parser-set-current-ctrl! [(ctrl (dyn NodeOps))] (-> i64)
   (do
@@ -9023,6 +9027,101 @@
                   (scope-pop! (parser-node (.current-scope (parser-state))))
                   0)))))))))
 
+;; The compiler-only Scope names a for-of loop carries across its iterations: the iterator and the
+;; `next` method read from it once, as GetIterator does (§7.4.2 step 5).
+(const FOR-OF-ITERATOR "$aot$.for-of.iterator")
+
+(const FOR-OF-NEXT "$aot$.for-of.next")
+
+;; True on every path through the body, false on the path the exhausted iterator takes: at the
+;; loop's exit it is the Phi that says whether control left early, and an early exit closes the
+;; iterator (§7.4.9). An iterator that answered `done` is already closed and must not be returned to.
+(const FOR-OF-EARLY "$aot$.for-of.early")
+
+;; ForIn/OfBodyEvaluation (§14.7.5.7) over the iteration protocol: the iterable is evaluated once,
+;; GetIterator answers the iterator and its `next`, and each iteration calls `next`, stops on a
+;; truthy `done`, and binds `value` in the head's own binding. A `break` or a `return` leaves through
+;; the exit scope, where the iterator is closed (§7.4.9) — the loop's normal end does not close it,
+;; because an exhausted iterator is already done.
+(defn lower-for-of [(head ForInit) (right i64) (body i64)] (-> i64)
+  (do
+    (scope-push! (parser-node (.current-scope (parser-state))))
+    (match head
+      (ForInitDecl [stmt]
+                   (match (syntax-stmt-node stmt)
+                     (SsLet [name init final annotation] (lower-instantiate-lexical-stmt! stmt))
+                     (SsVar [name init annotation] (lower-syntax-statement stmt))
+                     (_ (unimplemented "destructuring for-in/of heads" "docs/GAPS.md — destructuring"))))
+      (ForInitPattern [pattern]
+                      (unimplemented "destructuring for-in/of heads" "docs/GAPS.md — destructuring"))
+      (_ 0))
+    (let [iterable (lower-syntax-expr right)]
+      (n-keep! iterable)
+      (scope-pop! (parser-node (.current-scope (parser-state))))
+      (let [iterator (lower-completion! (lower-jsl-values1 "JsGetIterator" iterable))]
+        (n-unkeep! iterable)
+        (n-keep! iterator)
+        (let [next (lower-completion! (lower-jsl-values1 "JsIteratorNextMethod" iterator))
+              scope (parser-node (.current-scope (parser-state)))]
+          (n-keep! next)
+          (scope-push! scope)
+          (scope-define! scope FOR-OF-ITERATOR (ty-dyn TAG-ANY) false iterator)
+          (scope-define! scope FOR-OF-NEXT (ty-dyn TAG-ANY) false next)
+          (scope-define! scope FOR-OF-EARLY (ty-dyn TAG-ANY) false (lower-singleton "JsTrue"))
+          (n-unkeep! next)
+          (n-unkeep! iterator)
+          (let [entry (lower-loop-head!)
+                result (lower-completion!
+                         (lower-jsl-values2 "JsIteratorStep"
+                                            (lower-for-in-slot FOR-OF-ITERATOR)
+                                            (lower-for-in-slot FOR-OF-NEXT)))]
+            (n-keep! result)
+            (let [done (lower-js-truthy (lower-completion! (lower-jsl-values1 "JsIteratorDone" result)))
+                  condition-scope (parser-node (.current-scope (parser-state)))
+                  iff (if-make (scope-ctrl condition-scope) done)
+                  arms (if-arms! iff)]
+              ;; `done` true leaves the loop; the false arm is the body.
+              (scope-set-ctrl! condition-scope (arms-true arms))
+              (let [exit-scope (scope-dup condition-scope false)]
+                ;; Only the exhausted path is not an early exit; the body keeps the true it was
+                ;; given, so a `break` carries it into this same scope and the Phi says so.
+                (scope-update! exit-scope FOR-OF-EARLY (lower-singleton "JsFalse"))
+                (parser-push-jump! exit-scope JUMP-LOOP)
+                (scope-set-ctrl! condition-scope (arms-false arms))
+                (set! (.current-ctrl (parser-state)) (n-nid (arms-false arms)))
+                (let [value (lower-completion! (lower-jsl-values1 "JsIteratorValue" result))]
+                  (n-keep! value)
+                  (n-unkeep! result)
+                  (scope-push! (parser-node (.current-scope (parser-state))))
+                  (lower-for-in-bind! head value)
+                  (n-unkeep! value)
+                  (let [terminated (lower-syntax-statement body)]
+                    (scope-pop! (parser-node (.current-scope (parser-state))))
+                    (parser-close-continues! terminated)
+                    (scope-end-loop! entry (parser-node (.current-scope (parser-state))) exit-scope)
+                    (parser-pop-jump!)
+                    (n-unkeep! entry)
+                    (parser-use-scope! exit-scope)
+                    (lower-for-of-close!)
+                    (scope-pop! (parser-node (.current-scope (parser-state))))
+                    0))))))))))
+
+;; At the loop's exit: the iterator is closed exactly when control left the body early.
+(defn lower-for-of-close! [] (-> i64)
+  (let [early (lower-js-truthy (lower-for-in-slot FOR-OF-EARLY))
+        scope (parser-node (.current-scope (parser-state)))
+        iff (if-make (scope-ctrl scope) early)
+        arms (if-arms! iff)
+        skipped (scope-dup scope false)]
+    (scope-set-ctrl! scope (arms-true arms))
+    (set! (.current-ctrl (parser-state)) (n-nid (arms-true arms)))
+    (lower-completion! (lower-jsl-values1 "JsIteratorClose" (lower-for-in-slot FOR-OF-ITERATOR)))
+    (scope-set-ctrl! skipped (arms-false arms))
+    (let [merged (scope-merge! (parser-node (.current-scope (parser-state))) skipped)]
+      (set! (.current-scope (parser-state)) (n-nid merged))
+      (set! (.current-ctrl (parser-state)) (n-nid (scope-ctrl merged)))
+      0)))
+
 (defn lower-for-in-slot [(name (slice u8))] (-> (dyn NodeOps))
   (match (scope-lookup (parser-node (.current-scope (parser-state))) name)
     (Some [v] v)
@@ -9141,12 +9240,10 @@
     (SsDoWhile [body condition] (lower-do-while body condition))
     (SsFor [init test update body] (lower-for init test update body))
     (SsForIn [head of right body awaited]
-             (if (or awaited of)
-                 (unimplemented (if awaited
-                                    "for-await-of asynchronous iteration"
-                                    "for-of iteration protocol")
+             (if awaited
+                 (unimplemented "for-await-of asynchronous iteration"
                                 "docs/GAPS.md — iteration statements")
-                 (lower-for-in head right body)))
+                 (if of (lower-for-of head right body) (lower-for-in head right body))))
     (SsLabeled [label body] (lower-labeled label body))
     (SsThrow [value] (lower-throw value))
     (SsTry [body catch-param catch-body finally-body]
@@ -9717,7 +9814,11 @@
     ;; head is an environment write that can throw.
     (SsForIn [head of right body awaited]
              (do
-               (if (and (not protected) (.external-mutation (parser-state))) (set! direct true) 0)
+               ;; A for-of drives the iteration protocol: GetIterator, `next` and the result's
+               ;; property reads are all calls into user code, and each of them throws.
+               (if (and (not protected) (or of (.external-mutation (parser-state))))
+                   (set! direct true)
+                   0)
                (syntax-throw-walk-parts! id protected (mut direct) (mut edges))))
     ;; A class declaration evaluates the class: its member definitions can throw.
     (SsClassDecl [cls] (if protected 0 (set! direct true)))
@@ -10557,6 +10658,15 @@
 ;; still see `undefined`.
 ;; Reusable Script units omit source bindings from this template. Their initializers check and
 ;; create those bindings in the executing global; only intrinsic properties exist on adoption.
+;; globalThis (§19.1.1): the global object itself, writable and configurable but not enumerable.
+;; It is a property whose value is its own carrier, so it is defined here rather than declared.
+(defn realm-image-global-this! [(global i64)] (-> i64)
+  (heap-define-own-attrs! global
+                          "globalThis"
+                          (heap-ref-word DYNAMIC-PREFIX-OBJECT global)
+                          HEAP-WORD-REF
+                          (+ SHAPE-ATTR-WRITABLE SHAPE-ATTR-CONFIGURABLE)))
+
 (defn realm-image-build! [] (-> i64)
   (let [p (parser-state)
         global (heap-add-object! DYNAMIC-NULL-WORD)]
@@ -10567,6 +10677,7 @@
           (heap-define-own-attrs! global "undefined" DYNAMIC-UNDEFINED-WORD HEAP-WORD-CONST 0)
           (heap-define-own-attrs! global "Infinity" NUMBER-INFINITY-BITS HEAP-WORD-CONST 0)
           (heap-define-own-attrs! global "NaN" NUMBER-NAN-BITS HEAP-WORD-CONST 0)
+          (realm-image-global-this! global)
           0)
         (do
           (al-for [g (.globals p)]
@@ -10726,12 +10837,22 @@
         obj (heap-add-object! DYNAMIC-NULL-WORD)
         entry (get table (intrinsic-index table name))]
     (push! [i64] (mut (.namespace-entries p)) obj)
-    (heap-define-own-attrs! (heap-global-entry)
-                            name
-                            (heap-ref-word DYNAMIC-PREFIX-OBJECT obj)
-                            HEAP-WORD-REF
-                            (.attrs entry))
-    (heap-set-intrinsic! name obj)
+    (if (.anonymous entry)
+        ;; An object the specification names and a program cannot: no global binding, and the
+        ;; registry name is the one JSL asks for (docs/DECISIONS.md, iteration).
+        (let [(mut b) (sb-new (compiler-allocator))]
+          (sb-push-str! (mut b) name)
+          (sb-push-str! (mut b) ".prototype")
+          (heap-set-intrinsic! (sb-str (mut b)) obj)
+          0)
+        (do
+          (heap-define-own-attrs! (heap-global-entry)
+                                  name
+                                  (heap-ref-word DYNAMIC-PREFIX-OBJECT obj)
+                                  HEAP-WORD-REF
+                                  (.attrs entry))
+          (heap-set-intrinsic! name obj)
+          0))
     (realm-image-intrinsic-data! entry obj -1)))
 
 ;; A built-in method on its owner's object, with its declared attributes.
@@ -10746,12 +10867,27 @@
                       (if (= (.target entry) INTRINSIC-TARGET-PROTOTYPE)
                           (realm-image-prototype-of (.static-entry owner))
                           (.static-entry owner))))]
-          (heap-define-own-attrs! carrier
-                                  (.prop entry)
-                                  (heap-ref-word DYNAMIC-PREFIX-FUNCTION (.static-entry f))
-                                  HEAP-WORD-REF
-                                  (.attrs entry)))
+          (if (.symbol-key entry)
+              ;; `Array.prototype[@@iterator]`: the key is the well-known Symbol the row names, whose
+              ;; id the compiler minted with the Symbol itself (docs/DECISIONS.md, iteration).
+              (heap-define-own-key-attrs! carrier
+                                          (realm-image-well-known-key (.prop entry))
+                                          (heap-ref-word DYNAMIC-PREFIX-FUNCTION (.static-entry f))
+                                          HEAP-WORD-REF
+                                          (.attrs entry))
+              (heap-define-own-attrs! carrier
+                                      (.prop entry)
+                                      (heap-ref-word DYNAMIC-PREFIX-FUNCTION (.static-entry f))
+                                      HEAP-WORD-REF
+                                      (.attrs entry))))
         0)))
+
+;; The key of the well-known Symbol a row names: `Symbol.iterator` for "iterator".
+(defn realm-image-well-known-key [(name (slice u8))] (-> i64)
+  (let [(mut b) (sb-new (compiler-allocator))]
+    (sb-push-str! (mut b) "Symbol.")
+    (sb-push-str! (mut b) name)
+    (shape-key-intern-symbol! (sb-str (mut b)))))
 
 ;; A materialized constructor's prototype is a well-known intrinsic the lowering may name
 ;; (`%IntrinsicPrototype "Array.prototype"`).
@@ -11493,7 +11629,11 @@
 (defn parser-row-observed? [(row Intrinsic) (d ImageDemand)] (-> bool)
   (let [key-matches
           (or (< (.key d) 0)
-              (shape-key-name-eq? (.key d) (if (intrinsic-method? row) (.prop row) (.name row))))]
+              (if (and (intrinsic-method? row) (.symbol-key row))
+                  ;; A symbol-keyed row is observed by the well-known Symbol's key id: its `prop` is
+                  ;; the Symbol's name, which no property name reaches.
+                  (= (.key d) (realm-image-well-known-key (.prop row)))
+                  (shape-key-name-eq? (.key d) (if (intrinsic-method? row) (.prop row) (.name row)))))]
     (if (not key-matches)
         false
         (if (not (intrinsic-method? row))

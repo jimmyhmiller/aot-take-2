@@ -1,5 +1,54 @@
 # Decisions
 
+## 2026-09-16 — Iteration
+
+`for-of` refused, and with it spread and array destructuring, because the protocol did not exist.
+
+**Nothing is privileged.** GetIterator reads @@iterator, calls it, and requires an object; `next` is
+read once, as §7.4.2 does, so a later assignment to it is not seen; each step calls `next` and reads
+`done` and `value` with ordinary property access. A user object with those two methods drives the
+loop exactly as an array does — the built-in array iterator is one implementation of the protocol,
+not a fast path beside it (`jsl/compiler/iterator.jsl`).
+
+**The loop closes the iterator exactly when it leaves early.** A compiler-only binding is true on
+every path through the body and false on the path the exhausted iterator takes, so at the loop's
+exit it is the Phi that says whether control left early — and `break` reaches the exit carrying
+true. An iterator that answered `done` is already finished and must not be returned to (§7.4.9).
+
+**An internal slot is a key nothing can name.** The array iterator's array and index live in
+properties under keys the compiler mints for the purpose (`%InternalKey`), which are Symbol-flagged
+keys with no Symbol value: no name reaches them, `getOwnPropertySymbols` cannot produce them because
+there is no Symbol to produce, and enumeration passes over them. The brand check `next` performs is
+the presence of the first of them, which is what RequireInternalSlot is.
+
+**A key is an identity, and the tables now agree on that.** Shape transitions, the image's property
+definitions and the property-store folds all take a key id rather than a name; rebuilding a
+transition path from names would have given a Symbol's key a string key of the same label, which is
+exactly what it did until the iterator's slots appeared as ordinary property names.
+
+**%ArrayIteratorPrototype% is a declared object with no global binding** (`:anonymous`), registered
+under the name JSL asks for, and `Array.prototype[@@iterator]` is a method row whose key is a
+well-known Symbol (`:symbol`). `Array.prototype.values` is not declared yet: it must be the same
+function object as the @@iterator method, which needs an alias row, and two distinct objects would
+be a wrong identity rather than a missing one.
+
+## 2026-09-16 — The console
+
+A compiled program could not say anything: it had an exit code and an uncaught error, and no output.
+
+**`%HostWrite` is the whole host surface**: a string's code units and a stream. What a value looks
+like is decided in JSL, where ToString is — a string prints itself, a Symbol its description (ToString
+of one throws, and printing is not the place to raise it), and everything else converts, so an array
+joins and a plain object is "[object Object]". A richer rendering is an inspector, which is its own
+feature.
+
+**`console.log` is variadic because its code is the callable ABI** (`jsl-definition-abi?`): it sees
+the call's own argument count, so `log()` writes an empty line, which a fixed slot count could not
+distinguish from `log(undefined)`.
+
+`globalThis` is the global object itself, defined in the image as a property of its own carrier and
+resolved by name the way `undefined`, `Infinity` and `NaN` already were.
+
 ## 2026-09-16 — What the well-known symbols decide
 
 Three of them now decide what the specification says they decide, which is what makes them values
