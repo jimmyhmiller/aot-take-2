@@ -560,6 +560,27 @@ group name (ID_Start/ID_Continue tables are not in the compiler) fails closed as
 error. Regex objects still do not lower (`regular expression objects`); the pattern is validated,
 not compiled.
 
+### 2026-09-16 — The built-ins a script reaches for
+
+Added: `String.prototype.replace`/`replaceAll` (string patterns), `toUpperCase`/`toLowerCase`,
+`Array.prototype.splice`/`fill`/`flat`/`reduceRight`/`findLast`/`findLastIndex`,
+`Object.fromEntries` and `Number.prototype.toFixed`.
+
+Three divergences, each narrow and deliberate:
+
+- **Case conversion is ASCII only.** The specification's `toUpperCase` is Unicode Default Case
+  Conversion; without case-mapping tables a code point above 127 is left as it is, so
+  `"é".toUpperCase()` answers `"é"`. Wrong, known, and written here rather than hidden.
+- **`replace` takes a string pattern only.** A RegExp argument is the `Symbol.replace` protocol and
+  raises a TypeError naming that it is not implemented, rather than being coerced to a string and
+  matched literally. `$&` and the other substitution patterns in a string replacement are likewise
+  not expanded.
+- **`toFixed` rounds the scaled integer half away from zero**, so a value that is not exactly
+  representable can differ from an engine that works from the decimal expansion.
+
+These methods work on a real array or string receiver; called on an array-like through `.call`,
+they refuse by name rather than silently doing the wrong thing.
+
 ### 2026-09-16 — Date
 
 `Date` executes: construction from now, a time value, an ISO string or calendar parts; the UTC and
