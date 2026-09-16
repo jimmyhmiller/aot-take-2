@@ -560,6 +560,30 @@ group name (ID_Start/ID_Continue tables are not in the compiler) fails closed as
 error. Regex objects still do not lower (`regular expression objects`); the pattern is validated,
 not compiled.
 
+### 2026-09-16 — Regular expressions: what is there and what the next change is
+
+`src/parse/regex.coil` validates every pattern at parse time (below, 2026-09-07) but **returns a
+verdict, not a tree**: it is a single recursive-descent walk over decoded code points that answers
+`RegexOk`, an error, or `RegexUnknown`. Nothing about a regex lowers, so `/a/.test(s)` refuses by
+name, and `String.prototype.replace` raises a TypeError for a non-string pattern rather than
+guessing.
+
+The shape the next change should take, so it is not re-derived:
+
+- **Compile the pattern, do not interpret its text.** The pattern of a literal is known at compile
+  time, so the same grammar walk emits a program — `CHAR`, `ANY`, `CLASS`, `SPLIT`, `JMP`, `SAVE`,
+  `BACKREF`, `BOL`, `EOL`, `WORDB`, `MATCH` — into image data. `new RegExp(s)` over a value the
+  compiler cannot see needs that walk at run time, in JSL, and refuses by name until then.
+- **The matcher backtracks, because the specification does.** ECMA-262 §22.2.2 is defined by
+  continuations with ordered alternatives, not leftmost-longest, so `SPLIT` tries its first branch
+  to exhaustion before its second. A DFA would answer different capture groups.
+- **Write the VM's recursion knowing what non-tail recursion costs here.** A backtracking VM is
+  recursive at `SPLIT` by nature; keep that to ONE recursive call site, mark it `:noinline`, and
+  accumulate rather than building results on the way back out (docs/DECISIONS.md, Date — the same
+  shape cost over ten minutes of compile time for two lines of JavaScript).
+- The `u` and `v` flags decide whether a step is a code point or a code unit; the validator already
+  makes that distinction and the matcher must carry it rather than assuming UTF-16.
+
 ### 2026-09-16 — The built-ins a script reaches for
 
 Added: `String.prototype.replace`/`replaceAll` (string patterns), `toUpperCase`/`toLowerCase`,
