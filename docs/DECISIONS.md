@@ -1,5 +1,47 @@
 # Decisions
 
+## 2026-09-16 — Closures: environment records
+
+A nested function that mentioned a binding of the function around it refused by name. Simple has no
+closures, so this is designed here.
+
+**A captured binding stops being an SSA value.** Two functions share it and either may write it, so
+it moves into the activation's *environment record*: an array whose element 0 is the enclosing
+environment and whose other elements are that activation's captured bindings, in the order the
+capture pass assigned (`jsl/compiler/environment.jsl`). The binding is still an ordinary Scope
+binding in the parser — it just carries the slot it lives in (`Var.env-slot`), so every read and
+write of it goes to the slot and shadowing, blocks and merges keep working unchanged.
+
+**The function object carries the environment, and the callee slot carries it back.** A closure is
+allocated with the creating activation's environment in its environment word — the same word a bound
+function's record and a method's home object use — and a body that mentions a captured binding reads
+it back through the function object its entry was passed in the hidden callee slot, which is exactly
+the mechanism `super` already used. A record that only encloses a capture forwards the environment
+it was called with rather than allocating one, so the chain has one link per activation that owns
+bindings and a read walks a fixed number of links (`JsEnvAncestor`).
+
+**Capture is decided before lowering, by one sweep.** Every record's own references — its nested
+records excluded, since they ask for themselves — are resolved against the records enclosing it
+(`syntax-compute-captures!`). A parameter, a `var`, a body function declaration, a body-level `let`,
+`const` or `class`, and an arrow's `this` are all activation bindings, so each gets a slot. A binding
+of an enclosing *block* is not: a block inside a loop has one per iteration, which one slot cannot
+model, and capturing it still refuses by name.
+
+**An environment is compiler state, not a JavaScript value.** Nothing in a program can name one, so
+a word that is not an environment record is a failed invariant, not a completion: the accessors trap
+(`%TrapInvariant`) instead of throwing, and reading a captured binding is an ordinary value. The one
+exception is the temporal dead zone — a captured `let`, `const` or `class` has an *empty* slot until
+its initialization, and reading it there is a real ReferenceError (`JsEnvSlotInitialized`), which
+the syntactic may-throw filter accounts for.
+
+**A lattice repair fell out of it.** Meeting a high dynamic set with a low one produced the right
+set of tags represented as a *high* type, which left the meet above one of its own arguments;
+`ty-isa?`, which asks whether the meet is that argument, then answered no, and SCCP's pessimistic
+bound check turned a legal optimistic state into a panic wherever a call's target set widened during
+the optimistic pass — reachable before this work through a derived constructor or an arguments
+object. A meet with anything below the centreline lands below it, so the mixed meet is now the low
+set of the union of both denotations (tests/type-test.coil).
+
 ## 2026-09-16 — Class fields
 
 **A field initializer is a function, and it is called.** An initializer sees `this` and the names

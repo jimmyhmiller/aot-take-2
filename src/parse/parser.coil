@@ -374,7 +374,10 @@
    (default-derived bool)  ; the synthesized `constructor(...args) { super(...args); }`
    (needs-callee bool)  ; its body needs the function object being called (`super`)
    (needs-home bool)  ; its body reads `super.x`: its function object carries its home object
-   (class-index i64)])  ; a class constructor: the class whose instance fields it initializes, or -1
+   (class-index i64)  ; a class constructor: the class whose instance fields it initializes, or -1
+   (owns-env bool)  ; a nested function captures one of its bindings: it allocates an environment
+   (uses-env bool)  ; it mentions a captured binding of an enclosing activation, or encloses one
+   (env-names (ArrayList (slice u8)))])  ; its captured bindings, in environment slot order
 
 ;; A var-like global: a top-level `var` or function declaration of some Script of the realm. The
 ;; realm's global object carries one property per binding from the start.
@@ -1441,6 +1444,56 @@
                  (Some [f] (push! [i64] (mut out) f))
                  (None [] 0))))
       (SsWith [object body] (push! [i64] (mut out) body))
+      (SsDebugger [] 0)
+      (SsFunctionDecl [fun] 0)
+      (SsClassDecl [cls] 0))
+    0))
+
+;; The expressions one statement owns, exhaustively — the counterpart of `syntax-stmt-children!`,
+;; which gives its nested statements. A generic walk over a body reaches every expression of it by
+;; iterating both; neither descends into a nested function record.
+(defn syntax-stmt-exprs! [(id i64) (out (mut (ArrayList i64)))] (-> i64)
+  (do
+    (match (syntax-stmt-node id)
+      (SsLet [name init final annotation]
+             (match init (Some [e] (push! [i64] (mut out) e)) (None [] 0)))
+      (SsVar [name init annotation]
+             (match init (Some [e] (push! [i64] (mut out) e)) (None [] 0)))
+      (SsLetPattern [pattern init final]
+                    (match init (Some [e] (push! [i64] (mut out) e)) (None [] 0)))
+      (SsVarPattern [pattern init]
+                    (match init (Some [e] (push! [i64] (mut out) e)) (None [] 0)))
+      (SsDeclList [decls] 0)
+      (SsReturn [value]
+                (match value (Some [e] (push! [i64] (mut out) e)) (None [] 0)))
+      (SsExpr [expr] (push! [i64] (mut out) expr))
+      (SsBlock [body] 0)
+      (SsIf [condition then-stmt else-stmt] (push! [i64] (mut out) condition))
+      (SsWhile [condition body] (push! [i64] (mut out) condition))
+      (SsEmpty [] 0)
+      (SsBreak [label] 0)
+      (SsContinue [label] 0)
+      (SsSwitch [discriminant cases] (push! [i64] (mut out) discriminant))
+      (SsCase [selector body]
+              (match selector (Some [e] (push! [i64] (mut out) e)) (None [] 0)))
+      (SsDoWhile [body condition] (push! [i64] (mut out) condition))
+      (SsFor [init test update body]
+             (do
+               (match init
+                 (ForInitExpr [e] (push! [i64] (mut out) e))
+                 (_ 0))
+               (match test (Some [e] (push! [i64] (mut out) e)) (None [] 0))
+               (match update (Some [e] (push! [i64] (mut out) e)) (None [] 0))))
+      (SsForIn [head of right body awaited]
+               (do
+                 (match head
+                   (ForInitExpr [e] (push! [i64] (mut out) e))
+                   (_ 0))
+                 (push! [i64] (mut out) right)))
+      (SsLabeled [label body] 0)
+      (SsThrow [value] (push! [i64] (mut out) value))
+      (SsTry [body catch-param catch-body finally-body] 0)
+      (SsWith [object body] (push! [i64] (mut out) object))
       (SsDebugger [] 0)
       (SsFunctionDecl [fun] 0)
       (SsClassDecl [cls] 0))
@@ -4199,6 +4252,7 @@
     (set! (.script (mut f)) (.current-script (parser-state)))
     (set! (.static-entry (mut f)) -1)
     (set! (.class-index (mut f)) -1)
+    (set! (.env-names (mut f)) (al-new [(slice u8)] (compiler-allocator)))
     (push! [SyntaxFun] (mut (.funs (parser-state))) (load f))
     index))
 
@@ -5782,9 +5836,166 @@
                 (continue))))
     (load found)))
 
+;; A record's own activation bindings: its parameters, its `var`s, its body function declarations
+;; and, for a function expression, its own name. These live exactly as long as one call does, which
+;; is what an environment record models.
+(defn syntax-fun-activation-names! [(fi i64) (out (mut (ArrayList (slice u8))))] (-> i64)
+  (let [f (syntax-fun-at fi)]
+    ;; A Script's root binds the realm: its `var`s are global properties and its declarations are
+    ;; the closed world's functions, neither of which a nested function captures.
+    (if (syntax-script-root? fi)
+        0
+        (do
+          (al-for [p (.params f)] (push! [(slice u8)] (mut out) p))
+          (match (.rest-param f)
+            (Some [r] (push! [(slice u8)] (mut out) r))
+            (None [] 0))
+          (syntax-collect-declarations! (.body f) false (mut out))
+          (syntax-function-decl-names! (.body f) (mut out))
+          (match (.kind f)
+            (FunExpression [] (push! [(slice u8)] (mut out) (.name f)))
+            (_ 0))
+          0))))
+
+;; A record's own block-scoped bindings: its body's `let`, `const` and `class` declarations, and
+;; those of the blocks enclosing `position`. Their lifetime is a block, or one loop iteration, which
+;; an activation's environment does not model, so capturing one still refuses by name.
+(defn syntax-fun-lexical-names! [(fi i64) (position i64) (out (mut (ArrayList (slice u8))))] (-> i64)
+  (let [f (syntax-fun-at fi)]
+    (syntax-capture-blocks! (.body f) position (mut out))
+    0))
+
+;; A record's own body-level `let`, `const` and `class` bindings. One activation has exactly one of
+;; each, so an environment slot models it — empty until its initialization, which is its temporal
+;; dead zone. A block's lexicals are not these: a block inside a loop has one per iteration.
+(defn syntax-fun-body-lexical-names! [(fi i64) (out (mut (ArrayList (slice u8))))] (-> i64)
+  (let [f (syntax-fun-at fi)]
+    (if (syntax-script-root? fi)
+        0
+        (do (syntax-collect-declarations! (.body f) true (mut out)) 0))))
+
+;; Whether a captured binding of `owner` is one of its body lexicals, and so starts in its dead zone.
+(defn syntax-env-name-lexical? [(owner i64) (name (slice u8))] (-> bool)
+  (let [(mut names) (al-new [(slice u8)] (compiler-allocator))]
+    (syntax-fun-body-lexical-names! owner (mut names))
+    (let [found (syntax-names-contain? (load names) name)]
+      (al-free! [(slice u8)] (mut names))
+      found)))
+
+(defn syntax-names-contain? [(names (ArrayList (slice u8))) (name (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (al-for [n names] (if (= n name) (set! (mut found) true) 0))
+    (load found)))
+
+;; Where a name one record mentions is bound: the innermost enclosing record binding it, and whether
+;; that binding is one of the activation's own. A name the record binds itself, or that nothing
+;; encloses, answers -1 and is not a capture.
+(defstruct CaptureOwner [(fun i64) (activation bool)])
+
+;; The compiler-only binding an arrow's `this` reads: the receiver of the nearest function around it.
+(const THIS-CAPTURE-SLOT "$aot$.this-capture")
+
+;; The nearest enclosing record that has a receiver of its own, for an arrow's `this`.
+(defn syntax-receiver-owner [(fun i64)] (-> i64)
+  (let [(mut current) (let [f (syntax-fun-at fun)] (.parent f))]
+    (loop (if (< (load current) 0)
+              (break -1)
+              (let [f (syntax-fun-at (load current))]
+                (match (.kind f)
+                  (FunArrow [] (do (set! (mut current) (.parent f)) (continue)))
+                  (_ (break (load current)))))))))
+
+(defn syntax-capture-owner [(fun i64) (name (slice u8))] (-> CaptureOwner)
+  (if (= name THIS-CAPTURE-SLOT)
+      (if (syntax-fun-arrow? fun)
+          (CaptureOwner :fun (syntax-receiver-owner fun) :activation true)
+          (CaptureOwner :fun -1 :activation false))
+  (let [(mut owner) -1
+        (mut activation?) false
+        (mut current) (let [f (syntax-fun-at fun)] (.parent f))
+        (mut child) fun]
+    (loop (if (or (>= (load owner) 0) (< (load current) 0))
+              (break 0)
+              (let [child-fun (syntax-fun-at (load child))
+                    current-fun (syntax-fun-at (load current))
+                    (mut activation) (al-new [(slice u8)] (compiler-allocator))
+                    (mut lexical) (al-new [(slice u8)] (compiler-allocator))]
+                (syntax-fun-activation-names! (load current) (mut activation))
+                (syntax-fun-body-lexical-names! (load current) (mut activation))
+                (syntax-fun-lexical-names! (load current) (.lo child-fun) (mut lexical))
+                (if (syntax-names-contain? (load lexical) name)
+                    (do (set! (mut owner) (load current)) (set! (mut activation?) false) 0)
+                    (if (syntax-names-contain? (load activation) name)
+                        (do (set! (mut owner) (load current)) (set! (mut activation?) true) 0)
+                        0))
+                (al-free! [(slice u8)] (mut activation))
+                (al-free! [(slice u8)] (mut lexical))
+                (set! (mut child) (load current))
+                (set! (mut current) (.parent current-fun))
+                (continue))))
+    (CaptureOwner :fun (load owner) :activation (load activation?)))))
+
+(defn syntax-fun-arrow? [(fi i64)] (-> bool)
+  (let [f (syntax-fun-at fi)] (match (.kind f) (FunArrow [] true) (_ false))))
+
+;; Every identifier one record's own code mentions, its nested records excluded — they ask the same
+;; question for themselves. A class body's heritage and computed keys belong to the record around
+;; the class; its methods and field initializers are records of their own.
+(defn syntax-fun-references! [(fi i64) (out (mut (ArrayList (slice u8))))] (-> i64)
+  (let [f (syntax-fun-at fi)]
+    (al-for [s (.body f)] (syntax-reference-walk-stmt! s (mut out)))
+    (match (.expression-body f)
+      (Some [e] (syntax-reference-walk-expr! e (mut out)))
+      (None [] 0))
+    (al-for [d (.param-defaults f)]
+            (match d (Some [init] (syntax-reference-walk-expr! init (mut out))) (None [] 0)))
+    0))
+
+(defn syntax-reference-walk-stmt! [(id i64) (out (mut (ArrayList (slice u8))))] (-> i64)
+  (match (syntax-stmt-node id)
+    ;; A nested record answers for itself; a class's own expressions belong to this record.
+    (SsFunctionDecl [fun] 0)
+    (SsClassDecl [cls] (syntax-reference-walk-class! cls (mut out)))
+    (_ (let [(mut exprs) (al-new [i64] (compiler-allocator))
+             (mut children) (al-new [i64] (compiler-allocator))]
+         (syntax-stmt-exprs! id (mut exprs))
+         (al-for [e (load exprs)] (syntax-reference-walk-expr! e (mut out)))
+         (syntax-stmt-children! id (mut children))
+         (al-for [c (load children)] (syntax-reference-walk-stmt! c (mut out)))
+         (al-free! [i64] (mut exprs))
+         (al-free! [i64] (mut children))
+         0))))
+
+(defn syntax-reference-walk-expr! [(id i64) (out (mut (ArrayList (slice u8))))] (-> i64)
+  (match (syntax-node id)
+    (SxName [name] (do (push! [(slice u8)] (mut out) name) 0))
+    ;; An arrow's `this` is the receiver of the function around it, which is a capture like any
+    ;; other; a non-arrow's is its own and is dropped by the resolution below. A `super` reference
+    ;; reads that same receiver, and needs the home object besides, which is what refuses.
+    (SxThis [] (do (push! [(slice u8)] (mut out) THIS-CAPTURE-SLOT) 0))
+    (SxSuper [] (do (push! [(slice u8)] (mut out) THIS-CAPTURE-SLOT) 0))
+    (SxFunction [fun] 0)
+    (SxClass [cls] (syntax-reference-walk-class! cls (mut out)))
+    (_ (let [(mut children) (al-new [i64] (compiler-allocator))]
+         (syntax-expr-children! id (mut children))
+         (al-for [c (load children)] (syntax-reference-walk-expr! c (mut out)))
+         (al-free! [i64] (mut children))
+         0))))
+
+(defn syntax-reference-walk-class! [(cls i64) (out (mut (ArrayList (slice u8))))] (-> i64)
+  (let [(mut exprs) (al-new [i64] (compiler-allocator))]
+    (syntax-class-exprs! cls (mut exprs))
+    (al-for [e (load exprs)] (syntax-reference-walk-expr! e (mut out)))
+    (al-free! [i64] (mut exprs))
+    0))
+
+;; What is left of the capture refusal: an enclosing function's binding that its activation does not
+;; own — a block's `let`, `const` or `class`, and a loop's per-iteration one above all, which has a
+;; lifetime one environment slot cannot model.
 (defn lower-require-uncaptured! [(name (slice u8))] (-> i64)
   (if (syntax-enclosing-binding? (.current-fun (parser-state)) name)
-      (unimplemented "captured variables (closures)" "docs/GAPS.md — function values and closures")
+      (unimplemented "a captured binding of an enclosing block or loop iteration"
+                     "docs/GAPS.md — function values and closures")
       0))
 
 ;; The program loop marks the declarations it parsed at the top level as hoisted Funs.
@@ -5920,7 +6131,24 @@
       (Some [slot] (lower-jsl-unary-value "JsReadGlobalLexicalSlot" slot))
       (None [] (lower-jsl-unary-value "JsGlobalBindingRead" (keyref-make (shape-key-intern name)))))))
 
+;; A name in an expression: its environment slot when this activation's binding is captured, the
+;; slot of an enclosing activation's when that is where it is bound, and otherwise the ordinary
+;; resolution — a Scope binding, a realm lexical, a global.
 (defn lower-name [(name (slice u8))] (-> (dyn NodeOps))
+  (let [scope (parser-node (.current-scope (parser-state)))
+        slot (scope-env-slot scope name)]
+    (if (>= slot 0)
+        (if (scope-env-tdz? scope name)
+            (lower-environment-load-checked slot)
+            (lower-environment-load slot))
+        (if (>= (scope-find scope name) 0)
+            (lower-name-uncaptured name)
+            (let [owner (syntax-capture-owner (.current-fun (parser-state)) name)]
+              (if (and (>= (.fun owner) 0) (.activation owner))
+                  (lower-environment-outer (.fun owner) name)
+                  (lower-name-uncaptured name)))))))
+
+(defn lower-name-uncaptured [(name (slice u8))] (-> (dyn NodeOps))
   (match (match (scope-lookup (parser-node (.current-scope (parser-state))) name)
            (Some [value] (Some value))
            (None [] (if (= name "arguments") (lower-arguments-object) (None [(dyn NodeOps)]))))
@@ -6056,7 +6284,8 @@
    (resolved-nid i64)
    (keyed bool)  ; `owner[key]`: key-nid is the evaluated key value, not an interned key
    (super bool)  ; `super.x`: owner-nid is the base above the home object, not the receiver
-   (receiver-nid i64)])  ; a super reference's `this`, the receiver of its [[Get]] and [[Set]]
+   (receiver-nid i64)  ; a super reference's `this`, the receiver of its [[Get]] and [[Set]]
+   (captured-owner i64)])  ; a captured binding of an enclosing activation: the record owning it, or -1
 
 (defn lower-ref-global-prepare! [(ref (ptr SyntaxRef))] (-> i64)
   (if (or (and (not (.script-unit (parser-state))) (syntax-script-binding? (.name ref)))
@@ -6113,9 +6342,16 @@
 
 (defn lower-ref-name-prepare! [(ref (ptr SyntaxRef)) (name (slice u8))] (-> i64)
   (set! (.name ref) name)
+  (set! (.captured-owner ref) -1)
   (set! (.bound ref)
         (>= (scope-find (parser-node (.current-scope (parser-state))) name) 0))
-  (if (.bound ref) 0 (lower-require-uncaptured! name))
+  ;; A binding of an enclosing activation is read and written through its environment record.
+  (if (.bound ref)
+      0
+      (let [owner (syntax-capture-owner (.current-fun (parser-state)) name)]
+        (if (and (>= (.fun owner) 0) (.activation owner))
+            (do (set! (.captured-owner ref) (.fun owner)) 0)
+            (lower-require-uncaptured! name))))
   (if (and (.external-mutation (parser-state))
            (not (.bound ref))
            (not (syntax-restricted-global? name)))
@@ -6124,6 +6360,7 @@
 
 (defn lower-ref-prepare! [(target i64)] (-> SyntaxRef)
   (let [(mut ref) (primitive/zeroed SyntaxRef)]
+    (set! (.captured-owner (mut ref)) -1)
     (match (syntax-node target)
       (SxIndex [owner key optional]
                (if (syntax-is-super? owner)
@@ -6206,7 +6443,9 @@
           (parser-set-current-ctrl! (.ctrl loaded))
           (scope-set-mem! scope (.mem loaded))
           (lower-completion! (.value loaded))))
-      (lower-name (.name ref)))))
+      (if (>= (.captured-owner ref) 0)
+          (lower-environment-outer (.captured-owner ref) (.name ref))
+          (lower-name (.name ref))))))
 
 ;; PutValue against the live post-RHS Scope. Non-strict PutValue to the three non-writable
 ;; globals has no effect; lexical shadows take Scope's ordinary update and const/TDZ checks. JSL
@@ -6253,11 +6492,17 @@
             (scope-set-mem! scope (.mem stored))
             (lower-completion! (.value stored))
             0))
+        (if (>= (.captured-owner ref) 0)
+            (lower-environment-outer-store! (.captured-owner ref) (.name ref) value)
         (if (.bound ref)
             (let [binding (scope-var scope (scope-find scope (.name ref)))]
               (if (.realm-constant binding)
                   (lower-throw-type-error! "Assignment to constant variable")
-                  (scope-update! scope (.name ref) value)))
+                  ;; A binding a nested function captures lives in this activation's environment.
+                  (let [slot (scope-env-slot scope (.name ref))]
+                    (if (>= slot 0)
+                        (lower-environment-store! slot value)
+                        (scope-update! scope (.name ref) value)))))
             (if (syntax-restricted-global? (.name ref))
                 ;; `undefined = 1`: silently ignored in sloppy code; a TypeError in strict code
                 ;; (the runtime's TypeError trap until exception objects exist).
@@ -6283,7 +6528,7 @@
                         (al-free! [(dyn NodeOps)] (mut wargs))
                         (parser-set-current-ctrl! (.ctrl w))
                         (scope-set-mem! scope (.mem w))
-                        0)))))))))
+                        0))))))))))
 
 (defn lower-ref-release! [(ref SyntaxRef)] (-> i64)
   (if (.object-binding ref) (n-unkeep! (parser-node (.resolved-nid ref))) 0)
@@ -6657,6 +6902,19 @@
 ;; object (MakeConstructor). A hoisted declaration's object exists once per program run and lives
 ;; in the static heap image (`realm-image-build!`); every other function form allocates one per
 ;; evaluation, as the specification's InstantiateOrdinaryFunctionExpression does.
+;; Why a record has no entry, named where it is used: the reason decides what to implement next.
+(defn unimplemented-function-value [(fi i64)] (-> i64)
+  (let [f (syntax-fun-at fi)]
+    (if (.generator f)
+        (unimplemented "a generator function as a value" "docs/GAPS.md — generators")
+        (if (.async f)
+            (unimplemented "an async function as a value" "docs/GAPS.md — promises and async functions")
+            (if (syntax-fun-has-patterns? f)
+                (unimplemented "a function with destructuring parameters as a value"
+                               "docs/GAPS.md — destructuring")
+                (unimplemented "a function record with no entry as a value"
+                               "docs/GAPS.md — function values and closures"))))))
+
 (defn lower-function-object [(fun-index i64)] (-> (dyn NodeOps))
   (let [f (syntax-fun-at fun-index)]
     (if (>= (.static-entry f) 0)
@@ -6668,7 +6926,12 @@
               (unimplemented "`super` outside a class method"
                              "docs/GAPS.md — classes")
               (unreachable-node))
-            (lower-function-value fun-index (dyn-null-make))))))
+            ;; A function that mentions a captured binding carries the environment it was created
+            ;; in; every other one has none (docs/DECISIONS.md, closures).
+            (lower-function-value fun-index
+                                  (if (.uses-env (syntax-fun-ptr fun-index))
+                                      (lower-environment-value)
+                                      (dyn-null-make)))))))
 
 ;; A method's function object, carrying its home object (§10.2.7 MakeMethod): the class's prototype
 ;; object, or the constructor for a static member. `super.x` reads from the object above it.
@@ -6685,8 +6948,7 @@
 (defn lower-function-value [(fun-index i64) (env (dyn NodeOps))] (-> (dyn NodeOps))
   (if (not (syntax-fun-lowered? fun-index))
       (do
-        (unimplemented "methods, accessors, generators and async functions as values"
-                       "docs/GAPS.md — function values and closures")
+        (unimplemented-function-value fun-index)
         (unreachable-node))
       (let [scope (parser-node (.current-scope (parser-state)))
             ctrl (parser-node (.current-ctrl (parser-state)))
@@ -7583,11 +7845,16 @@
     (if (syntax-script-root? (.current-fun p))
         (lower-global-object)
         (match (.kind f)
+          ;; An arrow's `this` is the receiver of the function around it, read from the
+          ;; environment that function put it in (docs/DECISIONS.md, closures).
           (FunArrow []
-                    (do
-                      (unimplemented "arrow function `this` (a capture of the enclosing receiver)"
-                                     "docs/GAPS.md — function values and closures")
-                      (unreachable-node)))
+                    (let [owner (syntax-receiver-owner (.current-fun p))]
+                      (if (< owner 0)
+                          (do
+                            (unimplemented "arrow function `this` outside every function"
+                                           "docs/GAPS.md — function values and closures")
+                            (unreachable-node))
+                          (lower-environment-outer owner THIS-CAPTURE-SLOT))))
           (_ (let [fun (parser-node (.fun-nid f))
                    receiver
                      (match (fun-parm fun 0)
@@ -7621,9 +7888,7 @@
                               (let [f (syntax-fun-at fun)]
                                 (if (.hoisted f)
                                     0
-                                    (scope-update! (parser-node (.current-scope (parser-state)))
-                                                   (.name f)
-                                                   (lower-function-object fun)))))
+                                    (lower-binding-write! (.name f) (lower-function-object fun)))))
               (_ 0)))
     0))
 
@@ -7659,6 +7924,9 @@
     (if (or bound (< target-idx 0)
             (and (>= target-idx 0)
                  (or (syntax-fun-forwarding? target-idx)
+                     ;; Its entry fills a hidden slot from the call itself: the callee it was called
+                     ;; with (its environment, its home object), an arguments object, a rest array.
+                     (.needs-callee (syntax-fun-ptr target-idx))
                      (match (syntax-fun-hidden-builtin target-idx) (Some [b] true) (None [] false)))))
         ;; A binding, not a hoisted declaration, a forwarding entry (it has no local body to call
         ;; directly) or a function whose entry fills a hidden slot from the call itself (an
@@ -8253,20 +8521,28 @@
     (al-for [id stmts]
             (match (syntax-stmt-node id)
               (SsLet [name init final annotation]
-                     (scope-declare! (parser-node (.current-scope (parser-state)))
-                                     name
-                                     (ty-dyn TAG-ANY)
-                                     final))
+                     ;; A captured lexical was already bound to its environment slot at entry, empty
+                     ;; until its initialization (docs/DECISIONS.md, closures).
+                     (if (>= (scope-env-slot (parser-node (.current-scope (parser-state))) name) 0)
+                         0
+                         (scope-declare! (parser-node (.current-scope (parser-state)))
+                                         name
+                                         (ty-dyn TAG-ANY)
+                                         final)))
               (SsLetPattern [pattern init final]
                             (unimplemented "destructuring declarations"
                                            "docs/GAPS.md — destructuring"))
               ;; A class declaration is a lexical binding of its name, in its temporal dead zone
               ;; until the class is evaluated.
               (SsClassDecl [cls]
-                           (scope-declare! (parser-node (.current-scope (parser-state)))
-                                           (syntax-class-name cls)
-                                           (ty-dyn TAG-ANY)
-                                           true))
+                           (if (>= (scope-env-slot (parser-node (.current-scope (parser-state)))
+                                                   (syntax-class-name cls))
+                                   0)
+                               0
+                               (scope-declare! (parser-node (.current-scope (parser-state)))
+                                               (syntax-class-name cls)
+                                               (ty-dyn TAG-ANY)
+                                               true)))
               (SsDeclList [decls] (lower-instantiate-lexicals! decls))
               (SsCase [selector body] (lower-instantiate-lexicals! body))
               ;; A block-level FunctionDeclaration is a lexical binding initialized on block entry.
@@ -8735,7 +9011,7 @@
                      (Some [e] (lower-syntax-expr e))
                      (None [] (lower-singleton "JsUndefined")))]
              (if (>= (scope-find (parser-node (.current-scope (parser-state))) name) 0)
-                 (scope-initialize! (parser-node (.current-scope (parser-state))) name value)
+                 (lower-binding-initialize! name value)
                  (if (and (.script-unit (parser-state))
                           (syntax-script-root? (.current-fun (parser-state)))
                           (syntax-script-binding? name))
@@ -9079,7 +9355,83 @@
     ;; a strict function's receiver is taken as it is (`lower-this`), and a strict write to a
     ;; non-writable global is a TypeError (`lower-ref-put!`).
     (syntax-check-strict-functions!)
+    (syntax-compute-captures!)
     (syntax-compute-may-throw!)))
+
+;; ---------------------------------------------------------------------------
+;; Which bindings a nested function captures (docs/DECISIONS.md, closures)
+;;
+;; A binding one activation owns and a nested function mentions cannot stay an SSA value: the two
+;; functions share it, and either may write it. Such a binding moves into the activation's
+;; environment record, a JS array whose element 0 is the enclosing environment and whose other
+;; elements are its captured bindings in a fixed order. A record that mentions a captured binding
+;; reaches the chain through the function object it was called with, so it needs the callee slot.
+;;
+;; The pass is one sweep: every record's own references, resolved against the records enclosing it.
+;; A name bound by a block, a `let`, a `const` or a class of an enclosing function is not an
+;; activation binding — its lifetime is a block or a loop iteration — and capturing it still refuses
+;; by name where it is written.
+;; Whether a record reads a captured `let`, `const` or `class` — its own or an enclosing
+;; activation's — whose slot is empty until its initialization runs.
+(defn syntax-fun-reads-captured-lexical? [(fi i64)] (-> bool)
+  (let [(mut names) (al-new [(slice u8)] (compiler-allocator))
+        (mut found) false]
+    (syntax-fun-references! fi (mut names))
+    (al-for [name (load names)]
+            (if (load found)
+                0
+                (do
+                  (if (and (syntax-names-contain? (.env-names (syntax-fun-ptr fi)) name)
+                           (syntax-env-name-lexical? fi name))
+                      (set! (mut found) true)
+                      (let [owner (syntax-capture-owner fi name)]
+                        (if (and (>= (.fun owner) 0)
+                                 (.activation owner)
+                                 (syntax-env-name-lexical? (.fun owner) name))
+                            (set! (mut found) true)
+                            0)))
+                  0)))
+    (al-free! [(slice u8)] (mut names))
+    (load found)))
+
+(defn syntax-compute-captures! [] (-> i64)
+  (let [p (parser-state)
+        count (len (.funs p))
+        (mut i) 0]
+    (loop (if (>= (load i) count)
+              (break 0)
+              (let [(mut names) (al-new [(slice u8)] (compiler-allocator))]
+                (syntax-fun-references! (load i) (mut names))
+                (al-for [name (load names)]
+                        (let [owner (syntax-capture-owner (load i) name)]
+                          (if (and (>= (.fun owner) 0) (.activation owner))
+                              (syntax-capture-binding! (.fun owner) name (load i))
+                              0)))
+                (al-free! [(slice u8)] (mut names))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))
+
+;; `name` is a binding of `owner` that `user`, a function inside it, mentions: give it a slot in
+;; `owner`'s environment, and mark every record from `user` out to `owner` as needing the chain.
+(defn syntax-capture-binding! [(owner i64) (name (slice u8)) (user i64)] (-> i64)
+  (let [op (syntax-fun-ptr owner)]
+    (if (syntax-names-contain? (.env-names op) name)
+        0
+        (do (push! [(slice u8)] (mut (.env-names op)) name) 0))
+    (set! (.owns-env op) true)
+    (let [(mut current) user]
+      (loop (if (= (load current) owner)
+                (break 0)
+                (let [fp (syntax-fun-ptr (load current))]
+                  (set! (.uses-env fp) true)
+                  (set! (.needs-callee fp) true)
+                  (set! (mut current) (.parent fp))
+                  (if (< (load current) 0)
+                      (broken "syntax-capture-binding!: the owner does not enclose the user")
+                      0)
+                  (continue)))))
+    0))
 
 ;; ---------------------------------------------------------------------------
 ;; Which functions can complete with the exception sentinel
@@ -9266,7 +9618,10 @@
                           ;; A forwarding entry's builtin can complete with any exception, and a class
                           ;; constructor throws when it is called without `new`.
                           (> (len (.abi-builtin f)) 0)
-                          (.class-ctor f))
+                          (.class-ctor f)
+                          ;; A captured lexical is read through its environment slot, which is empty
+                          ;; in its temporal dead zone: that read is a ReferenceError.
+                          (syntax-fun-reads-captured-lexical? (load i)))
                     (mut edges) (al-new [i64] (compiler-allocator))]
                 (al-for [id (.body f)]
                         (syntax-throw-walk-stmt! id
@@ -10152,8 +10507,7 @@
 (defn realm-image-function-object! [(fi i64)] (-> i64)
   (let [f (syntax-fun-at fi)]
     (if (not (syntax-fun-lowered? fi))
-        (unimplemented "methods, accessors, generators and async functions as values"
-                       "docs/GAPS.md — function values and closures")
+        (unimplemented-function-value fi)
         0)
     (let [flags (syntax-fun-construct-flags fi)
           constructor (!= (& flags FUNCTION-FLAG-CONSTRUCTOR) 0)
@@ -10750,6 +11104,8 @@
                     (scope-define! (parser-node (.current-scope (parser-state))) rest-name (ty-dyn TAG-ANY) false rest)
                     0)))
           (None [] 0))
+        ;; The activation's environment, before anything can read a captured binding.
+        (lower-environment-entry! fi fun)
         (lower-class-constructor-entry! fi fun)
         (lower-derived-this-entry! fi (parser-node (.current-scope (parser-state))))
         (lower-bind-arguments-object! fi scope fun)
@@ -11750,7 +12106,7 @@
         name (syntax-class-name cls)
         value (lower-class cls)]
     (if (>= (scope-find (parser-node (.current-scope p)) name) 0)
-        (scope-initialize! (parser-node (.current-scope p)) name value)
+        (lower-binding-initialize! name value)
         (if (and (.script-unit p)
                  (syntax-script-root? (.current-fun p))
                  (syntax-script-binding? name))
@@ -11842,6 +12198,176 @@
   (match (scope-lookup (parser-node (.current-scope (parser-state))) DERIVED-THIS-SLOT)
     (Some [v] v)
     (None [] (do (broken "lower-derived-this-value: the derived `this` binding is missing") (unreachable-node)))))
+
+;; ---------------------------------------------------------------------------
+;; Environments (docs/DECISIONS.md, closures)
+
+;; The compiler-only Scope name holding the running activation's environment record.
+(const ENVIRONMENT-SLOT "$aot$.env")
+
+;; The environment a record hands to the function objects it creates: its own record when it owns
+;; one, else the environment it was called with, else null.
+(defn lower-environment-value [] (-> (dyn NodeOps))
+  (match (scope-lookup (parser-node (.current-scope (parser-state))) ENVIRONMENT-SLOT)
+    (Some [env] env)
+    (None [] (dyn-null-make))))
+
+;; A record's environment at entry: a fresh record over the one it was called with when nested
+;; functions capture its bindings, else that one unchanged. Its captured parameters are stored into
+;; their slots at once, so every later read of them is the slot.
+(defn lower-environment-entry! [(fi i64) (fun (dyn NodeOps))] (-> i64)
+  (let [f (syntax-fun-ptr fi)]
+    (if (and (.needs-home f) (.uses-env f))
+        (do
+          (unimplemented "a method that both reads `super` and captures a binding"
+                         "docs/GAPS.md — function values and closures")
+          0)
+        (if (not (or (.owns-env f) (.uses-env f)))
+            0
+            (let [scope (parser-node (.current-scope (parser-state)))
+                  outer (if (.uses-env f)
+                            (lower-completion!
+                              (lower-jsl-values1 "JsFunctionEnvironment" (lower-hidden-callee fi fun)))
+                            (dyn-null-make))]
+              (if (not (.owns-env f))
+                  (do (scope-define! scope ENVIRONMENT-SLOT (ty-dyn TAG-ANY) true outer) 0)
+                  (let [env (lower-jsl-values2 "JsNewEnvironment" outer (con-int (len (.env-names f))))]
+                    (scope-define! scope ENVIRONMENT-SLOT (ty-dyn TAG-ANY) true env)
+                    ;; A captured parameter's actual is its first value; every other captured
+                    ;; binding is stored where its declaration or assignment runs.
+                    (lower-environment-parameters! fi)
+                    0)))))))
+
+;; Each captured binding of the running record becomes a Scope binding that lives in a slot: a
+;; parameter keeps the value its Parm already bound, and the rest start undefined.
+(defn lower-environment-parameters! [(fi i64)] (-> i64)
+  (let [f (syntax-fun-ptr fi)
+        (mut slot) 1]
+    (al-for [name (.env-names f)]
+            (let [scope (parser-node (.current-scope (parser-state)))]
+              (if (= name THIS-CAPTURE-SLOT)
+                  ;; The receiver an arrow inside this function reads as `this`.
+                  (if (.derived-ctor (syntax-fun-ptr fi))
+                      (unimplemented "an arrow that reads `this` in a derived constructor"
+                                     "docs/GAPS.md — classes")
+                      (do
+                        (lower-environment-store! (load slot) (lower-this))
+                        (scope-define-captured! scope
+                                                name
+                                                (ty-dyn TAG-ANY)
+                                                true
+                                                (load slot)
+                                                (dyn-undefined-make))))
+              (if (>= (scope-find scope name) 0)
+                  ;; A parameter: its actual is the binding's first value, and the binding lives in
+                  ;; the slot from here on.
+                  (let [value (lower-name-uncaptured name)]
+                    (lower-environment-store! (load slot) value)
+                    (scope-mark-captured! (parser-node (.current-scope (parser-state))) name (load slot)))
+                  (if (syntax-env-name-lexical? fi name)
+                      ;; A body-level `let`, `const` or `class`: its slot stays empty until its
+                      ;; initialization runs, which is its temporal dead zone (§9.1.1.1.6).
+                      (scope-define-captured-lexical! scope
+                                                      name
+                                                      (ty-dyn TAG-ANY)
+                                                      false
+                                                      (load slot)
+                                                      (dyn-undefined-make))
+                      ;; A `var` or a body function declaration: undefined from instantiation on, as
+                      ;; FunctionDeclarationInstantiation binds it (§10.2.11 step 27); instantiation
+                      ;; then finds the binding here and leaves it alone, and each write goes to the
+                      ;; slot.
+                      (do
+                        (lower-environment-store! (load slot) (dyn-undefined-make))
+                        (scope-define-captured! scope
+                                                name
+                                                (ty-dyn TAG-ANY)
+                                                false
+                                                (load slot)
+                                                (dyn-undefined-make))))))
+              (set! (mut slot) (+ (load slot) 1))
+              0))
+    0))
+
+;; InitializeBinding for a binding of the running activation: a captured lexical's slot was empty
+;; until now, and filling it ends its temporal dead zone.
+(defn lower-binding-initialize! [(name (slice u8)) (value (dyn NodeOps))] (-> i64)
+  (let [scope (parser-node (.current-scope (parser-state)))
+        slot (scope-env-slot scope name)]
+    (if (>= slot 0)
+        (lower-environment-store! slot value)
+        (scope-initialize! scope name value))))
+
+;; A write to a binding of the running activation, wherever it lives.
+(defn lower-binding-write! [(name (slice u8)) (value (dyn NodeOps))] (-> i64)
+  (let [scope (parser-node (.current-scope (parser-state)))
+        slot (scope-env-slot scope name)]
+    (if (>= slot 0)
+        (lower-environment-store! slot value)
+        (scope-update! scope name value))))
+
+(defn lower-environment-store! [(slot i64) (value (dyn NodeOps))] (-> i64)
+  (lower-jsl-values3 "JsEnvStore" (lower-environment-value) (con-int slot) value)
+  0)
+
+(defn lower-environment-load [(slot i64)] (-> (dyn NodeOps))
+  (lower-jsl-values2 "JsEnvSlot" (lower-environment-value) (con-int slot)))
+
+;; A captured lexical's read: an empty slot is its temporal dead zone, which is a ReferenceError.
+(defn lower-environment-load-checked [(slot i64)] (-> (dyn NodeOps))
+  (lower-completion!
+    (lower-jsl-values2 "JsEnvSlotInitialized" (lower-environment-value) (con-int slot))))
+
+;; A binding of an enclosing activation: the environment `depth` links above the running one, and
+;; its slot there. Depth counts the records between the two that own an environment.
+(defn lower-environment-outer [(owner i64) (name (slice u8))] (-> (dyn NodeOps))
+  (let [ancestor (lower-jsl-values2 "JsEnvAncestor"
+                                    (lower-environment-value)
+                                    (con-int (syntax-environment-depth (.current-fun (parser-state)) owner)))]
+    (if (syntax-env-name-lexical? owner name)
+        (lower-completion!
+          (lower-jsl-values2 "JsEnvSlotInitialized" ancestor (con-int (syntax-environment-slot owner name))))
+        (lower-jsl-values2 "JsEnvSlot" ancestor (con-int (syntax-environment-slot owner name))))))
+
+(defn lower-environment-outer-store! [(owner i64) (name (slice u8)) (value (dyn NodeOps))] (-> i64)
+  (let [ancestor (lower-jsl-values2 "JsEnvAncestor"
+                                    (lower-environment-value)
+                                    (con-int (syntax-environment-depth (.current-fun (parser-state)) owner)))]
+    (n-keep! ancestor)
+    (let [slot (syntax-environment-slot owner name)]
+      (lower-completion! (lower-jsl-values3 "JsEnvStore" ancestor (con-int slot) value))
+      (n-unkeep! ancestor)
+      0)))
+
+;; The slot `name` has in `owner`'s environment record.
+(defn syntax-environment-slot [(owner i64) (name (slice u8))] (-> i64)
+  (let [f (syntax-fun-ptr owner)
+        (mut slot) 1
+        (mut answer) -1]
+    (al-for [n (.env-names f)]
+            (do
+              (if (and (< (load answer) 0) (= n name)) (set! (mut answer) (load slot)) 0)
+              (set! (mut slot) (+ (load slot) 1))
+              0))
+    (if (< (load answer) 0)
+        (broken "syntax-environment-slot: the owner has no slot for a captured binding")
+        0)
+    (load answer)))
+
+;; How many environment records separate the one `user` holds from `owner`'s: the records between
+;; them that own one, the user's own included when it does.
+(defn syntax-environment-depth [(user i64) (owner i64)] (-> i64)
+  (let [(mut depth) 0
+        (mut current) user]
+    (loop (if (= (load current) owner)
+              (break 0)
+              (let [f (syntax-fun-ptr (load current))]
+                (if (.owns-env f) (set! (mut depth) (+ (load depth) 1)) 0)
+                (set! (mut current) (.parent f))
+                (if (< (load current) 0)
+                    (break (do (broken "syntax-environment-depth: the owner does not enclose the user") 0))
+                    (continue)))))
+    (load depth)))
 
 ;; InitializeInstanceElements (§10.2.11): each instance field of the class, in declaration order,
 ;; defined on the object being constructed — for a base constructor before its body runs, for a

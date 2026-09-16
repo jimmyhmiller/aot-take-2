@@ -55,6 +55,15 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-16 — Closures
+
+A nested function that reads or writes a binding of the function around it executes: parameters,
+`var`s, body function declarations, body-level `let`, `const` and `class` (with a real temporal dead
+zone), and an arrow's `this` (docs/DECISIONS.md, closures). Missing, each refusing by name: a
+binding of an enclosing *block* — including a loop's per-iteration `let` — an arrow's `this` in a
+derived constructor, `arguments` read from a nested function, and `super` in a function that also
+captures.
+
 ### 2026-09-16 — Class fields and static blocks
 
 Instance and static fields, with and without an initializer, in base and derived classes, and static
@@ -144,9 +153,7 @@ under the FUNCTION prefix whose payload is prototype, properties, raw code word 
 environment; every source function shares the `[ret this new.target slot…]` ABI with the program-wide formal
 count; a value call loads the code word, guards `%IsFunction` and traps to
 `aot_rt_throw_type_error` otherwise (docs/DECISIONS.md, function values). Remaining in this
-subsystem: captured variables (a reference to an enclosing function's binding refuses by name),
-`this` binding, `new`, prototypes on function objects, methods, accessors, generators, async
-functions, default and rest parameters, and reads or writes of Script-level global-object bindings
+subsystem: generators, async functions, and reads or writes of Script-level global-object bindings
 (a Script-level function declaration read as a value works; assigning to it, or touching an
 undeclared global, refuses as a global-object property access).
 
@@ -744,7 +751,10 @@ or a singleton global. Initializer-free let obtains undefined through JSL at dec
 Statement-only if/while bodies reject bare lexical declarations; const requires an initializer.
 Block exit after a loop now removes bindings from the live exit Scope.
 
-Executable TDZ ReferenceError completions and captured lexical environments remain absent.
+A captured lexical's dead zone IS executable: its environment slot is empty until initialization and
+reading it there is a ReferenceError (docs/DECISIONS.md, closures). A dead-zone read of a binding no
+nested function captures is still a compile-time refusal, because the parser-only marker cannot
+express a path-dependent one.
 Declaration-name validation now covers unreachable nested blocks as described above. These refusals are
 compiler outcomes, not successful Test262 runtime-negative results. Scope merges check matching
 initialization markers; path-dependent initialization outside the admitted grammar must hard-error
