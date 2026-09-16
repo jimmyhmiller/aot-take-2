@@ -55,6 +55,13 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-16 — Symbol keys
+
+A Symbol is a property key: `o[s] = v`, reads, writes, `delete`, and a computed Symbol key in an
+object literal or a class all execute, and enumeration passes over them (docs/DECISIONS.md, symbol
+keys). Missing: `Object.getOwnPropertySymbols` (the key table holds no way back from a key id to its
+Symbol), and the well-known symbols, which need Symbol ids in the compiler's static key table.
+
 ### 2026-09-16 — Symbol values
 
 `Symbol()`, `Symbol(description)`, `typeof`, identity comparison, `toString`, `valueOf` and the

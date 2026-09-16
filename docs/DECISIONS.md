@@ -1,5 +1,25 @@
 # Decisions
 
+## 2026-09-16 — Symbol keys
+
+**A Symbol's property key is minted with the Symbol.** The shape tree transitions on key ids, and a
+Symbol needs one that no name can collide with, so a Symbol takes a fresh id from the runtime key
+table when it is created and carries it in its payload's second word — a raw integer beside the
+description, so the word the collector scans is never a reference it would have to forward. The id
+is stable for the Symbol's life, which is what makes `o[s]` the same property every time, and two
+Symbols with the same description take different ids, which is what makes them different keys.
+
+**Enumeration is the whole observable difference.** A Symbol-keyed property is an ordinary own
+property — defined, read, written and deleted through the same shape machinery as any other — but
+the key table marks its id as a Symbol's, and the own-keys walk passes over those before it asks for
+a name. `Object.keys`, `Object.getOwnPropertyNames` and `for-in` therefore do not see it, and
+nothing a program can write as a name reaches it. `Object.getOwnPropertySymbols` needs the reverse
+mapping, from key back to Symbol, which the table does not hold yet, so it is still absent.
+
+**Static keys are still names only.** The compiler's key table, which the shapes blob carries, has
+no Symbol ids: the well-known symbols will need them, and that is a blob format change rather than
+something to approximate here.
+
 ## 2026-09-16 — Symbol values
 
 `Symbol` was an undeclared global, and the whole family — the iteration protocol, well-known
