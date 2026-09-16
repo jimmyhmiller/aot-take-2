@@ -221,6 +221,37 @@ per-case compile time is what to fix. Never edit `jsl/` or run `coil build` duri
 AOT_T262_SAMPLE=20 AOT_T262_JOBS=8 coil run tools/test262.coil -- run /Users/jimmyhmiller/Documents/Code/open-source/test262 ./build/aot-test262-compiler build/release/aot-runtime.o build/test262-sample-YYYYMMDD
 ```
 
+## Latest measured campaign, 2026-09-16 (full, after iteration, JSON, collections and Date)
+
+The full inventory, 53,582 files, in memory at `AOT_T262_JOBS=6`: **14,806 files passing
+(27.63%)**, up from 11,720 (21.87%). 55 minutes wall. Variants: pass 28,627, fail 25,889,
+unsupported 39,034, compiler-error 9,252, crash 113, timeout 11.
+
+What moved it: destructuring, optional chaining, spread and object rest, the iteration protocol,
+`Array.prototype.sort`, the array iterator kinds, `Array.from`/`of`, `Object.entries`/`values`/
+`assign`/`fromEntries`, JSON with replacer and reviver, Map and Set, image accessors, Date, and the
+String and Array methods a script reaches for.
+
+**One bug is 75% of the compiler errors.** `rt-unit-merge-object-properties!: conflicting existing
+property` accounts for **6,958 of the 9,252** — about 13% of the whole corpus, dwarfing every other
+cause (the next are 285 `expected semicolon or line terminator` and 96 `invalid destructuring
+target`). It is worth knowing exactly what it is before anyone fixes it:
+
+- It is **not reachable through `aot run-script`**. The harness and the test compiled together in
+  one compilation pass; so do two scripts that materialize overlapping intrinsics, and two scripts
+  that redeclare each other's globals.
+- It needs the runner's **cached harness bundle**: the harness is compiled once as its own unit and
+  merged with each test unit, so the two images were built against realms that materialized
+  different sets of intrinsics, and the merge then finds one property defined twice with values
+  that are not SameValue.
+- Reproduction: `AOT_T262_LIMIT=60 AOT_T262_JOBS=1` gives 6 conflicts out of 8 compiler errors.
+  `test/built-ins/Array/proto.js` conflicts under the runner and passes standalone;
+  `test/built-ins/DataView/prototype/getFloat16/this-is-not-object.js` conflicts under the runner
+  and standalone refuses honestly by name (`Float64Array`).
+
+So the 27.63% understates what the compiler does by something under 13 points, and the fix is in
+artifact reuse rather than in JavaScript semantics.
+
 ## Latest measured campaign, 2026-09-09 (sampled, after Math and the number globals)
 
 With Function.prototype call/apply, the Object statics and prototype methods, the Number and
