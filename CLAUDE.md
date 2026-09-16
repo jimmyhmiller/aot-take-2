@@ -192,7 +192,15 @@ When a `--fix` suggestion looks wrong, check it rather than accepting it. Report
 
 ## Working here
 
-- `coil test` is the gate. Green is the contract; nothing is committed red.
+- **The gate is `coil build -o build/release/aot` then `coil test --jobs 12`.** Green is the
+  contract; nothing is committed red. Both halves matter: `coil test` does not rebuild the runtime
+  object, and without `--jobs` it runs one test at a time — 954 s instead of 161 s for the same 904
+  tests (docs/COMPILE-TIME.md §7 has the measurements). Run it against a snapshot worktree and
+  **build nothing while it runs**; a gate competing with a `coil build` in the same tree took
+  40 minutes. During iteration run only the suites the change can break — `execution-test` is the
+  one slow suite at 188 s and the one that catches JavaScript-semantics regressions.
+- A wall-clock assertion is a backstop against a blowup, never a budget: the suite runs in parallel,
+  so elapsed time measures the machine's load. Gate on deterministic counts — nodes, blocks, rounds.
 - When the user asks to see compiler or IR graphs, use this repository's Graphviz machinery
   (`aot.print.dot` and the Coil tools built on it). Do not use pad or substitute a generic
   visualization: these graphs have project-specific node, edge, control, and memory conventions.
