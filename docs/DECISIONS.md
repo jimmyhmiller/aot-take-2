@@ -1,5 +1,78 @@
 # Decisions
 
+## 2026-09-16 — CopyDataProperties: object spread and object rest
+
+`{...o}` in a literal and `{a, ...rest}` in a pattern are the same abstract operation
+(CopyDataProperties, §7.3.25) and share one implementation in `jsl/compiler/object-rest.jsl`. It
+**copies**, it does not alias: an accessor on the source is read once and the target holds the
+value it returned, as a writable, enumerable, configurable data property.
+
+**The read is keyed, not named.** An array's elements and a string's code units are own properties
+that `JsGetNamed` does not reach — it answers only `length` and named properties — so the copy
+reads each own key with `JsGetKeyed`. `{...[7, 8]}` gives `{0: 7, 1: 8}`, and `{..."hi"}` gives
+`{0: "h", 1: "i"}`, both without the array's or string's `length`, which is not enumerable.
+
+**What is excluded is a key identity, not a spelling.** A pattern builds its exclusion list as it
+reads, pushing the key id each property was read under, so `{[k]: v, ...rest}` converts `k` exactly
+once and `rest` omits whatever that conversion named. Symbol keys are copied by neither path yet,
+because nothing enumerates them (docs/GAPS.md — property enumeration).
+
+A spread in a literal ends the literal's fixed layout, the way a computed key does, and copies onto
+the raw object under construction — which is why it has its own entry (`JsCopyLiteralProperties`)
+that boxes that object, as the literal's accessor and computed-key definitions do. Later properties
+of the same literal are defined after the copy and overwrite what it brought in, which is what
+source order says. A rest property in a pattern instead creates a fresh ordinary object; unlike a
+spread, it raises a TypeError on undefined or null, because a pattern requires something to copy.
+
+## 2026-09-16 — Optional chains
+
+`a?.b.c(d)` evaluates `a` once, and if it is null or undefined the value of the **whole chain** is
+undefined: the `.c` read does not happen, the call does not happen, and `d` is never evaluated. The
+short-circuit spans the rest of the chain, not one link, which is what decides the lowering.
+
+A chain is therefore lowered as a **list of links**, not by recursing on the syntax tree. The base
+is the operand of the first `?.` and is lowered by the ordinary expression walk, so a direct call,
+a `super` base or an intrinsic keeps the lowering it would have had. Each link is then applied to
+the value the chain holds; a `?.` link first opens a Scope diamond on `JsNullish`, whose nullish arm
+is an *arrival* that leaves the chain with the Scope it left in. Every arrival merges into one
+Scope, which meets the live path at a single merge past the last link, where a Phi selects the
+chain's value or undefined. That is `break` arriving at a loop's exit, spelled for an expression.
+
+A call link's receiver is the base of the member access it follows, so `a?.b(c)` calls `b` with `a`
+as `this`, and `(a?.b)(c)` — where the group ends the chain — calls it with undefined. The group
+boundary is already what `syntax-optional-chain?` respects, so a parenthesized chain is a complete
+chain whose result feeds an ordinary access.
+
+`delete a?.b` still refuses by name: the chain produces a value, and `delete` needs the Reference
+the last link would have produced.
+
+## 2026-09-16 — Destructuring
+
+A pattern is a *binder driven by a value*, and the same walk lowers every form the grammar admits:
+`let`/`const`/`var` declarations, formal and rest parameters, `=` assignment targets, `for (… of …)`
+heads and catch clauses. `lower-pattern-bind!` takes the pattern, the node holding the value it
+destructures, and a mode — `PATTERN-LET`, `PATTERN-VAR`, `PATTERN-ASSIGN`, `PATTERN-PARAM` — which
+decides only what a *leaf* does: initialize a lexical binding, write a `var`, PutValue a Reference,
+or define a parameter slot. Nothing else in the walk varies, so a nested leaf behaves the same
+however deep it sits, and a new pattern position costs one call.
+
+**An object pattern reads properties; an array pattern drives the iteration protocol.** That is the
+specification's distinction and it is observable: `let [a] = o` calls `o[Symbol.iterator]`, and a
+pattern with a hole still steps the iterator over the hole. The array walk is `JsDestructureState`
+plus `JsDestructureStep`/`JsDestructureRest`/`JsDestructureClose` in `jsl/compiler/iterator.jsl`, so
+the iterator is closed when the pattern is shorter than the iterable, exactly once.
+
+A default is applied where the specification applies it — to `undefined` only, after the read or the
+step, and per leaf — which is why a parameter's own default is applied to the slot value *before*
+the pattern walk rather than by the name-update path a plain parameter uses.
+
+Every pattern position throws: a property read, a `next` call, a ReferenceError from a leaf. The
+syntactic may-throw filter therefore counts a destructuring declaration, a destructuring assignment,
+a function with pattern parameters, and a destructured catch parameter — the last because the
+binding runs in the handler, which its own `try` does not protect.
+
+Object rest (`{...rest}`, CopyDataProperties) is not lowered yet and refuses by name.
+
 ## 2026-09-16 — A Script's lexical bindings belong to the realm
 
 `let`, `const` and `class` at a Script's top level were Scope values of the Script's own initializer

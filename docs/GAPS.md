@@ -187,11 +187,11 @@ arguments objects refuse (their `callee` accessor is %ThrowTypeError%, not decla
 `delete` of a property, an element, a name and any other expression, `for (… in …)` with `var`,
 `let`, `const` and expression heads, `Object.getOwnPropertyNames`, and `Object.keys` in
 OrdinaryOwnPropertyKeys order execute (docs/DECISIONS.md, delete and for-in). Missing: `delete` of
-an optional chain (optional chaining refuses as a whole), of a private member (an early error the
+an optional chain (the chain gives a value, and `delete` needs the Reference the last link would
+have produced), of a private member (an early error the
 class slice owns), of a closed program's intrinsic global binding (refused by name: its reads fold
 to the intrinsic), and of `arguments` inside a function (the implicit arguments object refuses); a
-for-in head `let` is one binding per iteration only because nothing captures it yet; destructuring
-for-in heads; symbol keys are neither enumerated nor listed (no symbol keys exist). Deleted fields
+for-in head `let` is one binding per iteration only because nothing captures it yet; symbol keys are neither enumerated nor listed (no symbol keys exist). Deleted fields
 leave hole rows, so an object whose middle properties are deleted and re-added again and again
 grows its layout; no dictionary mode compacts it.
 
@@ -573,9 +573,12 @@ simple target (assignment), method or call or optional-chain leaves, a parenthes
 parenthesized name where a binding is required, duplicate bound names across a parameter list or
 lexical scope, catch-parameter/lexical conflicts, `yield`/`await` inside destructured parameters,
 strict `eval`/`arguments` leaves, and destructuring declarations without initializers. Not yet
-lowered — every form refuses by name (`destructuring declarations`, `destructuring parameters`,
-`destructuring assignment`, `destructuring for-in/of heads`); the runtime needs iterator
-destructuring (`IteratorRestArray`, `ObjectRest`) and per-leaf PutValue/InitializeBinding first.
+lowered when this was written. **Lowered since 2026-09-16** (docs/DECISIONS.md — Destructuring):
+declarations, parameters, assignment patterns, `for-in`/`for-of` heads and catch clauses all bind.
+Object rest (`{...rest}`) copies since 2026-09-16 (docs/DECISIONS.md — CopyDataProperties). An array
+pattern over a string (`for (const [a, b] in o)`, which destructures the key) raises "value is not
+iterable" because `String.prototype[Symbol.iterator]` does not exist yet, not because the pattern
+does not lower.
 
 ### 2026-09-07 — Grammar-completion campaign follow-up
 

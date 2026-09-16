@@ -168,6 +168,7 @@ aot-take-2/
 │           ; symbol.jsl Symbol values, their prototype methods and their refused conversions
 │           ; console.jsl the host's output and how a value is shown
 │           ; iterator.jsl the iteration protocol and the array iterator
+│           ; object-rest.jsl CopyDataProperties: object spread in a literal, rest in a pattern
 │       function/ array-buffer/ data-view/ typed-array/
 ├── src/
 │   ├── main.coil            ; CLI driver: compile, emit, run, dump; `AOT_SEED=N` compiles under a test's arena seed
