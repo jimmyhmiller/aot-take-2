@@ -7,10 +7,18 @@ whose value form is `(symbol "description")`: the realm image builder makes one 
 declaration, so the value has the identity the specification requires for the program's life, and
 the row's attributes are the specification's — neither writable, enumerable nor configurable.
 
-**Their property key is minted on first use.** A key id belongs to the running program and the image
-is written before it starts, so an image Symbol's key word starts unminted and `rt-symbol-key` fills
-it the first time the Symbol is used as a key. Nothing else changes: the id is then as stable as a
-runtime Symbol's, and the compiler's static key table still holds names only.
+**Their property key is the compiler's.** A property defined under `@@iterator` has to be image data
+— `Array.prototype[@@iterator]` is — so the key cannot wait for the program to start: the compiler
+mints one per well-known Symbol (`shape-key-intern-symbol!`) and the Symbol's image payload carries
+it. A Symbol created at run time still mints its key on first use, because nothing in the image
+refers to it.
+
+**One flag bit carries it through every table.** A key record is an offset and a length, in the
+compiler's table, in the shapes blob and in a compilation unit's own table; the high bit of the
+length marks a Symbol's key, which no name length can reach. The readers mask it off before reading
+the name, name interning skips flagged keys so no source name can collide with a label, and the
+compilation-unit importer carries the flag across the link — without which two units interning the
+same label would merge a Symbol's key with a property name.
 
 ## 2026-09-16 — Symbol keys
 

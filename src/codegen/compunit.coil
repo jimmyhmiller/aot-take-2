@@ -28,7 +28,7 @@
 (import "coil.slice" :use [slice-data slice-new])
 (import "aot.rt.shapes" :use [SHAPES-VERSION SHAPES-HEADER-BYTES SHAPES-RECORD-BYTES
                                SHAPES-KEY-RECORD-BYTES SHAPES-WORD-BYTES SHAPES-FLAG-NONEXTENSIBLE
-                               shapes-read-u32 shapes-blob-magic?])
+                               shapes-read-u32 shapes-blob-magic? SHAPES-KEY-SYMBOL-FLAG SHAPES-KEY-NAME-LENGTH-MASK])
 (import "aot.shape" :use [SHAPE-STRING SHAPE-ELEMENTS])
 (import "aot.rt.rt" :use [RT-IMAGE-FIXED-BYTES RT-IMAGE-VERSION RT-HEADER-BYTES
                            rt-image-magic? rt-read-u32 rt-read-u64 rt-align8])
@@ -87,7 +87,11 @@
 (defstruct CuShapeRow [(parent i64) (key i64) (offset i64) (fields i64) (attrs i64) (flags i64)])
 (defstruct CuShapeBuilder
   [(names (ArrayList (slice u8))) (rows (ArrayList CuShapeRow))
-   (key-index (HashMap (slice u8) i64)) (row-index (HashMap CuShapeRow i64))])
+   ;; 1 where that key is a well-known Symbol's, whose recorded name is a label: it must never merge
+   ;; with a property name that happens to read the same (`aot.shape`, SHAPE-KEY-SYMBOL-FLAG).
+   (symbols (ArrayList i64))
+   (key-index (HashMap (slice u8) i64)) (symbol-index (HashMap (slice u8) i64))
+   (row-index (HashMap CuShapeRow i64))])
 
 (defn cu-shape-row-hash [(raw (ptr i8)) (size i64)] (-> i64)
   (let [r (primitive/cast (ptr CuShapeRow) raw)]
@@ -108,34 +112,42 @@
 
 (defn cu-shape-builder-new [] (-> CuShapeBuilder)
   (let [a (alloc/malloc-allocator) (mut names) (al-new [(slice u8)] a)
-        (mut rows) (al-new [CuShapeRow] a)]
+        (mut rows) (al-new [CuShapeRow] a)
+        (mut symbols) (al-new [i64] a)]
     (push! [(slice u8)] (mut names) "")
+    (push! [i64] (mut symbols) 0)
     (push! [CuShapeRow] (mut rows) (primitive/zeroed CuShapeRow))
     (push! [CuShapeRow] (mut rows) (primitive/zeroed CuShapeRow))
-    (CuShapeBuilder :names (load names) :rows (load rows)
+    (CuShapeBuilder :names (load names) :rows (load rows) :symbols (load symbols)
                     :key-index (hm-new [(slice u8) i64] a (str-keyops-borrowed))
+                    :symbol-index (hm-new [(slice u8) i64] a (str-keyops-borrowed))
                     :row-index (hm-new [CuShapeRow i64] a (cu-shape-row-keyops)))))
 
 (defn cu-shape-builder-free! [(builder (ptr CuShapeBuilder))] (-> i64)
   ;; The index borrows names; destroy it before releasing its key storage.
   (hm-free! (mut (.key-index builder)))
+  (hm-free! (mut (.symbol-index builder)))
   (hm-free! (mut (.row-index builder)))
   (let [(mut i) 1]
     (loop (if (>= (load i) (len (.names builder))) (break 0)
               (do (alloc/free [u8] (alloc/malloc-allocator) (get (.names builder) (load i)))
                   (set! (mut i) (+ (load i) 1)) (continue)))))
   (al-free! (mut (.names builder))) (al-free! (mut (.rows builder)))
+  (al-free! (mut (.symbols builder)))
   0)
 
-(defn cu-shape-key! [(builder (ptr CuShapeBuilder)) (name (slice u8))] (-> i64)
-  (match (get (.key-index builder) name)
+(defn cu-shape-key! [(builder (ptr CuShapeBuilder)) (name (slice u8)) (symbol? bool)] (-> i64)
+  (match (if symbol? (get (.symbol-index builder) name) (get (.key-index builder) name))
     (Some [id] id)
     (None []
       (let [(mut bytes) (al-new [u8] (alloc/malloc-allocator)) id (len (.names builder))]
         (al-extend! [u8] (mut bytes) (slice-data name) (len name))
         (let [owned (al-into-slice (mut bytes))]
           (push! [(slice u8)] (mut (.names builder)) owned)
-          (set! (mut (.key-index builder)) owned id)
+          (push! [i64] (mut (.symbols builder)) (if symbol? 1 0))
+          (if symbol?
+              (set! (mut (.symbol-index builder)) owned id)
+              (set! (mut (.key-index builder)) owned id))
           id)))))
 
 (defn cu-shape-row! [(builder (ptr CuShapeBuilder)) (row CuShapeRow)] (-> i64)
@@ -178,7 +190,10 @@
             (set! (mut k) 0)
             (loop (if (>= (load k) key-count) (break 0)
                       (let [at (+ key-start (* (load k) SHAPES-KEY-RECORD-BYTES))
-                            offset (shapes-read-u32 p at) bytes (shapes-read-u32 p (+ at 4))]
+                            offset (shapes-read-u32 p at)
+                            recorded (shapes-read-u32 p (+ at 4))
+                            symbol? (!= (& recorded SHAPES-KEY-SYMBOL-FLAG) 0)
+                            bytes (& recorded SHAPES-KEY-NAME-LENGTH-MASK)]
                         (if (or (> offset name-bytes) (> bytes (- name-bytes offset)))
                             (panic "cu-shape-import!: key name outside name storage") 0)
                         (if (= (load k) 0)
@@ -186,7 +201,9 @@
                                 (panic "cu-shape-import!: malformed invalid key") 0)
                             (do (if (= bytes 0) (panic "cu-shape-import!: empty property key is not admitted") 0)
                                 (push! [i64] (mut keys)
-                                       (cu-shape-key! builder (slice-new [u8] (primitive/index p (+ names-start offset)) bytes))) 0))
+                                       (cu-shape-key! builder
+                                                      (slice-new [u8] (primitive/index p (+ names-start offset)) bytes)
+                                                      symbol?)) 0))
                         (set! (mut k) (+ (load k) 1)) (continue))))
             (set! (mut k) 2)
             (loop (if (>= (load k) shape-count) (break 0)
@@ -237,9 +254,15 @@
         (cu-shape-put-u32! (mut out) (.parent r)) (cu-shape-put-u32! (mut out) (.key r))
         (cu-shape-put-u32! (mut out) (.offset r)) (cu-shape-put-u32! (mut out) (.fields r))
         (cu-shape-put-u32! (mut out) (.attrs r)) (cu-shape-put-u32! (mut out) (.flags r))))
-    (al-for [name (.names builder)]
-      (cu-shape-put-u32! (mut out) (load offset)) (cu-shape-put-u32! (mut out) (len name))
-      (set! (mut offset) (+ (load offset) (len name))))
+    (let [(mut i) 0]
+      (al-for [name (.names builder)]
+        (cu-shape-put-u32! (mut out) (load offset))
+        (cu-shape-put-u32! (mut out)
+                           (if (= (get (.symbols builder) (load i)) 1)
+                               (| (len name) SHAPES-KEY-SYMBOL-FLAG)
+                               (len name)))
+        (set! (mut offset) (+ (load offset) (len name)))
+        (set! (mut i) (+ (load i) 1))))
     (al-for [name (.names builder)] (al-extend! [u8] (mut out) (slice-data name) (len name)))
     (al-into-slice (mut out))))
 
