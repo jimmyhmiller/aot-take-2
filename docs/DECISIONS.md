@@ -1,5 +1,63 @@
 # Decisions
 
+## 2026-09-16 — JSON
+
+`jsl/compiler/json.jsl` is `jsl/json/stringify.jsl` and `jsl/json/parse.jsl` brought into the
+compiler's JSL. The structure and the decisions are theirs and are kept: the serializer's **omission
+sentinel** (a serialized value is a tagged string, or tagged undefined for a value the surrounding
+object must omit, which an array turns into the token `null`), **cycle detection by a stack** of the
+objects on the path from the root, and a parser in which **every arm returns the value it read
+together with the cursor it stopped at**, as a two-element array, so mutually recursive arms keep one
+shape. What changed is the vocabulary: a loop is recursion into a named definition, a completion
+travels as the exception sentinel rather than a `%Throw`, and property access goes through the
+`JsGetKeyed`/`JsSetKeyed` entries the rest of the compiler's JSL uses.
+
+The parser implements JSON's grammar, not JavaScript's: `{a:1}`, `[1,]`, `01`, `'x'`, an
+unterminated string, trailing junk after a complete value, and a truncated keyword are each a
+SyntaxError. A number is validated here and converted by StringToNumber over its exact substring.
+
+`stringify` reads **keyed** and filters by enumerability, for the reason CopyDataProperties does.
+The `replacer` (function or key-selecting array), the `reviver` and `space` all apply. A reviver
+walks an array over its indices rather than its own property names, because `length` is an own
+property and reviving it would resize the array.
+
+**The serializer carries its state as ordinary parameters** — the cycle stack, the replacer, the
+property list, the indent unit and the current indent — rather than bundling them into one object.
+That is not a style choice: a value that has been through an array slot is any dynamic value again
+and carries no representation proof, so the typed `arr` and `str` parameters are what let the body
+concatenate and index without a guard at every use. Bundling them cost six proofs and three
+compiler refusals before this was clear.
+
+Two rules of the JSL checker shaped the rest: a **completion cannot be passed as an argument**, so
+`toJSON`'s result is tested before the replacer sees it — which is also the order the specification
+applies them in; and **a receiver's family does not cross a call boundary**, so the holder is
+tested to be an object where a call passes it as `this`.
+
+## 2026-09-16 — The built-ins a program reaches for first
+
+`Array.prototype.sort` is a **merge sort**, because the specification requires a stable one: the
+merge takes the left element whenever the comparison is not positive, and that is the whole of
+stability. A comparator is user code, so every comparison can throw, and a completion stops the
+sort where it happened rather than writing back a partial order. Holes and undefined both move to
+the end, in that order, and they get there by construction: only present elements are collected,
+SortCompare sorts undefined after every value, and the write-back leaves the positions past the
+collected elements as holes.
+
+`keys`, `values` and `entries` are one array iterator with an iteration kind in a third internal
+slot, as CreateArrayIterator has. An iterator is also its own iterable — %IteratorPrototype%'s
+`@@iterator` returns `this` — which is what makes `for (const k of a.keys())` and
+`[...a.entries()]` work at all; without it a `for-of` over an iterator raises "not iterable".
+
+`Array.from`, `Object.entries`, `Object.values` and `Object.assign` all read **keyed**, for the
+reason CopyDataProperties does: an array's elements and a string's code units are own properties a
+named read cannot reach. `Object.assign` sets rather than defines, so a setter on the target runs;
+a spread defines, so it does not. `Array.from` prefers the iterator and falls back to `length`,
+and a mapper that throws closes the iterator, as IteratorClose requires.
+
+`Array.of` is variadic, so — like `console.log` — its code is the callable ABI itself. An intrinsic
+method whose parameters are all `dyn` cannot see how many arguments arrived, which is the
+difference between `Array.of()` and `Array.of(undefined)`.
+
 ## 2026-09-16 — CopyDataProperties: object spread and object rest
 
 `{...o}` in a literal and `{a, ...rest}` in a pattern are the same abstract operation

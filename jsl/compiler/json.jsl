@@ -1,0 +1,687 @@
+; JSON.stringify (§25.5.2) and JSON.parse (§25.5.1).
+;
+; This is `jsl/json/stringify.jsl` and `jsl/json/parse.jsl` brought into the compiler's JSL: the
+; structure and the decisions are theirs — the serializer's omission sentinel, cycle detection by a
+; stack of the objects being visited, and a parser whose every arm returns the value it read
+; together with the cursor it stopped at — spelled with this vocabulary, where a loop is recursion
+; into a named definition and every completion travels as the exception sentinel.
+;
+; A serialized value is a tagged string, or tagged undefined for a value the surrounding object must
+; omit; an array turns that same sentinel into the token `null`. The parser's result is a two
+; element array, the value and the index after it, so mutually recursive arms keep one shape.
+
+; ---------------------------------------------------------------------------------------------
+; JSON.stringify
+
+(macro JsonQuote :transitioning true :params [] :ret str
+  (%StringFromCharCode 34))
+
+(macro JsonBackslash :transitioning true :params [] :ret str
+  (%StringFromCharCode 92))
+
+(builtin JsonHexChar :transitioning true :params [(digit int)] :ret str
+  (%StringFromCharCode (if (%Lt digit 10) (%Add digit 48) (%Add digit 87))))
+
+; QuoteJSONString's escapes (§25.5.2.2): the two that must be escaped, the five with short forms,
+; and every other control character as \u00xx.
+(builtin JsonEscapeCodeUnit :transitioning true :params [(code int)] :ret str
+  (if (%Eq code 34)
+      (%StringConcat (JsonBackslash) (JsonQuote))
+      (if (%Eq code 92)
+          (%StringConcat (JsonBackslash) (JsonBackslash))
+          (if (%Eq code 8)
+              (%StringConcat (JsonBackslash) "b")
+              (if (%Eq code 9)
+                  (%StringConcat (JsonBackslash) "t")
+                  (if (%Eq code 10)
+                      (%StringConcat (JsonBackslash) "n")
+                      (if (%Eq code 12)
+                          (%StringConcat (JsonBackslash) "f")
+                          (if (%Eq code 13)
+                              (%StringConcat (JsonBackslash) "r")
+                              (if (%Lt code 32)
+                                  (%StringConcat (%StringConcat (JsonBackslash) "u")
+                                                 (%StringConcat "00"
+                                                                (%StringConcat (JsonHexChar (%Div code 16))
+                                                                               (JsonHexChar (%Sub code (%Mul (%Div code 16) 16))))))
+                                  (%StringFromCharCode code))))))))))
+
+(builtin JsonQuoteString :transitioning true :params [(raw str)] :ret str
+  (%StringConcat (JsonQuoteFrom raw 0 (JsonQuote)) (JsonQuote)))
+
+(builtin JsonQuoteFrom :transitioning true :params [(raw str) (i int) (out str)] :ret str
+  (if (%Lt i (%StringLength raw))
+      (JsonQuoteFrom raw
+                     (%Add i 1)
+                     (%StringConcat out (JsonEscapeCodeUnit (%StringCharCode raw i))))
+      out))
+
+; The objects on the path from the root to the value being serialized. A value already on it is the
+; circular structure TypeError (§25.5.2.2 step 1).
+(builtin JsonStackHas :params [(stack arr) (value dyn) (i int)] :ret bool
+  (if (%Lt i (%ArrayLen stack))
+      (if (%SameBits (%ArrayLoad stack i) value)
+          (%Eq 0 0)
+          (JsonStackHas stack value (%Add i 1)))
+      (%Eq 0 1)))
+
+; The indent unit (§25.5.2.1 steps 5-8): a number is that many spaces, at most ten; a string is
+; itself, at most ten code units; anything else indents nothing.
+(builtin JsonGap :transitioning true :throws true :params [(space dyn)] :ret dyn
+  (if (JsIsNumberValue space)
+      (let [(n (JsPrimitiveNumber space))]
+        (%Box (JsonSpaces (if (%Lt n (%ToFloat 0))
+                              0
+                              (if (%Lt (%ToFloat 10) n) 10 (%ToInteger n)))
+                          "")))
+      (if (%IsString space)
+          (let [(raw (%UnboxString space))]
+            (%Box (%Substring raw 0 (if (%Lt 10 (%StringLength raw)) 10 (%StringLength raw)))))
+          (%Box ""))))
+
+(builtin JsonSpaces :transitioning true :params [(count int) (out str)] :ret str
+  (if (%Lt 0 count)
+      (JsonSpaces (%Sub count 1) (%StringConcat out " "))
+      out))
+
+; The serializer carries its state as ORDINARY PARAMETERS — the stack of objects on the current
+; path, the replacer, the property list an array replacer selects, the indent unit and the current
+; indent — rather than bundling them into one object. A value that has been through an array slot
+; is any dynamic value again: it carries no representation proof, so every use of it would need a
+; guard the caller has already established. Six parameters keep six proofs.
+
+; A `toJSON` method is called with the key, and its result is what is serialized (§25.5.2.2 step 2).
+(builtin JsonApplyToJSON :transitioning true :throws true :params [(value dyn) (key dyn)] :ret dyn
+  (if (%IsObjectLike value)
+      (let [(method (JsGetNamed value (%PropertyKey "toJSON")))]
+        (if (%IsException method)
+            method
+            (if (%IsFunction method)
+                (%CallFunction method value key (%Undefined) (%Undefined) (%Undefined))
+                value)))
+      value))
+
+; A replacer function sees each key and value on the object that holds them, and its result is what
+; is serialized (§25.5.2.2 step 3). It runs after `toJSON`, as the specification orders them.
+(builtin JsonApplyReplacer :transitioning true :throws true
+  :params [(value dyn) (key dyn) (holder dyn) (replacer dyn)] :ret dyn
+  (if (%IsFunction replacer)
+      ;; The holder is an object the serializer made or walked, but a receiver's family does not
+      ;; cross a call boundary: the test is the proof this call needs.
+      (if (%IsObjectLike holder)
+          (%CallFunction replacer holder key value (%Undefined) (%Undefined))
+          (%CallFunction replacer (%Undefined) key value (%Undefined) (%Undefined)))
+      value))
+
+; SerializeJSONProperty (§25.5.2.2): `toJSON` is consulted, then the replacer, then the value is
+; serialized by its type. A Number that is not finite, and every value with no JSON form, is `null`
+; inside an array and omitted inside an object — which is what the undefined sentinel says.
+(builtin JsonSerialize :transitioning true :throws true
+  :params [(value dyn) (key dyn) (holder dyn) (stack arr) (replacer dyn) (props dyn) (gap str) (indent str)] :ret dyn
+  ;; A completion cannot be passed on as an argument, so `toJSON`'s result is tested before the
+  ;; replacer sees it.
+  (let [(json (JsonApplyToJSON value key))]
+    (if (%IsException json)
+        json
+        (let [(converted (JsonApplyReplacer json key holder replacer))]
+          (if (%IsException converted)
+              converted
+              (if (%IsString converted)
+                  (%Box (JsonQuoteString (%UnboxString converted)))
+                  (if (%IsBool converted)
+                      (JsToStringValue converted)
+                      (if (%IsNull converted)
+                          (%Box "null")
+                          (if (JsIsNumberValue converted)
+                              (if (JsNumberFinite (JsPrimitiveNumber converted))
+                                  (JsToStringValue converted)
+                                  (%Box "null"))
+                              (if (%IsArray converted)
+                                  (JsonSerializeArray converted stack replacer props gap indent)
+                                  (if (%IsFunction converted)
+                                      (%Undefined)
+                                      (if (%IsObjectLike converted)
+                                          (JsonSerializeObject converted stack replacer props gap indent)
+                                          (%Undefined))))))))))))) 
+
+(builtin JsonSerializeArray :transitioning true :throws true
+  :params [(value dyn) (stack arr) (replacer dyn) (props dyn) (gap str) (indent str)] :ret dyn
+  (if (JsonStackHas stack value 0)
+      (JsThrowTypeError (%Box "Converting circular structure to JSON"))
+      (let [(depth (%ArrayLen stack))]
+        (let [(pushed (%ArrayStore stack depth value))]
+          (let [(body (JsonArrayMembers value stack replacer props gap (%StringConcat indent gap) 0 ""))]
+            (if (%IsException body)
+                body
+                (let [(popped (%ArraySetLength stack depth))]
+                  (%Box (JsonWrap "[" "]"
+                                  (%UnboxString body)
+                                  gap
+                                  indent
+                                  (%ArrayLen (%UnboxArray value)))))))))))
+
+(builtin JsonArrayMembers :transitioning true :throws true
+  :params [(value dyn) (stack arr) (replacer dyn) (props dyn) (gap str) (indent str) (i int) (out str)] :ret dyn
+  (if (%Lt i (%ArrayLen (%UnboxArray value)))
+      (let [(element (JsGetKeyed value (%BoxInt i)))]
+        (if (%IsException element)
+            element
+            (let [(serialized (JsonSerialize element
+                                             (%Box (%NumberToString (%BoxInt i)))
+                                             value
+                                             stack
+                                             replacer
+                                             props
+                                             gap
+                                             indent))]
+              (if (%IsException serialized)
+                  serialized
+                  ;; A member with no JSON form is `null` here, where an object would omit it.
+                  (let [(piece (if (%IsUndefined serialized) "null" (%UnboxString serialized)))]
+                    (JsonArrayMembers value
+                                      stack
+                                      replacer
+                                      props
+                                      gap
+                                      indent
+                                      (%Add i 1)
+                                      (JsonJoin out piece gap indent)))))))
+      (%Box out)))
+
+; An array replacer selects the keys and their order; without one the object's own enumerable string
+; keys are used, in OrdinaryOwnPropertyKeys order.
+(builtin JsonSerializeObject :transitioning true :throws true
+  :params [(value dyn) (stack arr) (replacer dyn) (props dyn) (gap str) (indent str)] :ret dyn
+  (if (JsonStackHas stack value 0)
+      (JsThrowTypeError (%Box "Converting circular structure to JSON"))
+      (let [(depth (%ArrayLen stack))]
+        (let [(pushed (%ArrayStore stack depth value))]
+          (let [(names (if (%IsArray props)
+                           props
+                           (JsObjectGetOwnPropertyNames (%Undefined) value)))]
+            (if (%IsException names)
+                names
+                (let [(body (JsonObjectMembers value
+                                               stack
+                                               replacer
+                                               props
+                                               gap
+                                               (%StringConcat indent gap)
+                                               (%UnboxArray names)
+                                               0
+                                               ""))]
+                  (if (%IsException body)
+                      body
+                      (let [(popped (%ArraySetLength stack depth))]
+                        (%Box (JsonWrap "{" "}"
+                                        (%UnboxString body)
+                                        gap
+                                        indent
+                                        (%StringLength (%UnboxString body)))))))))))))
+
+(builtin JsonObjectMembers :transitioning true :throws true
+  :params [(value dyn) (stack arr) (replacer dyn) (props dyn) (gap str) (indent str) (names arr) (i int) (out str)] :ret dyn
+  (if (%Lt i (%ArrayLen names))
+      (let [(name (%ArrayLoad names i))]
+        ;; A selected key is serialized whether or not the object has it; an unselected walk skips
+        ;; the keys that are not enumerable.
+        (if (if (%IsArray props)
+                (%Eq 0 0)
+                (JsForInEnumerable value name (JsToPropertyKey name)))
+            (let [(member (JsGetKeyed value name))]
+              (if (%IsException member)
+                  member
+                  (let [(serialized (JsonSerialize member name value stack replacer props gap indent))]
+                    (if (%IsException serialized)
+                        serialized
+                        (if (%IsUndefined serialized)
+                            (JsonObjectMembers value stack replacer props gap indent names (%Add i 1) out)
+                            (let [(text (JsToStringValue name))]
+                              (if (%IsException text)
+                                  text
+                                  (let [(pair (%StringConcat (%StringConcat (JsonQuoteString (%UnboxString text))
+                                                                            (if (%Eq (%StringLength gap) 0) ":" ": "))
+                                                             (%UnboxString serialized)))]
+                                    (JsonObjectMembers value
+                                                       stack
+                                                       replacer
+                                                       props
+                                                       gap
+                                                       indent
+                                                       names
+                                                       (%Add i 1)
+                                                       (JsonJoin out pair gap indent))))))))))
+            (JsonObjectMembers value stack replacer props gap indent names (%Add i 1) out)))
+      (%Box out)))
+
+; One member appended: the separator is a comma, and with an indent unit a newline and this level's
+; indent as well. The first member has no comma and is recognized by the empty accumulator.
+(builtin JsonJoin :transitioning true :params [(out str) (piece str) (gap str) (indent str)] :ret str
+  (%StringConcat out
+                 (%StringConcat (if (%Eq (%StringLength gap) 0)
+                                    (if (%Eq (%StringLength out) 0) "" ",")
+                                    (%StringConcat (if (%Eq (%StringLength out) 0)
+                                                       (%StringFromCharCode 10)
+                                                       (%StringConcat "," (%StringFromCharCode 10)))
+                                                   indent))
+                                piece)))
+
+; The brackets around a body: with an indent unit a non-empty body also closes on its own line.
+(builtin JsonWrap :transitioning true
+  :params [(open str) (close str) (body str) (gap str) (indent str) (count int)] :ret str
+  (%StringConcat (%StringConcat open body)
+                 (if (if (%Eq (%StringLength gap) 0) (%Eq 0 0) (%Eq count 0))
+                     close
+                     (%StringConcat (%StringConcat (%StringFromCharCode 10) indent) close))))
+
+; The property list an array replacer selects (§25.5.2.1 step 4.b): its string and number entries,
+; each once, in the order they appear.
+(builtin JsonPropertyList :transitioning true :throws true :params [(replacer dyn)] :ret dyn
+  (if (%IsArray replacer)
+      (JsonPropertyListFrom replacer 0 (JsNewArray 0))
+      (%Undefined)))
+
+(builtin JsonPropertyListFrom :transitioning true :throws true
+  :params [(replacer dyn) (i int) (out dyn)] :ret dyn
+  (if (%Lt i (%ArrayLen (%UnboxArray replacer)))
+      (let [(item (%ArrayLoad (%UnboxArray replacer) i))]
+        (let [(name (if (%IsString item)
+                        item
+                        (if (JsIsNumberValue item) (JsToStringValue item) (%Undefined))))]
+          (if (%IsException name)
+              name
+              (if (%IsUndefined name)
+                  (JsonPropertyListFrom replacer (%Add i 1) out)
+                  (if (JsonListHas (%UnboxArray out) (%UnboxString name) 0)
+                      (JsonPropertyListFrom replacer (%Add i 1) out)
+                      (let [(stored (%ArrayStore (%UnboxArray out) (%ArrayLen (%UnboxArray out)) name))]
+                        (JsonPropertyListFrom replacer (%Add i 1) out)))))))
+      out))
+
+(builtin JsonListHas :params [(list arr) (name str) (i int)] :ret bool
+  (if (%Lt i (%ArrayLen list))
+      (let [(entry (%ArrayLoad list i))]
+        (if (%IsString entry)
+            (if (%StringEq (%UnboxString entry) name)
+                (%Eq 0 0)
+                (JsonListHas list name (%Add i 1)))
+            (JsonListHas list name (%Add i 1))))
+      (%Eq 0 1)))
+
+; JSON.stringify(value, replacer, space) (§25.5.2). The value is serialized as the only property of
+; a wrapper object, under the empty key, which is what gives a replacer function something to be
+; called on at the top level.
+(builtin JsonStringify :transitioning true :throws true
+  :params [(this dyn) (value dyn) (replacer dyn) (space dyn)] :ret dyn
+  (let [(gap (JsonGap space))]
+    (if (%IsException gap)
+        gap
+        (let [(props (JsonPropertyList replacer))]
+          (if (%IsException props)
+              props
+              (let [(holder (JsFinishObjectLiteral (JsSetObjectLiteralPrototype (JsNewObjectRaw)
+                                                                                (%IntrinsicPrototype "Object.prototype"))))]
+                (let [(stored (JsSetKeyed holder (%Box "") value 1))]
+                  (if (%IsException stored)
+                      stored
+                      (JsonSerialize value
+                                     (%Box "")
+                                     holder
+                                     (%UnboxArray (JsNewArray 0))
+                                     replacer
+                                     props
+                                     (%UnboxString gap)
+                                     "")))))))))
+
+; ---------------------------------------------------------------------------------------------
+; JSON.parse
+;
+; Every arm returns a two element array — the value it read and the index after it — so mutually
+; recursive arms keep one shape, and a SyntaxError travels as the exception sentinel through the
+; same position. The grammar is JSON's, not JavaScript's: no trailing comma, no single quotes, no
+; leading zero, no unquoted key.
+
+(builtin JsonResult :transitioning true :params [(value dyn) (next int)] :ret dyn
+  (let [(out (JsNewArray 0))]
+    (let [(with-value (%ArrayStore (%UnboxArray out) 0 value))]
+      (let [(with-next (%ArrayStore (%UnboxArray out) 1 (%BoxInt next)))]
+        out))))
+
+(macro JsonValueOf :params [(result dyn)] :ret dyn
+  (%ArrayLoad (%UnboxArray result) 0))
+
+(macro JsonNextOf :params [(result dyn)] :ret int
+  (let [(boxed (%ArrayLoad (%UnboxArray result) 1))]
+    (if (%IsInt boxed) (%UnboxInt boxed) (let [(trapped (%TrapInvariant))] 0))))
+
+(macro JsonIsDigit :params [(code int)] :ret bool
+  (if (%Lt code 48) (%Eq 0 1) (%Le code 57)))
+
+(builtin JsonIsWhitespace :params [(code int)] :ret bool
+  (if (%Eq code 32)
+      (%Eq 0 0)
+      (if (%Eq code 10)
+          (%Eq 0 0)
+          (if (%Eq code 13) (%Eq 0 0) (%Eq code 9)))))
+
+(builtin JsonSkipWhitespace :params [(raw str) (cursor int)] :ret int
+  (if (%Lt cursor (%StringLength raw))
+      (if (JsonIsWhitespace (%StringCharCode raw cursor))
+          (JsonSkipWhitespace raw (%Add cursor 1))
+          cursor)
+      cursor))
+
+(builtin JsonHexDigit :params [(code int)] :ret int
+  (if (%Le 48 code)
+      (if (%Le code 57)
+          (%Sub code 48)
+          (JsonHexLetter code))
+      -1))
+
+(builtin JsonHexLetter :params [(code int)] :ret int
+  (if (%Le 65 code)
+      (if (%Le code 70)
+          (%Sub code 55)
+          (if (%Le 97 code)
+              (if (%Le code 102) (%Sub code 87) -1)
+              -1))
+      -1))
+
+; The code unit a \uXXXX escape names, or -1 when the four digits are not hexadecimal.
+(builtin JsonHex4 :params [(raw str) (i int)] :ret int
+  (if (%Le (%Add i 4) (%StringLength raw))
+      (let [(a (JsonHexDigit (%StringCharCode raw i)))
+            (b (JsonHexDigit (%StringCharCode raw (%Add i 1))))
+            (c (JsonHexDigit (%StringCharCode raw (%Add i 2))))
+            (d (JsonHexDigit (%StringCharCode raw (%Add i 3))))]
+        (if (%Lt a 0)
+            -1
+            (if (%Lt b 0)
+                -1
+                (if (%Lt c 0)
+                    -1
+                    (if (%Lt d 0)
+                        -1
+                        (%Add (%Add (%Mul a 4096) (%Mul b 256)) (%Add (%Mul c 16) d)))))))
+      -1))
+
+; The code unit a single-character escape names, or -1 for one JSON does not have.
+(builtin JsonEscapeUnit :params [(code int)] :ret int
+  (if (%Eq code 34)
+      34
+      (if (%Eq code 92)
+          92
+          (if (%Eq code 47)
+              47
+              (if (%Eq code 98)
+                  8
+                  (if (%Eq code 102)
+                      12
+                      (if (%Eq code 110)
+                          10
+                          (if (%Eq code 114) 13 (if (%Eq code 116) 9 -1)))))))))
+
+; A string, decoded as it is scanned: the result is the string and the index after its closing
+; quote. An unterminated string, a raw control character and an escape JSON does not have are each
+; the SyntaxError.
+(builtin JsonParseString :transitioning true :throws true :params [(raw str) (i int)] :ret dyn
+  (JsonStringFrom raw (%Add i 1) ""))
+
+(builtin JsonStringFrom :transitioning true :throws true :params [(raw str) (i int) (out str)] :ret dyn
+  (if (%Lt i (%StringLength raw))
+      (let [(code (%StringCharCode raw i))]
+        (if (%Eq code 34)
+            (JsonResult (%Box out) (%Add i 1))
+            (if (%Lt code 32)
+                (JsThrowSyntaxError)
+                (if (%Eq code 92)
+                    (JsonStringEscape raw (%Add i 1) out)
+                    (JsonStringFrom raw (%Add i 1) (%StringConcat out (%StringFromCharCode code)))))))
+      (JsThrowSyntaxError)))
+
+(builtin JsonStringEscape :transitioning true :throws true :params [(raw str) (i int) (out str)] :ret dyn
+  (if (%Lt i (%StringLength raw))
+      (let [(code (%StringCharCode raw i))]
+        (if (%Eq code 117)
+            (let [(unit (JsonHex4 raw (%Add i 1)))]
+              (if (%Lt unit 0)
+                  (JsThrowSyntaxError)
+                  (JsonStringFrom raw (%Add i 5) (%StringConcat out (%StringFromCharCode unit)))))
+            (let [(unit (JsonEscapeUnit code))]
+              (if (%Lt unit 0)
+                  (JsThrowSyntaxError)
+                  (JsonStringFrom raw (%Add i 1) (%StringConcat out (%StringFromCharCode unit)))))))
+      (JsThrowSyntaxError)))
+
+(builtin JsonScanDigits :params [(raw str) (i int)] :ret int
+  (if (%Lt i (%StringLength raw))
+      (if (JsonIsDigit (%StringCharCode raw i))
+          (JsonScanDigits raw (%Add i 1))
+          i)
+      i))
+
+; JSON's number grammar: an optional minus, an integer part with no leading zero, an optional
+; fraction and an optional exponent — each part, once begun, requiring a digit.
+(builtin JsonParseNumber :transitioning true :throws true :params [(raw str) (i int)] :ret dyn
+  (let [(start (if (%Eq (%StringCharCode raw i) 45) (%Add i 1) i))]
+    (if (%Le (%StringLength raw) start)
+        (JsThrowSyntaxError)
+        (let [(first (%StringCharCode raw start))]
+          (if (JsonIsDigit first)
+              (let [(integer-end (if (%Eq first 48) (%Add start 1) (JsonScanDigits raw (%Add start 1))))]
+                ;; `01` is two tokens in JSON, not one number.
+                (if (JsonDigitAt raw integer-end)
+                    (JsThrowSyntaxError)
+                    (let [(fraction-end (JsonFractionEnd raw integer-end))]
+                      (if (%Lt fraction-end 0)
+                          (JsThrowSyntaxError)
+                          (let [(end (JsonExponentEnd raw fraction-end))]
+                            (if (%Lt end 0)
+                                (JsThrowSyntaxError)
+                                (JsonResult (%StringToNumber (%Substring raw i end)) end)))))))
+              (JsThrowSyntaxError))))))
+
+(macro JsonDigitAt :params [(raw str) (i int)] :ret bool
+  (if (%Lt i (%StringLength raw)) (JsonIsDigit (%StringCharCode raw i)) (%Eq 0 1)))
+
+; The index after a fraction, the index itself when there is none, or -1 for a `.` with no digit.
+(builtin JsonFractionEnd :params [(raw str) (i int)] :ret int
+  (if (%Lt i (%StringLength raw))
+      (if (%Eq (%StringCharCode raw i) 46)
+          (if (JsonDigitAt raw (%Add i 1))
+              (JsonScanDigits raw (%Add i 1))
+              -1)
+          i)
+      i))
+
+(builtin JsonExponentEnd :params [(raw str) (i int)] :ret int
+  (if (%Lt i (%StringLength raw))
+      (let [(code (%StringCharCode raw i))]
+        (if (if (%Eq code 101) (%Eq 0 0) (%Eq code 69))
+            (let [(after (JsonExponentSign raw (%Add i 1)))]
+              (if (JsonDigitAt raw after)
+                  (JsonScanDigits raw (%Add after 1))
+                  -1))
+            i))
+      i))
+
+(macro JsonExponentSign :params [(raw str) (i int)] :ret int
+  (if (%Lt i (%StringLength raw))
+      (let [(code (%StringCharCode raw i))]
+        (if (if (%Eq code 43) (%Eq 0 0) (%Eq code 45)) (%Add i 1) i))
+      i))
+
+(builtin JsonLiteralAt :transitioning true :throws true
+  :params [(raw str) (i int) (literal str) (value dyn)] :ret dyn
+  (let [(end (%Add i (%StringLength literal)))]
+    (if (%Le end (%StringLength raw))
+        (if (%StringEq (%Substring raw i end) literal)
+            (JsonResult value end)
+            (JsThrowSyntaxError))
+        (JsThrowSyntaxError))))
+
+(builtin JsonParseArray :transitioning true :throws true :params [(raw str) (i int)] :ret dyn
+  (let [(out (JsNewArray 0))]
+    (let [(start (JsonSkipWhitespace raw (%Add i 1)))]
+      (if (JsonCharAt raw start 93)
+          (JsonResult out (%Add start 1))
+          (JsonArrayElements raw start out 0)))))
+
+(builtin JsonArrayElements :transitioning true :throws true
+  :params [(raw str) (i int) (out dyn) (element int)] :ret dyn
+  (let [(parsed (JsonParseValue raw i))]
+    (if (%IsException parsed)
+        parsed
+        (let [(stored (%ArrayStore (%UnboxArray out) element (JsonValueOf parsed)))]
+          (let [(after (JsonSkipWhitespace raw (JsonNextOf parsed)))]
+            (if (JsonCharAt raw after 93)
+                (JsonResult out (%Add after 1))
+                (if (JsonCharAt raw after 44)
+                    (JsonArrayElements raw
+                                       (JsonSkipWhitespace raw (%Add after 1))
+                                       out
+                                       (%Add element 1))
+                    (JsThrowSyntaxError))))))))
+
+(macro JsonCharAt :params [(raw str) (i int) (code int)] :ret bool
+  (if (%Lt i (%StringLength raw)) (%Eq (%StringCharCode raw i) code) (%Eq 0 1)))
+
+(builtin JsonParseObject :transitioning true :throws true :params [(raw str) (i int)] :ret dyn
+  (let [(out (JsFinishObjectLiteral (JsSetObjectLiteralPrototype (JsNewObjectRaw)
+                                                                 (%IntrinsicPrototype "Object.prototype"))))]
+    (let [(start (JsonSkipWhitespace raw (%Add i 1)))]
+      (if (JsonCharAt raw start 125)
+          (JsonResult out (%Add start 1))
+          (JsonObjectMembersFrom raw start out)))))
+
+(builtin JsonObjectMembersFrom :transitioning true :throws true
+  :params [(raw str) (i int) (out dyn)] :ret dyn
+  (if (JsonCharAt raw i 34)
+      (let [(key (JsonParseString raw i))]
+        (if (%IsException key)
+            key
+            (let [(after-key (JsonSkipWhitespace raw (JsonNextOf key)))]
+              (if (JsonCharAt raw after-key 58)
+                  (let [(parsed (JsonParseValue raw (JsonSkipWhitespace raw (%Add after-key 1))))]
+                    (if (%IsException parsed)
+                        parsed
+                        (let [(stored (JsSetKeyed out (JsonValueOf key) (JsonValueOf parsed) 1))]
+                          (if (%IsException stored)
+                              stored
+                              (let [(after (JsonSkipWhitespace raw (JsonNextOf parsed)))]
+                                (if (JsonCharAt raw after 125)
+                                    (JsonResult out (%Add after 1))
+                                    (if (JsonCharAt raw after 44)
+                                        (JsonObjectMembersFrom raw
+                                                               (JsonSkipWhitespace raw (%Add after 1))
+                                                               out)
+                                        (JsThrowSyntaxError))))))))
+                  (JsThrowSyntaxError)))))
+      (JsThrowSyntaxError)))
+
+(builtin JsonParseValue :transitioning true :throws true :params [(raw str) (i int)] :ret dyn
+  (let [(cursor (JsonSkipWhitespace raw i))]
+    (if (%Le (%StringLength raw) cursor)
+        (JsThrowSyntaxError)
+        (let [(code (%StringCharCode raw cursor))]
+          (if (%Eq code 34)
+              (JsonParseString raw cursor)
+              (if (%Eq code 91)
+                  (JsonParseArray raw cursor)
+                  (if (%Eq code 123)
+                      (JsonParseObject raw cursor)
+                      (if (%Eq code 116)
+                          (JsonLiteralAt raw cursor "true" (%BoxBool (%Eq 0 0)))
+                          (if (%Eq code 102)
+                              (JsonLiteralAt raw cursor "false" (%BoxBool (%Eq 0 1)))
+                              (if (%Eq code 110)
+                                  (JsonLiteralAt raw cursor "null" (%Null))
+                                  (if (if (%Eq code 45) (%Eq 0 0) (JsonIsDigit code))
+                                      (JsonParseNumber raw cursor)
+                                      (JsThrowSyntaxError)))))))))))) 
+
+; InternalizeJSONProperty (§25.5.1.1): the reviver is called on a value's children before the value
+; itself, on the object that holds it, and a child it answers undefined for is deleted. The keys are
+; snapshotted before the walk, because a callback may add or delete a sibling and the specification
+; iterates the list it took.
+(builtin JsonRevive :transitioning true :throws true
+  :params [(holder dyn) (key dyn) (reviver dyn)] :ret dyn
+  (let [(value (JsGetKeyed holder key))]
+    (if (%IsException value)
+        value
+        ;; An array is walked over its indices — `length` is an own property but not an element, and
+        ;; reviving it would resize the array (§25.5.1.1 step 2.a); an object is walked over its own
+        ;; enumerable keys.
+        (let [(walked (if (%IsArray value)
+                          (JsonReviveIndices value reviver 0)
+                          (if (%IsObjectLike value)
+                              (let [(names (JsObjectKeys (%Undefined) value))]
+                                (if (%IsException names)
+                                    names
+                                    (JsonReviveKeys value reviver (%UnboxArray names) 0)))
+                              value)))]
+          (if (%IsException walked)
+              walked
+              (if (%IsFunction reviver)
+                  (if (%IsObjectLike holder)
+                      (%CallFunction reviver holder key walked (%Undefined) (%Undefined))
+                      (%CallFunction reviver (%Undefined) key walked (%Undefined) (%Undefined)))
+                  walked))))))
+
+(builtin JsonReviveIndices :transitioning true :throws true
+  :params [(value dyn) (reviver dyn) (i int)] :ret dyn
+  (if (%Lt i (%ArrayLen (%UnboxArray value)))
+      (let [(child (JsonRevive value (%Box (%NumberToString (%BoxInt i))) reviver))]
+        (if (%IsException child)
+            child
+            (let [(applied (if (%IsUndefined child)
+                               (JsonDeleteKey value (%Box (%NumberToString (%BoxInt i))))
+                               (JsSetKeyed value (%Box (%NumberToString (%BoxInt i))) child 1)))]
+              (if (%IsException applied)
+                  applied
+                  (JsonReviveIndices value reviver (%Add i 1))))))
+      value))
+
+(builtin JsonReviveKeys :transitioning true :throws true
+  :params [(value dyn) (reviver dyn) (names arr) (i int)] :ret dyn
+  (if (%Lt i (%ArrayLen names))
+      (let [(child (JsonRevive value (%ArrayLoad names i) reviver))]
+        (if (%IsException child)
+            child
+            (let [(applied (if (%IsUndefined child)
+                               (JsonDeleteKey value (%ArrayLoad names i))
+                               (JsSetKeyed value (%ArrayLoad names i) child 1)))]
+              (if (%IsException applied)
+                  applied
+                  (JsonReviveKeys value reviver names (%Add i 1))))))
+      value))
+
+; [[Delete]] of the key a reviver answered undefined for. The status is a spec value we do not use:
+; the walk continues either way, as InternalizeJSONProperty's "ignore the result" says.
+(macro JsonDeleteKey :transitioning true :throws true :params [(value dyn) (name dyn)] :ret dyn
+  (if (%IsObjectLike value)
+      (let [(status (%PropDelete (%UnboxObjectLike value) (JsToPropertyKey name)))]
+        (%Undefined))
+      (%Undefined)))
+
+; JSON.parse(text, reviver) (§25.5.1): the whole text must be one value and nothing but whitespace
+; after it. A reviver walks the result bottom-up, from a wrapper object holding it under the empty
+; key — which is the holder the top-level call sees.
+(builtin JsonParse :transitioning true :throws true :params [(this dyn) (text dyn) (reviver dyn)] :ret dyn
+  (let [(source (JsToStringValue text))]
+    (if (%IsException source)
+        source
+        (let [(raw (%UnboxString source))]
+          (let [(parsed (JsonParseValue raw 0))]
+            (if (%IsException parsed)
+                parsed
+                (if (%Eq (JsonSkipWhitespace raw (JsonNextOf parsed)) (%StringLength raw))
+                    (if (%IsFunction reviver)
+                        (let [(holder (JsFinishObjectLiteral (JsSetObjectLiteralPrototype (JsNewObjectRaw)
+                                                                                          (%IntrinsicPrototype "Object.prototype"))))]
+                          (let [(stored (JsSetKeyed holder (%Box "") (JsonValueOf parsed) 1))]
+                            (if (%IsException stored)
+                                stored
+                                (JsonRevive holder (%Box "") reviver))))
+                        (JsonValueOf parsed))
+                    (JsThrowSyntaxError))))))))

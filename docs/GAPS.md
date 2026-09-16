@@ -559,6 +559,13 @@ group name (ID_Start/ID_Continue tables are not in the compiler) fails closed as
 error. Regex objects still do not lower (`regular expression objects`); the pattern is validated,
 not compiled.
 
+### 2026-09-16 — JSON
+
+`JSON.stringify` and `JSON.parse` execute, with `replacer`, `reviver` and `space`
+(docs/DECISIONS.md — JSON). Missing: symbol keys are not serialized because nothing enumerates
+them; a lone surrogate is copied through rather than being escaped as §25.5.2.2's well-formed
+stringify requires; and a BigInt has no serialization because there are no BigInts.
+
 ### 2026-09-07 — Destructuring patterns as syntax
 
 Binding and assignment patterns parse everywhere the grammar admits them: `let`/`const`/`var`

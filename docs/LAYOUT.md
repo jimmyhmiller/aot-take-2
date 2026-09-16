@@ -169,6 +169,9 @@ aot-take-2/
 │           ; console.jsl the host's output and how a value is shown
 │           ; iterator.jsl the iteration protocol and the array iterator
 │           ; object-rest.jsl CopyDataProperties: object spread in a literal, rest in a pattern
+│           ; array-sort.jsl the stable merge sort Array.prototype.sort is defined over
+│           ; collect.jsl Array.from/of, Object.entries/values/assign, the Number predicates
+│           ; json.jsl JSON.stringify and JSON.parse
 │       function/ array-buffer/ data-view/ typed-array/
 ├── src/
 │   ├── main.coil            ; CLI driver: compile, emit, run, dump; `AOT_SEED=N` compiles under a test's arena seed
