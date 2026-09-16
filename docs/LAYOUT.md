@@ -165,6 +165,7 @@ aot-take-2/
 │           ; literal.jsl object literal accessor and replacing data definitions,
 │           ; class.jsl the class prototype object, its member definitions and super references
 │           ; environment.jsl the environment records closures read and write
+│           ; symbol.jsl Symbol values, their prototype methods and their refused conversions
 │       function/ array-buffer/ data-view/ typed-array/
 ├── src/
 │   ├── main.coil            ; CLI driver: compile, emit, run, dump; `AOT_SEED=N` compiles under a test's arena seed

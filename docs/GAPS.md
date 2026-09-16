@@ -55,6 +55,13 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-16 — Symbol values
+
+`Symbol()`, `Symbol(description)`, `typeof`, identity comparison, `toString`, `valueOf` and the
+TypeError every conversion of a Symbol raises execute (docs/DECISIONS.md, symbol values). Missing:
+Symbol-keyed properties (a Symbol used as a key refuses), the well-known symbols, `Symbol.for` and
+`Symbol.keyFor`, the `description` accessor, and a Symbol wrapper object.
+
 ### 2026-09-16 — Computed property keys
 
 `{[k]: v}`, `{[k]() {}}`, `{get [k]() {}}` and a class's computed methods, accessors and static

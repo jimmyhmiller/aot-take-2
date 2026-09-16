@@ -1,5 +1,33 @@
 # Decisions
 
+## 2026-09-16 — Symbol values
+
+`Symbol` was an undeclared global, and the whole family — the iteration protocol, well-known
+symbols, symbol-keyed properties — rests on the value existing first, so this is the value alone.
+
+**A Symbol's identity is a traced allocation.** The NaN-box family was already reserved
+(`DYNAMIC-PREFIX-SYMBOL`); a Symbol is a payload under it holding the description it was created
+with, and nothing else. Two Symbols are the same value exactly when they are the same allocation, so
+strict equality is the tagged-word identity every non-number, non-string value already uses, and the
+collector forwards the word like any other reference. `%NewSymbol` allocates one and `%Box` tags it
+from the payload type, as it does for strings, functions and arrays.
+
+**Its methods are found the way a string's are.** A Symbol is a primitive with no wrapper object
+here, so a property access on one resolves on %Symbol.prototype% directly (GetV without the wrapper
+ToObject would make), which is exactly how a primitive string, boolean and number already reach
+theirs.
+
+**Converting one is a TypeError, and that belongs to the operators.** ToString and ToNumber of a
+Symbol throw (§7.1.17, §7.1.4), but `JsToString` is total — it returns a string and never a
+completion — so the refusal lives where a completion can carry it: `JsToStringValue`,
+`JsToNumberValue`, and a conversion step the binary operators now share
+(`JsEitherNeedsConversion`/`JsBinaryConversion`), which is the same place an object operand leaves
+the numeric cores. `+` names the string conversion in its message and every other operator the
+numeric one, as engines do.
+
+Symbol-keyed properties, well-known symbols, `Symbol.for`/`keyFor`, `description` and a Symbol
+wrapper object are the next stages; a Symbol used as a property key still refuses by name.
+
 ## 2026-09-16 — Computed property keys
 
 `{[k]: v}` and `class C { [k]() {} }` refused by name. A computed key is an expression evaluated
