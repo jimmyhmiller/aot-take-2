@@ -372,7 +372,9 @@
    (class-ctor bool)  ; a class's constructor: [[Call]] without `new` is a TypeError
    (derived-ctor bool)  ; a derived class's constructor: `this` waits for `super()`
    (default-derived bool)  ; the synthesized `constructor(...args) { super(...args); }`
-   (needs-callee bool)])  ; its body needs the function object being called (`super`)
+   (needs-callee bool)  ; its body needs the function object being called (`super`)
+   (needs-home bool)  ; its body reads `super.x`: its function object carries its home object
+   (class-index i64)])  ; a class constructor: the class whose instance fields it initializes, or -1
 
 ;; A var-like global: a top-level `var` or function declaration of some Script of the realm. The
 ;; realm's global object carries one property per binding from the start.
@@ -610,6 +612,18 @@
 
 (defn parser-ctx-allows-super-call? [] (-> bool)
   (let [home (parser-ctx-home)] (.derived-constructor home)))
+
+;; A `super.x` reference in the method the nearest non-arrow context is parsing: its function object
+;; carries the home object, and its entry passes that function object in the hidden callee slot.
+(defn parser-ctx-needs-home! [] (-> i64)
+  (let [home (parser-ctx-home)
+        fi (.fun home)]
+    (if (< fi 0)
+        (panic "parser-ctx-needs-home!: a super property reference outside every function")
+        (let [fp (syntax-fun-ptr fi)]
+          (set! (.needs-home fp) true)
+          (set! (.needs-callee fp) true)
+          0))))
 
 ;; `return` is legal directly inside a function or arrow body, never in a static block or Script.
 (defn parser-return-allowed? [] (-> bool)
@@ -2086,12 +2100,15 @@
                                         (lex-consumed-end))))))))))
 
 ;; `super.x`, `super[x]` inside a method (through arrows); `super(...)` only inside a derived
-;; class constructor, which does not exist yet. Anything else is a proven error.
+;; class constructor. Anything else is a proven error. A super property reference makes the home
+;; object part of the method's function object, and its entry pass that object in the callee slot.
 (defn parse-syntax-super [(t Token)] (-> i64)
   (let [next (peek-token)]
     (if (or (token-is next ".") (token-is next "["))
         (if (parser-ctx-home-method?)
-            (syntax-add-node! (SxSuper) (.start t) (.end t))
+            (do
+              (parser-ctx-needs-home!)
+              (syntax-add-node! (SxSuper) (.start t) (.end t)))
             (syntax-error! "parser: super property access is only allowed in a method"))
         (if (token-is next "(")
             (if (parser-ctx-allows-super-call?)
@@ -4181,6 +4198,7 @@
     (set! (.lo (mut f)) lo)
     (set! (.script (mut f)) (.current-script (parser-state)))
     (set! (.static-entry (mut f)) -1)
+    (set! (.class-index (mut f)) -1)
     (push! [SyntaxFun] (mut (.funs (parser-state))) (load f))
     index))
 
@@ -4844,7 +4862,7 @@
             index (len (.classes p))
             ;; ClassDefinitionEvaluation synthesizes an empty constructor for a class body without
             ;; one (§15.7.14 step 10); a derived class's default forwards its arguments (§15.7.14).
-            ctor (syntax-class-constructor-record! (load elements) name (.start keyword) derived)]
+            ctor (syntax-class-constructor-record! (load elements) name (.start keyword) derived index)]
         (set! (.ctor (mut c)) ctor)
         (set! (.name (mut c)) name)
         (set! (.heritage (mut c)) heritage)
@@ -6036,7 +6054,9 @@
    (bound bool)
    (object-binding bool)
    (resolved-nid i64)
-   (keyed bool)])  ; `owner[key]`: key-nid is the evaluated key value, not an interned key
+   (keyed bool)  ; `owner[key]`: key-nid is the evaluated key value, not an interned key
+   (super bool)  ; `super.x`: owner-nid is the base above the home object, not the receiver
+   (receiver-nid i64)])  ; a super reference's `this`, the receiver of its [[Get]] and [[Set]]
 
 (defn lower-ref-global-prepare! [(ref (ptr SyntaxRef))] (-> i64)
   (if (or (and (not (.script-unit (parser-state))) (syntax-script-binding? (.name ref)))
@@ -6106,6 +6126,8 @@
   (let [(mut ref) (primitive/zeroed SyntaxRef)]
     (match (syntax-node target)
       (SxIndex [owner key optional]
+               (if (syntax-is-super? owner)
+                   (lower-ref-super-prepare! (mut ref) key "")
                (let [base (lower-syntax-expr owner)]
                  (n-keep! base)
                  (let [k (lower-syntax-expr key)]
@@ -6113,24 +6135,49 @@
                    (set! (.member (mut ref)) true)
                    (set! (.keyed (mut ref)) true)
                    (set! (.owner-nid (mut ref)) (n-nid base))
-                   (set! (.key-nid (mut ref)) (n-nid k)))))
+                   (set! (.key-nid (mut ref)) (n-nid k))))))
       (SxPrivateMember [owner name optional]
                        (unimplemented "private class members"
                                       "docs/GAPS.md — classes"))
       (SxMember [owner name optional]
+                (if (syntax-is-super? owner)
+                    (lower-ref-super-prepare! (mut ref) -1 name)
                 (let [base (lower-syntax-expr owner)
                       key (keyref-make (shape-key-intern name))]
                   (n-keep! base)
                   (n-keep! key)
                   (set! (.member (mut ref)) true)
                   (set! (.owner-nid (mut ref)) (n-nid base))
-                  (set! (.key-nid (mut ref)) (n-nid key))))
+                  (set! (.key-nid (mut ref)) (n-nid key)))))
       (SxName [name] (lower-ref-name-prepare! (mut ref) name))
       (SxCall [callee args optional]
               (unimplemented "call expression assignment target (sloppy runtime ReferenceError)"
                              "docs/GAPS.md — exceptions"))
       (_ (broken "lower-ref-prepare!: target survived syntax validation")))
     (load ref)))
+
+;; A `super` reference (§13.3.7.3 MakeSuperPropertyReference), in the specification's order: the
+;; method's `this`, which a derived constructor must have initialized, then the key of a computed
+;; access, then the base — the object above the home object its function object carries.
+(defn lower-ref-super-prepare! [(ref (ptr SyntaxRef)) (key-id i64) (name (slice u8))] (-> i64)
+  (let [receiver (lower-this)]
+    (n-keep! receiver)
+    (let [key (if (>= key-id 0)
+                  (lower-syntax-expr key-id)
+                  (keyref-make (shape-key-intern name)))]
+      (n-keep! key)
+      (let [base (lower-super-base)]
+        (n-keep! base)
+        (set! (.member ref) true)
+        (set! (.super ref) true)
+        (set! (.keyed ref) (>= key-id 0))
+        (set! (.receiver-nid ref) (n-nid receiver))
+        (set! (.key-nid ref) (n-nid key))
+        (set! (.owner-nid ref) (n-nid base))
+        0))))
+
+(defn syntax-is-super? [(id i64)] (-> bool)
+  (match (syntax-node (syntax-ungroup-id id)) (SxSuper [] true) (_ false)))
 
 (defn lower-ref-get! [(ref SyntaxRef)] (-> (dyn NodeOps))
   (if (.object-binding ref)
@@ -6140,6 +6187,12 @@
       (lower-ref-nonglobal-get! ref)))
 
 (defn lower-ref-nonglobal-get! [(ref SyntaxRef)] (-> (dyn NodeOps))
+  (if (.super ref)
+      (lower-completion!
+        (lower-jsl-values3 (if (.keyed ref) "JsSuperGetKeyed" "JsSuperGet")
+                           (parser-node (.owner-nid ref))
+                           (parser-node (.key-nid ref))
+                           (parser-node (.receiver-nid ref))))
   (if (.member ref)
       (let [scope (parser-node (.current-scope (parser-state)))
             (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
@@ -6153,7 +6206,7 @@
           (parser-set-current-ctrl! (.ctrl loaded))
           (scope-set-mem! scope (.mem loaded))
           (lower-completion! (.value loaded))))
-      (lower-name (.name ref))))
+      (lower-name (.name ref)))))
 
 ;; PutValue against the live post-RHS Scope. Non-strict PutValue to the three non-writable
 ;; globals has no effect; lexical shadows take Scope's ordinary update and const/TDZ checks. JSL
@@ -6165,6 +6218,20 @@
 
 (defn lower-ref-nonglobal-put! [(ref SyntaxRef) (value (dyn NodeOps))] (-> i64)
   (let [scope (parser-node (.current-scope (parser-state)))]
+    (if (.super ref)
+        (let [(mut sargs) (al-new [(dyn NodeOps)] (compiler-allocator))]
+          (push! [(dyn NodeOps)] (mut sargs) (parser-node (.owner-nid ref)))
+          (push! [(dyn NodeOps)] (mut sargs) (parser-node (.key-nid ref)))
+          (push! [(dyn NodeOps)] (mut sargs) value)
+          (push! [(dyn NodeOps)] (mut sargs) (parser-node (.receiver-nid ref)))
+          (push! [(dyn NodeOps)]
+                 (mut sargs)
+                 (con-int (if (.strict (syntax-fun-ptr (.current-fun (parser-state)))) 1 0)))
+          (let [stored (lower-jsl-values (if (.keyed ref) "JsSuperSetKeyed" "JsSuperSet")
+                                         (load sargs))]
+            (al-free! [(dyn NodeOps)] (mut sargs))
+            (lower-completion! stored)
+            0))
     (if (.member ref)
         (let [(mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
           (push! [(dyn NodeOps)] (mut args) (parser-node (.owner-nid ref)))
@@ -6216,10 +6283,11 @@
                         (al-free! [(dyn NodeOps)] (mut wargs))
                         (parser-set-current-ctrl! (.ctrl w))
                         (scope-set-mem! scope (.mem w))
-                        0))))))))
+                        0)))))))))
 
 (defn lower-ref-release! [(ref SyntaxRef)] (-> i64)
   (if (.object-binding ref) (n-unkeep! (parser-node (.resolved-nid ref))) 0)
+  (if (.super ref) (n-unkeep! (parser-node (.receiver-nid ref))) 0)
   (if (or (.member ref) (.object-binding ref))
       (do
         (n-unkeep! (parser-node (.key-nid ref)))
@@ -6593,22 +6661,46 @@
   (let [f (syntax-fun-at fun-index)]
     (if (>= (.static-entry f) 0)
         (box-make (staticref-make (.static-entry f) REP-FUNCTION))
-        (if (not (syntax-fun-lowered? fun-index))
+        (if (.needs-home (syntax-fun-ptr fun-index))
+            ;; MakeMethod (§10.2.7) gives a method its home object. Only a class defines one here;
+            ;; an object literal's methods and an arrow's inherited `super` wait.
             (do
-              (unimplemented "methods, accessors, generators and async functions as values"
-                             "docs/GAPS.md — function values and closures")
+              (unimplemented "`super` outside a class method"
+                             "docs/GAPS.md — classes")
               (unreachable-node))
-            (let [scope (parser-node (.current-scope (parser-state)))
-                  ctrl (parser-node (.current-ctrl (parser-state)))
-                  flags (syntax-fun-construct-flags fun-index)
-                  made (lower-allocate-function ctrl (scope-mem scope) fun-index (lower-function-prototype-word)
-                                                (dyn-null-make) (con-int flags))]
-              (scope-set-mem! scope (.mem made))
-              ;; A function with [[Construct]] gets MakeConstructor's `prototype`; an arrow does not.
-              (if (!= (& flags FUNCTION-FLAG-CONSTRUCTOR) 0)
-                  (lower-make-constructor! (.ptr made) (.fnobj made))
-                  0)
-              (.fnobj made))))))
+            (lower-function-value fun-index (dyn-null-make))))))
+
+;; A method's function object, carrying its home object (§10.2.7 MakeMethod): the class's prototype
+;; object, or the constructor for a static member. `super.x` reads from the object above it.
+(defn lower-method-object [(fun-index i64) (home (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [f (syntax-fun-at fun-index)]
+    (if (>= (.static-entry f) 0)
+        (do
+          (broken "lower-method-object: a method with a home object was built into the image")
+          (unreachable-node))
+        (lower-function-value fun-index home))))
+
+;; InstantiateOrdinaryFunctionExpression over a record's public entry, with the environment word a
+;; method's home object fills and every other function value leaves null.
+(defn lower-function-value [(fun-index i64) (env (dyn NodeOps))] (-> (dyn NodeOps))
+  (if (not (syntax-fun-lowered? fun-index))
+      (do
+        (unimplemented "methods, accessors, generators and async functions as values"
+                       "docs/GAPS.md — function values and closures")
+        (unreachable-node))
+      (let [scope (parser-node (.current-scope (parser-state)))
+            ctrl (parser-node (.current-ctrl (parser-state)))
+            flags (syntax-fun-construct-flags fun-index)
+            made (lower-allocate-function ctrl (scope-mem scope) fun-index (lower-function-prototype-word)
+                                          env (con-int flags))]
+        (scope-set-mem! scope (.mem made))
+        ;; A function with [[Construct]] gets MakeConstructor's `prototype`; an arrow does not, and
+        ;; a class constructor receives the class's own prototype object instead (§15.7.14 step 15).
+        (if (and (!= (& flags FUNCTION-FLAG-CONSTRUCTOR) 0)
+                 (not (.class-ctor (syntax-fun-ptr fun-index))))
+            (lower-make-constructor! (.ptr made) (.fnobj made))
+            0)
+        (.fnobj made))))
 
 (defstruct FunctionAllocation [(ptr (dyn NodeOps)) (fnobj (dyn NodeOps)) (mem (dyn NodeOps))])
 
@@ -7820,14 +7912,18 @@
                               (unimplemented "optional chaining"
                                              "docs/GAPS.md — nullish short-circuit chains")
                               (unreachable-node))
-                            (lower-member-read owner name)))
+                            (if (syntax-is-super? owner)
+                                (lower-super-read id)
+                                (lower-member-read owner name))))
               (SxIndex [owner key optional]
                        (if optional
                            (do
                              (unimplemented "optional chaining"
                                             "docs/GAPS.md — nullish short-circuit chains")
                              (unreachable-node))
-                           (lower-keyed-read owner key)))
+                           (if (syntax-is-super? owner)
+                               (lower-super-read id)
+                               (lower-keyed-read owner key))))
               (SxCall [callee args optional]
                       (if optional
                           (do
@@ -7843,7 +7939,11 @@
                                             (unimplemented "optional chaining"
                                                            "docs/GAPS.md — nullish short-circuit chains")
                                             (unreachable-node))
-                                          (lower-member-call owner member args)))
+                                          (if (syntax-is-super? owner)
+                                              (lower-super-member-call (syntax-ungroup-id callee)
+                                                                       args
+                                                                       (lower-callee-message "super." member))
+                                              (lower-member-call owner member args))))
                             (SxPrivateMember [owner member optional]
                                              (do
                                                (unimplemented "private method calls"
@@ -7855,7 +7955,11 @@
                                            (unimplemented "optional chaining"
                                                           "docs/GAPS.md — nullish short-circuit chains")
                                            (unreachable-node))
-                                         (lower-keyed-call owner key args)))
+                                         (if (syntax-is-super? owner)
+                                             (lower-super-member-call (syntax-ungroup-id callee)
+                                                                      args
+                                                                      "super[...]")
+                                             (lower-keyed-call owner key args))))
                             (_ (lower-value-call (lower-syntax-expr callee)
                                                  args
                                                  (syntax-callee-label callee))))))
@@ -7899,10 +8003,11 @@
                          (unimplemented "await"
                                         "docs/GAPS.md — promises and async functions")
                          (unreachable-node)))
+              ;; `super` is never a value of its own: it is the owner of a member or index (handled
+              ;; there) or the callee of a call.
               (SxSuper []
                        (do
-                         (unimplemented "super property access"
-                                        "docs/GAPS.md — methods and home objects")
+                         (broken "lower-syntax-expr: a bare `super` survived syntax validation")
                          (unreachable-node)))
               (SxClass [cls] (lower-class cls))
               (SxDestructuringAssign [pattern value]
@@ -8468,6 +8573,12 @@
     (parser-set-current-ctrl! (.ctrl r))
     (scope-set-mem! scope (.mem r))
     (.value r)))
+
+(defn lower-jsl-values0 [(name (slice u8))] (-> (dyn NodeOps))
+  (let [(mut values) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (let [v (lower-jsl-values name (load values))]
+      (al-free! [(dyn NodeOps)] (mut values))
+      v)))
 
 (defn lower-jsl-values2 [(name (slice u8)) (a (dyn NodeOps)) (b (dyn NodeOps))] (-> (dyn NodeOps))
   (let [(mut values) (al-new [(dyn NodeOps)] (compiler-allocator))]
@@ -11514,7 +11625,8 @@
 (defn syntax-class-constructor-record! [(elements (ArrayList ClassElement))
                                         (name (slice u8))
                                         (lo i64)
-                                        (derived bool)] (-> i64)
+                                        (derived bool)
+                                        (class-index i64)] (-> i64)
   (let [(mut found) -1]
     (al-for [element elements]
             (match element
@@ -11529,6 +11641,7 @@
         (let [fp (syntax-fun-ptr (load found))]
           (set! (.class-ctor fp) true)
           (set! (.derived-ctor fp) derived)
+          (set! (.class-index fp) class-index)
           ;; A derived constructor's `super()` needs the function object being called.
           (if derived (set! (.needs-callee fp) true) 0)
           (load found))
@@ -11538,6 +11651,7 @@
           (set! (.in-class fp) true)
           (set! (.class-ctor fp) true)
           (set! (.derived-ctor fp) derived)
+          (set! (.class-index fp) class-index)
           ;; The default derived constructor forwards the call's arguments to `super`.
           (set! (.default-derived fp) derived)
           (set! (.needs-callee fp) derived)
@@ -11561,32 +11675,43 @@
                   (set! (mut parent-nid) (n-nid v))
                   0))
       (None [] 0))
-    (let [ctor (lower-function-object (.ctor c))]
-      (n-keep! ctor)
-      (let [proto (if derived
-                      (let [parent (parser-node (load parent-nid))
-                            parent-proto (lower-jsl-values1 "JsClassHeritagePrototype" parent)]
-                        (n-keep! parent-proto)
-                        (let [made (lower-completion!
-                                     (lower-jsl-values3 "JsMakeDerivedClassPrototype" ctor parent parent-proto))]
-                          (n-unkeep! parent-proto)
-                          (n-unkeep! parent)
-                          (parser-node (n-nid made))))
-                      (lower-jsl-values1 "JsMakeClassPrototype" ctor))]
-        (n-keep! proto)
-        (al-for [element (.elements c)]
-                (match element
-                  (CeMethod [key is-static fun]
-                            (if (= fun (.ctor c))
-                                0
-                                (lower-class-member! (if is-static ctor proto) key fun)))
-                  (CeField [key is-static init-fun]
-                           (unimplemented "class fields" "docs/GAPS.md — classes"))
-                  (CeStaticBlock [fun]
-                                 (unimplemented "class static blocks" "docs/GAPS.md — classes"))))
-        (n-unkeep! proto)
-        (n-unkeep! ctor)
-        ctor))))
+    ;; The prototype object precedes the constructor, which takes it as its home object.
+    (let [proto (if derived
+                    (let [parent (parser-node (load parent-nid))
+                          parent-proto (lower-jsl-values1 "JsClassHeritagePrototype" parent)]
+                      (lower-jsl-values1 "JsNewClassPrototype" parent-proto))
+                    (lower-jsl-values0 "JsNewBaseClassPrototype"))]
+      (n-keep! proto)
+      (let [ctor (lower-method-object (.ctor c) proto)]
+        (n-keep! ctor)
+        (let [linked (if derived
+                         (lower-completion!
+                           (lower-jsl-values3 "JsLinkDerivedClass" ctor (parser-node (load parent-nid)) proto))
+                         (lower-completion! (lower-jsl-values2 "JsLinkClassPrototype" ctor proto)))]
+          (if derived (n-unkeep! (parser-node (load parent-nid))) 0)
+          ;; Every method is defined before any static element runs (§15.7.14 steps 25-29): an
+          ;; initializer sees the finished constructor and prototype.
+          (al-for [element (.elements c)]
+                  (match element
+                    (CeMethod [key is-static fun]
+                              (if (= fun (.ctor c))
+                                  0
+                                  (lower-class-member! (if is-static ctor proto) key fun)))
+                    (_ 0)))
+          (al-for [element (.elements c)]
+                  (match element
+                    (CeField [key is-static init-fun]
+                             ;; A static field is defined on the constructor, with the constructor
+                             ;; as its `this`, in declaration order; an instance field waits for a
+                             ;; construction.
+                             (if is-static (lower-define-field! ctor key init-fun) 0))
+                    ;; A static block is a body run with the constructor as its `this`, in the same
+                    ;; order as the static fields it sits among (§15.7.14 step 29).
+                    (CeStaticBlock [fun] (do (lower-static-block! fun ctor) 0))
+                    (_ 0)))
+          (n-unkeep! proto)
+          (n-unkeep! ctor)
+          ctor)))))
 
 ;; One method or accessor of a class, on the prototype object or on the constructor.
 (defn lower-class-member! [(target (dyn NodeOps)) (key ClassKey) (fun i64)] (-> i64)
@@ -11594,7 +11719,8 @@
                (CkNamed [k] k)
                (CkComputed [e] (do (unimplemented "computed class keys" "docs/GAPS.md — classes") ""))
                (CkPrivate [k] (do (unimplemented "private class elements" "docs/GAPS.md — classes") "")))
-        function (lower-function-object fun)
+        ;; MakeMethod (§15.7.14 step 25): the home object is the object the member is defined on.
+        function (lower-method-object fun target)
         setter (match (.kind (syntax-fun-ptr fun)) (FunSetter [] 1) (_ 0))
         accessor (match (.kind (syntax-fun-ptr fun))
                    (FunGetter [] true)
@@ -11656,6 +11782,11 @@
         (scope-set-ctrl! constructed (arms-false arms))
         (set! (.current-scope (parser-state)) (n-nid constructed))
         (set! (.current-ctrl (parser-state)) (n-nid (arms-false arms)))
+        ;; A base constructor's instance fields are defined on its `this` before its body runs
+        ;; (§10.2.2 step 8); a derived one's wait for `super()`.
+        (if (.derived-ctor (syntax-fun-ptr fi))
+            0
+            (lower-instance-fields! fi (lower-receiver-parm fi)))
         0)))
 
 ;; The ABI builtins that fill a record's hidden slots, in slot order.
@@ -11703,6 +11834,7 @@
                                              constructed))]
               (n-unkeep! constructed)
               (scope-update! (parser-node (.current-scope p)) DERIVED-THIS-SLOT bound)
+              (lower-instance-fields! fi bound)
               (dyn-undefined-make)))))))
 
 ;; The current derived constructor's `this` binding, before any initialization check.
@@ -11710,6 +11842,142 @@
   (match (scope-lookup (parser-node (.current-scope (parser-state))) DERIVED-THIS-SLOT)
     (Some [v] v)
     (None [] (do (broken "lower-derived-this-value: the derived `this` binding is missing") (unreachable-node)))))
+
+;; InitializeInstanceElements (§10.2.11): each instance field of the class, in declaration order,
+;; defined on the object being constructed — for a base constructor before its body runs, for a
+;; derived one the moment `super()` binds `this` (§13.3.7.1 step 8).
+(defn lower-instance-fields! [(fi i64) (receiver (dyn NodeOps))] (-> i64)
+  (let [cls (.class-index (syntax-fun-ptr fi))]
+    (if (< cls 0)
+        0
+        (let [c (get (.classes (parser-state)) cls)]
+          (n-keep! receiver)
+          (al-for [element (.elements c)]
+                  (match element
+                    (CeField [key is-static init-fun]
+                             (if is-static 0 (lower-define-field! receiver key init-fun)))
+                    (_ 0)))
+          (n-unkeep! receiver)
+          0))))
+
+;; DefineField (§10.2.11): CreateDataPropertyOrThrow of the initializer's value — undefined when the
+;; field has none — on the object the field belongs to. The initializer is a function of `this`
+;; alone: the constructor's parameters and body bindings are not in its scope, so it is called, not
+;; inlined.
+(defn lower-define-field! [(target (dyn NodeOps)) (key ClassKey) (init (Option i64))] (-> i64)
+  (let [name (match key
+               (CkNamed [k] k)
+               (CkComputed [e] (do (unimplemented "computed class keys" "docs/GAPS.md — classes") ""))
+               (CkPrivate [k] (do (unimplemented "private class elements" "docs/GAPS.md — classes") "")))
+        value (match init
+                (Some [f] (lower-field-initializer f target))
+                (None [] (dyn-undefined-make)))]
+    (n-keep! value)
+    (let [(mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+      (push! [(dyn NodeOps)] (mut args) target)
+      (push! [(dyn NodeOps)] (mut args) (keyref-make (shape-key-intern name)))
+      (push! [(dyn NodeOps)] (mut args) value)
+      (let [defined (lower-jsl-values "JsDefineField" (load args))]
+        (al-free! [(dyn NodeOps)] (mut args))
+        (lower-completion! defined)
+        (n-unkeep! value)
+        0))))
+
+;; A static block: its record's entry called with the constructor as the receiver, its value dropped.
+(defn lower-static-block! [(fi i64) (ctor (dyn NodeOps))] (-> i64)
+  (if (.needs-home (syntax-fun-ptr fi))
+      (do
+        (unimplemented "`super` in a class static block" "docs/GAPS.md — classes")
+        0)
+      (if (not (syntax-fun-lowered? fi))
+          (do
+            (unimplemented "a class static block that is not an admitted function value"
+                           "docs/GAPS.md — classes")
+            0)
+          (do (lower-receiver-entry-call fi ctor) 0))))
+
+;; A field initializer's value: its record's entry called with the field's object as the receiver.
+(defn lower-field-initializer [(fi i64) (receiver (dyn NodeOps))] (-> (dyn NodeOps))
+  (if (.needs-home (syntax-fun-ptr fi))
+      (do
+        (unimplemented "`super` in a class field initializer"
+                       "docs/GAPS.md — classes")
+        (unreachable-node))
+      (if (not (syntax-fun-lowered? fi))
+          (do
+            (unimplemented "a class field initializer that is not an admitted function value"
+                           "docs/GAPS.md — classes")
+            (unreachable-node))
+          (lower-receiver-entry-call fi receiver))))
+
+;; A direct call of a record's own entry with a receiver and no arguments.
+(defn lower-receiver-entry-call [(fi i64) (receiver (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [target-syntax (syntax-fun-at fi)
+        target (parser-node (.fun-nid target-syntax))
+        scope (parser-node (.current-scope (parser-state)))
+        c (call-make-with-mem (parser-node (.current-ctrl (parser-state)))
+                              (scope-mem scope))
+        formal-count (parser-abi-slots)
+        (mut i) 0]
+    (call-add-arg! c receiver)
+    (call-add-arg! c (dyn-undefined-make))
+    (loop (if (>= (load i) formal-count)
+              (break 0)
+              (do
+                (call-add-arg! c (dyn-undefined-make))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (n-set-def! c CALL-CTRL (Some (parser-node (.current-ctrl (parser-state)))))
+    (n-set-def! c CALL-MEM (Some (scope-mem (parser-node (.current-scope (parser-state))))))
+    (call-set-fptr! c (funptr-make target (.fidx target-syntax)))
+    (let [end (callend-make c)]
+      (parser-set-current-ctrl! (cproj-make end RETURN-CTRL "call.ctrl"))
+      (scope-set-mem! (parser-node (.current-scope (parser-state)))
+                      (proj-make end RETURN-MEM "call.mem"))
+      (let [value (proj-make end RETURN-VALUE "call.value")]
+        (if (syntax-fun-may-throw? fi)
+            (lower-exception-check! value)
+            (cast-make (parser-node (.current-ctrl (parser-state)))
+                       value
+                       (ty-dyn TAG-ANY)))))))
+
+;; MakeSuperPropertyReference (§13.3.7.3): the base of a `super` reference is the object above the
+;; running method's home object, which its function object carries. Its receiver is the method's
+;; own `this`, so an inherited accessor runs on the current object.
+(defn lower-super-base [] (-> (dyn NodeOps))
+  (let [p (parser-state)
+        fi (.current-fun p)]
+    (if (not (.needs-home (syntax-fun-ptr fi)))
+        ;; An arrow inherits `super` from the method around it, which is a capture.
+        (do
+          (unimplemented "`super` through an arrow function"
+                         "docs/GAPS.md — lexical environments and closures")
+          (unreachable-node))
+        (let [fun (parser-node (.fun-nid (syntax-fun-ptr fi)))
+              callee (lower-hidden-callee fi fun)]
+          (lower-completion! (lower-jsl-values1 "JsSuperBase" callee))))))
+
+;; `super.x` and `super[k]` as a value: the reference, read and released.
+(defn lower-super-read [(target i64)] (-> (dyn NodeOps))
+  (let [ref (lower-ref-prepare! target)
+        value (lower-ref-get! ref)]
+    (lower-ref-release! ref)
+    value))
+
+;; `super.m(args)` and `super[k](args)`: the method is found on the base object and called with the
+;; running method's `this` — the receiver of a super call is never the base (§13.3.7.1).
+(defn lower-super-member-call [(target i64) (args (ArrayList i64)) (label (slice u8))] (-> (dyn NodeOps))
+  (let [ref (lower-ref-prepare! target)
+        function (lower-ref-get! ref)]
+    (n-keep! function)
+    (let [answer (lower-value-call-with-receiver function
+                                                 (parser-node (.receiver-nid ref))
+                                                 (dyn-undefined-make)
+                                                 args
+                                                 (lower-callee-message label " is not a function"))]
+      (n-unkeep! function)
+      (lower-ref-release! ref)
+      answer)))
 
 ;; The function object being called, from the hidden slot its entry filled.
 (defn lower-hidden-callee [(fi i64) (fun (dyn NodeOps))] (-> (dyn NodeOps))
@@ -11753,4 +12021,5 @@
                   (lower-jsl-values2 "JsRequireThisUninitialized" (lower-derived-this-value fi) constructed))]
       (n-unkeep! constructed)
       (scope-update! (parser-node (.current-scope (parser-state))) DERIVED-THIS-SLOT bound)
+      (lower-instance-fields! fi bound)
       0)))

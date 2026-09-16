@@ -55,17 +55,30 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-16 — Class fields and static blocks
+
+Instance and static fields, with and without an initializer, in base and derived classes, and static
+blocks in their declaration order among the static fields (docs/DECISIONS.md, class fields).
+Missing: `super` in a field initializer or a static block, a computed field key, an initializer that
+captures a name around the class (closures), and private elements — each refusing by name.
+
+### 2026-09-16 — Home objects and super property access
+
+`super.x`, `super[k]`, `super.x = v` and `super.m()` execute in a class's methods, accessors, static
+members and constructor (docs/DECISIONS.md, home objects). Missing: `super` in an object literal's
+method, and `super` inside an arrow, which is a capture of the method around it — both refuse by
+name.
+
 ### 2026-09-15 — Derived classes
 
 `extends`, `super()` in a constructor, inherited methods and statics, and the synthesized default
-derived constructor execute (docs/DECISIONS.md, derived classes). Missing: `super.x` in a method,
-which needs its home object.
+derived constructor execute (docs/DECISIONS.md, derived classes).
 
 ### 2026-09-15 — Base classes
 
 A class with no heritage — its constructor, methods, accessors, statics, prototype links and the
-TypeError of a call without `new` — executes (docs/DECISIONS.md, base classes). Missing: `extends`
-and `super`, instance and static fields, static blocks, computed class keys, private elements,
+TypeError of a call without `new` — executes (docs/DECISIONS.md, base classes). Missing: instance
+and static fields, static blocks, computed class keys, private elements,
 generator and async methods, a class's `name`, and the class's own inner binding of its name (a
 method reads the outer binding, which differs only if something reassigns it). A closed program
 still refuses a Script-level class name read from inside a function body, as it does every Script

@@ -1,5 +1,65 @@
 # Decisions
 
+## 2026-09-16 — Class fields
+
+**A field initializer is a function, and it is called.** An initializer sees `this` and the names
+around the class, but not the constructor's parameters or body bindings, so it cannot be inlined
+into the constructor: each initializer keeps the record the parse gave it, and the constructor calls
+that record's entry directly with the field's object as the receiver and no arguments
+(`lower-receiver-entry-call`). A field with no initializer defines undefined without calling
+anything. The value is then CreateDataPropertyOrThrow'd — writable, enumerable, configurable —
+on the object (`JsDefineField`).
+
+**The constructor knows its class.** A constructor record carries its class's index
+(`class-index`), which is what makes InitializeInstanceElements compilable: the field list is
+static, so the constructor defines exactly its own class's instance fields, in declaration order.
+A base constructor does it at entry, before its body (§10.2.2 step 8); a derived constructor does it
+where `super()` binds `this` (§13.3.7.1 step 8), at each `super()` in the body and in the
+synthesized default derived constructor — never both, because only one `super()` can run.
+
+**Static fields and static blocks run at class definition, after every method.**
+ClassDefinitionEvaluation defines all the methods first and only then evaluates the static elements
+in declaration order — a field's initializer and a static block alike, each called with the
+constructor as its `this`, a block's value dropped — so a static element sees the finished prototype
+and constructor and the static elements before it.
+
+`super` in a field initializer or a static block (each needs its own home object), computed field
+keys and private elements refuse by name.
+
+## 2026-09-16 — Home objects: super property access in methods
+
+**A method's home object is its function object's environment word.** MakeMethod (§10.2.7) gives a
+method a [[HomeObject]], and `super.x` reads from the object *above* it. The word a bound function
+uses for its bound record (docs/DECISIONS.md, builtin closures) carries it: `lower-method-object`
+allocates the function object with the home object as its environment, and `JsSuperBase` reads it
+back with `%ClosureEnv` and answers its [[Prototype]]. Nothing else in a function object changes,
+and a function value with no home object keeps the null environment it had.
+
+**The running method reaches its own function object through the callee slot.** A body naming
+`super` marks its record `needs-home`, which implies `needs-callee`: its entry passes the function
+object in the hidden slot after the formals, exactly as a derived constructor's `super()` already
+did. The mark is made where `super` is parsed, on the nearest non-arrow context's record
+(`parser-ctx-needs-home!`), so it is fixed before any entry is lowered.
+
+**A super reference is an ordinary reference with two objects.** `SyntaxRef` gains the base and the
+receiver: the base is the object above the home object, the receiver is the method's own `this`, and
+every form follows from that pair — `super.x` is [[Get]] on the base with that receiver
+(`JsSuperGet`), `super.x = v` is [[Set]] on the base with that receiver, so an inherited setter runs
+on `this` and a plain assignment creates the property on `this` and never on the base
+(`JsSuperSetViaHolder`, OrdinarySet's walk with a receiver that is not the object it starts from and
+need not be an object at all), and `super.m()` is that [[Get]] called with `this` — never with the
+base — as its receiver. The order is the specification's: `this` (a derived constructor's must be
+initialized), then a computed key, then the base.
+
+**The class's prototype object now precedes its constructor**, as §15.7.14 has it, because the
+constructor's own home object is that prototype: `JsNewClassPrototype` makes it, the constructor is
+allocated with it, and `JsLinkClassPrototype` (`JsLinkDerivedClass` with a heritage) then links the
+two. A class constructor therefore skips MakeConstructor's fresh `prototype` — the class's prototype
+object is the one it gets, and the throwaway allocation is gone.
+
+`super` outside a class method — an object literal's methods, and an arrow's inherited `super` —
+refuses by name, as do fields, static blocks, computed keys and private names.
+
 ## 2026-09-15 — Derived classes: extends and super()
 
 **A body that needs the call itself gets hidden slots.** The slot after a record's formals, which an
