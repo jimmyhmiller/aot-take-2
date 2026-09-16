@@ -172,6 +172,7 @@ aot-take-2/
 │           ; array-sort.jsl the stable merge sort Array.prototype.sort is defined over
 │           ; collect.jsl Array.from/of, Object.entries/values/assign, the Number predicates
 │           ; json.jsl JSON.stringify and JSON.parse
+│           ; map-set.jsl Map and Set: entry arrays under internal slots, scanned
 │       function/ array-buffer/ data-view/ typed-array/
 ├── src/
 │   ├── main.coil            ; CLI driver: compile, emit, run, dump; `AOT_SEED=N` compiles under a test's arena seed

@@ -1,5 +1,52 @@
 # Decisions
 
+## 2026-09-16 — Map and Set
+
+A Map's entries are two arrays under internal slots — the keys and the values at matching indices —
+and a Set's are one. That representation gives three things for free: **insertion order**, which is
+what the specification's iteration order is; `size` as the array's length; and a `delete` that
+removes rather than tombstones, so nothing has to remember holes.
+
+What it does not give is a hash: a lookup is a **scan under SameValueZero**, so a large Map costs
+what a scan costs (docs/GAPS.md — collections). A hash would need a stable hash for an object, which
+is its address — and a moving collector is free to change that, so it is a design of its own.
+
+`size` is an accessor, which is only possible because the realm image can hold one
+(docs/DECISIONS.md — image accessors); a method would be observably wrong.
+
+The iterators are array iterators over a **copy** of the entries. The specification's Map iterator
+follows insertions made while it is being walked, which needs a live cursor into the entry list;
+that is recorded as a gap rather than pretended.
+
+## 2026-09-16 — Image accessors
+
+The realm image held no accessor property, and `heap-define-own-key-attrs!` panicked on one,
+because two compiler types assume it: `prop-attrs-ty` narrows an attribute word to [-2..7] and
+`prop-get-ty` to a plain value, so a site's accessor arm — `attrs < 8`, and the exception sentinel
+test — folds away entirely while the program can define no accessor. That invariant made every
+specification getter unreachable: `Symbol.prototype.description`, `Map.prototype.size`,
+`RegExp.prototype.flags`. A getter is observably not a method: `s.description` reads without a
+call, and its descriptor has `get`, not `value`.
+
+An intrinsic declaration now has a third row kind beside `method` and `data`:
+
+    (accessor "description" :target prototype :get JsSymbolDescriptionMethod :configurable true)
+
+The row's getter becomes an ordinary image function, and the property's value is the **pair object a
+descriptor holds** — `get` and `set`, in that order — with the accessor attribute set, exactly what
+a getter defined at run time produces. An accessor property has no writable bit, so only enumerable
+and configurable survive from what the row declared.
+
+**Defining one marks descriptors for that realm.** The accessor arms stop folding, which is the
+honest price: the image really can answer an accessor now. It is paid narrowly because intrinsics
+materialize on demand — a program that never reaches such a property never builds the row, and
+keeps the narrow types.
+
+Doing this exposed a second bug, older than the feature: **GetV on a primitive receiver resolved on
+the prototype and then called an accessor with the prototype as its receiver.** A string, boolean,
+Symbol or number receiver now goes through `JsGetFromHolder`, which carries the original value, so
+`s.description` sees the Symbol rather than `%Symbol.prototype%`.
+
 ## 2026-09-16 — JSON
 
 `jsl/compiler/json.jsl` is `jsl/json/stringify.jsl` and `jsl/json/parse.jsl` brought into the

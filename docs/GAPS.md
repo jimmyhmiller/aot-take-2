@@ -78,7 +78,8 @@ Symbol), and the well-known symbols, which need Symbol ids in the compiler's sta
 `Symbol()`, `Symbol(description)`, `typeof`, identity comparison, `toString`, `valueOf` and the
 TypeError every conversion of a Symbol raises execute (docs/DECISIONS.md, symbol values). Missing:
 Symbol-keyed properties (a Symbol used as a key refuses), the well-known symbols, `Symbol.for` and
-`Symbol.keyFor`, the `description` accessor, and a Symbol wrapper object.
+`Symbol.keyFor` and a Symbol wrapper object. The `description` accessor executes since 2026-09-16
+(docs/DECISIONS.md, image accessors).
 
 ### 2026-09-16 — Script lexical bindings
 
@@ -558,6 +559,15 @@ The syntax-only panic on any regex literal is gone. Not classified: a non-ASCII 
 group name (ID_Start/ID_Continue tables are not in the compiler) fails closed as a compiler
 error. Regex objects still do not lower (`regular expression objects`); the pattern is validated,
 not compiled.
+
+### 2026-09-16 — Collections
+
+`Map` and `Set` execute: construction from an iterable, `get`/`set`/`add`/`has`/`delete`/`clear`,
+`size`, `forEach`, `keys`/`values`/`entries` and `@@iterator` (docs/DECISIONS.md — Map and Set).
+Missing: a hash index, so every lookup is a scan — correct at any size, slow at a large one; an
+iterator that follows insertions made during its own walk (the iterators walk a copy); `WeakMap`,
+`WeakSet` and `WeakRef`, which need the collector to know about weak references; and subclassing a
+collection, which needs `new.target`'s prototype to reach the entry-slot creation.
 
 ### 2026-09-16 — JSON
 
