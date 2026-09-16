@@ -276,6 +276,32 @@ alert.
   cases and fails the campaign if any case exceeds its deadline (`AOT_T262_COMPILE_SECONDS`,
   which drops to 5 s once §3–§5 land).
 
+### Running the gate
+
+**`coil test` runs one test at a time unless told otherwise, and the whole suite is CPU-bound on
+that.** Measured 2026-09-16 on a 12-core machine, warm:
+
+| | |
+|---|---|
+| `coil build -o build/release/aot` (incremental) | 10 s |
+| `coil test --no-run` (build every suite, run nothing) | 15 s |
+| `coil test` (904 tests, the default one at a time) | 954 s |
+| **`coil test --jobs 12`** | **161 s** |
+| `coil test --jobs 24` | 155 s |
+
+So the gate is `coil build` then `coil test --jobs 12`: about **three minutes**, not sixteen.
+Building is never the cost — 15 s of the 954 — and `--jobs` past the core count buys nothing.
+
+Two things make a parallel gate honest. A wall-clock assertion measures the machine's load as much
+as the compiler, so it is a 10 s backstop against a blowup and never a budget; the deterministic
+counts above are the guard (`tests/budget-test.coil` failed at `--jobs 24` on a 1 s bound while
+every node, block and round assertion passed). And nothing else may build while the gate runs: a
+gate timed at 40 minutes was one competing with `coil build` in the same tree, on a machine with
+four cores already held by stray processes.
+
+`Coil.toml` has no `[test] jobs` key, so the flag is passed on the command line each time — a
+Coil-side gap, not a project one.
+
 ---
 
 ## 8. The road, in order of leverage over risk
