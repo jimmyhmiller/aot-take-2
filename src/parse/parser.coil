@@ -5562,7 +5562,7 @@
          (FunMethod [] (not (.in-class f)))
          (FunGetter [] (not (.in-class f)))
          (FunSetter [] (not (.in-class f))))
-       (.simple-params f)
+       ;; Defaults and a rest parameter lower; destructuring parameters do not.
        (not (.generator f))
        (not (.async f))
        (not (syntax-fun-has-patterns? f))))
@@ -5580,8 +5580,12 @@
         (mut members) (al-new [i64] (compiler-allocator))]
     (al-for [f (.funs (parser-state))]
             (let [fun f
-                  ;; An arguments object rides in the slot after the formals.
-                  needed (+ (len (.params fun)) (if (.arguments-object fun) 1 0))]
+                  ;; An arguments object, or the actuals of a call for a rest parameter, rides in the
+                  ;; slot after the formals.
+                  needed (+ (len (.params fun))
+                            (if (or (.arguments-object fun)
+                                    (match (.rest-param fun) (Some [r] true) (None [] false)))
+                                1 0))]
               (if (> needed (load slots))
                   (set! (mut slots) needed)
                   0)))
@@ -7552,10 +7556,11 @@
                   (syntax-find-fun name)))]
     (if (or bound (< target-idx 0)
             (and (>= target-idx 0)
-                 (or (syntax-fun-forwarding? target-idx) (.arguments-object (syntax-fun-ptr target-idx)))))
+                 (or (syntax-fun-forwarding? target-idx)
+                     (match (syntax-fun-hidden-builtin target-idx) (Some [b] true) (None [] false)))))
         ;; A binding, not a hoisted declaration, a forwarding entry (it has no local body to call
-        ;; directly) or a function with an arguments object (its entry makes the object from the
-        ;; call): call through whatever value it holds.
+        ;; directly) or a function whose entry fills a hidden slot from the call itself (an
+        ;; arguments object, a rest parameter): call through whatever value it holds.
         (lower-value-call (lower-name name) args name)
         (let [target-syntax (syntax-fun-at target-idx)
               target (parser-node (.fun-nid target-syntax))
@@ -9145,6 +9150,11 @@
                                                  (mut direct)
                                                  (mut edges)))
                   (None [] 0))
+                ;; A parameter default is an expression of this function too.
+                (al-for [d (.param-defaults f)]
+                        (match d
+                          (Some [init] (syntax-throw-walk-expr! init false (mut direct) (mut edges)))
+                          (None [] 0)))
                 (set! (.may-throw f) (load direct))
                 (al-for [t (load edges)]
                         (do
@@ -10416,10 +10426,8 @@
                        (mut (.funs (parser-state)))
                        fi)
             argc (+ 2 (parser-abi-slots))]
-        (if (or (not (.simple-params fp))
-                (.generator fp)
-                (.async fp))
-            (unimplemented "default, rest, generator and async functions"
+        (if (or (.generator fp) (.async fp))
+            (unimplemented "generator and async functions"
                            "docs/GAPS.md — function environments")
             0)
         ;; JavaScript calling convention: return, `this` and every argument slot are
@@ -10491,9 +10499,9 @@
                                 (.fidx fp)
                                 (len (.params fp))
                                 (parser-callable-name fi)
-                                (if (.arguments-object fp)
-                                    (Some (jsl-call-target "JsCreateArgumentsObject"))
-                                    (None [(dyn NodeOps)])))]
+                                (match (syntax-fun-hidden-builtin fi)
+                                  (Some [builder] (Some (jsl-call-target builder)))
+                                  (None [] (None [(dyn NodeOps)]))))]
         (set! (.adapter-fidx fp) (next-inline-fidx!))
         (set! (.adapter-nid fp) (n-nid adapter))
         (if (syntax-script-root? fi)
@@ -10570,7 +10578,8 @@
                                             (+ (load later) 1))
                                       (continue)))))
                       (if (not (load shadowed))
-                          (scope-define! scope
+                          ;; A default merged Scopes, so later parameters bind into the live one.
+                          (scope-define! (parser-node (.current-scope (parser-state)))
                                          name
                                          (ty-dyn TAG-ANY)
                                          false
@@ -10581,8 +10590,31 @@
                                            (None []
                                                  (unreachable-node))))
                           0)
+                      ;; A default is evaluated, in order, when the actual is undefined; it sees the
+                      ;; parameters bound before it.
+                      (match (get (.param-defaults f) (load i))
+                        (Some [init]
+                              (let [defaulted (lower-parameter-default (match (fun-parm fun (+ (load i) 2))
+                                                                        (Some [p] p)
+                                                                        (None [] (unreachable-node)))
+                                                                      init)]
+                                (if (load shadowed) 0 (scope-update! (parser-node (.current-scope (parser-state))) name defaulted))
+                                0))
+                        (None [] 0))
                       (set! (mut i) (+ (load i) 1))
                       (continue)))))
+        ;; The rest parameter is the actuals from the formal count on; its entry passed them in the
+        ;; hidden slot (§10.2.11 step 28).
+        (match (.rest-param f)
+          (Some [rest-name]
+                (let [(mut rest-args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+                  (push! [(dyn NodeOps)] (mut rest-args) (lower-hidden-slot-parm fi fun))
+                  (push! [(dyn NodeOps)] (mut rest-args) (con-int (len (.params f))))
+                  (let [rest (lower-jsl-values "JsRestFrom" (load rest-args))]
+                    (al-free! [(dyn NodeOps)] (mut rest-args))
+                    (scope-define! (parser-node (.current-scope (parser-state))) rest-name (ty-dyn TAG-ANY) false rest)
+                    0)))
+          (None [] 0))
         (lower-bind-arguments-object! fi scope fun)
         ;; An intrinsic belongs to no Script (`script` -1): it leaves the current
         ;; Script index as it is.
@@ -11396,3 +11428,44 @@
                 (set! (mut i) (+ (load i) 1))
                 (continue))))
     (load acc)))
+
+;; The ABI builtin that fills a record's hidden slot, the one after its formals: the actuals as an
+;; array for a rest parameter, or the function's arguments object. A record with neither has no
+;; hidden slot.
+(defn syntax-fun-hidden-builtin [(fi i64)] (-> (Option (slice u8)))
+  (let [f (syntax-fun-ptr fi)]
+    (match (.rest-param f)
+      (Some [name] (Some "JsCallArgumentsArray"))
+      (None [] (if (.arguments-object f) (Some "JsCreateArgumentsObject") (None [(slice u8)]))))))
+
+;; The hidden slot's Parm, which the entry filled.
+(defn lower-hidden-slot-parm [(fi i64) (fun (dyn NodeOps))] (-> (dyn NodeOps))
+  (match (fun-parm fun (+ (len (.params (syntax-fun-ptr fi))) 2))
+    (Some [p] p)
+    (None [] (do (broken "lower-hidden-slot-parm: the hidden slot has no Parm") (unreachable-node)))))
+
+;; A parameter's default (§8.6.3 IteratorBindingInitialization): the actual when it is not undefined,
+;; the initializer's value otherwise, evaluated in the scope where the earlier parameters are bound.
+(defn lower-parameter-default [(actual (dyn NodeOps)) (init i64)] (-> (dyn NodeOps))
+  (let [condition (n-peephole! (typetest-make actual TAG-UNDEFINED))
+        iff (if-make (parser-node (.current-ctrl (parser-state))) condition)
+        arms (if-arms! iff)
+        supplied-scope (parser-node (.current-scope (parser-state)))
+        missing-scope (scope-dup supplied-scope false)]
+    (n-keep! actual)
+    (set! (.current-scope (parser-state)) (n-nid missing-scope))
+    (scope-set-ctrl! missing-scope (arms-true arms))
+    (set! (.current-ctrl (parser-state)) (n-nid (arms-true arms)))
+    (let [defaulted (lower-syntax-expr init)]
+      (n-keep! defaulted)
+      (let [missing-exit (parser-node (.current-scope (parser-state)))]
+        (scope-set-ctrl! supplied-scope (arms-false arms))
+        (let [merged (scope-merge! missing-exit supplied-scope)
+              phi (phi-make (scope-ctrl merged) (ty-dyn TAG-ANY) "parameter.default")]
+          (phi-add-value! phi defaulted)
+          (phi-add-value! phi actual)
+          (set! (.current-scope (parser-state)) (n-nid merged))
+          (set! (.current-ctrl (parser-state)) (n-nid (scope-ctrl merged)))
+          (n-unkeep! defaulted)
+          (n-unkeep! actual)
+          (n-peephole! phi))))))

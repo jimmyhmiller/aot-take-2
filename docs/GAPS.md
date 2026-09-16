@@ -55,6 +55,12 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-15 — Default and rest parameters
+
+Parameter defaults and a rest parameter execute in declarations, expressions, arrows and methods
+(docs/DECISIONS.md). Missing: destructuring parameters, generator and async functions, an arguments
+object in a non-simple parameter list, and a function's `length` (which excludes them).
+
 ### 2026-09-15 — Object literal methods and accessors
 
 Methods, getters and setters in object literals execute (docs/DECISIONS.md). Missing: `super` in a

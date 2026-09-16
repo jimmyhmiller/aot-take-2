@@ -1,5 +1,27 @@
 # Decisions
 
+## 2026-09-15 — Default and rest parameters
+
+A parameter list that was not simple refused whole ("default, rest, generator and async functions").
+
+**A default is a branch in the prologue.** Each parameter binds its actual, in order, and a
+parameter with an initializer then binds the merge of its actual and the initializer's value,
+evaluated only where the actual is undefined (`lower-parameter-default`) and in the Scope where the
+parameters before it are already bound — so `function f(a, b = a)` sees `a`, and an explicit
+`undefined` takes the default, as the specification says. Because that merge replaces the live
+Scope, every later parameter binds into the Scope the merge produced, not the one the body started
+with. A default is an expression of its function, so the syntactic may-throw filter walks it.
+
+**A rest parameter takes the call's actuals from the hidden slot.** The slot after the formals —
+the one an arguments object already used — is filled by the entry with the call's actuals as an
+array (`JsCallArgumentsArray`), and the body binds the rest name to the elements from the formal
+count on (`JsRestFrom`). A direct call cannot fill that slot, so a call of such a function goes
+through its entry, exactly as a call of a function with an arguments object does
+(`syntax-fun-hidden-builtin`).
+
+Destructuring parameters, generators and async functions still refuse by name, and a non-simple
+list still has no arguments object (its unmapped `callee` needs %ThrowTypeError%).
+
 ## 2026-09-15 — Object literal methods and accessors
 
 `{ m() {} }`, `{ get x() {} }` and `{ set x(v) {} }` refused as "object methods and accessors".
