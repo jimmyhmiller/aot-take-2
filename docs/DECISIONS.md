@@ -1,5 +1,30 @@
 # Decisions
 
+## 2026-09-15 — Base classes
+
+`class` refused as "class definitions", which was the largest implementable blocker of the campaign.
+
+**A class is its constructor function object.** ClassDefinitionEvaluation (§15.7.14) for a class with
+no heritage: the constructor is the `constructor` element's record, or an empty one the parse
+synthesizes so that every class has exactly one (`syntax-class-constructor-record!`, the record
+carrying `class-ctor`). It is an ordinary function value with [[Construct]] and a base constructor's
+own `this`; what makes it a class is that its body begins by throwing a TypeError when `new.target`
+is undefined (`lower-class-constructor-entry!`), which is a class constructor's [[Call]], so the
+check holds through every call path — a direct call, a value call, `Function.prototype.call`. The
+syntactic may-throw filter therefore counts every class constructor as throwing.
+
+**The members are definitions, not stores.** `JsMakeClassPrototype` (jsl/compiler/class.jsl) makes
+the prototype object on %Object.prototype%, links `constructor` (writable, configurable) and
+`prototype` (neither writable, enumerable nor configurable), and each method, getter and setter is
+defined non-enumerable on that prototype, or on the constructor when it is static — an accessor
+keeping the other half of one already defined, as an object literal's does. A class declaration
+binds its name as a Script lexical like `let`, which the shared-realm image now carries
+(CU-SCRIPT-CLASS); a class expression's value is the constructor itself.
+
+`extends` and `super`, fields, static blocks, computed keys and private names refuse by name, each
+naming what it is. The class's inner binding of its own name is the outer one, which is observable
+only by reassigning it (docs/GAPS.md).
+
 ## 2026-09-15 — Default and rest parameters
 
 A parameter list that was not simple refused whole ("default, rest, generator and async functions").

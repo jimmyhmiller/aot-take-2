@@ -167,6 +167,7 @@
   [(name (slice u8))
    (heritage (Option i64))
    (elements (ArrayList ClassElement))
+   (ctor i64)  ; the constructor record: the `constructor` element, or one synthesized empty
    (lo i64)
    (hi i64)])
 
@@ -367,7 +368,8 @@
    (static-entry i64)  ; a hoisted declaration's function object in the static heap image, or -1
    (abi-builtin (slice u8))  ; an intrinsic whose JSL builtin takes the callable ABI: no local body, a forwarding entry
    (arguments-object bool)  ; its code names `arguments`: its entry passes the object in the slot after the formals
-   (arguments-unmappable bool)])  ; a sloppy mapped object's aliasing would be observable (refused)
+   (arguments-unmappable bool)  ; a sloppy mapped object's aliasing would be observable (refused)
+   (class-ctor bool)])  ; a class's constructor: [[Call]] without `new` is a TypeError
 
 ;; A var-like global: a top-level `var` or function declaration of some Script of the realm. The
 ;; realm's global object carries one property per binding from the start.
@@ -4836,7 +4838,11 @@
                         (CeStaticBlock [fun] (CkNamed "")))]
                 (match key (CkComputed [e] (syntax-check-strict-expr! e)) (_ 0))))
       (let [(mut c) (primitive/zeroed SyntaxClass)
-            index (len (.classes p))]
+            index (len (.classes p))
+            ;; ClassDefinitionEvaluation synthesizes an empty constructor for a class body without
+            ;; one (§15.7.14 step 10); a derived class's default forwards its arguments (§15.7.14).
+            ctor (syntax-class-constructor-record! (load elements) name (.start keyword))]
+        (set! (.ctor (mut c)) ctor)
         (set! (.name (mut c)) name)
         (set! (.heritage (mut c)) heritage)
         (set! (.elements (mut c)) (load elements))
@@ -5556,12 +5562,11 @@
          (FunDeclaration [] true)
          (FunExpression [] true)
          (FunArrow [] true)
-         ;; A method or accessor is a function without [[Construct]]; `super` in it refuses where
-         ;; it is written (a home object is a class-slice concern).
-         ;; Class elements wait for classes.
-         (FunMethod [] (not (.in-class f)))
-         (FunGetter [] (not (.in-class f)))
-         (FunSetter [] (not (.in-class f))))
+         ;; A method or accessor is a function without [[Construct]] — a class constructor has one —
+         ;; and `super` in one refuses where it is written (a home object waits).
+         (FunMethod [] true)
+         (FunGetter [] true)
+         (FunSetter [] true))
        ;; Defaults and a rest parameter lower; destructuring parameters do not.
        (not (.generator f))
        (not (.async f))
@@ -7893,11 +7898,7 @@
                          (unimplemented "super property access"
                                         "docs/GAPS.md — methods and home objects")
                          (unreachable-node)))
-              (SxClass [cls]
-                       (do
-                         (unimplemented "class definitions"
-                                        "docs/GAPS.md — classes")
-                         (unreachable-node)))
+              (SxClass [cls] (lower-class cls))
               (SxDestructuringAssign [pattern value]
                                      (do
                                        (unimplemented "destructuring assignment"
@@ -8148,6 +8149,13 @@
               (SsLetPattern [pattern init final]
                             (unimplemented "destructuring declarations"
                                            "docs/GAPS.md — destructuring"))
+              ;; A class declaration is a lexical binding of its name, in its temporal dead zone
+              ;; until the class is evaluated.
+              (SsClassDecl [cls]
+                           (scope-declare! (parser-node (.current-scope (parser-state)))
+                                           (syntax-class-name cls)
+                                           (ty-dyn TAG-ANY)
+                                           true))
               (SsDeclList [decls] (lower-instantiate-lexicals! decls))
               (SsCase [selector body] (lower-instantiate-lexicals! body))
               ;; A block-level FunctionDeclaration is a lexical binding initialized on block entry.
@@ -8688,8 +8696,7 @@
                         0
                         (unimplemented "generator and async function declarations"
                                        "docs/GAPS.md — function environments")))
-    (SsClassDecl [cls]
-                 (unimplemented "class definitions" "docs/GAPS.md — classes"))))
+    (SsClassDecl [cls] (lower-class-declaration! cls))))
 
 (defn lower-syntax-statements [(stmts (ArrayList i64))] (-> i64)
   (let [(mut i) 0
@@ -9013,6 +9020,8 @@
       ;; A substitution is ToString'd, which can call user code and throw.
       (SxTemplate [quasis substitutions]
                   (if (and (not protected) (> (len substitutions) 0)) (set! direct true) 0))
+      ;; A class definition defines its prototype links and members, each of which can throw.
+      (SxClass [cls] (if protected 0 (set! direct true)))
       ;; A property access on undefined or null is a TypeError.
       (SxMember [owner name optional] (if protected 0 (set! direct true)))
       (SxIndex [owner key optional] (if protected 0 (set! direct true)))
@@ -9102,6 +9111,8 @@
              (do
                (if (and (not protected) (.external-mutation (parser-state))) (set! direct true) 0)
                (syntax-throw-walk-parts! id protected (mut direct) (mut edges))))
+    ;; A class declaration evaluates the class: its member definitions can throw.
+    (SsClassDecl [cls] (if protected 0 (set! direct true)))
     (_ (syntax-throw-walk-parts! id protected (mut direct) (mut edges)))))
 
 (defn syntax-throw-walk-parts! [(id i64)
@@ -9135,8 +9146,10 @@
                     (mut direct)
                       (or (and (.external-mutation p)
                                (syntax-script-root? (load i)))
-                          ;; A forwarding entry's builtin can complete with any exception.
-                          (> (len (.abi-builtin f)) 0))
+                          ;; A forwarding entry's builtin can complete with any exception, and a class
+                          ;; constructor throws when it is called without `new`.
+                          (> (len (.abi-builtin f)) 0)
+                          (.class-ctor f))
                     (mut edges) (al-new [i64] (compiler-allocator))]
                 (al-for [id (.body f)]
                         (syntax-throw-walk-stmt! id
@@ -9419,10 +9432,14 @@
       (let [f (syntax-fun-at i)]
         (if (or (.generator f) (.async f))
             0
-            (match (.kind f)
-              (FunDeclaration [] (+ FUNCTION-FLAG-CONSTRUCTOR FUNCTION-FLAG-BASE-CONSTRUCTOR))
-              (FunExpression [] (+ FUNCTION-FLAG-CONSTRUCTOR FUNCTION-FLAG-BASE-CONSTRUCTOR))
-              (_ 0))))))
+            (if (.class-ctor f)
+                ;; A class constructor constructs; calling it without `new` is a TypeError its body
+                ;; raises (§15.7.14). A base class creates its own `this`.
+                (+ FUNCTION-FLAG-CONSTRUCTOR FUNCTION-FLAG-BASE-CONSTRUCTOR)
+                (match (.kind f)
+                  (FunDeclaration [] (+ FUNCTION-FLAG-CONSTRUCTOR FUNCTION-FLAG-BASE-CONSTRUCTOR))
+                  (FunExpression [] (+ FUNCTION-FLAG-CONSTRUCTOR FUNCTION-FLAG-BASE-CONSTRUCTOR))
+                  (_ 0)))))))
 
 ;; An intrinsic declared `:constructor` (not a global function, method or namespace).
 (defn syntax-intrinsic-constructor? [(i i64)] (-> bool)
@@ -10615,6 +10632,7 @@
                     (scope-define! (parser-node (.current-scope (parser-state))) rest-name (ty-dyn TAG-ANY) false rest)
                     0)))
           (None [] 0))
+        (lower-class-constructor-entry! fi fun)
         (lower-bind-arguments-object! fi scope fun)
         ;; An intrinsic belongs to no Script (`script` -1): it leaves the current
         ;; Script index as it is.
@@ -11469,3 +11487,128 @@
           (n-unkeep! defaulted)
           (n-unkeep! actual)
           (n-peephole! phi))))))
+
+;; The record a class's `constructor` element names, or a fresh empty one standing for the default
+;; constructor. Class code is strict.
+(defn syntax-class-constructor-record! [(elements (ArrayList ClassElement))
+                                        (name (slice u8))
+                                        (lo i64)] (-> i64)
+  (let [(mut found) -1]
+    (al-for [element elements]
+            (match element
+              (CeMethod [key is-static fun]
+                        (if is-static
+                            0
+                            (match key
+                              (CkNamed [k] (if (= k "constructor") (set! (mut found) fun) 0))
+                              (_ 0))))
+              (_ 0)))
+    (if (>= (load found) 0)
+        (do (set! (.class-ctor (syntax-fun-ptr (load found))) true) (load found))
+        (let [index (syntax-fun-reserve! name (FunMethod) false false lo)
+              fp (syntax-fun-ptr index)]
+          (set! (.strict fp) true)
+          (set! (.in-class fp) true)
+          (set! (.class-ctor fp) true)
+          index))))
+
+;; ---------------------------------------------------------------------------
+;; Classes (docs/DECISIONS.md, classes)
+;;
+;; ClassDefinitionEvaluation (§15.7.14) for a base class: the constructor is the `constructor`
+;; element's record, or the empty one the parse synthesized; its function object gets the class's
+;; prototype object with the specified attributes, and every method and accessor is defined —
+;; non-enumerable — on that prototype, or on the constructor when it is static. Heritage, fields,
+;; static blocks, computed keys and private names refuse by name.
+(defn lower-class [(cls i64)] (-> (dyn NodeOps))
+  (let [c (get (.classes (parser-state)) cls)]
+    (match (.heritage c)
+      (Some [h] (unimplemented "class heritage (`extends` and `super`)" "docs/GAPS.md — classes"))
+      (None [] 0))
+    (let [ctor (lower-function-object (.ctor c))]
+      (n-keep! ctor)
+      (let [proto (lower-jsl-values1 "JsMakeClassPrototype" ctor)]
+        (n-keep! proto)
+        (al-for [element (.elements c)]
+                (match element
+                  (CeMethod [key is-static fun]
+                            (if (= fun (.ctor c))
+                                0
+                                (lower-class-member! (if is-static ctor proto) key fun)))
+                  (CeField [key is-static init-fun]
+                           (unimplemented "class fields" "docs/GAPS.md — classes"))
+                  (CeStaticBlock [fun]
+                                 (unimplemented "class static blocks" "docs/GAPS.md — classes"))))
+        (n-unkeep! proto)
+        (n-unkeep! ctor)
+        ctor))))
+
+;; One method or accessor of a class, on the prototype object or on the constructor.
+(defn lower-class-member! [(target (dyn NodeOps)) (key ClassKey) (fun i64)] (-> i64)
+  (let [name (match key
+               (CkNamed [k] k)
+               (CkComputed [e] (do (unimplemented "computed class keys" "docs/GAPS.md — classes") ""))
+               (CkPrivate [k] (do (unimplemented "private class elements" "docs/GAPS.md — classes") "")))
+        function (lower-function-object fun)
+        setter (match (.kind (syntax-fun-ptr fun)) (FunSetter [] 1) (_ 0))
+        accessor (match (.kind (syntax-fun-ptr fun))
+                   (FunGetter [] true)
+                   (FunSetter [] true)
+                   (_ false))
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (push! [(dyn NodeOps)] (mut args) target)
+    (push! [(dyn NodeOps)] (mut args) (keyref-make (shape-key-intern name)))
+    (push! [(dyn NodeOps)] (mut args) function)
+    (if accessor (push! [(dyn NodeOps)] (mut args) (con-int setter)) 0)
+    (let [defined (lower-jsl-values (if accessor "JsDefineClassAccessor" "JsDefineClassMethod")
+                                    (load args))]
+      (al-free! [(dyn NodeOps)] (mut args))
+      (lower-completion! defined)
+      0)))
+
+(defn lower-jsl-values1 [(name (slice u8)) (a (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [(mut values) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (push! [(dyn NodeOps)] (mut values) a)
+    (let [v (lower-completion! (lower-jsl-values name (load values)))]
+      (al-free! [(dyn NodeOps)] (mut values))
+      v)))
+
+;; `class C { … }` as a statement: the class value initializes C's lexical binding.
+(defn lower-class-declaration! [(cls i64)] (-> i64)
+  (let [p (parser-state)
+        name (syntax-class-name cls)
+        value (lower-class cls)]
+    (if (>= (scope-find (parser-node (.current-scope p)) name) 0)
+        (scope-initialize! (parser-node (.current-scope p)) name value)
+        (if (and (.script-unit p)
+                 (syntax-script-root? (.current-fun p))
+                 (syntax-script-binding? name))
+            (lower-script-declaration-effect! "JsInitializeGlobalLexicalBinding" name (Some value))
+            (panic "lower-class-declaration!: the class binding was not instantiated")))
+    0))
+
+(defn syntax-class-name [(cls i64)] (-> (slice u8))
+  (let [c (get (.classes (parser-state)) cls)] (.name c)))
+
+;; A class constructor's entry (§15.7.14, the [[Call]] of a class constructor): calling it without
+;; `new` — so with an undefined `new.target` — is a TypeError before anything else runs.
+(defn lower-class-constructor-entry! [(fi i64) (fun (dyn NodeOps))] (-> i64)
+  (if (not (.class-ctor (syntax-fun-ptr fi)))
+      0
+      (let [new-target (match (fun-parm fun 1)
+                         (Some [p] p)
+                         (None [] (do (broken "lower-class-constructor-entry!: no new.target Parm")
+                                      (unreachable-node))))
+            iff (if-make (parser-node (.current-ctrl (parser-state)))
+                         (n-peephole! (typetest-make new-target TAG-UNDEFINED)))
+            arms (if-arms! iff)
+            scope (parser-node (.current-scope (parser-state)))
+            constructed (scope-dup scope false)]
+        ;; The called path throws and never joins the constructed one.
+        (scope-set-ctrl! scope (arms-true arms))
+        (set! (.current-ctrl (parser-state)) (n-nid (arms-true arms)))
+        (lower-throw-type-error! "Class constructor cannot be invoked without 'new'")
+        (scope-set-ctrl! constructed (arms-false arms))
+        (set! (.current-scope (parser-state)) (n-nid constructed))
+        (set! (.current-ctrl (parser-state)) (n-nid (arms-false arms)))
+        0)))

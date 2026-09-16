@@ -55,6 +55,16 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-15 — Base classes
+
+A class with no heritage — its constructor, methods, accessors, statics, prototype links and the
+TypeError of a call without `new` — executes (docs/DECISIONS.md, base classes). Missing: `extends`
+and `super`, instance and static fields, static blocks, computed class keys, private elements,
+generator and async methods, a class's `name`, and the class's own inner binding of its name (a
+method reads the outer binding, which differs only if something reassigns it). A closed program
+still refuses a Script-level class name read from inside a function body, as it does every Script
+`let`.
+
 ### 2026-09-15 — Default and rest parameters
 
 Parameter defaults and a rest parameter execute in declarations, expressions, arrows and methods
