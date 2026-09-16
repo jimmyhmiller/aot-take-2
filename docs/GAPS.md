@@ -59,9 +59,12 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 The thirteen well-known Symbols exist as values on the `Symbol` constructor, with the right
 identity, description and attributes, and each is usable as a property key (docs/DECISIONS.md,
-well-known symbols). Missing: everything that consults one — the iteration protocol (@@iterator),
-@@toPrimitive in ToPrimitive, @@hasInstance in `instanceof`, @@toStringTag in
-`Object.prototype.toString` — each still behaves as it did before the symbols existed.
+well-known symbols). Three are consulted where the specification says: @@toPrimitive in ToPrimitive
+(an object with one converts through it, and an object result is a TypeError), @@hasInstance in
+`instanceof` (a right operand with one answers the question itself, and only one without falls back
+to OrdinaryHasInstance), and @@toStringTag in `Object.prototype.toString`. Missing: the iteration
+protocol (@@iterator), which needs iterator objects, and the rest, which need the builtins that
+consult them.
 
 ### 2026-09-16 — Symbol keys
 

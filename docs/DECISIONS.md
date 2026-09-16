@@ -1,5 +1,15 @@
 # Decisions
 
+## 2026-09-16 — What the well-known symbols decide
+
+Three of them now decide what the specification says they decide, which is what makes them values
+rather than declarations: **@@toPrimitive** is looked up before OrdinaryToPrimitive, called with the
+hint as a string, and a result that is still an object is a TypeError; **@@hasInstance** lets a right
+operand of `instanceof` answer the question itself, with OrdinaryHasInstance's prototype-chain walk
+reached only when the operand has none — and a non-object right operand is now the TypeError §13.10.2
+gives it, before any callability question; **@@toStringTag**, when it is a string, is the tag
+`Object.prototype.toString` reports, and every other value falls through to the builtin tag.
+
 ## 2026-09-16 — Well-known symbols
 
 **Each is one image allocation.** `Symbol.iterator` and its twelve siblings are declared as data rows
