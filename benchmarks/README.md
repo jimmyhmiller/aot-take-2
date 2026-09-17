@@ -74,3 +74,44 @@ Set `AOT_RT_GC_STATS=1` on the generated AOT executable to print machine-readabl
 allocation, promotion, and remembered-card counters to standard error at process exit. The flag is
 off by default and does not change collection policy. Statistics mode deliberately routes
 allocations through the instrumented slow path, so benchmark elapsed time without that flag.
+
+## V8 Benchmark Suite, version 7
+
+`benchmarks/v8/` holds the eight benchmarks of the V8 Benchmark Suite v7 and its `base.js` harness,
+as the original Scripts: Richards, DeltaBlue, Crypto, RayTrace, EarleyBoyer, RegExp, Splay and
+NavierStokes. Each file keeps its own license header. They were taken from the Node.js packaging
+of v7 with its CommonJS wrapper removed (three lines per file), and checked line for line against
+the plain-Script v6 copies, whose benchmark bodies are identical; only `BenchmarkSuite.version`
+differs. `run.js` is the driver: it runs every suite the preceding Scripts registered and prints
+each result and the score, as the suite's `run.html` does.
+
+Run one benchmark as a realm of three Scripts, in order:
+
+```sh
+build/release/aot run-script benchmarks/v8/base.js benchmarks/v8/richards.js benchmarks/v8/run.js \
+  /tmp/richards.o /tmp/richards
+cat benchmarks/v8/base.js benchmarks/v8/richards.js benchmarks/v8/run.js | node -
+```
+
+### Status, 2026-09-16
+
+None of the eight runs yet. Under Node 26.5.0 on the Apple M2 Max all eight complete.
+
+| Benchmark | Node score | aot-take-2 |
+| --- | ---: | --- |
+| Richards | 54,499 | compiler panic: register allocator split budget (harness) |
+| DeltaBlue | 138,563 | compiler panic: register allocator split budget (harness) |
+| Crypto | 63,030 | compiler panic: register allocator split budget (harness) |
+| RayTrace | 140,524 | compiler panic: register allocator split budget (harness) |
+| EarleyBoyer | 124,661 | parser refusal: escaped or non-ASCII string property key |
+| RegExp | 16,167 | refusal by name: regular expression objects |
+| Splay | 66,366 | compiler panic: register allocator split budget (harness) |
+| NavierStokes | 42,294 | compiler panic: register allocator split budget |
+
+Five of the eight stop in the same place, and it is not benchmark code: **compiling `base.js` by
+itself** fails with `ra-run!: allocator exceeded its split budget` on the Phi for
+`continuation || index < length`, the loop condition of `RunStep` inside
+`BenchmarkSuite.RunSuites`. A reduction of that function alone compiles and runs, so the failure
+needs more of the harness than the loop. NavierStokes fails in the allocator the same way at a
+different node. The harness had never compiled in this repository before: the 2026-09-15 compiler
+stops earlier, on captured variables.
