@@ -201,6 +201,11 @@ When a `--fix` suggestion looks wrong, check it rather than accepting it. Report
   one slow suite at 188 s and the one that catches JavaScript-semantics regressions.
 - A wall-clock assertion is a backstop against a blowup, never a budget: the suite runs in parallel,
   so elapsed time measures the machine's load. Gate on deterministic counts — nodes, blocks, rounds.
+- **Any comparison against Node lets V8 finish its JIT warm-up first, or it is not a comparison.**
+  Hyperfine's `--warmup` only discards whole processes; every timed `node` run still starts cold.
+  Warm the workload inside the process until V8 has optimized it (confirm with `--trace-opt`), then
+  time only the measured region after the warm-up, the same way in both runtimes. A cold
+  whole-process Node number may be reported as startup cost, never as Node's speed.
 - When the user asks to see compiler or IR graphs, use this repository's Graphviz machinery
   (`aot.print.dot` and the Coil tools built on it). Do not use pad or substitute a generic
   visualization: these graphs have project-specific node, edge, control, and memory conventions.
