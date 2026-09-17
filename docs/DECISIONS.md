@@ -1,5 +1,38 @@
 # Decisions
 
+## 2026-09-17 — A dynamic integer carries its range, and relational tests narrow it
+
+The dynamic axis was a tag set and nothing else, so no fact about a JavaScript number survived a
+boundary: `Box(2)` was `dyn{int}`, as general as any integer. Three things followed. A literal
+operand was never inlining evidence (decision 3 of the compile-time architecture compares types, and
+the literal's type was the Parm's). A comparison had nowhere to record what it proved. And integer
+arithmetic could not prove it does not overflow the signed-48 payload, so `fib(value - 1)` had to
+admit a double. Adding special cases for each of these — literal evidence by node shape, dominator
+walks over raw comparisons, overflow folding by pattern — was tried and abandoned
+(`archive/int-fast-path-attempt`): each exposed the next, and it slowed `fib` down.
+
+The design instead gives the lattice the missing fact, in three parts, landed in this order:
+
+1. **`TDyn` carries an integer component.** It is an ordinary `TInt`, widen stage included, that
+   describes the payload of the `int` member. Where `int` is not a member it is canonically the int
+   top (low set) or bottom (high set), so it never distinguishes two denotations that are equal; a
+   range covering or leaving the signed-48 payload canonicalizes to "any integer". It duals and
+   meets with the existing integer lattice, and the tag set keeps its complemented-set rules. `Box`
+   of a raw integer carries the integer's range; `Unbox_int` of a proven integer reads it back. Loop
+   Phis and recursive Parms widen the component exactly as they widen raw integers.
+2. **An integer fast path for `+`, `-` and the relations** (JSL), with signed-48 overflow boxed as
+   binary64, dispatch bodies kept under the inline size cap, `Unbox(Box(x))` folding only when `x`
+   fits the payload, and pessimistic widening only of falling ranges (all found by the abandoned
+   attempt).
+3. **Relational guards.** Simple's `ScopeNode.addGuards` narrows a tested value on each arm of an
+   `if`; `scope-add-guards!` ports it and is not yet called. For `x < k` (and `<=`, `>`, `>=`) with
+   `x` a binding and `k` an integer literal, each arm rebinds `x` to a Cast narrowing only its
+   integer component. It is sound for every value: the Cast constrains the `int` member alone.
+
+With these, `fib`'s recursive arm sees `value` as `int[2..]`, both subtractions fit the payload, the
+overflow arm is dead, and no double reaches the parameter. Specialization (int and generic clones)
+is not needed for that; it remains the tool for callers of mixed types.
+
 ## 2026-09-16 — A call through a function value names only functions that can be there
 
 The rest of the whole-program call resolution the previous entry began. A code-word `Load` whose
