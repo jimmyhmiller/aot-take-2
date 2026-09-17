@@ -96,10 +96,19 @@ Apple M2 Max, Node 26.5.0, three process runs each (a background process held cl
 | `fib(30)`, 100 measured after 30 warm-up | 5.56–6.81 ms each | 18.1–21.3 ms each | Node ~3.3× faster |
 | binary trees depth 15, 20 measured after 5 warm-up | 43.4–48.6 ms each | 489–505 ms each | Node ~11× faster |
 
-Two things these show that the whole-process table hid. Against a warmed Node, recursive Fibonacci
+Re-measured 2026-09-16 after calls through function values stopped naming functions that cannot be
+there (docs/DECISIONS.md), three process runs each on an otherwise idle machine:
+
+| Workload | Node, warmed | aot-take-2 | |
+| --- | ---: | ---: | --- |
+| `fib(30)`, 100 measured after 30 warm-up | 5.51–5.61 ms each | 7.97–8.09 ms each | Node ~1.45× faster |
+| binary trees depth 15, 20 measured after 5 warm-up | not re-run | 491–501 ms each | unchanged |
+
+Two things the first table showed that the whole-process table hid. Against a warmed Node, recursive Fibonacci
 is a third of V8's speed, not faster. And the same `fib` compiled as a Script runs about 2.4× slower
 than compiled through `aot compile`'s function entry (`fib(40)` at 996 ms is about 8.1 ms per
-`fib(30)`), which matters because real programs are Scripts.
+`fib(30)`), which matters because real programs are Scripts. That second gap is now closed: the
+Script's `fib` had been a possible `valueOf` of every `console.log` argument, and no longer is.
 
 Binary trees has also regressed in its own right: the whole-process run was 127 ms when recorded
 above, 364 ms built with the 2026-09-15 compiler, and 437–457 ms now, with identical collector

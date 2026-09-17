@@ -1,5 +1,50 @@
 # Decisions
 
+## 2026-09-16 — A call through a function value names only functions that can be there
+
+The rest of the whole-program call resolution the previous entry began. A code-word `Load` whose
+pointer is not an image `StaticRef` — a function read from a property, an argument, an array
+element — was typed as every value-taken function. `console.log(s)` reaches the generic
+`OrdinaryToPrimitive` and `Call` getter paths, so `fib` became a possible `valueOf`, and the
+optimistic fixpoint merged those sites' `undefined` and `string` arguments into its parameter.
+
+The closed-world image scan (aot.node.imagefacts, "Call targets") already knows which image entries
+each value can be, and which escape. It now publishes, per code-word `Load`, the functions its
+pointer can call (`facts-code-targets`, aot.facts):
+
+- a pointer the analysis names is those entries, so its code is their code words;
+- a pointer it cannot name (TOP) is an escaped entry or an object the image never held, and the only
+  function objects the image never held are the ones the program allocates — each written by a
+  code-word `Store` in the graph — so its code is an escaped entry's code word or one of those
+  Stores' values.
+
+`load-compute-of` joins the declared type with that set. Nothing is published when outside code may
+mutate the realm, when some allocation's code word is not a finite known set, or when a named
+pointer names no function. An inlined clone of a `Load` inherits its original's entry
+(`facts-inherit-code-targets!`, from `copy--shell`): the clone keeps the narrowed type it was copied
+with, and the fact about the body holds in each context the scan joined into it. Without that the
+clone's next compute widens back to the declaration, which the monotone `n-set-ty!` rejects.
+
+Simple has no counterpart: its function pointers come only from `FunPtr` constants and flow through
+the ordinary type lattice. Our image function objects have no `FunPtr` in the graph, so their flow
+is recovered by the image scan instead.
+
+Measured on `benchmarks/fib-steady.js` compiled as a Script: `fib`'s parameter narrows from every
+JavaScript type to `dyn{int,double}`, and `fib(30)` drops from 18.1–21.3 ms to 8.4 ms, the speed of
+the same `fib` through `aot compile`'s function entry. The comparisons in `fib` still call the shared
+`JsLtOperator`/`JsSubOperator` bodies: every caller's argument types now equal those bodies' Parm
+types, so the inline gate sees no new evidence. That is the specialization question, not this one.
+
+Narrowing those sets exposed a hole in Simple's optimistic pass. `Opto.sccp` asserts no type falls
+below its pessimistic type, but loop widening is order-dependent: `JsArrayUnshift`'s argument-count
+Phi saw `[0..3]` and then `[0..4]` at its last widen stage and jumped to the declared `int`, where the
+pessimistic pass had met `[0..4]` first. During the optimistic pass (`optimistic-pass?`, set only
+around the SCCP worklist, when the graph is frozen) a falling loop Phi or recursive Parm whose widen
+stages are spent now lands on its pessimistic integer range when the new range lies inside it
+(`phi-widen-bound`, aot.node.phi), and on the declaration otherwise. The landing point is still
+fixed, so termination is unchanged, and it is sound because the pass started from it on the same
+graph.
+
 ## 2026-09-16 — Calls through image function objects link their one callee
 
 A call through a built-in — `console.log(x)`, `Function.prototype.call` — loads the code word of a
