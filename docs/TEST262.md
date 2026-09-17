@@ -258,6 +258,13 @@ Symbol and nothing bound them. On the 60-file reproducer compiler errors fell fr
 merge conflict left, and a regression test runs two independently compiled units in both orders
 (`independent_script_units_share_well_known_symbols`).
 
+Re-measured on the full inventory after the fix: **15,397 files passing (28.73%)**, up from 14,806.
+Compiler errors fell from 9,252 to **2,295** — the merge conflict is gone entirely — and verdict-fail
+rose from 25,889 to 31,677, because most of the tests it had been stopping now run and fail on a
+missing feature instead. Crashes rose from 113 to 125. The compiler errors that remain are led by
+parser refusals: 882 lexically unclassified tokens, 560 phase imports, 285 `expected semicolon or
+line terminator`, 96 invalid destructuring targets, 86 non-ASCII identifiers. 32 minutes wall.
+
 ## Latest measured campaign, 2026-09-09 (sampled, after Math and the number globals)
 
 With Function.prototype call/apply, the Object statics and prototype methods, the Number and
