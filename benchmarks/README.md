@@ -104,6 +104,15 @@ there (docs/DECISIONS.md), three process runs each on an otherwise idle machine:
 | `fib(30)`, 100 measured after 30 warm-up | 5.51–5.61 ms each | 7.97–8.09 ms each | Node ~1.45× faster |
 | binary trees depth 15, 20 measured after 5 warm-up | not re-run | 491–501 ms each | unchanged |
 
+Re-measured 2026-09-17 after dynamic integers started carrying their range and `+`, `-` and the
+relations took inline integer and binary64 arms (docs/DECISIONS.md, "A dynamic integer carries its
+range"), three process runs each on an otherwise idle machine:
+
+| Workload | Node, warmed | aot-take-2 | |
+| --- | ---: | ---: | --- |
+| `fib(30)`, 100 measured after 30 warm-up | 5.50–5.52 ms each | 5.17–5.18 ms each | aot-take-2 ~6% faster |
+| binary trees depth 15, 20 measured after 5 warm-up | not re-run | 439–440 ms each | Node ~10× faster |
+
 Two things the first table showed that the whole-process table hid. Against a warmed Node, recursive Fibonacci
 is a third of V8's speed, not faster. And the same `fib` compiled as a Script runs about 2.4× slower
 than compiled through `aot compile`'s function entry (`fib(40)` at 996 ms is about 8.1 ms per

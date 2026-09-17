@@ -33,6 +33,35 @@ With these, `fib`'s recursive arm sees `value` as `int[2..]`, both subtractions 
 overflow arm is dead, and no double reaches the parameter. Specialization (int and generic clones)
 is not needed for that; it remains the tool for callers of mixed types.
 
+### As landed (parts 2 and 3, 2026-09-17)
+
+The guards landed before the fast path, since the fast path alone was measured slower. What the
+implementation had to add, each found by measurement or by a failing test:
+
+- **The fast path lives in the operators.** `JsAddOperator`, `JsSubOperator` and the four relational
+  operators test `%IsNumber` on both operands, then `%IsInt`: two integers compute as integers
+  through `JsBoxInt48`, two other Numbers as binary64 inline, and every other pair calls the
+  operator's generic definition (`jsl/compiler/int-arith.jsl`), which is `:noinline`. Measured with
+  `AOT_INLINE_TRACE`: `JsLtOperator` built at 106 nodes (over Simple's cap of 100) never inlined, and a
+  generic definition allowed to inline grew the shared operator body past the cap again (`fib(30)`
+  22 ms). `JsSub`, `JsAdd` and `JsRelationalOrder` are unchanged.
+- **`%IsNumber`** is a tag predicate over int and double. On arm64 it is the double classifier with
+  the reserved positive range starting one above the integer prefix.
+- **An unboxed integer is at worst the signed-48 payload range**, at the last widen stage, and
+  `Unbox(Box(x))` folds only when `x` fits it.
+- **The pessimistic pass does not walk a rising range.** A loop Phi, recursive Parm or call result
+  keeps its range instead of narrowing to a non-constant one; the optimistic pass, which widens,
+  finds the precise range. Without this, `value >= 2` feeding `value - 1` back into `value` narrowed
+  the range by one per recomputation.
+- **A call's result widens like a Parm.** `return 1 + down(n - 1)` grows the result range by one per
+  optimistic iteration through the CallEnd, which is neither a loop Phi nor a Parm, and compiling it
+  did not finish.
+- The harness-realm budget grew 6,120 → 6,631 machine nodes and 1,215 → 1,315 blocks, rounds
+  unchanged at 4: the Number arms at every operator site.
+
+`benchmarks/fib-steady.js`: `fib(30)` 8.1 → 5.2 ms per iteration, with `fib`'s parameter
+`dyn{int[0..30]}`.
+
 ## 2026-09-16 — A call through a function value names only functions that can be there
 
 The rest of the whole-program call resolution the previous entry began. A code-word `Load` whose
