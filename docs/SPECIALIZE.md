@@ -322,7 +322,38 @@ to 6,500/1,300; the six `:noinline` marks removed; `fib(30)` 5.16 ms. The operat
 int/binary64 arms: a proven site then folds in one hop, where moving the arms back into `JsAdd`/`JsSub`
 would leave a second call to fold.
 
-## 11. Order of work
+## 11. Measured: is there a Simple-shaped way to do this?
+
+Simple grows a body by exactly one transform — cloning, which copies existing nodes, so its types and
+links are ones the graph already had. Our specialization re-lowers JSL source at the site, which is a
+different kind of operation and is where all five seam bugs above came from. So: could a proven site
+just CLONE instead, and let SCCP fold the arms the proof kills?
+
+It is easy to build. The hook exists already: asking the specializer with `mutate` false answers "is
+this site proven?", so a proven site can bypass the evidence gate and the two size caps and take the
+ordinary clone path. About thirty lines. Measured against tier 1 as landed (2026-09-17):
+
+| | re-lowering (landed) | proof-gated cloning | no specialization at all |
+| --- | ---: | ---: | ---: |
+| `fib(30)` | **5.16 ms** | 7.29 ms | 7.81 ms |
+| harness realm, ideal nodes | **4,464** | 4,976 | 4,743 |
+| harness realm, machine nodes | **6,248** | 6,941 | 6,816 |
+| harness realm, blocks | **1,235** | 1,414 | 1,399 |
+| budget test | passes | fails | fails |
+| inlines fired (harness) | 169 | 166 | — |
+
+Cloning fires about as often; it is the *residual* that differs. Re-lowering never BUILDS the arms the
+proof kills; cloning builds the whole body — for `JsGetNamed` that is ~300 tokens of string, array,
+accessor and TypeError paths — and then relies on SCCP to remove them, which on these programs it does
+not fully do. That difference is worth 40% on `fib` and ~11% of the machine nodes, and it is not
+something a better fold order recovers: the arms are built before anything can decide they are dead.
+
+So the divergence earns its keep, and the conclusion is to harden the seam rather than remove it: keep
+the guards in §3, test each one, and fix the open loop-tree bug in §10. "Do not build what the proof
+kills" is a capability Simple's single transform cannot express, because Simple has no source to
+re-lower — its bodies are graphs from the start.
+
+## 12. Order of work
 
 1. §3.1 and §3.2 with their tests. No behaviour change otherwise; this is the unlock.
 2. §4 rule language, with checker refusals.
