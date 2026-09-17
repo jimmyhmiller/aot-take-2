@@ -75,6 +75,36 @@ allocation, promotion, and remembered-card counters to standard error at process
 off by default and does not change collection policy. Statistics mode deliberately routes
 allocations through the instrumented slow path, so benchmark elapsed time without that flag.
 
+## Steady state against a warmed Node, 2026-09-16
+
+The whole-process numbers above include V8's startup and tier-up inside every Node run, so they are
+not Node's speed. `fib-steady.js` and `binarytrees-steady.js` are single Scripts that run unchanged
+under both runtimes: each warms its workload in the process, then times only the measured
+iterations with `Date.now()` and validates every result. Under `node --trace-opt --trace-deopt`,
+`fib`, `bottomUpTree`, `itemCheck` and `work` reach TurboFan during the warm-up, and no optimization
+or deoptimization event occurs after timing starts.
+
+```sh
+node benchmarks/fib-steady.js
+build/release/aot run-script benchmarks/fib-steady.js /tmp/fib-steady.o /tmp/fib-steady && /tmp/fib-steady
+```
+
+Apple M2 Max, Node 26.5.0, three process runs each (a background process held close to two cores):
+
+| Workload | Node, warmed | aot-take-2 | |
+| --- | ---: | ---: | --- |
+| `fib(30)`, 100 measured after 30 warm-up | 5.56–6.81 ms each | 18.1–21.3 ms each | Node ~3.3× faster |
+| binary trees depth 15, 20 measured after 5 warm-up | 43.4–48.6 ms each | 489–505 ms each | Node ~11× faster |
+
+Two things these show that the whole-process table hid. Against a warmed Node, recursive Fibonacci
+is a third of V8's speed, not faster. And the same `fib` compiled as a Script runs about 2.4× slower
+than compiled through `aot compile`'s function entry (`fib(40)` at 996 ms is about 8.1 ms per
+`fib(30)`), which matters because real programs are Scripts.
+
+Binary trees has also regressed in its own right: the whole-process run was 127 ms when recorded
+above, 364 ms built with the 2026-09-15 compiler, and 437–457 ms now, with identical collector
+counters (64 minor collections, ~20 ms total), so the time is in generated code.
+
 ## V8 Benchmark Suite, version 7
 
 `benchmarks/v8/` holds the eight benchmarks of the V8 Benchmark Suite v7 and its `base.js` harness,
