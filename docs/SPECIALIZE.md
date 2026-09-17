@@ -94,10 +94,16 @@ optimistic one. Linking adds a caller, and a `Parm` is the meet over its callers
 a type outside the current meet **widens** it. In the pessimistic pass that is a monotonicity
 violation.
 
-Simple cannot hit this: it adds call-graph edges only inside `Opto.sccp`
-(`codegen/Opto.java`), where every type starts at TOP and a new caller is a fall. Our
-lazy linking runs in both phases, and gets away with it today only because the three definitions that
-specialize re-lower into bodies whose callees' Parms are already at their widest.
+Simple links in the very same place — `CallNode.idealize` (`node/CallNode.java:96-112`) links during the
+pessimistic peephole — so this is not a phase-ordering divergence. It is safe there for two reasons.
+Before Opto every Fun carries its unknown-caller hook (`FunNode.compute`, `:135-148`), so its Parms hold
+their declared types and no link can widen them; `unlinkStart` removes the hook inside Opto, exactly as
+`parser-close-world!` does here. Simple then runs a pessimistic iterate as well (`Opto.opto`), but it
+never MANUFACTURES a call: its only body-growing transform is cloning, and a clone's links carry
+argument types already in the meet. JSL specialization does manufacture calls — re-lowering a body at a
+site brings that body's own calls with it — and that is the divergence. The three definitions that
+specialized before this work happened to re-lower into bodies whose callees' Parms were already at
+their widest, so it never showed.
 
 **Fix.** Linking is an optimistic-pass action. Concretely: in `call-idealize`, before linking, if the
 link would widen any of the callee's Parms and we are not in the optimistic pass, do not link — register

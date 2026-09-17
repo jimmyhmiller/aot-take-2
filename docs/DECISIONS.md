@@ -30,10 +30,12 @@ Four things had to change with them, each found by measurement (docs/SPECIALIZE.
    Cast then recomputed WIDER, which the monotone node types reject. A Cast to the projection's own
    type keeps that fact, which is the callee's own Return meet and not something specializing refutes.
 3. **Linking a call may not widen a Parm in the pessimistic pass.** A residual body contains calls;
-   `call-idealize` links them in either pass, and a new caller widens the callee's Parm. Simple adds
-   call-graph edges only inside `Opto.sccp`, where types start at TOP and a new caller is a fall. The
-   pessimistic pass now declines a widening link and depends on the Parm; the next optimistic pass
-   performs it.
+   `call-idealize` links them in either pass, and a new caller widens the callee's Parm. Simple links in
+   the same place and is safe because it never manufactures a call: before Opto every Fun carries its
+   unknown-caller hook so its Parms hold declared types, and after `unlinkStart` its only body-growing
+   transform is cloning, whose links carry argument types already in the meet. Specialization
+   manufactures calls, so the pessimistic pass now declines a widening link and depends on the Parm; the
+   next optimistic pass performs it.
 4. **Rules do not make a definition specialize-only.** An unproven site returns UNHANDLED and the
    ordinary inliner decides. A recursive site's operand types can be polluted by the shared body's
    other callers, so no proof exists there until a clone breaks the cycle: `fib(n-1) + fib(n-2)` is
