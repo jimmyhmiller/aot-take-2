@@ -1,5 +1,27 @@
 # Decisions
 
+## 2026-09-16 — Calls through image function objects link their one callee
+
+A call through a built-in — `console.log(x)`, `Function.prototype.call` — loads the code word of a
+function object in the static image and calls through it. That word was typed as its declaration
+says: every value-taken function in the program. The call was therefore linked to all of them, and
+the optimistic fixpoint merged that site's arguments into every one of their parameters.
+
+A code-word `Load` from a `StaticRef` function object is now typed as the single function the image
+stores there (`load-image-code-fidx`, aot.node.memory). Code words are written only when a fresh
+function object is allocated, never through an image object, so the image's word holds for the
+whole run. Call idealize already links a call whose pointer type is a singleton.
+
+Simple never peeks constant object data: `LoadNode.compute` types a field by its declaration joined
+with memory, and leaves "if offset is known, can peek the constant" as a TODO. The divergence is the
+one the image prototype-word fold in `load-idealize` already made, for the same reason — image
+objects have no Store in the graph to fold through.
+
+This is the first and smallest piece of whole-program call resolution. It does not yet reach the
+calls that most widen a function's types: a call through a function read from an object's property
+(`valueOf`, `toString`, an accessor's `get`) is still linked to every value-taken function, because
+that set is not keyed by the property the function was stored under.
+
 ## 2026-09-16 — A well-known Symbol is one identity in an assembled realm
 
 A realm assembled from separately compiled units — the test262 runner's cached harness bundle and
