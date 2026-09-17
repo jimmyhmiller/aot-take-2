@@ -1,5 +1,62 @@
 # Decisions
 
+## 2026-09-17 — A JSL definition carries the proofs that collapse it
+
+Decision 3 of the compile-time architecture (2026-09-08) sent every JSL definition through one gate: a
+size cap on the unspecialized body, plus evidence that some argument is sharper than the callee's
+parameter. Measured, that gate decides arithmetic badly. `JsLtOperator` is 106 nodes at construction,
+over Simple's cap of 100, so the answer was NEVER — permanently, since a construction size never
+changes; `fib` was made fast the day before by reshaping JSL until the bodies fit under the cap, which
+cost 686 ideal nodes on the test262 harness realm and six `:noinline` marks. And because a parameter's
+type is the meet over its callers, "sharper than the parameter" reduces to "the callers disagree",
+which inlined `JsSymbolToStringRefused` — a pure TypeError path — six times into a 34-line harness.
+
+The mechanism for asking the right question already existed and was used by three definitions:
+`:specialize` re-lowers **the JSL body itself** at a site where a declared proof holds, so the tag
+tests fold during lowering and the semantics stay in one place. It is consulted before the ordinary
+inliner and consults no size cap. Arithmetic simply had no rules.
+
+So: **a definition declares the proofs that collapse it, and the proof decides, not the body's size.**
+The six numeric and relational operators carry
+`:specialize [[(%IsInt a) (%IsInt b)] [(%IsNumber a) (%IsNumber b)]]`. A third rule for two strings is
+written and left out: it panics the loop tree on one program, recorded with its repro in
+docs/SPECIALIZE.md §10.
+Four things had to change with them, each found by measurement (docs/SPECIALIZE.md records the runs):
+
+1. **A rule may be a conjunction.** A rule element that is a vector means all of its predicates; the
+   list stays alternatives. `+` needs both operands proven, not either.
+2. **A specialization preserves the proof the site already had.** Forwarding the residual body to the
+   site's projections handed consumers a value typed by the declaration; the parser's completion-check
+   Cast then recomputed WIDER, which the monotone node types reject. A Cast to the projection's own
+   type keeps that fact, which is the callee's own Return meet and not something specializing refutes.
+3. **Linking a call may not widen a Parm in the pessimistic pass.** A residual body contains calls;
+   `call-idealize` links them in either pass, and a new caller widens the callee's Parm. Simple adds
+   call-graph edges only inside `Opto.sccp`, where types start at TOP and a new caller is a fall. The
+   pessimistic pass now declines a widening link and depends on the Parm; the next optimistic pass
+   performs it.
+4. **Rules do not make a definition specialize-only.** An unproven site returns UNHANDLED and the
+   ordinary inliner decides. A recursive site's operand types can be polluted by the shared body's
+   other callers, so no proof exists there until a clone breaks the cycle: `fib(n-1) + fib(n-2)` is
+   exactly that shape, and deferring instead of falling through kept its `+` a call (5.2 → 6.5 ms).
+   Proof-driven specialization and speculative cloning are complements, not alternatives.
+
+A tag rule must also name a parameter the body tag-tests, refused by the checker: a proof of something
+the body never asks about buys a re-lowering and nothing else.
+
+A definition specialized at every one of its sites loses its last caller and is collected during Opto;
+`jsl-finish-opto!` releases the hold `jsl-prepare-opto!` installed, so it now skips a Return already
+collected. The residual's edges are peepholed after the forwarding walk rather than at construction:
+the folds that matter depend on the users the walk installs.
+
+Measured on the harness realm: 6,631 → 6,248 machine nodes and 1,315 → 1,235 blocks, so the ceilings
+raised the day before went back to 6,500 and 1,300. The six `:noinline` marks on the operator generics
+are gone. `fib(30)` stays at 5.16 ms against a warmed Node's 5.5 ms.
+
+What this does not change: the ordinary inliner's evidence rule still admits a clone whenever a caller
+is sharper, so cold paths are still cloned at unproven sites. That is the next piece (docs/SPECIALIZE.md
+§7), together with the phase where nothing inlines at all and the missing `dyn` payloads for `bool`
+and `double`.
+
 ## 2026-09-17 — A dynamic integer carries its range, and relational tests narrow it
 
 The dynamic axis was a tag set and nothing else, so no fact about a JavaScript number survived a

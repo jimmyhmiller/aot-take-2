@@ -255,29 +255,61 @@
       (if (= name (rd/sexp-sym (rd/sexp-nth (rd/sexp-nth params (load i)) 0)))
           (break (load i)) (do (set! (mut i) (+ (load i) 1)) (continue)))))))
 
+;; One predicate of a specialization rule, against the call's actual argument types. Registers a
+;; dependency on everything it reads, so a site that declines is re-asked when SCCP sharpens it.
+(defn jsl--predicate-proven? [(rule (ptr rd/Sexp)) (params (ptr rd/Sexp)) (c (dyn NodeOps))
+                              (end (dyn NodeOps))] (-> bool)
+  (let [predicate (rd/sexp-sym (rd/sexp-nth rule 0))
+        arg (call-arg c (jsl-specialization-parameter params (rd/sexp-sym (rd/sexp-nth rule 1))))
+        t (n-ty arg)]
+    (n-add-dep! arg end)
+    (if (or (= t TY-INVALID) (ty-high? t))
+        false
+        (if (= (rd/sexp-count rule) 2)
+            (ty-isa? t (ty-dyn (jsl-tag-predicate predicate)))
+            (let [key-node (call-arg c (jsl-specialization-parameter params (rd/sexp-sym (rd/sexp-nth rule 2))))
+                  key (keyref-local key-node) mem (call-mem c)]
+              (n-add-dep! key-node end) (n-add-dep! mem end)
+              (if (or (= predicate "%StringLength") (= predicate "%ArrayLength"))
+                  (and (>= key 0) (= (shape-key-name key) "length")
+                       (ty-isa? t (ty-dyn (if (= predicate "%StringLength") TAG-STRING TAG-ARRAY))))
+                  (and (ty-isa? t (ty-dyn (jsl-tag-predicate "%IsObjectLike")))
+                       (property-specialization-proven? mem arg key (= predicate "%OwnWritableDataProperty")))))))))
+
+;; A rule is one predicate, or a VECTOR of predicates meaning all of them — `+` needs "both operands
+;; are Numbers", not "either" (docs/SPECIALIZE.md §4.2). The rule list itself stays alternatives: any
+;; rule proven grants permission to re-lower, and permission is all it is — ordinary JSL lowering still
+;; decides what the proof actually folds.
+(defn jsl--rule-proven? [(rule (ptr rd/Sexp)) (params (ptr rd/Sexp)) (c (dyn NodeOps))
+                         (end (dyn NodeOps))] (-> bool)
+  (if (not (rd/sexp-vec? rule))
+      (jsl--predicate-proven? rule params c end)
+      (let [n (rd/sexp-count rule)
+            (mut all) (> n 0)
+            (mut i) 0]
+        ;; Every predicate is asked, not just up to the first failure: each one's dependencies are
+        ;; what bring this site back when its argument sharpens.
+        (loop (if (>= (load i) n)
+                  (break 0)
+                  (do
+                    (if (jsl--predicate-proven? (rd/sexp-nth rule (load i)) params c end)
+                        0
+                        (set! (mut all) false))
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        (load all))))
+
 (defn jsl-specialization-proven? [(form (ptr rd/Sexp)) (c (dyn NodeOps)) (end (dyn NodeOps))] (-> bool)
   (let [source-policy (jsl-form-option form "specialize")
         rules (rd/sexp-nth form (if (>= source-policy 0) source-policy (jsl-form-option form "inline-when")))
         params (jsl-form-params form) (mut ready) false (mut i) 0]
     (loop (if (>= (load i) (rd/sexp-count rules)) (break 0)
-      (let [rule (rd/sexp-nth rules (load i))
-            predicate (rd/sexp-sym (rd/sexp-nth rule 0))
-            arg (call-arg c (jsl-specialization-parameter params (rd/sexp-sym (rd/sexp-nth rule 1))))
-            t (n-ty arg)]
-        (n-add-dep! arg end)
-        (if (and (!= t TY-INVALID) (not (ty-high? t)))
-          (if (= (rd/sexp-count rule) 2)
-              (if (ty-isa? t (ty-dyn (jsl-tag-predicate predicate))) (set! (mut ready) true) 0)
-              (let [key-node (call-arg c (jsl-specialization-parameter params (rd/sexp-sym (rd/sexp-nth rule 2))))
-                    key (keyref-local key-node) mem (call-mem c)]
-                (n-add-dep! key-node end) (n-add-dep! mem end)
-                (if (if (or (= predicate "%StringLength") (= predicate "%ArrayLength"))
-                        (and (>= key 0) (= (shape-key-name key) "length")
-                             (ty-isa? t (ty-dyn (if (= predicate "%StringLength") TAG-STRING TAG-ARRAY))))
-                        (and (ty-isa? t (ty-dyn (jsl-tag-predicate "%IsObjectLike")))
-                             (property-specialization-proven? mem arg key (= predicate "%OwnWritableDataProperty"))))
-                    (set! (mut ready) true) 0))) 0)
-        (set! (mut i) (+ (load i) 1)) (continue))))
+      (do
+        (if (jsl--rule-proven? (rd/sexp-nth rules (load i)) params c end)
+            (set! (mut ready) true)
+            0)
+        (set! (mut i) (+ (load i) 1))
+        (continue))))
     (load ready)))
 
 (defn jsl-specialize-call! [(end (dyn NodeOps)) (mutate bool)] (-> i64)
@@ -301,8 +333,14 @@
                               (!= (n-nins end) (if (= (n-op fp) OP-EXTERN) 1 2))
                               (!= (call-nargs c) (rd/sexp-count (jsl-form-params form)))
                               (= (n-ty (call-ctrl c)) TY-XCTRL)
-                              (ty-high? (n-ty (call-mem c)))
-                              (not (jsl-specialization-proven? form c end))) INLINE-DEFER
+                              (ty-high? (n-ty (call-mem c)))) INLINE-DEFER
+                      ;; No proof: this is not the specializer's business, so the ordinary inliner
+                      ;; decides (docs/SPECIALIZE.md §7). Rules must not make a definition
+                      ;; specialize-ONLY: a recursive site's operand types can be polluted by the
+                      ;; shared body's other callers, so no proof exists until a clone breaks that
+                      ;; cycle — `fib(n-1) + fib(n-2)` is exactly that shape, and deferring here kept
+                      ;; its `+` a call (5.2 -> 6.5 ms per fib(30)).
+                      (if (not (jsl-specialization-proven? form c end)) INLINE-UNHANDLED
                         ;; A guarded graph inline retains the established Call/Return edges and
                         ;; proven types via Simple's copier. It does not manufacture fresh calls
                         ;; after SCCP. An imported provider has no local graph to copy, so its
@@ -313,7 +351,7 @@
                         (if (and (= (n-op fp) OP-FUNPTR) (fun-self-recursive? (n-in! fp 0)))
                             (do (n-add-dep! (n-in! fp 0) end) INLINE-DEFER)
                             (if (not mutate) INLINE-TRIVIAL
-                              (do (jsl-specialize-body! form c end) INLINE-TRIVIAL))))))))))))))))
+                              (do (jsl-specialize-body! form c end) INLINE-TRIVIAL)))))))))))))))))
 
 (defn jsl-specialize-body! [(form (ptr rd/Sexp)) (c (dyn NodeOps)) (end (dyn NodeOps))] (-> i64)
   (let [prior (n-origin-enter! (rd/sexp-sym (rd/sexp-nth form 1)) "specialize"
@@ -330,8 +368,12 @@
     (loop (if (>= (load i) (call-nargs c)) (break 0)
       (do (push! [(dyn NodeOps)] (mut args) (call-arg c (load i)))
           (set! (mut i) (+ (load i) 1)) (continue))))
-    (let [body (jsl-lower-expr (jsl-form-body form) (jsl-form-params form) (load args)
-                              (mut names) (mut values) (call-ctrl c) (call-mem c))
+    (let [lowered (jsl-lower-expr (jsl-form-body form) (jsl-form-params form) (load args)
+                                  (mut names) (mut values) (call-ctrl c) (call-mem c))
+          ;; Peephole the residual's three edges HERE, before anything keeps them: the forwarding walk
+          ;; below holds them, and a peephole there could replace a node it is still keeping, while
+          ;; leaving them unpeepholed hands the loop tree an unfolded control node.
+          body lowered
           local (= (n-op (call-fptr c)) OP-FUNPTR)]
       (n-keep! (.ctrl body)) (n-keep! (.mem body)) (n-keep! (.value body))
       (if local
@@ -341,7 +383,17 @@
       (prop-access-forward! end (.ctrl body) (.mem body) (.value body))
       (n-unkeep! end) (if (n-unused? end) (n-kill! end) 0)
       (n-unkeep! c) (if (n-unused? c) (n-kill! c) 0)
-      (n-unkeep! (.ctrl body)) (n-unkeep! (.mem body)) (n-unkeep! (.value body)))
+      (n-unkeep! (.ctrl body)) (n-unkeep! (.mem body)) (n-unkeep! (.value body))
+      ;; Now that nothing holds them, peephole the residual's edges. It has to happen here rather than
+      ;; at construction: the folds that matter — a Region with one live input, a Phi with one distinct
+      ;; value — depend on the users the forwarding walk just installed. Without this the loop tree
+      ;; meets an unfolded control node ("postvisited child has no loop tree").
+      ;; A residual edge can be dead by now: forwarding replaced its only user and the cascade
+      ;; collected it.
+      (if (n-dead? (.ctrl body)) 0 (do (n-peephole! (.ctrl body)) 0))
+      (if (n-dead? (.mem body)) 0 (do (n-peephole! (.mem body)) 0))
+      (if (n-dead? (.value body)) 0 (do (n-peephole! (.value body)) 0))
+      0)
     ;; Only the residual body's freshly allocated nodes, not a whole-arena reseed per call.
     (set! (mut i) first)
     (loop (if (> (load i) (arena-node-count)) (break 0)
@@ -2131,6 +2183,13 @@
                         (Some [fun]
                               (match (fun-ret fun)
                                 (Some [ret]
+                                      ;; A definition specialized at every one of its sites loses its
+                                      ;; last caller and is collected during Opto, taking its Return
+                                      ;; with it (docs/SPECIALIZE.md). The hold `jsl-prepare-opto!`
+                                      ;; installed went with it; releasing it again is an unkeep of a
+                                      ;; node that is no longer kept.
+                                      (if (n-dead? ret)
+                                          0
                                       (if (and (and (not (n-dead? fun))
                                                     (not (fun-folding? fun)))
                                                (not (ty-high? (n-ty fun))))
@@ -2143,7 +2202,7 @@
                                           ;; Return that has no CallEnd or Stop owner. A bare unkeep
                                           ;; leaves that unused CFG sink attached to caller control,
                                           ;; where it can corrupt later loop-tree nesting.
-                                          (n-unkill! ret)))
+                                          (n-unkill! ret))))
                                 (None []
                                       (panic "jsl-finish-opto!: JSL Fun lost its Return"))))
                         (None [] 0)))

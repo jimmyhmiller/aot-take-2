@@ -138,6 +138,7 @@ aot-take-2/
 │   ├── GAPS.md          ; complete inventory of absent and partial implementation
 │   ├── TEST262.md       ; pinned conformance campaign, denominator and runner contract
 │   ├── JSL.md           ; the runtime-library language
+│   ├── SPECIALIZE.md    ; proposal: a JSL definition carries its own idealization rules, and where to apply them
 │   └── JOURNAL.md       ; why something looks the way it does
 ├── jsl/                 ; the JavaScript runtime library, in JSL — already written
 │   ├── index            ; load order IS the format (function indices, golden hashes)
