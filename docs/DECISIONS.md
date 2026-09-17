@@ -1,5 +1,30 @@
 # Decisions
 
+## 2026-09-16 — A well-known Symbol is one identity in an assembled realm
+
+A realm assembled from separately compiled units — the test262 runner's cached harness bundle and
+each test, or any retained Scripts — binds each unit's intrinsic objects to the first unit's by
+name, then unions their initial properties. Well-known Symbols were not named identities, so every
+unit that materialized `%Symbol%` brought its own `Symbol.iterator`, and the union found one
+property with two values that are not SameValue. That single conflict was **6,958 of the 9,252
+compiler errors** in the full test262 campaign (docs/TEST262.md).
+
+A unit now publishes each well-known Symbol it allocated as an `IMAGE-REALM-SYMBOL` identity,
+named by its description, from a registry of its own (`heap-set-well-known-symbol!`). It is kept
+apart from the intrinsic registry because that list is also what the image analysis treats as a
+prototype a fresh object may carry, and a Symbol is not one. The assembler binds later copies to the
+first like any intrinsic, but **a Symbol never enters the property merge**: it has no properties,
+and its 16-byte payload is the same size as an ordinary object's, so the merge would otherwise read
+its description as a prototype and refuse it.
+
+Fixing identity exposed the next layer, which was already wrong and hidden behind the panic: **a
+Symbol's payload holds the key it is, as the compiling unit's own key id.** Assembly remaps the
+shape word in every image header but no payload word, while each unit's code reaches keys through
+its own key map, so `o[Symbol.iterator] = f` and a `for-of` over `o` read different keys in an
+assembled realm. The published Symbol identities say exactly which payloads carry a key, and
+assembly now remaps those (`image-remap-symbol-keys!`). A single program never saw either problem:
+its local ids are the program's.
+
 ## 2026-09-16 — Date, and what non-tail recursion costs
 
 A Date is **one number** — milliseconds since the epoch, in an internal slot — and the whole

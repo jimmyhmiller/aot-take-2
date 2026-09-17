@@ -252,6 +252,12 @@ target`). It is worth knowing exactly what it is before anyone fixes it:
 So the 27.63% understates what the compiler does by something under 13 points, and the fix is in
 artifact reuse rather than in JavaScript semantics.
 
+**Fixed the same day** (docs/DECISIONS.md, a well-known Symbol is one identity in an assembled
+realm). The conflicting property was `Symbol.iterator`: each unit allocated its own well-known
+Symbol and nothing bound them. On the 60-file reproducer compiler errors fell from 8 to 2 with no
+merge conflict left, and a regression test runs two independently compiled units in both orders
+(`independent_script_units_share_well_known_symbols`).
+
 ## Latest measured campaign, 2026-09-09 (sampled, after Math and the number globals)
 
 With Function.prototype call/apply, the Object statics and prototype methods, the Number and
