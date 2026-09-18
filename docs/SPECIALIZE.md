@@ -493,3 +493,95 @@ the gap? No"): that attempt modelled identity as the raw sentinel pair `TY-DYN-N
 component meets through `ty-meet` RECURSIVELY, so identity and shape should be TYPES as well — a
 real sub-lattice has distinct top and bottom, and the laws then hold by construction.
 
+
+## 14. Design: promoting realm-setup assignments into the image shape (2026-09-18)
+
+### The measurement that motivates it
+
+`AOT_SPECIALIZE_TRACE=1` on the harness realm, 2,484 refusals:
+
+| refusal | count |
+|---|---|
+| image shape lacks the key | **1,605** |
+| receiver is not a Box | 712 |
+| key is not a constant | 167 |
+
+and every missing key is assigned during realm setup:
+
+| key | refusals | written? |
+|---|---|---|
+| `sameValue` | 501 | yes |
+| `throws` | 334 | yes |
+| `_isSameValue` | 334 | yes |
+| `thrower` | 167 | yes |
+| `toString` | 166 | yes |
+| `Symbol.hasInstance` | 103 | no (genuinely absent) |
+
+`AOT_FACTS_TRACE=1` shows the stores that create them resolve to a SINGLE named image entry
+(`top false, 1 named`), on `StaticRef` receivers. So the compiler knows the entry and the key; what
+it lacks is a SLOT for the key in that entry's image shape, because the shape is fixed when the
+image is built and these properties appear only while the Script initializer runs.
+
+This is neither a lattice problem nor a specialization problem. `property-specialization-proven?`
+already accepts a `Box(StaticRef)` receiver, identity is available, the key is constant and facts
+are ready. Identity or shape in `TDyn` would not move this number — the §13 note that tier 3 is the
+largest remaining win was right about the size and wrong about the mechanism.
+
+### Why the slot is enough
+
+`prop-image-read` with the key PRESENT and `written` true and the property writable emits two Loads
+— the properties word, then the slot at `shape-offset-key` — and no dispatch. So promotion needs
+only presence and writable attributes. It does NOT need the stored value, which is what makes this
+tractable: we are adding a layout fact, not evaluating the realm.
+
+### The rule
+
+Promote `(entry, key)` into the entry's image shape as a writable, enumerable, configurable data
+property whose initial image word is `undefined`, when ALL of:
+
+1. every store to that key resolves to that ONE entry — no `facts-any-key?`, no top/unknown owner,
+   no escaped-with-unknown-owner;
+2. at least one such store is UNCONDITIONAL in the Script initializer: its control block dominates
+   the initializer's Return and is not inside a loop (`cfg-idom` / `idom-lca`);
+3. `facts-layout-unknown?` is false for it — already `(descriptors OR deletes) AND written`, so any
+   `delete`, `defineProperty`, `freeze`, `seal` or `preventExtensions` anywhere vetoes it;
+4. the key is not an accessor;
+5. the entry's PRESENCE is never observed. This is the one new fact required, because `PROP-HAS`
+   consults shape presence, so a promoted key would make `'sameValue' in assert` fold to `true`.
+   The imagefacts scan must mark an entry when it sees `PROP-HAS`, `PROP-ATTRS`,
+   `JS-OBJECT-OWN-NAMES` or `JS-OBJECT-KEYS` on it, and promotion skips a marked entry.
+
+Condition 2 is what makes the promotion unobservable to user code: the Script initializer runs
+exactly once before any user code, so by the time anything else executes the property really does
+exist. The residual hazard is an observation INSIDE the initializer before the store; condition 5
+removes it by refusing any entry whose presence is ever observed at all.
+
+Promotion must happen in PROGRAM ORDER of the assignments, because a shape transition fixes a
+field's offset by its introducing edge and therefore fixes enumeration order.
+
+### Where it runs
+
+In the facts/opto loop of `pipeline-opto-under-facts!`. Promotion changes shapes, so it invalidates
+the image (any `heap-define-own-*` resets `image-built`) and the facts computed over it; the
+existing `facts-signature` convergence loop already re-runs `imagefacts-compute-with-boundary!` and
+`opto-run!` until nothing changes, and promotion joins it as a step that can only add layout facts.
+It is monotone — a key is promoted once and never demoted — so the loop still terminates.
+
+### What it should move
+
+The 17 surviving `JsGetNamed` call sites, the 9 `JsGetFromHolder`, and 1,605 of the 2,484 refusals.
+The harness realm is 4,289 nodes after §13's placement change (from 4,464).
+
+### Risks
+
+- **Enumeration order.** Promoting out of program order would reorder `Object.keys`. Condition 5
+  makes it unobservable for promoted entries, but the ordering discipline is kept anyway so that
+  relaxing condition 5 later does not silently change behaviour.
+- **Condition 5 is coarse.** Any `in` on an entry disables promotion for all its keys. A later
+  refinement is per-key, or a presence bit distinguishing "absent" from "present holding undefined",
+  which is what real engines carry.
+- **A read inside the initializer before the store** is covered only by condition 5; with a presence
+  bit it would be exact.
+- **Shape growth during opto** must not invalidate a shape id another node cached. `shape-transition`
+  already returns a new id rather than mutating, and `heap-define-own-key-attrs!` reshapes in place
+  only for a key the object already has.
