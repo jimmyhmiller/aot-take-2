@@ -4,6 +4,12 @@ This is the design for making a JSL definition carry its own idealization rules,
 where to apply it. It is a proposal: nothing here is law until it lands and `docs/DECISIONS.md` records
 it. Every number in it was measured on 2026-09-17 at commit `9c221b1`; the commands are in §9.
 
+The 2026-09-18 implementation in `DESIGN.md` supersedes the property-promotion
+proposal: identity is a lattice coordinate, while current property presence is
+proved from memory SSA. Reserving storage does not make a property present.
+Source expansion admits one site between complete worklist drains and charges a
+compilation-wide growth budget. See the corresponding decision in `DECISIONS.md`.
+
 ---
 
 ## 1. The idea, and why it is not a new IR

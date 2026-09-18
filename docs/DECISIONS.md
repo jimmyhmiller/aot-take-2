@@ -4145,7 +4145,38 @@ The IFG builder now records pairwise interference between overlapping, register-
 at a block head before its ordinary backwards walk. This states the SSA parallel-definition rule
 directly and remains conservative when a Phi later needs spilling.
 
+## 2026-09-18 — Property proofs use identity and the incoming memory state
+
+`docs/DESIGN.md` specifies the implemented contract. Image identity is an
+independent finite/cofinite lattice coordinate on dynamic and managed-pointer
+types. Mutable property presence, attributes and values do not live in that
+identity. The common own-property query follows memory SSA and may fall back to
+conservative whole-program invariants. Direct shape transitions require complete
+shape evidence; a per-key invariant is not a complete layout.
+
+`%OwnPropertyAbsent` admits JSL assignment specialization when the complete shape
+proves absence. It authorizes lowering the assignment body, not skipping inherited
+setters or creating a property unconditionally. The residual PropSet uses the same
+proof query and must still establish extensibility and the prototype descriptor.
+
+Process entry alone receives a fresh-image memory projection. Unknown callers
+and retained Script units receive arbitrary incoming memory. An initializer's
+assignment establishes presence after the assignment, never at image creation.
+The promotion proposal in SPECIALIZE §14 is superseded: explicit presence tests
+are not the only observations of absence, because inherited Get/Set behavior can
+also distinguish it.
+
+Specialization admits one expansion before another peephole drain and charges
+compilation-wide site and construction budgets. This amends the batched admission
+argument below: a residual smaller than a shared callee still grows the graph.
+Type-preserving forwarding, valid call linkage and graph lifetime remain separate
+obligations. Facts convergence uses exact snapshot equality; three outer rounds
+are an optional precision budget and do not assert a combined fixed point.
+
 ## 2026-09-18 — Specialization is admitted at a round boundary, never from the inline worklist
+
+*Amended by the property-proof contract above: admission is one site per round,
+and boundary placement alone does not establish all replacement invariants.*
 
 Every production sea-of-nodes compiler builds a callee's IR fresh at the call site, folding as it
 builds, and every one of them runs that as a phase rather than from inside the peephole fixpoint.

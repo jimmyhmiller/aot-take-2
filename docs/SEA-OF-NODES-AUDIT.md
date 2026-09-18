@@ -1,5 +1,18 @@
 # Are we doing proper sea of nodes?
 
+**Implementation amendment, 2026-09-18:** the subsequent repair is specified in
+`DESIGN.md`. It replaces opcode-based own-property proofs with identity and
+memory-position queries, admits one specialization per round, budgets source
+expansion, and compares actual fact snapshots. The image-shape promotion proposal
+below is not implemented: precreating a property can change inherited reads and
+setters even without explicit presence tests. The original measurements below
+describe the audited revision, not the repaired revision.
+
+The historical claim that round-boundary placement alone explains or repairs all
+five seam bugs is also superseded. Type monotonicity, safe call linking, ownership
+of replacement edges, and CFG invalidation remain separate obligations. A residual
+smaller than its shared callee can still grow the caller and the compilation.
+
 An audit that started from an instinct — "this seems to make an end run around the sea-of-nodes
 setup rather than leaning into it" — and ended somewhere other than where it aimed. This document
 is the whole chain: what was actually wrong, what was fixed, what was diagnosed and left, what the

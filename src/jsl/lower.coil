@@ -72,7 +72,15 @@
    (pending (ArrayList i64))
    (closed bool)
    (link-mode i64)
+   (specialized-sites i64)
+   (specialized-nodes i64)
    (booted bool)])
+
+;; Optional graph growth has a compilation-wide budget, independent of arena growth. A residual
+;; can be smaller than its shared callee and still add code to the compilation. The counters charge
+;; actual construction (including subsequently dead nodes); exhausting either leaves generic calls.
+(const JSL-SPECIALIZE-SITES 4096)
+(const JSL-SPECIALIZE-NODES 262144)
 
 (const JSL-LINK-LOCAL 0)
 (const JSL-LINK-IMPORT 1)
@@ -142,6 +150,8 @@
           (set! (.items g) (al-new [JslGraph] (compiler-allocator)))
           (set! (.pending g) (al-new [i64] (compiler-allocator)))
           (set! (.closed g) false)
+          (set! (.specialized-sites g) 0)
+          (set! (.specialized-nodes g) 0)
           (set! (.booted g) true)
           0))))
 
@@ -189,6 +199,8 @@
     (al-clear! [JslGraph] (mut (.items (jsl-graphs))))
     (al-clear! [i64] (mut (.pending (jsl-graphs))))
     (set! (.closed (jsl-graphs)) false)
+    (set! (.specialized-sites (jsl-graphs)) 0)
+    (set! (.specialized-nodes (jsl-graphs)) 0)
     (set! (.set (jsl-value-call-abi)) false)
     (set-specialize-round-ext! (primitive/fnptr-of jsl-specialize-admit-all!))
     0))
@@ -276,7 +288,9 @@
                   (and (>= key 0) (= (shape-key-name key) "length")
                        (ty-isa? t (ty-dyn (if (= predicate "%StringLength") TAG-STRING TAG-ARRAY))))
                   (and (ty-isa? t (ty-dyn (jsl-tag-predicate "%IsObjectLike")))
-                       (property-specialization-proven? mem arg key (= predicate "%OwnWritableDataProperty")))))))))
+                       (if (= predicate "%OwnPropertyAbsent")
+                           (property-specialization-absent? mem arg key end)
+                           (property-specialization-proven? mem arg key (= predicate "%OwnWritableDataProperty") end)))))))))
 
 ;; A rule is one predicate, or a VECTOR of predicates meaning all of them — `+` needs "both operands
 ;; are Numbers", not "either" (docs/SPECIALIZE.md §4.2). The rule list itself stays alternatives: any
@@ -314,39 +328,18 @@
         (continue))))
     (load ready)))
 
-;; SPECIALIZATION IS A PHASE, not a worklist interruption.
-;;
-;; Every production sea-of-nodes compiler builds a callee's IR fresh at the call site, folding as
-;; it builds, and every one of them runs that as a PHASE rather than from inside the peephole
-;; fixpoint:
-;;
-;;   HotSpot C2   `Parse::do_call` parses the callee's bytecode straight into the caller's graph;
-;;                every node is created through `PhaseGVN::transform`, which runs Value (constant
-;;                folding), Ideal and Identity at creation, so a branch whose test already folded
-;;                is never parsed. Inlining is not a graph operation at all.
-;;   TurboFan     `JSInliner` does not copy an optimized callee graph: it runs the
-;;                BytecodeGraphBuilder on the callee to make a fresh subgraph and replaces the Call.
-;;   Graal/Truffle  the one graph->graph variant: each method's graph is encoded once and
-;;                `PEGraphDecoder` decodes it incrementally, canonicalizing as it decodes, so
-;;                "dead branches are not parsed in the first place" (Wuerthinger et al., PLDI 2017
-;;                SS5.1). Partial evaluation runs to completion and hands a finished graph to the
-;;                optimizer; "method inlining in the compiler is [then] not important at all".
-;;
-;; Our re-lowering IS the C2/TurboFan mechanism. What diverged is the PLACEMENT: it was consulted
-;; from the CallEnd inline worklist, so it grew the graph mid-fixpoint -- the one thing Simple's
-;; `IterPeeps` assumes never happens ("this should be linear because peepholes rarely (never?)
-;; increase code size"). Every bug in docs/SPECIALIZE.md SS3 was an interleaving bug and not a
-;; re-lowering bug: a Cast recomputing wider, a fresh link widening a callee's Parm, a held Return
-;; released twice, residual edges peepholed after the walk, a loop tree built over a half-rewritten
-;; graph. Admitting at a boundary removes the whole class rather than guarding each instance.
-;;
-;; The arena limit is captured BEFORE the walk: nodes this pass creates belong to the next round,
-;; which is what makes one call of this function a phase and not a fixpoint.
+;; Simple IterPeeps drains reducing peepholes, admits one graph-growing inline, then drains again.
+;; Source re-lowering obeys that same publication boundary. It still needs independent lifetime,
+;; type and call-linking contracts: a boundary does not make a widened Parm or a stale proof sound.
+;; Admit ONE replacement, then drain the ordinary worklist before asking another site. Merely
+;; snapshotting the arena size does not keep proofs quiescent after the first graph mutation.
 (defn jsl-specialize-admit-all! [] (-> i64)
   (let [limit (+ (arena-node-count) 1)
         (mut applied) 0
         (mut id) 1]
-    (loop (if (>= (load id) limit)
+    (loop (if (or (> (load applied) 0) (>= (load id) limit)
+                  (>= (.specialized-sites (jsl-graphs)) JSL-SPECIALIZE-SITES)
+                  (>= (.specialized-nodes (jsl-graphs)) JSL-SPECIALIZE-NODES))
               (break 0)
               (do
                 (match (arena-node (load id))
@@ -437,9 +430,13 @@
                               (do (jsl-specialize-body! form c end) INLINE-TRIVIAL)))))))))))))))))
 
 (defn jsl-specialize-body! [(form (ptr rd/Sexp)) (c (dyn NodeOps)) (end (dyn NodeOps))] (-> i64)
-  (let [prior (n-origin-enter! (rd/sexp-sym (rd/sexp-nth form 1)) "specialize"
+  (let [before (arena-node-count)
+        prior (n-origin-enter! (rd/sexp-sym (rd/sexp-nth form 1)) "specialize"
                                (n-source-lo c) (n-source-hi c))]
     (jsl-specialize-body-inner! form c end)
+    (let [g (jsl-graphs)]
+      (set! (.specialized-sites g) (+ (.specialized-sites g) 1))
+      (set! (.specialized-nodes g) (+ (.specialized-nodes g) (- (arena-node-count) before))))
     (n-origin-leave! prior)))
 
 (defn jsl-specialize-body-inner! [(form (ptr rd/Sexp)) (c (dyn NodeOps)) (end (dyn NodeOps))] (-> i64)

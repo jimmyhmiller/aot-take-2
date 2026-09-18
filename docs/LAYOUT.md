@@ -291,6 +291,7 @@ aot-take-2/
 │   ├── lex-test.coil  parse-test.coil  regex-test.coil  tstype-test.coil  jsl-test.coil
 │   ├── number-test.coil             ; StringToNumber grammar and the Number word (aot.rt.number)
 │   ├── imagefacts-test.coil         ; the closed-world image facts: named, parameter and runtime-key stores
+│   ├── property-test.coil           ; memory-position property proofs, identity propagation, storage transitions and worklist-order regressions
 │   ├── image-test.coil              ; in-memory relocation, entry ABI, realm isolation and moving GC
 │   ├── library-support.coil         ; the runtime-library provider retained Script units import from, for tests
 │   ├── test262-test.coil            ; metadata, runner policy and accounting regressions
