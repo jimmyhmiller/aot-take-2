@@ -361,7 +361,40 @@ property read folds the way Simple's `LoadNode.compute` reads `pfld._t` — orde
 point cloning should match re-lowering there too and the re-lowering path, with all five of its guards,
 can be deleted.
 
-That is the case for doing tier 3 before adding more rules on top of the seam.
+### Tested: would object identity in the lattice close the gap? No (2026-09-17)
+
+The hypothesis above — that re-lowering only compensates for the missing tier-3 lattice facts — was
+built and measured, not argued. `TDyn` gained an identity component (which image entry this value IS,
+two-sided endpoints so `join` keeps it, self-dual entries, canonicalized away for non-object tag sets),
+`Box` of a `StaticRef` seeds it, and the image property fold reads it from the type instead of matching
+a `StaticRef` node. The lattice laws still hold (the existing law test passes) and the ordinary build is
+unchanged, node for node.
+
+It did not close the gap: the clone-shaped build stayed at 2,175 nodes with the same six generic
+property gets. Instrumenting the moment of surrender showed why. Exactly ONE access is expanded — the
+other five are copies the inliner made afterwards — and its receiver is not the source site's object at
+all. It is `Unbox(Cast)` of `dyn{object,function,array}`: the parameter of an intermediate SHARED JSL
+body, which has several callers with different receivers, so the identity is erased by the meet before
+it ever reaches the access.
+
+That is the real difference, and it is not a defect:
+
+- **A per-site fact is erased at every shared body boundary.** Re-lowering rebuilds the whole call tree
+  at the site, so the concrete receiver reaches every level of it. Cloning would have to clone the whole
+  tree to match, and the inline policy will not (size caps, evidence, one inline per round).
+- **Identity in the lattice helps where the identity survives the meet** — a body with one caller, or
+  whose callers agree. It cannot help library plumbing shared by callers that disagree.
+
+So the honest conclusion is the opposite of the previous section's guess: the seam is not paying for a
+missing lattice fact, it is paying for per-site specialization of a call TREE, which no single local
+rewrite expresses. Two things follow. Tier 3 is still worth doing, but its payoff is user code —
+property access on a parameter or a return value whose object is monomorphic — not this plumbing. And
+the seam stays, so the guards in §3 and their tests are permanent, not temporary.
+
+A side finding, worth fixing on its own: `prop-access-idealize` registers NO dependencies on any of its
+decline paths (`src/node/property.coil`), though the project's own rule is that a deferral depends on
+whatever blocked it. Adding them changed nothing here (the receiver never becomes known in this program),
+but an access that declines early and is never re-asked is exactly how a fold gets lost.
 
 ## 12. Order of work
 
