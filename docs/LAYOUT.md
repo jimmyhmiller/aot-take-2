@@ -139,6 +139,7 @@ aot-take-2/
 │   ├── TEST262.md       ; pinned conformance campaign, denominator and runner contract
 │   ├── JSL.md           ; the runtime-library language
 │   ├── SPECIALIZE.md    ; proposal: a JSL definition carries its own idealization rules, and where to apply them
+│   ├── SEA-OF-NODES-AUDIT.md ; are we a proper sea of nodes: what was fixed, what remains, what the traces measured
 │   └── JOURNAL.md       ; why something looks the way it does
 ├── jsl/                 ; the JavaScript runtime library, in JSL — already written
 │   ├── index            ; load order IS the format (function indices, golden hashes)
