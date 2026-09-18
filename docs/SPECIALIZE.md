@@ -324,34 +324,44 @@ would leave a second call to fold.
 
 ## 11. Measured: is there a Simple-shaped way to do this?
 
-Simple grows a body by exactly one transform — cloning, which copies existing nodes, so its types and
-links are ones the graph already had. Our specialization re-lowers JSL source at the site, which is a
-different kind of operation and is where all five seam bugs above came from. So: could a proven site
-just CLONE instead, and let SCCP fold the arms the proof kills?
+Simple grows a body by exactly one transform — cloning, which copies existing nodes. Our specialization
+re-lowers JSL source at the site, which is a different kind of operation and is where all five seam bugs
+came from. So: could a proven site just CLONE, and let the graph fold the arms the proof kills?
 
-It is easy to build. The hook exists already: asking the specializer with `mutate` false answers "is
-this site proven?", so a proven site can bypass the evidence gate and the two size caps and take the
-ordinary clone path. About thirty lines. Measured against tier 1 as landed (2026-09-17):
+It is easy to build: asking the specializer with `mutate` false already answers "is this site proven?",
+so a proven site can bypass the evidence gate and both size caps and take the ordinary clone path. About
+thirty lines. What it measures is more interesting than a yes or no.
 
-| | re-lowering (landed) | proof-gated cloning | no specialization at all |
-| --- | ---: | ---: | ---: |
-| `fib(30)` | **5.16 ms** | 7.29 ms | 7.81 ms |
-| harness realm, ideal nodes | **4,464** | 4,976 | 4,743 |
-| harness realm, machine nodes | **6,248** | 6,941 | 6,816 |
-| harness realm, blocks | **1,235** | 1,414 | 1,399 |
-| budget test | passes | fails | fails |
-| inlines fired (harness) | 169 | 166 | — |
+**Where the fact is in the lattice, cloning is exactly as good.** A typed program whose only JSL calls
+are the operators — a `while` loop doing `s - i`, `i + 1`, `i < n` — compiles to **100 ideal nodes both
+ways**, node for node. Tag and integer-range facts flow through `Parm`s, the guards fold, the dead arms
+die. For tier 1 the seam buys nothing at all; the proof only needs to decide *whether* to clone.
 
-Cloning fires about as often; it is the *residual* that differs. Re-lowering never BUILDS the arms the
-proof kills; cloning builds the whole body — for `JsGetNamed` that is ~300 tokens of string, array,
-accessor and TypeError paths — and then relies on SCCP to remove them, which on these programs it does
-not fully do. That difference is worth 40% on `fib` and ~11% of the machine nodes, and it is not
-something a better fold order recovers: the arms are built before anything can decide they are dead.
+**Where the fact is outside the lattice, cloning loses folds.** The same loop as a Script — the only
+difference being `console.log` — is 1,586 nodes re-lowered and 2,175 cloned. The extra material is not
+dead arms that failed to die: it is **live** `If`/`TypeTest`/`Cast` (+52/+39/+51) and four extra generic
+`JS-PROP-GET` dispatches whose receivers are `StaticRef`s — property reads on image objects with constant
+keys, exactly the case `:specialize` resolves.
 
-So the divergence earns its keep, and the conclusion is to harden the seam rather than remove it: keep
-the guards in §3, test each one, and fix the open loop-tree bug in §10. "Do not build what the proof
-kills" is a capability Simple's single transform cannot express, because Simple has no source to
-re-lower — its bodies are graphs from the start.
+Those reads have a node rule (`prop-image-resolve!`, `src/node/property.coil`), so the knowledge is not
+locked inside the specializer. But that rule is **structural and order-sensitive**: it fires on a
+`PROPLOAD` whose receiver is a `StaticRef`, declines while control or memory are still transient, and
+then asks the closed-world image facts (`facts-written?`, `facts-layout-unknown?`) — facts recomputed
+over whatever graph exists at that moment. And because JSL definitions are built on demand
+(docs/DECISIONS.md, 2026-09-09), the two configurations do not even materialize the same image: 147
+entries re-lowered versus 98 cloned. So the Script comparison is not apples to apples, and the honest
+reading of the 589-node gap is not "deletion is harder than non-emission" — it is that property
+resolution depends on a structural rule plus whole-program facts, both sensitive to when it is asked.
+
+**What that says about the seam.** Re-lowering is not buying a fundamental capability. It is
+compensating for property resolution living outside the type lattice — the tier-3 gap: `dyn{object}`
+cannot say which object or which shape, so the compiler recovers that by walking nodes and consulting
+side tables instead of by `compute` over types. Put shapes and object identity in the lattice and a
+property read folds the way Simple's `LoadNode.compute` reads `pfld._t` — order-insensitively — at which
+point cloning should match re-lowering there too and the re-lowering path, with all five of its guards,
+can be deleted.
+
+That is the case for doing tier 3 before adding more rules on top of the seam.
 
 ## 12. Order of work
 
