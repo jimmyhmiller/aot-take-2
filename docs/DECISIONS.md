@@ -4144,3 +4144,42 @@ turn a terminating loop into an infinite loop.
 The IFG builder now records pairwise interference between overlapping, register-producing Phi masks
 at a block head before its ordinary backwards walk. This states the SSA parallel-definition rule
 directly and remains conservative when a Phi later needs spilling.
+
+## 2026-09-18 — Specialization is admitted at a round boundary, never from the inline worklist
+
+Every production sea-of-nodes compiler builds a callee's IR fresh at the call site, folding as it
+builds, and every one of them runs that as a phase rather than from inside the peephole fixpoint.
+HotSpot C2's `Parse::do_call` parses the callee's bytecode straight into the caller's graph, with
+every node created through `PhaseGVN::transform` (Value, Ideal, Identity at creation), so a branch
+whose test already folded is never parsed. TurboFan's `JSInliner` does not copy an optimized callee
+graph: it runs the BytecodeGraphBuilder on the callee and replaces the Call with the fresh subgraph.
+Graal is the one graph-to-graph variant — each method's graph is encoded once and `PEGraphDecoder`
+decodes it incrementally, canonicalizing as it decodes, so "dead branches are not parsed in the
+first place" (Würthinger et al., PLDI 2017 §5.1) — and its partial evaluator runs to completion
+before the optimizer sees the graph.
+
+Our JSL re-lowering IS that mechanism. What diverged was the placement: the specializer was
+consulted per CallEnd from inside `callend-maybe-inline!`, interleaved with inline decisions while
+the worklist was draining and types were still moving. Simple's `IterPeeps` states the invariant
+that bends — "this should be linear because peepholes rarely (never?) increase code size" — and
+Simple grows the graph in exactly one rationed way, `copyBody`. Every bug in SPECIALIZE.md §3 was an
+interleaving bug and not a re-lowering bug: a Cast recomputing wider, a fresh link widening a
+callee's Parm, a held Return released twice, residual edges peepholed after the walk, a loop tree
+built over a half-rewritten graph.
+
+Admission now happens once per `iter-run!` round, through `specialize-admit-round!`, after
+`iter-peeps!` has fully drained the peephole worklist: the graph is quiescent and every type has
+settled for the round before a residual is lowered into it. A round that specialized anything counts
+as progress exactly like a fired inline, so the deferred inline set is retried. Because it is a
+round-level operation inside `iter-run!` rather than a step each driver must remember, all twelve
+opto drivers get it without knowing it exists — an earlier cut placed the rounds in `pipeline.coil`
+only, and `parser-test-run-opto!` silently lost specialization altogether.
+
+Admission is batched, not rationed one-per-round like inlining: re-lowering replaces a call with a
+residual SMALLER than the generic body it came from, so it is not the code-growing transform
+inlining is. `CallSpecializeExt` and its per-CallEnd consult are deleted; `aot.node.call` holds only
+an opaque round-level hook and still knows nothing about JavaScript.
+
+Measured: 912 tests green, node counts unchanged, fib(30) 5.16–5.22 ms against 5.21–5.29 ms before,
+binary trees 441 ms against 461 ms, compile time unchanged on richards and deltablue (a fixed
++0.02 s on programs small enough for the per-round arena walk to show).

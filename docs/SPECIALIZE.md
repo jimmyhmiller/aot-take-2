@@ -407,3 +407,89 @@ but an access that declines early and is never re-asked is exactly how a fold ge
 6. Lattice payloads (`bool`, `double`, then string length/contents) and structure (object shape, array
    element type), which unlocks tier 3 — the largest remaining win for real programs, and the reason
    `JsGetNamed` still has 20 generic sites.
+
+## 13. What the other sea-of-nodes compilers do, and what that settled (2026-09-18)
+
+§11 asked whether there is a Simple-shaped way to do this and answered by comparing re-lowering
+against body cloning. The comparison was right but the frame was too narrow: Simple has no generic
+operation, so fidelity to Simple cannot decide a question it never faced. The honest references are
+the three production sea-of-nodes compilers, and they agree with each other.
+
+| compiler | how a callee's IR reaches the call site |
+|---|---|
+| HotSpot C2 | `Parse::do_call` parses the callee's BYTECODE into the caller's graph; every node is created through `PhaseGVN::transform` (Value/Ideal/Identity at creation), so a branch whose test folded is never parsed |
+| TurboFan | `JSInliner` runs the BytecodeGraphBuilder on the callee for a FRESH subgraph and replaces the Call; it does not copy an optimized graph |
+| Graal/Truffle | graph-to-graph: the method's graph is encoded once, `PEGraphDecoder` decodes it incrementally and canonicalizes as it decodes, so "dead branches are not parsed in the first place" (PLDI 2017 §5.1) |
+| Simple | `copyBody` clones already-typed nodes, `IterPeeps` folds afterwards — sound only because Simple's callees have no dispatch tree to collapse |
+
+All three build fresh at the site and fold as they build. **Our JSL re-lowering is that mechanism**,
+and the conclusion is that it should not be replaced. What was wrong was its PLACEMENT (recorded in
+DECISIONS.md, 2026-09-18) and the fact that we had TWO mechanisms chosen by a policy extension
+where each of those compilers has one.
+
+Note the cost the node-per-operation design would have carried: V8 keeps two implementations of `+`
+(the Torque builtin and the C++ typed lowering) and has a team to keep them in sync. §1's rejection
+of "operator as node" stands, though a `Call`+`CallEnd` already being the node — with a `compute`
+derived for free from the callee's Returns — is the sharper reason than the one §1 gave.
+
+### The A/B harness
+
+Two presence switches (any value, including `0`, turns them on), for measuring only:
+
+```sh
+AOT_NO_SPECIALIZE=1     # admit no re-lowering; proven sites take the clone path instead
+AOT_INLINE_UNCAPPED=1   # a JSL callee skips the evidence gate and both size caps
+AOT_INLINE_TRACE=1      # every inline decision; a DEFER now names the guard that stopped it
+```
+
+### Measured: cloning against re-lowering, per shape of program
+
+| fixture | re-lowered | cloned |
+|---|---|---|
+| `s = s + i` in a loop (typed operators) | 100 nodes | **100** |
+| `s.length + s.length` | 63 | **63** |
+| `{x: n, y: 1}` then `p.x + p.y` | 39 | **736** |
+
+Operators and strings are at exact parity: where the lattice already carries the fact, the seam buys
+nothing. Property access is 19x, and it is NOT the size caps — `AOT_INLINE_UNCAPPED` does not move it.
+
+### Why property access cannot be cloned, in three findings
+
+1. **A guard we added that Simple does not have.** 40 of 57 defers were `unknown-callers`.
+   `jsl-close-world!` deliberately keeps the Start hook on shared provider definitions, and the
+   decision asked `fun-unknown-callers?` BEFORE the trivial/clone split — so every shared JSL
+   definition deferred forever and could never be cloned. Simple's `inlineCandidate` has no such
+   check: the hook is just another input, so `fun.nIns() > 2` holds and it takes the CLONE path,
+   which is sound because a clone is a private copy that leaves the shared body standing. Only the
+   TRIVIAL fold destroys that body, so only the trivial arm may refuse.
+2. **Moving the guard is not a win on its own.** Default went 39 -> 51 nodes: cloning shared
+   definitions currently COSTS nodes. The corrected order therefore sits behind
+   `AOT_INLINE_UNCAPPED` rather than landing as default behaviour.
+3. **The real blocker is self-recursion.** With `unknown-callers` gone, all 109 remaining defers are
+   `self-recursive` — `JsGetFromHolder`, the prototype-chain walk. Exactly one `object` Parm survives
+   in the whole cloned graph, with five inputs one of which is itself. That is the monovariant
+   erasure in its purest form: a self-recursive body whose parameter is the meet over all callers
+   INCLUDING its own recursive edge. Cloning a self-recursive function is loop unrolling, correctly
+   refused, so no specialization mechanism reaches it.
+
+Re-lowering wins here only because, working from source with the key constant, it folds
+`%IsObjectLike` and `(%Eq key (%PropertyKey "length"))` before any node exists, so the whole
+else-cascade — string, undefined, null, bool, symbol, number, containing ALL FIVE `JsGetFromHolder`
+calls — is never built.
+
+### What this means for tier 3
+
+The chain walk is folded by knowing the receiver's shape and prototype chain AS A TYPE, which is
+what V8's map checks and Graal's stable-shape folding do. Today `prop-image-resolve!` reads
+`facts-written?` and `heap-storage-shape` from side tables frozen at a moment, keyed on the node
+SHAPE `OP-STATICREF` (`prop-access-idealize`, the `(= (n-op object) OP-STATICREF)` test), where
+Simple's `LoadNode.compute` reads the field type off the POINTER'S TYPE and is therefore
+order-insensitive. That is the real defect, it is independent of the seam, and it is the largest
+remaining win.
+
+One correction to the earlier lattice experiment (§11, "would object identity in the lattice close
+the gap? No"): that attempt modelled identity as the raw sentinel pair `TY-DYN-NO-ENTRY` /
+`TY-DYN-ANY-ENTRY`, which made the component self-dual and let GVN's `ty-join` drop it. The `int`
+component meets through `ty-meet` RECURSIVELY, so identity and shape should be TYPES as well — a
+real sub-lattice has distinct top and bottom, and the laws then hold by construction.
+
