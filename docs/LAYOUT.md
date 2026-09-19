@@ -462,6 +462,7 @@ aot-take-2/
     ├── lint/
     │   ├── unused-imports.coil ; project lint rule (Coil.toml `[lint] rules`): an import nothing uses; `--fix` removes it
     │   ├── layout.coil      ; project lint rule: every source file has a row in this document, and every row a file
+    │   ├── cond.coil        ; project lint rule: a staircase of three or more nested ifs is a cond; `--fix` rewrites it
     │   └── size.coil        ; opt-in report: functions and files over a line budget
     ├── refactor/            ; refactoring metaprograms, inert unless named with `coil lint --use` (docs/REFACTORING.md)
     │   ├── source.coil      ; a module's top-level forms with the lines that travel with them; file reads and writes
