@@ -139,6 +139,7 @@ aot-take-2/
 │   ├── TEST262.md       ; pinned conformance campaign, denominator and runner contract
 │   ├── JSL.md           ; the runtime-library language
 │   ├── SPECIALIZE.md    ; proposal: a JSL definition carries its own idealization rules, and where to apply them
+│   ├── FUNCTION-VERSIONS.md ; bounded callable versions, entry contracts, research and validation
 │   ├── SEA-OF-NODES-AUDIT.md ; are we a proper sea of nodes: what was fixed, what remains, what the traces measured
 │   └── JOURNAL.md       ; why something looks the way it does
 ├── jsl/                 ; the JavaScript runtime library, in JSL — already written
@@ -205,6 +206,7 @@ aot-take-2/
 │   │   ├── node.coil        ; NodeHdr, NodeOps, edges, peephole/peepholeOpt, GVN, deps,
 │   │   │                    ;   kill/subsume, the OP-* constants, the in-progress windows
 │   │   ├── copy.coil        ; shallow shells and two-pass selected-subgraph copying
+│   │   ├── versions.coil    ; reusable callable versions, policy, contracts and graph lifetime
 │   │   ├── cfg.coil         ; CFGNode: idom, depth, blocks, loop depth, the loop tree
 │   │   ├── control.coil     ; Start, Stop, Region, Loop, If, Never, XCtrl, Proj, CProj, Multi
 │   │   ├── phi.coil         ; Phi and the region/phi arity invariant
@@ -297,6 +299,7 @@ aot-take-2/
 │   ├── test262-test.coil            ; metadata, runner policy and accounting regressions
 │   ├── harness.coil                 ; source in → linked binary out → node's answer beside it
 │   ├── bloat-test.coil              ; graph-size budgets: node-count ceilings after optimization
+│   ├── versions-test.coil           ; callable version contracts, reuse, fallback and lifetime
 │   ├── budget-test.coil             ; compile-time budgets as gates: rounds, shape, wall time (docs/COMPILE-TIME.md §7)
 │   ├── execution-test.coil          ; cases that must RUN, not merely compile
 │   └── differential-test.coil       ; compiled output vs. a JavaScript engine

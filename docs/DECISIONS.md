@@ -4214,3 +4214,19 @@ an opaque round-level hook and still knows nothing about JavaScript.
 Measured: 912 tests green, node counts unchanged, fib(30) 5.16–5.22 ms against 5.21–5.29 ms before,
 binary trees 441 ms against 461 ms, compile time unchanged on richards and deltablue (a fixed
 +0.02 s on programs small enough for the per-round arena walk to show).
+
+## 2026-09-19 — callable function versions
+
+Local source functions and local JSL graphs may have bounded reusable callable versions,
+independently of inlining. This supersedes the earlier absence of a shared specialized-body cache;
+it does not change imported-provider fallback semantics. See [FUNCTION-VERSIONS.md](FUNCTION-VERSIONS.md)
+for the research, proof obligations, policy and validation status.
+
+A body is copied only under captured entry bounds at least as precise as the source's proven
+parameter and memory domain. Private entry contracts stay fixed while routing remains open and
+every incoming call must prove compatibility. Unpublished trials are optimized before acceptance.
+Version copying preserves JavaScript function
+identity; only internal code entries get fresh symbols. Recursive calls use ordinary contract
+selection and ordinary optimistic graph typing. After admission, private entries resume ordinary
+closed-world caller-meet typing. No deoptimization or handwritten semantic summary is
+introduced.

@@ -1,5 +1,12 @@
 # Are we doing proper sea of nodes?
 
+**Callable versions, 2026-09-19:** [FUNCTION-VERSIONS.md](FUNCTION-VERSIONS.md) records the
+research and implementation of bounded reusable entries for JavaScript and local JSL functions.
+Versions use ordinary Fun/Parm/Return typing, proven argument and memory contracts, generic
+fallback, and per-function limits independently of inlining. The saved allocation-proof experiment
+now recovers Fibonacci's numeric return when versioning isolates its unrelated string caller;
+the separate binary-trees runtime gap remains. Validation and measurements are in that document.
+
 **Implementation amendment, 2026-09-18:** the subsequent repair is specified in
 `DESIGN.md`. It replaces opcode-based own-property proofs with identity and
 memory-position queries, admits one specialization per round, budgets source
