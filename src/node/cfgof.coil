@@ -1,0 +1,320 @@
+;; The CFG view of a node: which kinds are control, their dominator and depth, the owning function, and the extension points later families install.
+
+(module aot.node.cfgof)
+(import "aot.util.arena"
+        :use
+        [compiler-allocator compiler-state CompilerStateSlot])
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.cfg" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.control"
+        :use
+        [StartNode StopNode XCtrlNode IfNode CProjNode ReturnNode])
+(import "aot.node.region" :use *)
+
+;; ---------------------------------------------------------------------------
+;; The generic dominator walks
+;;
+;; These live here rather than in `aot.node.cfg` because they need to turn a `(dyn NodeOps)` back
+;; into a control view, and `cfg-of` — the one place that knows which opcodes are control — needs
+;; the concrete structs, which are in this module.
+
+;; The one place that knows which opcodes are control. Simple's `instanceof CFGNode`.
+;;
+;; Do not replicate this test anywhere else. A new control opcode that only some sites learn about
+;; would be treated as a data node, and GCM would try to place it.
+;; Tested most-frequent first: a dominator walk steps through CProj, If and Region nodes almost
+;; exclusively, and this is asked twice per step.
+(defn cfg-of [(n (dyn NodeOps))] (-> (Option (dyn CFGOps)))
+  (let [op (n-op n)]
+    (if (= op OP-CPROJ)
+        (Some (primitive/make-dyn CFGOps
+                                  (primitive/cast (ptr CProjNode) (hdr n))))
+        (if (or (= op OP-IF) (= op OP-NEVER))
+            (Some (primitive/make-dyn CFGOps
+                                      (primitive/cast (ptr IfNode) (hdr n))))
+            (if (= op OP-REGION)
+                (Some (primitive/make-dyn CFGOps
+                                          (primitive/cast (ptr RegionNode)
+                                                          (hdr n))))
+                (if (= op OP-START)
+                    (Some (primitive/make-dyn CFGOps
+                                              (primitive/cast (ptr StartNode)
+                                                              (hdr n))))
+                    (if (= op OP-STOP)
+                        (Some (primitive/make-dyn CFGOps
+                                                  (primitive/cast (ptr StopNode)
+                                                                  (hdr n))))
+                        (if (= op OP-XCTRL)
+                            (Some (primitive/make-dyn CFGOps
+                                                      (primitive/cast (ptr XCtrlNode)
+                                                                      (hdr n))))
+                            (cfg-of-more n)))))))))
+
+(defn cfg? [(n (dyn NodeOps))] (-> bool)
+  (match (cfg-of n) (Some [_] true) (None [] false)))
+
+;; The immediate dominator of any control node, or None. A data node has no dominator and asking is
+;; a hard error rather than a quiet None — the caller has confused a value for control.
+(defn cfg-idom-of [(n (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (match (cfg-of n)
+    (Some [c] (cfg-idom c))
+    (None []
+          (do
+            (panic-i "cfg-idom-of: not a control node (op)" (n-op n))
+            (None [(dyn NodeOps)])))))
+
+(defn cfg-idepth-of [(n (dyn NodeOps))] (-> i64)
+  (match (cfg-of n)
+    (Some [c] (cfg-idepth c))
+    (None [] (do (panic-i "cfg-idepth-of: not a control node (op)" (n-op n)) 0))))
+
+(defn cfg-block-head-of? [(n (dyn NodeOps))] (-> bool)
+  (match (cfg-of n) (Some [c] (block-head? c)) (None [] false)))
+
+;; The default idepth for a kind with a single control predecessor: one plus the parent's.
+(defn cfg-idepth-default [(n (dyn NodeOps))] (-> i64)
+  (if (n-idepth-valid? n)
+      (n-idepth-cached n)
+      (do
+        (n-set-idepth! n 0)  ; seed before recursing, so a cycle terminates
+        (n-set-idepth! n
+                       (+ 1
+                          (match (cfg-idom-of n)
+                            (Some [p] (cfg-idepth-of p))
+                            (None [] 0)))))))
+
+;; The Fun that owns a control node: the first node up its dominator chain that `fun?` accepts
+;; (the caller supplies the test, since a machine Fun has a machine opcode). Memoized on every node
+;; the walk crosses under the control edit version, so the self-recursion check, GCM's global
+;; splitting and frame finalization each pay for a chain once instead of once per query.
+;; A parameter is passed by reference, which is what the predicate's pointer type takes.
+(defn cfg--owner-test [(fun? (fnptr c [(ref (dyn NodeOps))] bool))
+                       (c (dyn NodeOps))] (-> bool)
+  (primitive/call-ptr fun? c))
+
+(defstruct CfgOwnerStats [(steps i64)])
+
+(defn cfg-owner-stats [] (-> (ptr CfgOwnerStats))
+  (compiler-state [CfgOwnerStats] (primitive/alloc-static CompilerStateSlot)))
+
+(defn cfg-owner-fun [(n (dyn NodeOps))
+                     (fun? (fnptr c [(ref (dyn NodeOps))] bool))] (-> (Option (dyn NodeOps)))
+  (let [a (compiler-allocator)
+        (mut path) (al-new [i64] a)
+        (mut cur) (Some n)
+        (mut answer) (None [(dyn NodeOps)])
+        (mut done) false
+        (mut guard) 0]
+    (loop (if (or (load done) (> (load guard) 1000000))
+              (break 0)
+              (match (load cur)
+                (None [] (set! (mut done) true))
+                (Some [c]
+                      (if (n-owner-cache-valid? c)
+                          (do
+                            (set! (mut answer)
+                                  (if (= (n-owner-cached-nid c) 0)
+                                      (None [(dyn NodeOps)])
+                                      (arena-node (n-owner-cached-nid c))))
+                            (set! (mut done) true))
+                          (if (cfg--owner-test fun? c)
+                              (do
+                                (set! (mut answer) (Some c))
+                                (set! (mut done) true))
+                              (do
+                                (push! [i64] (mut path) (n-nid c))
+                                (set! (.steps (cfg-owner-stats))
+                                      (+ (.steps (cfg-owner-stats)) 1))
+                                (set! (mut cur) (cfg-idom-of c))
+                                (set! (mut guard) (+ (load guard) 1))
+                                (continue))))))))
+    (if (> (load guard) 1000000)
+        (broken "cfg-owner-fun: dominator walk did not converge")
+        0)
+    (let [owner-nid (match (load answer) (Some [f] (n-nid f)) (None [] 0))
+          (mut i) 0]
+      (loop (if (>= (load i) (len (load path)))
+                (break 0)
+                (do
+                  (match (arena-node (get (load path) (load i)))
+                    (Some [visited] (n-set-owner-cache! visited owner-nid))
+                    (None [] 0))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    (al-free! [i64] (mut path))
+    (load answer)))
+
+;; Walk two dominator chains upward in parallel, stepping whichever side is deeper, until they meet.
+;; `None` on either side means no common dominator.
+;;
+;; Simple notes this does NOT cache and can be linear in the program size — accepted deliberately,
+;; because a cached dominator in a graph peepholes are rewriting goes stale, and a stale dominator
+;; schedules a node outside its own dominance region.
+(defn idom-lca-nodes [(a (dyn NodeOps)) (b (Option (dyn NodeOps)))] (-> (Option (dyn NodeOps)))
+  (match b
+    (None [] (Some a))
+    (Some [b0]
+          (let [(mut lhs) (Some a)
+                (mut rhs) (Some b0)
+                (mut out) (None [(dyn NodeOps)])
+                (mut guard) 0]
+            (loop
+              ;; A safety net, not part of the algorithm: a malformed chain would otherwise spin
+              ;; forever, and a hang is a far worse failure than a named panic.
+              (if (> (load guard) 1000000)
+                  (do
+                    (broken "idom-lca-nodes: dominator walk did not converge")
+                    (break 0))
+                  (match (load lhs)
+                    (None [] (break 0))
+                    (Some [l]
+                          (match (load rhs)
+                            (None [] (break 0))
+                            (Some [r]
+                                  (if (n-same? l r)
+                                      (do (set! (mut out) (Some l)) (break 0))
+                                      (let [ld (cfg-idepth-of l)
+                                            rd (cfg-idepth-of r)]
+                                        (do
+                                          (if (>= ld rd)
+                                              (set! (mut lhs) (cfg-idom-of l))
+                                              0)
+                                          (if (<= ld rd)
+                                              (set! (mut rhs) (cfg-idom-of r))
+                                              0)
+                                          (set! (mut guard) (+ (load guard) 1))
+                                          (continue))))))))))
+            (load out)))))
+
+;; The second half of `cfg-of`, split only because one `if` chain of that depth is unreadable.
+(defn cfg-of-more [(n (dyn NodeOps))] (-> (Option (dyn CFGOps)))
+  (let [op (n-op n)]
+    (if (= op OP-LOOP)
+        (Some (primitive/make-dyn CFGOps
+                                  (primitive/cast (ptr LoopNode) (hdr n))))
+        (if (or (= op OP-IF) (= op OP-NEVER))
+            (Some (primitive/make-dyn CFGOps
+                                      (primitive/cast (ptr IfNode) (hdr n))))
+            (if (= op OP-CPROJ)
+                (Some (primitive/make-dyn CFGOps
+                                          (primitive/cast (ptr CProjNode)
+                                                          (hdr n))))
+                (if (= op OP-RETURN)
+                    (Some (primitive/make-dyn CFGOps
+                                              (primitive/cast (ptr ReturnNode)
+                                                              (hdr n))))
+                    (if (or (= op OP-MACH-CFG) (= op OP-MACH-CALL))
+                        (selected-cfg-of n)
+                        (cfg-of-ext n))))))))
+
+;; Is this opcode a Phi, for the purposes of Region's arity invariant?
+;;
+;; A PARM IS A PHI — that is the whole design of `aot.node.call`, and it means a Parm must be counted
+;; here. Miss it and dropping a call site from a Fun leaves every Parm one value too long, reading
+;; the wrong caller's argument: a miscompile that typechecks cleanly.
+(defn phi-like? [(op i64)] (-> bool)
+  (or (= op OP-PHI) (= op OP-MEMPHI) (= op OP-PARM) (= op OP-MACH-PHI)))
+
+;; ---------------------------------------------------------------------------
+;; Extending `cfg-of` across a module boundary
+;;
+;; `cfg-of` must be the ONE place that knows which opcodes are control. But `Fun`, `Call` and
+;; `CallEnd` are control and live in `aot.node.call`, which imports THIS module — so this module
+;; cannot name them, and Coil has no cyclic imports.
+;;
+;; The answer is one registered extension, installed at boot. It is not a workaround: it keeps the
+;; single-dispatch property (there is still exactly one `cfg-of`) while letting a later module
+;; contribute the kinds it owns.
+;;
+;; An UNREGISTERED extension is a hard error the moment a call node is asked a control question,
+;; rather than a quiet "not control" — which would make GCM try to place a Call as if it were data.
+;; NOTE the `(ref …)`: a `defn` parameter of `dyn` type compiles to a reference, so the function-
+;; pointer type has to say so or the two signatures do not match.
+(defstruct CfgExt
+  [(f (fnptr c [(ref (dyn NodeOps))] (Option (dyn CFGOps)))) (installed bool)])
+
+(defn cfg-ext [] (-> (ptr CfgExt))
+  (compiler-state [CfgExt] (primitive/alloc-static CompilerStateSlot)))
+
+(defn set-cfg-ext! [(f (fnptr c [(ref (dyn NodeOps))] (Option (dyn CFGOps))))] (-> i64)
+  (do (set! (.f (cfg-ext)) f) (set! (.installed (cfg-ext)) true) 0))
+
+;; The engine's control-edit hook (aot.node.node, `n-cfg-edited!`): is this node control? Installed
+;; at boot after the call-family extension, which `cfg-of` consults for call opcodes.
+(defn cfg-edit-pred [(n (dyn NodeOps))] (-> bool)
+  (cfg? n))
+
+(defn cfg-install-edit-hook! [] (-> i64)
+  (set-cfg-edit-hook! (primitive/fnptr-of cfg-edit-pred)))
+
+;; Machine CFG kinds live in target modules. This second extension is deliberately separate from
+;; the ideal call-family extension: selected nodes have one coarse opcode and are always owned by
+;; the active Machine port.
+(defstruct SelectedCfgExt
+  [(f (fnptr c [(ref (dyn NodeOps))] (Option (dyn CFGOps))))
+   (installed bool)])
+
+(defn selected-cfg-ext [] (-> (ptr SelectedCfgExt))
+  (compiler-state [SelectedCfgExt] (primitive/alloc-static CompilerStateSlot)))
+
+(defn set-selected-cfg-ext! [(f (fnptr c
+                                       [(ref (dyn NodeOps))]
+                                       (Option (dyn CFGOps))))] (-> i64)
+  (do
+    (set! (.f (selected-cfg-ext)) f)
+    (set! (.installed (selected-cfg-ext)) true)
+    0))
+
+(defn selected-cfg-of [(n (dyn NodeOps))] (-> (Option (dyn CFGOps)))
+  (if (not (.installed (selected-cfg-ext)))
+      (do
+        (panic "cfg-of: selected-CFG extension is not installed")
+        (None [(dyn CFGOps)]))
+      (primitive/call-ptr (.f (selected-cfg-ext)) n)))
+
+(defstruct PCopyExt
+  [(f (fnptr c [(ref (dyn NodeOps)) i64] (Option (dyn NodeOps))))
+   (installed bool)])
+
+(defn pcopy-extension [] (-> (ptr PCopyExt))
+  (compiler-state [PCopyExt] (primitive/alloc-static CompilerStateSlot)))
+
+(defn set-pcopy-ext! [(f (fnptr c
+                                [(ref (dyn NodeOps)) i64]
+                                (Option (dyn NodeOps))))] (-> i64)
+  (do
+    (set! (.f (pcopy-extension)) f)
+    (set! (.installed (pcopy-extension)) true)
+    0))
+
+(defn pcopy-ext [(n (dyn NodeOps)) (idx i64)] (-> (Option (dyn NodeOps)))
+  (if (not (.installed (pcopy-extension)))
+      (do
+        (panic "multi-pcopy: CallEnd projection asked before ctrl-install-call-ext! ran")
+        (None [(dyn NodeOps)]))
+      (primitive/call-ptr (.f (pcopy-extension)) n idx)))
+
+;; Opcodes this module does not own but which ARE control. Asking about one before the extension is
+;; installed is a wiring bug, and it says so.
+(defn cfg--ext-owned? [(op i64)] (-> bool)
+  (or (= op OP-FUN)
+      (= op OP-CALL)
+      (= op OP-CALLEND)
+      (= op OP-PROPLOAD)
+      (= op OP-PROPSTORE)))
+
+(defn cfg-of-ext [(n (dyn NodeOps))] (-> (Option (dyn CFGOps)))
+  (if (not (cfg--ext-owned? (n-op n)))
+      (None [(dyn CFGOps)])
+      (if (not (.installed (cfg-ext)))
+          (do
+            (panic-i "cfg-of: a control opcode owned by aot.node.call was asked a control question before ctrl-install-call-ext! ran (op)"
+                     (n-op n))
+            (None [(dyn CFGOps)]))
+          (primitive/call-ptr (.f (cfg-ext)) n))))

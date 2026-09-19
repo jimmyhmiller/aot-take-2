@@ -1,0 +1,146 @@
+;; Global value numbering: the hash, structural equality, the table, and unlocking a node before its edges change.
+
+(module aot.node.gvn)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.slice" :use *)
+(import "coil.os" :as os)
+(import "aot.node.node" :use [NodeOps n-nid n-op n-hash-of n-same? n-nins n-in])
+(import "aot.node.arena" :use *)
+
+;; ---------------------------------------------------------------------------
+;; GVN table
+;;
+;; A node is IN the table exactly when its cached hash is non-zero. While in the table its edges are
+;; frozen, because the hash is computed from them — so every edge mutator calls `n-unlock!` first.
+
+;; Recompute the structural hash from current opcode, inputs, and payload even if a cached GVN hash
+;; exists. The verifier uses this form; ordinary lookup uses the cached wrapper below.
+(defn n-gvn-hash-current [(n (dyn NodeOps))] (-> i64)
+  (let [(mut h) (+ (* (n-op n) 1000003) 0x9e3779b9)
+        cnt (n-nins n)
+        (mut i) 0]
+    (loop (if (>= (load i) cnt)
+              (break 0)
+              (do
+                (set! (mut h)
+                      (^ (^ (* (load h) 31) (primitive/ishl (load h) 7))
+                         (match (n-in n (load i))
+                           (Some [v] (n-nid v))
+                           (None [] 0))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (let [x (^ (load h) (hash-extra n))]
+      ;; 0 is reserved for "not in the table" and must never be produced.
+      (if (= x 0) 0xDEADBEEF x))))
+
+;; Structural hash with the normal GVN cache fast path.
+(defn n-gvn-hash [(n (dyn NodeOps))] (-> i64)
+  (if (!= (n-hash-of n) 0) (n-hash-of n) (n-gvn-hash-current n)))
+
+;; Two nodes are equal when they have the same opcode, the same inputs BY IDENTITY, and the kind's
+;; own `eq-extra` agrees.
+(defn n-gvn-eq? [(a (dyn NodeOps)) (b (dyn NodeOps))] (-> bool)
+  (if (!= (n-op a) (n-op b))
+      false
+      (if (!= (n-nins a) (n-nins b))
+          false
+          (let [cnt (n-nins a)
+                (mut i) 0
+                (mut same) true]
+            (loop (if (or (>= (load i) cnt) (not (load same)))
+                      (break 0)
+                      (do
+                        (if (not (edge-same? (n-in a (load i))
+                                             (n-in b (load i))))
+                            (set! (mut same) false)
+                            0)
+                        (set! (mut i) (+ (load i) 1))
+                        (continue))))
+            (if (load same) (eq-extra a b) false)))))
+
+(defn edge-same? [(a (Option (dyn NodeOps))) (b (Option (dyn NodeOps)))] (-> bool)
+  (match a
+    (Some [x] (match b (Some [y] (n-same? x y)) (None [] false)))
+    (None [] (match b (Some [_] false) (None [] true)))))
+
+(defn n-locked? [(n (dyn NodeOps))] (-> bool)
+  (!= (n-hash-of n) 0))
+
+(defn arena--gvn-next [(id i64)] (-> i64)
+  (if (>= id (len (.gvn-next (arena)))) 0 (get (.gvn-next (arena)) id)))
+
+(defn arena--set-gvn-next! [(id i64) (nxt i64)] (-> i64)
+  (do
+    (let [(mut i) (len (.gvn-next (arena)))]
+      (loop (if (> (load i) id)
+                (break 0)
+                (do
+                  (push! [i64] (mut (.gvn-next (arena))) 0)
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    (set! (mut (.gvn-next (arena))) id nxt)
+    0))
+
+;; Find an existing node equal to `n`, or None. Does NOT insert.
+(defn n-gvn-find [(n (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (do
+    (arena-boot!)
+    (let [h (n-gvn-hash n)
+          (mut cur)
+            (match (get (.gvn-index (arena)) h) (Some [v] v) (None [] 0))
+          (mut found) (None [(dyn NodeOps)])]
+      (loop (if (= (load cur) 0)
+                (break 0)
+                (do
+                  (match (arena-node (load cur))
+                    (Some [other]
+                          (if (and (not (n-same? other n)) (n-gvn-eq? n other))
+                              (do (set! (mut found) (Some other)) (break 0))
+                              0))
+                    (None [] 0))
+                  (set! (mut cur) (arena--gvn-next (load cur)))
+                  (continue))))
+      (load found))))
+
+;; Insert `n` into the table, caching its hash. Its edges are frozen from here.
+(defn n-gvn-insert! [(n (dyn NodeOps))] (-> i64)
+  (do
+    (arena-boot!)
+    (let [h (n-gvn-hash n)
+          head (match (get (.gvn-index (arena)) h) (Some [v] v) (None [] 0))]
+      (arena--set-gvn-next! (n-nid n) head)
+      (set! (mut (.gvn-index (arena))) h (n-nid n))
+      (set! (.hash (hdr n)) h)
+      0)))
+
+;; Leave the GVN table so the edges can be mutated. A no-op when not in it.
+;;
+;; EVERY edge mutator calls this. Skipping it leaves a table entry whose cached hash no longer
+;; matches the node's edges, which later unifies two nodes that are not equal — a miscompile that
+;; typechecks.
+(defn n-unlock! [(n (dyn NodeOps))] (-> i64)
+  (let [h (n-hash-of n)]
+    (if (= h 0)
+        0
+        (let [id (n-nid n)
+              head (match (get (.gvn-index (arena)) h) (Some [v] v) (None [] 0))]
+          (if (= head id)
+              (set! (mut (.gvn-index (arena))) h (arena--gvn-next id))
+              (let [(mut prev) head]
+                (loop (if (= (load prev) 0)
+                          (break 0)
+                          (if (= (arena--gvn-next (load prev)) id)
+                              (do
+                                (arena--set-gvn-next! (load prev)
+                                                      (arena--gvn-next id))
+                                (break 0))
+                              (do
+                                (set! (mut prev) (arena--gvn-next (load prev)))
+                                (continue)))))
+                0))
+          (arena--set-gvn-next! id 0)
+          (set! (.hash (hdr n)) 0)
+          0))))

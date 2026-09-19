@@ -1,0 +1,379 @@
+;; Specialization: a definition's own idealization rules, the proofs that admit them, and the specialized body (docs/SPECIALIZE.md).
+
+(module aot.jsl.lower.specialize)
+(import "aot.util.arena"
+        :use
+        [compiler-allocator compiler-state CompilerStateSlot])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.str" :as str)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.reader" :as rd)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.property" :use *)
+(import "aot.shape" :use *)
+(import "aot.type.type" :use *)
+(import "aot.jsl.reader" :use *)
+(import "aot.jsl.check" :use *)
+(import "aot.jsl.lower"
+        :use
+        [JSL-SPECIALIZE-SITES JSL-SPECIALIZE-NODES JSL-LINK-IMPORT jsl-graphs])
+(import "aot.jsl.lower.expr" :use *)
+
+;; Simple's CallEnd inline worklist expands one body and then cleans up. For a JSL definition
+;; with :specialize, the same worklist instead lowers the checked source with actual arguments.
+;; The annotation lists alternative tag proofs sufficient to justify expansion; it grants no
+;; type assumption. Unknown/TOP arguments keep an ordinary call, including its full memory and
+;; exception tuple. A satisfied rule only permits lowering: ordinary JSL if/guard lowering still
+;; proves which branches disappear. This avoids cloning the generic graph before discarding it.
+;; The full generic body and its dependencies must exist before specialization; facts therefore
+;; see its effects. Proven parse-time types may specialize in the initial pessimistic solve;
+;; unknown types wait for SCCP or a caller inline. No operation-specific name dispatch is used.
+(defn jsl-specialization-parameter [(params (ptr rd/Sexp)) (name (slice u8))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (rd/sexp-count params))
+              (break (do
+                       (panic "jsl-specialization: checked parameter missing")
+                       0))
+              (if (= name
+                     (rd/sexp-sym (rd/sexp-nth (rd/sexp-nth params (load i)) 0)))
+                  (break (load i))
+                  (do (set! (mut i) (+ (load i) 1)) (continue)))))))
+
+;; One predicate of a specialization rule, against the call's actual argument types. Registers a
+;; dependency on everything it reads, so a site that declines is re-asked when SCCP sharpens it.
+(defn jsl--predicate-proven? [(rule (ptr rd/Sexp))
+                              (params (ptr rd/Sexp))
+                              (c (dyn NodeOps))
+                              (end (dyn NodeOps))] (-> bool)
+  (let [predicate (rd/sexp-sym (rd/sexp-nth rule 0))
+        arg
+          (call-arg c
+                    (jsl-specialization-parameter params
+                                                  (rd/sexp-sym (rd/sexp-nth rule
+                                                                            1))))
+        t (n-ty arg)]
+    (n-add-dep! arg end)
+    (if (or (= t TY-INVALID) (ty-high? t))
+        false
+        (if (= (rd/sexp-count rule) 2)
+            (ty-isa? t (ty-dyn (jsl-tag-predicate predicate)))
+            (let [key-node
+                    (call-arg c
+                              (jsl-specialization-parameter params
+                                                            (rd/sexp-sym (rd/sexp-nth rule
+                                                                                      2))))
+                  key (keyref-local key-node)
+                  mem (call-mem c)]
+              (n-add-dep! key-node end)
+              (n-add-dep! mem end)
+              (if (or (= predicate "%StringLength")
+                      (= predicate "%ArrayLength"))
+                  (and (>= key 0)
+                       (= (shape-key-name key) "length")
+                       (ty-isa? t
+                                (ty-dyn (if (= predicate "%StringLength")
+                                            TAG-STRING
+                                            TAG-ARRAY))))
+                  (and (ty-isa? t (ty-dyn (jsl-tag-predicate "%IsObjectLike")))
+                       (if (= predicate "%OwnPropertyAbsent")
+                           (property-specialization-absent? mem arg key end)
+                           (property-specialization-proven? mem
+                                                            arg
+                                                            key
+                                                            (= predicate
+                                                               "%OwnWritableDataProperty")
+                                                            end)))))))))
+
+;; A rule is one predicate, or a VECTOR of predicates meaning all of them — `+` needs "both operands
+;; are Numbers", not "either" (docs/SPECIALIZE.md §4.2). The rule list itself stays alternatives: any
+;; rule proven grants permission to re-lower, and permission is all it is — ordinary JSL lowering still
+;; decides what the proof actually folds.
+(defn jsl--rule-proven? [(rule (ptr rd/Sexp))
+                         (params (ptr rd/Sexp))
+                         (c (dyn NodeOps))
+                         (end (dyn NodeOps))] (-> bool)
+  (if (not (rd/sexp-vec? rule))
+      (jsl--predicate-proven? rule params c end)
+      (let [n (rd/sexp-count rule)
+            (mut all) (> n 0)
+            (mut i) 0]
+        ;; Every predicate is asked, not just up to the first failure: each one's dependencies are
+        ;; what bring this site back when its argument sharpens.
+        (loop (if (>= (load i) n)
+                  (break 0)
+                  (do
+                    (if (jsl--predicate-proven? (rd/sexp-nth rule (load i))
+                                                params
+                                                c
+                                                end)
+                        0
+                        (set! (mut all) false))
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        (load all))))
+
+(defn jsl-specialization-proven? [(form (ptr rd/Sexp))
+                                  (c (dyn NodeOps))
+                                  (end (dyn NodeOps))] (-> bool)
+  (let [source-policy (jsl-form-option form "specialize")
+        rules
+          (rd/sexp-nth form
+                       (if (>= source-policy 0)
+                           source-policy
+                           (jsl-form-option form "inline-when")))
+        params (jsl-form-params form)
+        (mut ready) false
+        (mut i) 0]
+    (loop (if (>= (load i) (rd/sexp-count rules))
+              (break 0)
+              (do
+                (if (jsl--rule-proven? (rd/sexp-nth rules (load i))
+                                       params
+                                       c
+                                       end)
+                    (set! (mut ready) true)
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load ready)))
+
+;; Simple IterPeeps drains reducing peepholes, admits one graph-growing inline, then drains again.
+;; Source re-lowering obeys that same publication boundary. It still needs independent lifetime,
+;; type and call-linking contracts: a boundary does not make a widened Parm or a stale proof sound.
+;; Admit ONE replacement, then drain the ordinary worklist before asking another site. Merely
+;; snapshotting the arena size does not keep proofs quiescent after the first graph mutation.
+(defn jsl-specialize-admit-all! [] (-> i64)
+  (let [limit (+ (arena-node-count) 1)
+        (mut applied) 0
+        (mut id) 1]
+    (loop (if (or (> (load applied) 0)
+                  (>= (load id) limit)
+                  (>= (.specialized-sites (jsl-graphs)) JSL-SPECIALIZE-SITES)
+                  (>= (.specialized-nodes (jsl-graphs)) JSL-SPECIALIZE-NODES))
+              (break 0)
+              (do
+                (match (arena-node (load id))
+                  (Some [n]
+                        (if (and (= (n-op n) OP-CALLEND) (not (n-dead? n)))
+                            (if (= (jsl-specialize-call! n true) INLINE-TRIVIAL)
+                                (set! (mut applied) (+ (load applied) 1))
+                                0)
+                            0))
+                  (None [] 0))
+                (set! (mut id) (+ (load id) 1))
+                (continue))))
+    (load applied)))
+
+;; `AOT_SPECIALIZE_TRACE=1`, read once: name the condition that refused each site. A tri-state that
+;; says DEFER tells you nothing about which of eight guards stopped it, and guessing costs a build
+;; per guess. Answers INLINE-DEFER so it can stand in for the refusal it reports.
+(defstruct SpecializeTraceFlag [(state i64)])
+
+(defn jsl--specialize-trace? [] (-> bool)
+  (let [f
+          (compiler-state [SpecializeTraceFlag]
+                          (primitive/alloc-static CompilerStateSlot))]
+    (if (= (.state f) 0)
+        (set! (.state f)
+              (if (!= (primitive/cast i64 (os/getenv c"AOT_SPECIALIZE_TRACE"))
+                      0)
+                  1
+                  2))
+        0)
+    (= (.state f) 1)))
+
+(defn jsl--trace-refusal [(name (slice u8)) (why (ptr i8))] (-> i64)
+  (do
+    (if (jsl--specialize-trace?)
+        (do (println "specialize: {s} refused: {s}" name (str/cstr->str why)) 0)
+        0)
+    INLINE-DEFER))
+
+(defn jsl-specialize-call! [(end (dyn NodeOps)) (mutate bool)] (-> i64)
+  (if (or (n-dead? end) (cend-folding? end))
+      INLINE-UNHANDLED
+      (match (n-in-safe end 0)
+        (None [] INLINE-UNHANDLED)
+        (Some [c]
+              (if (!= (n-op c) OP-CALL)
+                  INLINE-UNHANDLED
+                  (let [fp (call-fptr c)
+                        ft (n-ty fp)]
+                    (if (not (and (or (= (n-op fp) OP-FUNPTR)
+                                      (= (n-op fp) OP-EXTERN))
+                                  (ty-funptr? ft)
+                                  (ty-funptr-single? ft)))
+                        INLINE-UNHANDLED
+                        (let [index (ty-funptr-target-at ft 0)
+                              g (jsl-graphs)]
+                          (if (or (< index 0) (>= index (len (.items g))))
+                              INLINE-UNHANDLED
+                              (let [entry (get (.items g) index)
+                                    form (.form entry)]
+                                (if (or (and (< (jsl-form-option form
+                                                                 "specialize")
+                                                0)
+                                             (< (jsl-form-option form
+                                                                 "inline-when")
+                                                0))
+                                        (if (= (n-op fp) OP-EXTERN)
+                                            (!= (.link-mode g) JSL-LINK-IMPORT)
+                                            (!= (.nid entry)
+                                                (n-nid (n-in! fp 0)))))
+                                    INLINE-UNHANDLED
+                                    (if (or (> (len (.pending g)) 0)
+                                            (!= (n-nins end)
+                                                (if (= (n-op fp) OP-EXTERN) 1 2))
+                                            (!= (call-nargs c)
+                                                (rd/sexp-count (jsl-form-params form)))
+                                            (= (n-ty (call-ctrl c)) TY-XCTRL)
+                                            (ty-high? (n-ty (call-mem c))))
+                                        (jsl--trace-refusal (.name entry)
+                                                            (if (> (len (.pending g))
+                                                                   0)
+                                                                c"definitions still pending"
+                                                                (if (!= (n-nins end)
+                                                                        (if (= (n-op fp)
+                                                                               OP-EXTERN)
+                                                                            1
+                                                                            2))
+                                                                    c"not exactly one linked target"
+                                                                    (if (!= (call-nargs c)
+                                                                            (rd/sexp-count (jsl-form-params form)))
+                                                                        c"argument count disagrees with params"
+                                                                        (if (= (n-ty (call-ctrl c))
+                                                                               TY-XCTRL)
+                                                                            c"control is dead"
+                                                                            c"memory still at TOP")))))
+                                        ;; No proof: this is not the specializer's business, so the ordinary inliner
+                                        ;; decides (docs/SPECIALIZE.md §7). Rules must not make a definition
+                                        ;; specialize-ONLY: a recursive site's operand types can be polluted by the
+                                        ;; shared body's other callers, so no proof exists until a clone breaks that
+                                        ;; cycle — `fib(n-1) + fib(n-2)` is exactly that shape, and deferring here kept
+                                        ;; its `+` a call (5.2 -> 6.5 ms per fib(30)).
+                                        (if (not (jsl-specialization-proven? form
+                                                                             c
+                                                                             end))
+                                            (do
+                                              (jsl--trace-refusal (.name entry)
+                                                                  c"no rule proven")
+                                              INLINE-UNHANDLED)
+                                            ;; A guarded graph inline retains the established Call/Return edges and
+                                            ;; proven types via Simple's copier. It does not manufacture fresh calls
+                                            ;; after SCCP. An imported provider has no local graph to copy, so its
+                                            ;; generic ABI stays intact. No proof means no clone, even if some other
+                                            ;; argument (such as an error message) happens to be constant.
+                                            (if (>= (jsl-form-option form
+                                                                     "inline-when")
+                                                    0)
+                                                (if (= (n-op fp) OP-FUNPTR)
+                                                    INLINE-UNHANDLED
+                                                    INLINE-DEFER)
+                                                (if (and (= (n-op fp) OP-FUNPTR)
+                                                         (fun-self-recursive? (n-in! fp
+                                                                                     0)))
+                                                    (do
+                                                      (n-add-dep! (n-in! fp 0)
+                                                                  end)
+                                                      (jsl--trace-refusal (.name entry)
+                                                                          c"callee is self-recursive"))
+                                                    (if (not mutate)
+                                                        INLINE-TRIVIAL
+                                                        (do
+                                                          (jsl-specialize-body! form
+                                                                                c
+                                                                                end)
+                                                          INLINE-TRIVIAL)))))))))))))))))
+
+(defn jsl-specialize-body! [(form (ptr rd/Sexp))
+                            (c (dyn NodeOps))
+                            (end (dyn NodeOps))] (-> i64)
+  (let [before (arena-node-count)
+        prior
+          (n-origin-enter! (rd/sexp-sym (rd/sexp-nth form 1))
+                           "specialize"
+                           (n-source-lo c)
+                           (n-source-hi c))]
+    (jsl-specialize-body-inner! form c end)
+    (let [g (jsl-graphs)]
+      (set! (.specialized-sites g) (+ (.specialized-sites g) 1))
+      (set! (.specialized-nodes g)
+            (+ (.specialized-nodes g) (- (arena-node-count) before))))
+    (n-origin-leave! prior)))
+
+(defn jsl-specialize-body-inner! [(form (ptr rd/Sexp))
+                                  (c (dyn NodeOps))
+                                  (end (dyn NodeOps))] (-> i64)
+  (let [(mut args) (al-new [(dyn NodeOps)] (compiler-allocator))
+        (mut names) (al-new [(slice u8)] (compiler-allocator))
+        (mut values) (al-new [(dyn NodeOps)] (compiler-allocator))
+        (mut i) 0
+        first (+ (arena-node-count) 1)]
+    (n-keep! c)
+    (n-keep! end)
+    (loop (if (>= (load i) (call-nargs c))
+              (break 0)
+              (do
+                (push! [(dyn NodeOps)] (mut args) (call-arg c (load i)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (let [lowered
+            (jsl-lower-expr (jsl-form-body form)
+                            (jsl-form-params form)
+                            (load args)
+                            (mut names)
+                            (mut values)
+                            (call-ctrl c)
+                            (call-mem c))
+          ;; Peephole the residual's three edges HERE, before anything keeps them: the forwarding walk
+          ;; below holds them, and a peephole there could replace a node it is still keeping, while
+          ;; leaving them unpeepholed hands the loop tree an unfolded control node.
+          body lowered
+          local (= (n-op (call-fptr c)) OP-FUNPTR)]
+      (n-keep! (.ctrl body))
+      (n-keep! (.mem body))
+      (n-keep! (.value body))
+      (if local
+          (match (return-fun (n-in! end 1))
+            (Some [fun] (call-unlink! c fun))
+            (None [] (panic "jsl-specialize: missing function owner")))
+          0)
+      (prop-access-forward! end (.ctrl body) (.mem body) (.value body))
+      (n-unkeep! end)
+      (if (n-unused? end) (n-kill! end) 0)
+      (n-unkeep! c)
+      (if (n-unused? c) (n-kill! c) 0)
+      (n-unkeep! (.ctrl body))
+      (n-unkeep! (.mem body))
+      (n-unkeep! (.value body))
+      ;; Now that nothing holds them, peephole the residual's edges. It has to happen here rather than
+      ;; at construction: the folds that matter — a Region with one live input, a Phi with one distinct
+      ;; value — depend on the users the forwarding walk just installed. Without this the loop tree
+      ;; meets an unfolded control node ("postvisited child has no loop tree").
+      ;; A residual edge can be dead by now: forwarding replaced its only user and the cascade
+      ;; collected it.
+      (if (n-dead? (.ctrl body)) 0 (do (n-peephole! (.ctrl body)) 0))
+      (if (n-dead? (.mem body)) 0 (do (n-peephole! (.mem body)) 0))
+      (if (n-dead? (.value body)) 0 (do (n-peephole! (.value body)) 0))
+      0)
+    ;; Only the residual body's freshly allocated nodes, not a whole-arena reseed per call.
+    (set! (mut i) first)
+    (loop (if (> (load i) (arena-node-count))
+              (break 0)
+              (do
+                (match (arena-node (load i))
+                  (Some [n] (if (n-dead? n) 0 (do (code-add! n) 0)))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (al-free! (mut args))
+    (al-free! (mut names))
+    (al-free! (mut values))
+    (fun-size-epoch-bump!)
+    (invalidate-cfg!)
+    0))

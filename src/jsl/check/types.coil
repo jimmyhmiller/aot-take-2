@@ -1,0 +1,230 @@
+;; The checker's types: codes, names, assignability, joins, tag predicates and parameter lists.
+
+(module aot.jsl.check.types)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.reader" :as rd)
+(import "coil.os" :as os)
+(import "aot.type.type" :use *)
+
+;; The checker keeps JSL's source families distinct even where the ideal lattice shares a machine
+;; representation (notably raw `bool` as the integer range 0..1). Dynamic types carry their exact
+;; possible tag set so an `if (%IsX name)` can refine both branches before checking guarded code.
+(const JSL-CHECK-TY-INVALID 0)
+
+(const JSL-CHECK-TY-INT 1)
+
+(const JSL-CHECK-TY-BOOL 2)
+
+(const JSL-CHECK-TY-FLT 3)
+
+(const JSL-CHECK-TY-RAW-OBJECT 4)
+
+(const JSL-CHECK-TY-RAW-STRING 5)
+
+;; A proven raw array payload (`arr`): what `%NewArray` yields and `%UnboxArray` proves.
+(const JSL-CHECK-TY-RAW-ARRAY 6)
+
+;; A proven raw Symbol payload (`sym`): what `%NewSymbol` yields (docs/DECISIONS.md, symbols).
+(const JSL-CHECK-TY-RAW-SYMBOL 9)
+
+(const JSL-CHECK-TY-ARGUMENT-VECTOR 7)
+
+(const JSL-CHECK-TY-ARGUMENT-COUNT 8)
+
+(const JSL-CHECK-TY-DYN-BASE 4096)
+
+(defn jsl-check-dyn-type [(tags i64)] (-> i64)
+  (+ JSL-CHECK-TY-DYN-BASE tags))
+
+(defn jsl-check-dyn-type? [(t i64)] (-> bool)
+  (and (>= t JSL-CHECK-TY-DYN-BASE)
+       (<= t (+ JSL-CHECK-TY-DYN-BASE TAG-COMPLETION))))
+
+(defn jsl-check-dyn-tags [(t i64)] (-> i64)
+  (if (jsl-check-dyn-type? t) (- t JSL-CHECK-TY-DYN-BASE) 0))
+
+;; A dynamic value proven to be a Number: its tags are within {int, double} and non-empty.
+(defn jsl-check-number-word? [(t i64)] (-> bool)
+  (and (jsl-check-dyn-type? t)
+       (and (!= (jsl-check-dyn-tags t) 0)
+            (= (& (jsl-check-dyn-tags t)
+                  (primitive/inot (+ TAG-INT TAG-DOUBLE)))
+               0))))
+
+(defn jsl-check-type-name [(x (ptr rd/Sexp))] (-> i64)
+  (if (rd/sexp-sym-is x "never")
+      (jsl-check-dyn-type 0)
+      (if (rd/sexp-sym-is x "argument-vector")
+          JSL-CHECK-TY-ARGUMENT-VECTOR
+          (if (rd/sexp-sym-is x "argument-count")
+              JSL-CHECK-TY-ARGUMENT-COUNT
+              (jsl-check-type-name-refined x)))))
+
+(defn jsl-check-type-name-refined [(x (ptr rd/Sexp))] (-> i64)
+  (if (rd/sexp-sym-is x "dyn-object-like")
+      (jsl-check-dyn-type (+ TAG-OBJECT (+ TAG-FUNCTION TAG-ARRAY)))
+      (jsl-check-type-name-base x)))
+
+(defn jsl-check-type-name-base [(x (ptr rd/Sexp))] (-> i64)
+  (if (not (rd/sexp-sym? x))
+      JSL-CHECK-TY-INVALID
+      (let [name (rd/sexp-sym x)]
+        (if (= name "dyn")
+            (jsl-check-dyn-type TAG-ANY)
+            (if (= name "int")
+                JSL-CHECK-TY-INT
+                (if (= name "bool")
+                    JSL-CHECK-TY-BOOL
+                    (if (= name "flt")
+                        JSL-CHECK-TY-FLT
+                        (if (= name "obj")
+                            JSL-CHECK-TY-RAW-OBJECT
+                            (if (= name "str")
+                                JSL-CHECK-TY-RAW-STRING
+                                (if (= name "arr")
+                                    JSL-CHECK-TY-RAW-ARRAY
+                                    (if (= name "sym")
+                                        JSL-CHECK-TY-RAW-SYMBOL
+                                        JSL-CHECK-TY-INVALID)))))))))))
+
+(defn jsl-check-type-assignable? [(actual i64) (expected i64)] (-> bool)
+  (if (= actual JSL-CHECK-TY-INVALID)
+      false
+      (if (jsl-check-dyn-type? expected)
+          (and (jsl-check-dyn-type? actual)
+               (= (primitive/iand (jsl-check-dyn-tags actual)
+                                  (primitive/ixor TAG-COMPLETION
+                                                  (jsl-check-dyn-tags expected)))
+                  0))
+          (or (= actual expected)
+              (and (= expected JSL-CHECK-TY-INT) (= actual JSL-CHECK-TY-BOOL))))))
+
+(defn jsl-check-intlike? [(t i64)] (-> bool)
+  (or (= t JSL-CHECK-TY-INT) (= t JSL-CHECK-TY-BOOL)))
+
+(defn jsl-check-numeric? [(t i64)] (-> bool)
+  (or (jsl-check-intlike? t) (= t JSL-CHECK-TY-FLT)))
+
+(defn jsl-check-join [(a i64) (b i64)] (-> i64)
+  (if (= a b)
+      a
+      (if (and (jsl-check-dyn-type? a) (jsl-check-dyn-type? b))
+          (jsl-check-dyn-type (primitive/ior (jsl-check-dyn-tags a)
+                                             (jsl-check-dyn-tags b)))
+          (if (and (jsl-check-intlike? a) (jsl-check-intlike? b))
+              JSL-CHECK-TY-INT
+              JSL-CHECK-TY-INVALID))))
+
+;; Shared by checking and lowering so the admitted predicate set cannot drift from its graph tag.
+(defn jsl-property-specialization-predicate? [(name (slice u8))] (-> bool)
+  (or (= name "%OwnDataProperty")
+      (= name "%OwnWritableDataProperty")
+      (= name "%OwnPropertyAbsent")
+      (= name "%StringLength")
+      (= name "%ArrayLength")))
+
+(defn jsl-tag-predicate [(name (slice u8))] (-> i64)
+  (if (= name "%IsInt")
+      TAG-INT
+      (if (= name "%IsNumber")
+          (primitive/ior TAG-INT TAG-DOUBLE)
+          (if (= name "%IsFlt")
+              TAG-DOUBLE
+              (if (= name "%IsString")
+                  TAG-STRING
+                  (if (= name "%IsBool")
+                      TAG-BOOL
+                      (if (= name "%IsNull")
+                          TAG-NULL
+                          (if (= name "%IsUndefined")
+                              TAG-UNDEFINED
+                              (if (= name "%IsSymbol")
+                                  TAG-SYMBOL
+                                  (if (= name "%IsObject")
+                                      TAG-OBJECT
+                                      (if (= name "%IsFunction")
+                                          TAG-FUNCTION
+                                          (if (= name "%IsObjectLike")
+                                              (primitive/ior TAG-OBJECT
+                                                             (primitive/ior TAG-FUNCTION
+                                                                            TAG-ARRAY))
+                                              (if (= name "%IsException")
+                                                  TAG-EXCEPTION
+                                                  (if (= name "%IsArray")
+                                                      TAG-ARRAY
+                                                      0))))))))))))))
+
+;; These are precisely the scalar/value families the current ideal graph can represent at a JSL
+;; function boundary. Keeping the admission predicate shared by parameter and return checks avoids
+;; a declaration being accepted on one side and silently forced to `dyn` by the lowerer.
+(defn jsl-admitted-type? [(x (ptr rd/Sexp))] (-> bool)
+  (and (rd/sexp-sym? x)
+       (let [name (rd/sexp-sym x)]
+         (or (= name "dyn")
+             (= name "never")
+             (= name "dyn-object-like")
+             (= name "argument-vector")
+             (= name "argument-count")
+             (= name "int")
+             (= name "bool")
+             (= name "flt")
+             (= name "obj")
+             (= name "str")
+             (= name "arr")))))
+
+;; JSL is a specification DSL, not non-strict JavaScript: each formal has one unambiguous type and
+;; slot. Duplicate formal names would make the checker's name lookup and the lowerer's value lookup
+;; depend on traversal direction, so they are refused at this boundary.
+(defn jsl-check-params-unique? [(params (ptr rd/Sexp))] (-> bool)
+  (let [(mut i) 0
+        (mut unique) true]
+    (loop (if (or (not (load unique)) (>= (load i) (rd/sexp-count params)))
+              (break (load unique))
+              (let [decl (rd/sexp-nth params (load i))]
+                (if (and (rd/sexp-list? decl)
+                         (> (rd/sexp-count decl) 0)
+                         (rd/sexp-sym? (rd/sexp-nth decl 0)))
+                    (let [name (rd/sexp-sym (rd/sexp-nth decl 0))
+                          (mut prior) 0]
+                      (loop (if (or (not (load unique))
+                                    (>= (load prior) (load i)))
+                                (break 0)
+                                (let [other (rd/sexp-nth params (load prior))]
+                                  (if (and (rd/sexp-list? other)
+                                           (> (rd/sexp-count other) 0)
+                                           (rd/sexp-sym? (rd/sexp-nth other 0))
+                                           (= (rd/sexp-sym (rd/sexp-nth other 0))
+                                              name))
+                                      (set! (mut unique) false)
+                                      0)
+                                  (set! (mut prior) (+ (load prior) 1))
+                                  (continue)))))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn jsl-symbol-in-params? [(params (ptr rd/Sexp)) (name (slice u8))] (-> bool)
+  (let [(mut i) 0
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) (rd/sexp-count params)))
+              (break 0)
+              (let [p (rd/sexp-nth params (load i))]
+                (if (and (rd/sexp-list? p)
+                         (and (= (rd/sexp-count p) 2)
+                              (and (rd/sexp-sym? (rd/sexp-nth p 0))
+                                   (= (rd/sexp-sym (rd/sexp-nth p 0)) name))))
+                    (set! (mut found) true)
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
+(defn jsl-symbol-in-locals? [(locals (ArrayList (slice u8))) (name (slice u8))] (-> bool)
+  (let [(mut i) (- (len locals) 1)]
+    (loop (if (< (load i) 0)
+              (break false)
+              (if (= (get locals (load i)) name)
+                  (break true)
+                  (do (set! (mut i) (- (load i) 1)) (continue)))))))

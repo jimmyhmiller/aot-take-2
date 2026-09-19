@@ -1,0 +1,697 @@
+;; Late scheduling: use LCA, register-constrained placement, memory waits, the ready worklist, and anti-dependencies.
+
+(module aot.codegen.gcm.late)
+(import "aot.util.arena"
+        :use
+        [compiler-allocator compiler-state CompilerStateSlot])
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.codegen.codegen" :use *)
+(import "aot.codegen.machine" :use *)
+(import "aot.codegen.regmask" :use *)
+(import "aot.codegen.looptree" :use *)
+(import "aot.codegen.gcm" :use [gcm-ideal-op gcm-node-block gcm-selected-phi?])
+(import "aot.codegen.gcm.dom" :use *)
+
+;; Breadth-first backwards from Stop; place each node at the best position between its use-LCA and
+;; its early bound.
+(defn gcm-selected-reachable? [(n (dyn NodeOps))] (-> bool)
+  (and (!= (n-block-nid n) 0) (or (cfg? n) (mach? n))))
+
+(defn gcm-late-ready? [(n (dyn NodeOps)) (done (mut (ArrayList bool)))] (-> bool)
+  (let [(mut i) 0
+        (mut ready) true]
+    (loop (if (or (>= (load i) (n-nouts n)) (not (load ready)))
+              (break 0)
+              (do
+                (match (n-out n (load i))
+                  (Some [use_]
+                        (if (and (gcm-selected-reachable? use_)
+                                 (not (get (load done) (n-nid use_))))
+                            (set! (mut ready) false)
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    ;; The memory group's exact clobber count replaces repeated memory-output searches.
+    (and (load ready)
+         (match (mem-of n)
+           (Some [access]
+                 (or (not (mem-is-load? access))
+                     (= (get (.pending (gcm-memory-waits))
+                             (n-nid (mem-in access)))
+                        0)))
+           (None [] true)))))
+
+;; LCA is idempotent: visit each distinct user once, while use_block still includes
+;; EVERY matching predecessor. Scratch marks last only for this query; no dominance
+;; answer survives graph edits. Clearing through the output list costs O(use edges).
+(defstruct GcmUseScratch [(seen (ArrayList bool)) (booted bool)])
+
+(defn gcm-use-scratch [] (-> (ptr GcmUseScratch))
+  (let [s
+          (compiler-state [GcmUseScratch]
+                          (primitive/alloc-static CompilerStateSlot))]
+    (if (.booted s)
+        0
+        (do
+          (set! (.seen s) (al-new [bool] (compiler-allocator)))
+          (set! (.booted s) true)
+          0))
+    (loop (if (> (len (.seen s)) (arena-node-count))
+              (break 0)
+              (do (push! [bool] (mut (.seen s)) false) (continue))))
+    s))
+
+(defn gcm-late-lca [(n (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [scratch (gcm-use-scratch)
+        (mut i) 0
+        (mut lca) (None [(dyn NodeOps)])]
+    (loop (if (>= (load i) (n-nouts n))
+              (break 0)
+              (do
+                (match (n-out n (load i))
+                  (Some [use_]
+                        (if (and (not (get (.seen scratch) (n-nid use_)))
+                                 (gcm-selected-reachable? use_))
+                            (do
+                              (set! (mut (.seen scratch)) (n-nid use_) true)
+                              (set! (mut lca)
+                                    (gcm-idom-lca (gcm-use-block n use_)
+                                                  (load lca))))
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (set! (mut i) 0)
+    (loop (if (>= (load i) (n-nouts n))
+              (break 0)
+              (do
+                (match (n-out n (load i))
+                  (Some [use_] (set! (mut (.seen scratch)) (n-nid use_) false))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load lca)))
+
+(defn gcm-node-constrains-reg? [(n (dyn NodeOps)) (reg i64)] (-> bool)
+  (match (mach-of n)
+    (None [] false)
+    (Some [mach]
+          (let [(mut i) 1
+                (mut constrained) false]
+            (loop (if (or (>= (load i) (n-nins n)) (load constrained))
+                      (break 0)
+                      (do
+                        (match (m-regmap mach (load i))
+                          (Some [mask]
+                                (if (mask-test mask reg)
+                                    (set! (mut constrained) true)
+                                    0))
+                          (None [] 0))
+                        (set! (mut i) (+ (load i) 1))
+                        (continue))))
+            (load constrained)))))
+
+(defn gcm-block-constrains-reg? [(block (dyn NodeOps)) (reg i64)] (-> bool)
+  (let [(mut oi) 0
+        (mut constrained) (gcm-node-constrains-reg? block reg)]
+    ;; Our dominator metadata names block heads, whereas final Simple's chain can name the machine
+    ;; CFG tail itself. Inspect the fixed CFG members directly owned by each block so Call/Return/If
+    ;; operand constraints form the same hoist boundary.
+    (loop (if (or (>= (load oi) (n-nouts block)) (load constrained))
+              (break 0)
+              (do
+                (match (n-out block (load oi))
+                  (Some [use_]
+                        (if (and (cfg? use_)
+                                 (= (n-block-nid use_) (n-nid block)))
+                            (if (gcm-node-constrains-reg? use_ reg)
+                                (set! (mut constrained) true)
+                                0)
+                            0))
+                  (None [] 0))
+                (set! (mut oi) (+ (load oi) 1))
+                (continue))))
+    (load constrained)))
+
+(defn gcm-constrained-early [(n (dyn NodeOps))
+                             (early (dyn NodeOps))
+                             (late (dyn NodeOps))] (-> (dyn NodeOps))
+  (match (mach-of n)
+    (None [] early)
+    (Some [mach]
+          (match (m-outregmap mach)
+            (None [] early)
+            (Some [out]
+                  (if (not (mask-singleton? out))
+                      early
+                      (let [reg (mask-first out)
+                            (mut cur-id) (n-nid late)
+                            (mut answer-id) (n-nid early)
+                            (mut done) false
+                            (mut guard) 0]
+                        ;; Final Simple stops a singleton-register definition at the first CFG node
+                        ;; on late->early whose operand mask admits that same register. Hoisting it
+                        ;; above that use would create a long, necessarily conflicting fixed range.
+                        (loop (if (load done)
+                                  (break 0)
+                                  (let [cur
+                                          (match (arena-node (load cur-id))
+                                            (Some [x] x)
+                                            (None [] (unreachable-node)))]
+                                    (if (n-same? cur early)
+                                        (set! (mut done) true)
+                                        (if (gcm-block-constrains-reg? cur reg)
+                                            (do
+                                              (set! (mut answer-id) (n-nid cur))
+                                              (set! (mut done) true))
+                                            (match (cfg-idom-of cur)
+                                              (Some [parent]
+                                                    (set! (mut cur-id)
+                                                          (n-nid (gcm-node-block parent))))
+                                              (None []
+                                                    (do
+                                                      (panic "gcm-constrained-early: late is outside early")
+                                                      (set! (mut done) true))))))
+                                    (set! (mut guard) (+ (load guard) 1))
+                                    (if (> (load guard) 1000000)
+                                        (broken "gcm-constrained-early: dominator walk did not converge")
+                                        0)
+                                    (continue))))
+                        (match (arena-node (load answer-id))
+                          (Some [answer] answer)
+                          (None [] (unreachable-node))))))))))
+
+(defn gcm-best-block [(early (dyn NodeOps))
+                      (late0 (dyn NodeOps))
+                      (who (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [(mut cur-id) (n-nid late0)
+        (mut best-id) (n-nid late0)
+        (mut guard) 0]
+    (loop (let [cur
+                  (match (arena-node (load cur-id))
+                    (Some [n] n)
+                    (None []
+                          (do
+                            (panic-i "gcm-best-block: missing dominator block"
+                                     (load cur-id))
+                            (unreachable-node))))]
+            (if (n-same? cur early)
+                (break 0)
+                (if (> (load guard) 1000000)
+                    (do
+                      (broken "gcm-best-block: dominator walk did not reach early bound")
+                      (break 0))
+                    (match (cfg-idom-of cur)
+                      (Some [parent0]
+                            (let [parent (gcm-node-block parent0)
+                                  best
+                                    (match (arena-node (load best-id))
+                                      (Some [n] n)
+                                      (None [] (unreachable-node)))]
+                              (if (gcm-better? parent best)
+                                  (set! (mut best-id) (n-nid parent))
+                                  0)
+                              (set! (mut cur-id) (n-nid parent))
+                              (set! (mut guard) (+ (load guard) 1))
+                              (continue)))
+                      (None []
+                            (do
+                              (n-panic! "gcm-best-block: late block is not dominated by early block"
+                                        who)
+                              (break 0))))))))
+    (match (arena-node (load best-id))
+      (Some [best] best)
+      (None [] (unreachable-node)))))
+
+(defn gcm-place-late! [(n (dyn NodeOps))] (-> i64)
+  (let [early
+          (match (arena-node (n-early-nid n))
+            (Some [block] block)
+            (None []
+                  (do
+                    (panic-i "gcm-place-late!: missing early block"
+                             (n-early-nid n))
+                    (unreachable-node))))]
+    (match (gcm-late-lca n)
+      (Some [late]
+            (let [bounded
+                    (match (mem-of n)
+                      (Some [access]
+                            (if (mem-is-load? access)
+                                (gcm-find-anti-dep late n early)
+                                late))
+                      (None [] late))
+                  constrained-early (gcm-constrained-early n early bounded)
+                  best (gcm-best-block constrained-early bounded n)]
+              (n-set-def! n 0 (Some best))
+              (n-set-block-nid! n (n-nid best))))
+      ;; A selected value without a selected use is retained only by a keep edge. Its early block
+      ;; is the shortest legal lifetime and is already installed.
+      (None [] 0))))
+
+(defstruct GcmLateStats
+  [(pushes i64)
+   (pops i64)
+   (use-queries i64)
+   (phi-arms i64)
+   (memory-edges i64)
+   (memory-wakes i64)])
+
+(defstruct GcmMemoryWaits
+  [(heads (ArrayList i64)) (next (ArrayList i64)) (pending (ArrayList i64))])
+
+(defn gcm-memory-waits [] (-> (ptr GcmMemoryWaits))
+  (compiler-state [GcmMemoryWaits] (primitive/alloc-static CompilerStateSlot)))
+
+(defn gcm-memory-clobber? [(n (dyn NodeOps))] (-> bool)
+  (match (mem-of n)
+    (Some [access] (not (mem-is-load? access)))
+    (None [] (let [op (gcm-ideal-op n)] (or (= op OP-CALL) (= op OP-MEMPHI))))))
+
+;; Index only memory definitions actually consumed by a selected Load. In particular, a Fun or
+;; a shared scalar constant with thousands of users never triggers a search for memory waiters.
+(defn gcm-memory-waits-begin! [(limit i64)] (-> i64)
+  (let [state (gcm-memory-waits)
+        a (compiler-allocator)
+        (mut groups) (al-new [i64] a)
+        (mut i) 0]
+    (set! (.heads state) (al-new [i64] a))
+    (set! (.next state) (al-new [i64] a))
+    (set! (.pending state) (al-new [i64] a))
+    (loop (if (>= (load i) limit)
+              (break 0)
+              (do
+                (push! [i64] (mut (.heads state)) -1)
+                (push! [i64] (mut (.next state)) -1)
+                (push! [i64] (mut (.pending state)) 0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (set! (mut i) 1)
+    (loop (if (>= (load i) limit)
+              (break 0)
+              (do
+                (match (arena-node (load i))
+                  (Some [n]
+                        (if (gcm-selected-reachable? n)
+                            (match (mem-of n)
+                              (Some [access]
+                                    (if (mem-is-load? access)
+                                        (let [memory (n-nid (mem-in access))
+                                              head (get (.heads state) memory)]
+                                          (if (= head -1)
+                                              (push! [i64] (mut groups) memory)
+                                              0)
+                                          (set! (mut (.next state))
+                                                (n-nid n)
+                                                head)
+                                          (set! (mut (.heads state))
+                                                memory
+                                                (n-nid n)))
+                                        0))
+                              (None [] 0))
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (al-for [id (load groups)]
+            (let [memory
+                    (match (arena-node id)
+                      (Some [n] n)
+                      (None [] (unreachable-node)))
+                  (mut oi) 0]
+              (loop (if (>= (load oi) (n-nouts memory))
+                        (break 0)
+                        (do
+                          (set! (.memory-edges (gcm-late-stats))
+                                (+ (.memory-edges (gcm-late-stats)) 1))
+                          (match (n-out memory (load oi))
+                            (Some [use_]
+                                  (if (and (gcm-selected-reachable? use_)
+                                           (gcm-memory-clobber? use_))
+                                      (set! (mut (.pending state))
+                                            id
+                                            (+ (get (.pending state) id) 1))
+                                      0))
+                            (None [] 0))
+                          (set! (mut oi) (+ (load oi) 1))
+                          (continue))))))
+    (al-free! (mut groups))
+    0))
+
+(defn gcm-memory-waits-end! [] (-> i64)
+  (let [state (gcm-memory-waits)]
+    (al-free! (mut (.heads state)))
+    (al-free! (mut (.next state)))
+    (al-free! (mut (.pending state)))
+    0))
+
+(defn gcm-late-stats [] (-> (ptr GcmLateStats))
+  (compiler-state [GcmLateStats] (primitive/alloc-static CompilerStateSlot)))
+
+(defn gcm-last-late-pushes [] (-> i64)
+  (.pushes (gcm-late-stats)))
+
+(defn gcm-last-late-pops [] (-> i64)
+  (.pops (gcm-late-stats)))
+
+(defn gcm-late-push! [(n (dyn NodeOps))
+                      (done (mut (ArrayList bool)))
+                      (on (mut (ArrayList bool)))
+                      (work (mut (ArrayList i64)))] (-> i64)
+  (let [id (n-nid n)]
+    (if (or (>= id (len (load done)))
+            (get (load done) id)
+            (get (load on) id)
+            (not (gcm-selected-reachable? n)))
+        0
+        (do
+          (set! (mut on) id true)
+          (push! [i64] (mut work) id)
+          (set! (.pushes (gcm-late-stats)) (+ (.pushes (gcm-late-stats)) 1))
+          1))))
+
+(defn gcm-late-wake-defs! [(n (dyn NodeOps))
+                           (done (mut (ArrayList bool)))
+                           (on (mut (ArrayList bool)))
+                           (work (mut (ArrayList i64)))] (-> i64)
+  (let [(mut i) 0
+        state (gcm-memory-waits)
+        clobber (gcm-memory-clobber? n)]
+    (loop (if (>= (load i) (n-nins n))
+              (break 0)
+              (do
+                (match (n-in n (load i))
+                  (Some [def]
+                        (do
+                          (gcm-late-push! def (mut done) (mut on) (mut work))
+                          (if (and clobber
+                                   (>= (get (.heads state) (n-nid def)) 0))
+                              (let [memory (n-nid def)
+                                    old (get (.pending state) memory)]
+                                (if (<= old 0)
+                                    (broken "gcm-late-wake-defs!: memory pending count underflow")
+                                    0)
+                                (set! (mut (.pending state)) memory (- old 1))
+                                (if (= old 1)
+                                    (let [(mut id) (get (.heads state) memory)]
+                                      (loop (if (< (load id) 0)
+                                                (break 0)
+                                                (do
+                                                  (set! (.memory-wakes (gcm-late-stats))
+                                                        (+ (.memory-wakes (gcm-late-stats))
+                                                           1))
+                                                  (match (arena-node (load id))
+                                                    (Some [load_]
+                                                          (gcm-late-push! load_
+                                                                          (mut done)
+                                                                          (mut on)
+                                                                          (mut work)))
+                                                    (None []
+                                                          (broken "gcm-late-wake-defs!: missing waiting Load")))
+                                                  (set! (mut id)
+                                                        (get (.next state)
+                                                             (load id)))
+                                                  (continue)))))
+                                    0))
+                              0)))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (if (= (gcm-ideal-op n) OP-LOOP)
+        (let [(mut oi) 0]
+          (loop (if (>= (load oi) (n-nouts n))
+                    (break 0)
+                    (do
+                      (match (n-out n (load oi))
+                        (Some [use_]
+                              (if (gcm-selected-phi? use_)
+                                  (gcm-late-push! use_
+                                                  (mut done)
+                                                  (mut on)
+                                                  (mut work))
+                                  0))
+                        (None [] 0))
+                      (set! (mut oi) (+ (load oi) 1))
+                      (continue)))))
+        0)
+    0))
+
+(defn gcm-schedule-late! [] (-> i64)
+  (let [a (compiler-allocator)
+        (mut done) (al-new [bool] a)
+        (mut on) (al-new [bool] a)
+        (mut work) (al-new [i64] a)
+        limit (+ (arena-node-count) 1)
+        (mut i) 0]
+    (gcm-dom-begin!)
+    (loop (if (>= (load i) limit)
+              (break 0)
+              (do
+                (push! [bool] (mut done) false)
+                (push! [bool] (mut on) false)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (set! (.pushes (gcm-late-stats)) 0)
+    (set! (.pops (gcm-late-stats)) 0)
+    (set! (.use-queries (gcm-late-stats)) 0)
+    (set! (.phi-arms (gcm-late-stats)) 0)
+    (set! (.memory-edges (gcm-late-stats)) 0)
+    (set! (.memory-wakes (gcm-late-stats)) 0)
+    (gcm-memory-waits-begin! limit)
+    ;; Final Simple's sparse backwards walk: Stop is the only seed. A completed use wakes its defs;
+    ;; a completed memory use additionally wakes Loads sharing that memory definition.
+    (gcm-late-push! (code-stop) (mut done) (mut on) (mut work))
+    (loop (match (pop! [i64] (mut work))
+            (None [] (break 0))
+            (Some [id]
+                  (do
+                    (set! (mut on) id false)
+                    (set! (.pops (gcm-late-stats))
+                          (+ (.pops (gcm-late-stats)) 1))
+                    (if (get (load done) id)
+                        0
+                        (match (arena-node id)
+                          (Some [n]
+                                (if (or (cfg? n)
+                                        (is-pinned? n)
+                                        (gcm-late-ready? n (mut done)))
+                                    (do
+                                      (if (or (cfg? n) (is-pinned? n))
+                                          0
+                                          (gcm-place-late! n))
+                                      (set! (mut done) id true)
+                                      (gcm-late-wake-defs! n
+                                                           (mut done)
+                                                           (mut on)
+                                                           (mut work)))
+                                    0))
+                          (None [] 0)))
+                    (continue)))))
+    (if (code-time?)
+        (do
+          (println "aot gcm: {} use queries; {} Phi arms visited"
+                   (.use-queries (gcm-late-stats))
+                   (.phi-arms (gcm-late-stats)))
+          0)
+        0)
+    (if (code-time?)
+        (do
+          (println "aot gcm dominators: {} indexed queries; {} lifting steps"
+                   (.queries (gcm-dom-index))
+                   (.steps (gcm-dom-index)))
+          0)
+        0)
+    (set! (.active (gcm-dom-index)) false)
+    (gcm-memory-waits-end!)
+    0))
+
+;; The block in which `use_` consumes `n`. For a Phi arm this is the matching Region PREDECESSOR,
+;; not the Phi's own block.
+(defn gcm-use-block [(n (dyn NodeOps)) (use_ (dyn NodeOps))] (-> (dyn NodeOps))
+  (set! (.use-queries (gcm-late-stats)) (+ (.use-queries (gcm-late-stats)) 1))
+  (if (not (gcm-selected-phi? use_))
+      (gcm-node-block use_)
+      (let [region (n-in! use_ 0)
+            (mut found) (None [(dyn NodeOps)])
+            (mut i) 1]
+        (loop (if (>= (load i) (n-nins use_))
+                  (break 0)
+                  (do
+                    (set! (.phi-arms (gcm-late-stats))
+                          (+ (.phi-arms (gcm-late-stats)) 1))
+                    (match (n-in use_ (load i))
+                      (Some [arm]
+                            (if (n-same? arm n)
+                                (match (n-in region (load i))
+                                  (Some [pred]
+                                        (set! (mut found)
+                                              (gcm-idom-lca (gcm-node-block pred)
+                                                            (load found))))
+                                  (None []
+                                        (panic-i "gcm-use-block: Phi arm has no Region predecessor"
+                                                 (load i))))
+                                0))
+                      (None [] 0))
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        (match (load found)
+          (Some [block]
+                ;; The dominator LCA of sibling projection blocks is their If tail. Instructions
+                ;; cannot be left on a tail, so normalize to the tail's containing block now.
+                (gcm-node-block block))
+          (None []
+                (do
+                  (panic-i "gcm-use-block: value is not a Phi arm" (n-nid n))
+                  (unreachable-node)))))))
+
+;; Least loop depth first, then deepest idepth. Never leaves a node on an If.
+(defn gcm-better? [(lca (dyn NodeOps)) (best (dyn NodeOps))] (-> bool)
+  (or (< (looptree-depth-of lca) (looptree-depth-of best))
+      (= (gcm-ideal-op lca) OP-NEVER)
+      (> (cfg-idepth-of lca) (cfg-idepth-of best))
+      (= (gcm-ideal-op best) OP-IF)))
+
+;; Pull the LCA up so this Load stays above every Store on the same alias class.
+(defn gcm-anti-raise-at [(load_ (dyn NodeOps))
+                         (block (dyn NodeOps))
+                         (lca (dyn NodeOps))] (-> (dyn NodeOps))
+  (if (!= (n-anti block) (n-nid load_))
+      lca
+      (match (gcm-idom-lca block (Some lca))
+        (Some [x] (gcm-node-block x))
+        (None []
+              (do
+                (panic "gcm-anti-raise-at: conflict has no common dominator")
+                (unreachable-node))))))
+
+(defn gcm-anti-raise [(load_ (dyn NodeOps))
+                      (conflict (dyn NodeOps))
+                      (lca (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [block (gcm-node-block conflict)
+        raised (gcm-anti-raise-at load_ block lca)]
+    (if (and (n-same? raised block) (not (n-has? (.ins (hdr conflict)) load_)))
+        (n-add-def! conflict (Some load_))
+        0)
+    raised))
+
+(defn gcm-find-anti-dep [(lca (dyn NodeOps))
+                         (load_ (dyn NodeOps))
+                         (early (dyn NodeOps))] (-> (dyn NodeOps))
+  (match (mem-of load_)
+    (None []
+          (do
+            (panic "gcm-find-anti-dep: node is not a memory access")
+            (unreachable-node)))
+    (Some [load-access]
+          (if (not (mem-is-load? load-access))
+              (do
+                (panic "gcm-find-anti-dep: memory access is not a Load")
+                (unreachable-node))
+              (let [(mut cur-id) (n-nid lca)
+                    (mut raised-id) (n-nid lca)
+                    (mut done-marking) false
+                    (mut guard) 0]
+                ;; Candidate blocks are the legal dominator path from use-LCA through early.
+                (loop (if (load done-marking)
+                          (break 0)
+                          (let [cur
+                                  (match (arena-node (load cur-id))
+                                    (Some [x] x)
+                                    (None [] (unreachable-node)))]
+                            (n-set-anti! cur (n-nid load_))
+                            (if (n-same? cur early)
+                                (set! (mut done-marking) true)
+                                (match (cfg-idom-of cur)
+                                  (Some [parent]
+                                        (set! (mut cur-id)
+                                              (n-nid (gcm-node-block parent))))
+                                  (None []
+                                        (do
+                                          (panic "gcm-find-anti-dep: LCA is outside early bound")
+                                          (set! (mut done-marking) true)))))
+                            (set! (mut guard) (+ (load guard) 1))
+                            (if (> (load guard) 1000000)
+                                (broken "gcm-find-anti-dep: dominator marking did not converge")
+                                0)
+                            (continue))))
+                (let [memory (mem-in load-access)
+                      (mut i) 0]
+                  (loop (if (>= (load i) (n-nouts memory))
+                            (break 0)
+                            (do
+                              (match (n-out memory (load i))
+                                (Some [use_]
+                                      (if (or (n-same? use_ load_)
+                                              (not (gcm-selected-reachable? use_)))
+                                          0
+                                          (let [op (gcm-ideal-op use_)
+                                                conflict
+                                                  (match (mem-of use_)
+                                                    (Some [other]
+                                                          (and (not (mem-is-load? other))
+                                                               (= (mem-alias other)
+                                                                  (mem-alias load-access))))
+                                                    (None [] (= op OP-CALL)))]
+                                            (if conflict
+                                                (let [current
+                                                        (match (arena-node (load raised-id))
+                                                          (Some [x] x)
+                                                          (None []
+                                                                (unreachable-node)))
+                                                      raised
+                                                        (gcm-anti-raise load_
+                                                                        use_
+                                                                        current)]
+                                                  (set! (mut raised-id)
+                                                        (n-nid raised)))
+                                                (if (= op OP-MEMPHI)
+                                                    (let [region (n-in! use_ 0)
+                                                          (mut arm) 1]
+                                                      (loop (if (>= (load arm)
+                                                                    (n-nins use_))
+                                                                (break 0)
+                                                                (do
+                                                                  (match (n-in use_
+                                                                               (load arm))
+                                                                    (Some [state]
+                                                                          (if (n-same? state
+                                                                                       memory)
+                                                                              (match (n-in region
+                                                                                           (load arm))
+                                                                                (Some [pred]
+                                                                                      (let [current
+                                                                                              (match (arena-node (load raised-id))
+                                                                                                (Some [x]
+                                                                                                      x)
+                                                                                                (None []
+                                                                                                      (unreachable-node)))
+                                                                                            raised
+                                                                                              (gcm-anti-raise-at load_
+                                                                                                                 (gcm-node-block pred)
+                                                                                                                 current)]
+                                                                                        (set! (mut raised-id)
+                                                                                              (n-nid raised))))
+                                                                                (None []
+                                                                                      (panic-i "gcm-find-anti-dep: MemPhi arm has no predecessor"
+                                                                                               (load arm))))
+                                                                              0))
+                                                                    (None [] 0))
+                                                                  (set! (mut arm)
+                                                                        (+ (load arm)
+                                                                           1))
+                                                                  (continue)))))
+                                                    0)))))
+                                (None [] 0))
+                              (set! (mut i) (+ (load i) 1))
+                              (continue)))))
+                (match (arena-node (load raised-id))
+                  (Some [answer] answer)
+                  (None [] (unreachable-node))))))))

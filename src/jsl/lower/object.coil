@@ -1,0 +1,264 @@
+;; Lowering of allocation: ordinary and shaped objects, and string literals as UTF-16 units.
+
+(module aot.jsl.lower.object)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.str" :as str)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.reader" :as rd)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.property" :use *)
+(import "aot.shape" :use *)
+(import "aot.type.type" :use *)
+(import "aot.jsl.lower.expr" :use *)
+
+(defn jsl-lower-new-object [(ctrl (dyn NodeOps)) (mem (dyn NodeOps))] (-> JslExprResult)
+  (let [fresh
+          (new-make ctrl
+                    (con-int OBJECT-PAYLOAD-BYTES)
+                    mem
+                    SHAPE-EMPTY
+                    (ty-struct "JsObjectPayload"))
+        ptr_ (proj-make fresh 0 "jsl.new-object.ptr")
+        private-memory (proj-make fresh 1 "jsl.new-object.private-memory")
+        null-value (dyn-null-make)
+        prototype-state
+          (store-make ctrl
+                      private-memory
+                      ptr_
+                      (con-int OFFSET-OBJECT-PROTOTYPE)
+                      null-value
+                      ALIAS-OBJECT-PROTOTYPE
+                      (ty-dyn TAG-ANY))
+        properties-state
+          (store-make ctrl
+                      prototype-state
+                      ptr_
+                      (con-int OFFSET-OBJECT-PROPERTIES)
+                      null-value
+                      ALIAS-OBJECT-PROPERTIES
+                      (ty-dyn TAG-ANY))
+        merged (memmerge-make)]
+    (memmerge-set-alias! merged ALIAS-BULK mem)
+    (memmerge-set-alias! merged ALIAS-OBJECT-PROTOTYPE prototype-state)
+    (memmerge-set-alias! merged ALIAS-OBJECT-PROPERTIES properties-state)
+    (jsl-expr-result ptr_ ctrl merged)))
+
+;; Final Simple Parser.makeAllocator allocates the complete TypeStruct once, obtains its private
+;; memory projection, runs initialization, then publishes that memory. A JS literal likewise has
+;; a known final layout when all keys are fixed. Unlike Simple, its values are arbitrary JS
+;; expressions: initialize every GC-visible slot to undefined before evaluating any of them.
+;; The object stays unpublished until the literal finishes; pre-created own keys are therefore
+;; unobservable. Calls can lose the static backing proof, but the runtime still sees the final
+;; backing and updates it in place. Never turn the compiler-local layout operand into a runtime
+;; integer: New carries the layout through the existing image shape-remapping machinery.
+(defn jsl-lower-new-shaped-object [(ctrl (dyn NodeOps))
+                                   (mem (dyn NodeOps))
+                                   (layout (dyn NodeOps))] (-> JslExprResult)
+  (let [t (n-ty layout)]
+    (if (not (and (ty-int? t) (ty-constant? t)))
+        (panic "%NewObjectWithShape: layout must be a compiler constant")
+        0)
+    (let [shape (ty-int-lo t)]
+      (if (or (not (shape-valid? shape)) (= shape SHAPE-STRING))
+          (panic "%NewObjectWithShape: invalid object property layout")
+          0)
+      (if (not (shape-extensible? shape))
+          (panic "%NewObjectWithShape: literal layout must be extensible")
+          0)
+      (let [(mut row) shape]
+        (loop (if (= (load row) SHAPE-EMPTY)
+                  (break 0)
+                  (do
+                    (if (!= (get (.attrs (shape-table)) (load row))
+                            SHAPE-ATTRS-DEFAULT)
+                        (panic "%NewObjectWithShape: literal layout requires default data attributes")
+                        0)
+                    (set! (mut row) (get (.parent (shape-table)) (load row)))
+                    (continue)))))
+      (let [raw (jsl-lower-new-object ctrl mem)]
+        (if (= shape SHAPE-EMPTY)
+            raw
+            (let [(mut initial) (al-new [(dyn NodeOps)] (compiler-allocator))
+                  (mut i) 0]
+              (loop (if (>= (load i) (shape-field-count shape))
+                        (break 0)
+                        (do
+                          (push! (mut initial) (dyn-undefined-make))
+                          (set! (mut i) (+ (load i) 1))
+                          (continue))))
+              (let [storage
+                      (property-storage-new ctrl
+                                            (.mem raw)
+                                            shape
+                                            (load initial))
+                    installed
+                      (property-storage-install ctrl
+                                                (.mem raw)
+                                                (.value raw)
+                                                shape
+                                                storage)]
+                (al-free! (mut initial))
+                (jsl-expr-result (.value raw) ctrl installed))))))))
+
+(defn jsl-utf8-cont [(text (slice u8)) (i i64)] (-> i64)
+  (if (>= i (len text))
+      (do (panic "jsl string: truncated UTF-8") 0)
+      (let [b (primitive/cast i64 (get text i))]
+        (if (!= (& b 0xc0) 0x80)
+            (do (panic "jsl string: invalid UTF-8 continuation") 0)
+            (& b 0x3f)))))
+
+(defn jsl-string-append-utf8! [(text (slice u8)) (units (mut (ArrayList i64)))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len text))
+              (break 0)
+              (let [b0 (primitive/cast i64 (get text (load i)))
+                    (mut cp) 0
+                    (mut width) 1]
+                (if (< b0 0x80)
+                    (set! (mut cp) b0)
+                    (if (= (& b0 0xe0) 0xc0)
+                        (do
+                          (set! (mut cp)
+                                (| (primitive/ishl (& b0 0x1f) 6)
+                                   (jsl-utf8-cont text (+ (load i) 1))))
+                          (set! (mut width) 2)
+                          (if (< (load cp) 0x80)
+                              (panic "jsl string: overlong UTF-8")
+                              0))
+                        (if (= (& b0 0xf0) 0xe0)
+                            (do
+                              (set! (mut cp)
+                                    (| (primitive/ishl (& b0 0x0f) 12)
+                                       (| (primitive/ishl (jsl-utf8-cont text
+                                                                         (+ (load i)
+                                                                            1))
+                                                          6)
+                                          (jsl-utf8-cont text (+ (load i) 2)))))
+                              (set! (mut width) 3)
+                              (if (or (< (load cp) 0x800)
+                                      (and (>= (load cp) 0xd800)
+                                           (<= (load cp) 0xdfff)))
+                                  (panic "jsl string: invalid UTF-8 scalar")
+                                  0))
+                            (if (= (& b0 0xf8) 0xf0)
+                                (do
+                                  (set! (mut cp)
+                                        (| (primitive/ishl (& b0 0x07) 18)
+                                           (| (primitive/ishl (jsl-utf8-cont text
+                                                                             (+ (load i)
+                                                                                1))
+                                                              12)
+                                              (| (primitive/ishl (jsl-utf8-cont text
+                                                                                (+ (load i)
+                                                                                   2))
+                                                                 6)
+                                                 (jsl-utf8-cont text
+                                                                (+ (load i) 3))))))
+                                  (set! (mut width) 4)
+                                  (if (or (< (load cp) 0x10000)
+                                          (> (load cp) 0x10ffff))
+                                      (panic "jsl string: invalid UTF-8 scalar")
+                                      0))
+                                (panic "jsl string: invalid UTF-8 lead byte")))))
+                (if (<= (load cp) 0xffff)
+                    (push! [i64] (mut units) (load cp))
+                    (let [supplement (- (load cp) 0x10000)]
+                      (push! [i64]
+                             (mut units)
+                             (+ 0xd800 (primitive/ishr supplement 10)))
+                      (push! [i64] (mut units) (+ 0xdc00 (& supplement 0x3ff)))))
+                (set! (mut i) (+ (load i) (load width)))
+                (continue))))
+    0))
+
+(defn jsl-string-utf16-units [(text (slice u8))] (-> (ArrayList i64))
+  (let [(mut units) (al-new [i64] (compiler-allocator))]
+    (jsl-string-append-utf8! text (mut units))
+    (load units)))
+
+(defn jsl-lower-string-literal [(text (slice u8))
+                                (ctrl (dyn NodeOps))
+                                (mem (dyn NodeOps))] (-> JslExprResult)
+  (let [(mut units) (jsl-string-utf16-units text)
+        result (jsl-lower-string-units (load units) ctrl mem)]
+    (al-free! [i64] (mut units))
+    result))
+
+;; Both JSL text and decoded source literals enter the same allocation/memory graph. UTF-16
+;; units are not re-encoded as UTF-8: JavaScript permits unpaired surrogate code units.
+;; A string literal is a StrConst: data in the object file, no allocation, no stores, no memory
+;; effect (docs/DECISIONS.md, string literals are data).
+(defn jsl-lower-string-units [(units (ArrayList i64))
+                              (ctrl (dyn NodeOps))
+                              (mem (dyn NodeOps))] (-> JslExprResult)
+  (jsl-expr-result (strconst-make units) ctrl mem))
+
+(defn jsl-lower-string-units-allocated [(units (ArrayList i64))
+                                        (ctrl (dyn NodeOps))
+                                        (mem (dyn NodeOps))] (-> JslExprResult)
+  (let [payload-bytes (+ 8 (* (len units) 2))
+        fresh
+          (new-make ctrl
+                    (con-int payload-bytes)
+                    mem
+                    SHAPE-STRING
+                    (ty-struct "JsStringPayload"))
+        ptr_ (proj-make fresh 0 "jsl.string.ptr")
+        private-memory (proj-make fresh 1 "jsl.string.private-memory")
+        length-state
+          (store-make ctrl
+                      private-memory
+                      ptr_
+                      (con-int 0)
+                      (con-int (len units))
+                      ALIAS-STRING-LENGTH
+                      (ty-int-bot))
+        (mut data-state-nid) (n-nid length-state)
+        (mut unit) 0
+        (mut word-index) 0]
+    (loop (if (>= (load unit) (len units))
+              (break 0)
+              (let [(mut packed) 0
+                    (mut lane) 0]
+                (loop (if (or (>= (load lane) 4)
+                              (>= (+ (load unit) (load lane)) (len units)))
+                          (break 0)
+                          (do
+                            (set! (mut packed)
+                                  (| (load packed)
+                                     (primitive/ishl (get units
+                                                          (+ (load unit)
+                                                             (load lane)))
+                                                     (* (load lane) 16))))
+                            (set! (mut lane) (+ (load lane) 1))
+                            (continue))))
+                (let [stored
+                        (store-make ctrl
+                                    (jsl-node (load data-state-nid))
+                                    ptr_
+                                    (con-int (+ 8 (* (load word-index) 8)))
+                                    (con-int (load packed))
+                                    ALIAS-STRING-DATA
+                                    (ty-int-bot))]
+                  (set! (mut data-state-nid) (n-nid stored)))
+                (set! (mut unit) (+ (load unit) 4))
+                (set! (mut word-index) (+ (load word-index) 1))
+                (continue))))
+    (let [merged (memmerge-make)]
+      (memmerge-set-alias! merged ALIAS-BULK mem)
+      (memmerge-set-alias! merged ALIAS-STRING-LENGTH length-state)
+      (if (> (len units) 0)
+          (memmerge-set-alias! merged
+                               ALIAS-STRING-DATA
+                               (jsl-node (load data-state-nid)))
+          0)
+      (jsl-expr-result ptr_ ctrl merged))))

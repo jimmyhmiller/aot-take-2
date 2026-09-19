@@ -1,0 +1,316 @@
+;; Breaking up Start-pinned globals: one clone per using function, so a constant is not live across every call.
+
+(module aot.codegen.gcm.globals)
+(import "aot.util.arena"
+        :use
+        [compiler-allocator compiler-state CompilerStateSlot])
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.codegen.codegen" :use *)
+(import "aot.codegen.machine" :use *)
+(import "aot.codegen.gcm" :use [gcm-ideal-op gcm-node-block])
+
+;; Give each function its own copy of any constant shared across functions.
+(defn gcm-start-pinned-global? [(n (dyn NodeOps))] (-> bool)
+  (and (not (cfg? n))
+       (and (> (n-nins n) 0)
+            (match (n-in n 0)
+              (Some [ctrl]
+                    (and (= (gcm-ideal-op ctrl) OP-START)
+                         (match (mach-of n)
+                           (Some [mach]
+                                 (and (m-clone-cheap? mach)
+                                      (match (m-outregmap mach)
+                                        (Some [_] true)
+                                        (None [] false))))
+                           (None [] false))))
+              (None [] false)))))
+
+(defn gcm--fun? [(n (dyn NodeOps))] (-> bool)
+  (= (gcm-ideal-op n) OP-FUN))
+
+(defn gcm-enclosing-fun [(n (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (cfg-owner-fun n (primitive/fnptr-of gcm--fun?)))
+
+(defn gcm-use-fun [(use_ (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (if (= (n-block-nid use_) 0)
+      (None [(dyn NodeOps)])
+      (let [block (gcm-node-block use_)]
+        (if (n-same? block (code-start))
+            (None [(dyn NodeOps)])
+            (gcm-enclosing-fun block)))))
+
+;; Machine clones are born with an input-only copy used by instruction selection. That temporary
+;; representation has no matching output edges. Normalize it before installing registered edges,
+;; exactly as Simple normalizes both of its possible Node.copy shapes.
+(defn gcm-clear-clone-inputs! [(n (dyn NodeOps))] (-> i64)
+  (do
+    (if (!= (n-nouts n) 0)
+        (broken "gcm-clear-clone-inputs!: fresh clone already has output edges")
+        0)
+    (loop (if (= (n-nins n) 0)
+              (break 0)
+              (do (pop! (mut (.ins (hdr n)))) (continue))))
+    0))
+
+(defn gcm-clone-input-for-fun [(def_ (dyn NodeOps))
+                               (fun (dyn NodeOps))
+                               (memo (mut (ArrayList (Option (dyn NodeOps)))))] (-> (dyn NodeOps))
+  (if (gcm-start-pinned-global? def_)
+      (gcm-clone-global-for-fun def_ fun (mut memo))
+      def_))
+
+;; The clone memo (node id -> clone) is one arena-sized scratch, cleared through the ids it set:
+;; a fresh arena-sized table per shared global constant was the largest cost of the GCM phase.
+(defstruct GcmMemoScratch
+  [(memo (ArrayList (Option (dyn NodeOps))))
+   (touched (ArrayList i64))
+   (booted bool)])
+
+(defn gcm-memo-state [] (-> (ptr GcmMemoScratch))
+  (let [t
+          (compiler-state [GcmMemoScratch]
+                          (primitive/alloc-static CompilerStateSlot))]
+    (if (.booted t)
+        t
+        (let [a (compiler-allocator)]
+          (set! (.memo t) (al-new [(Option (dyn NodeOps))] a))
+          (set! (.touched t) (al-new [i64] a))
+          (set! (.booted t) true)
+          t))))
+
+;; The cleared scratch, grown to the arena. Returned by value: the ArrayList handles alias the
+;; state's storage only through `gcm-memo-set!`, which writes through the state.
+(defn gcm-memo-scratch! [] (-> (ArrayList (Option (dyn NodeOps))))
+  (let [t (gcm-memo-state)
+        limit (+ (arena-node-count) 1)
+        (mut i) 0]
+    (loop (if (>= (load i) (len (.touched t)))
+              (break 0)
+              (do
+                (set! (mut (.memo t))
+                      (get (.touched t) (load i))
+                      (None [(dyn NodeOps)]))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (al-clear! [i64] (mut (.touched t)))
+    (loop (if (>= (len (.memo t)) limit)
+              (break 0)
+              (do
+                (push! [(Option (dyn NodeOps))]
+                       (mut (.memo t))
+                       (None [(dyn NodeOps)]))
+                (continue))))
+    (.memo t)))
+
+(defn gcm-memo-set! [(nid i64) (copy (dyn NodeOps))] (-> i64)
+  (let [t (gcm-memo-state)]
+    (set! (mut (.memo t)) nid (Some copy))
+    (push! [i64] (mut (.touched t)) nid)
+    0))
+
+(defn gcm-clone-global-for-fun [(con (dyn NodeOps))
+                                (fun (dyn NodeOps))
+                                (memo (mut (ArrayList (Option (dyn NodeOps)))))] (-> (dyn NodeOps))
+  (match (get (load memo) (n-nid con))
+    (Some [copy] copy)
+    (None []
+          (let [copy
+                  (match (mach-of con)
+                    (Some [mach]
+                          (match (m-clone mach)
+                            (Some [clone] clone)
+                            (None []
+                                  (do
+                                    (panic-i "gcm-clone-global-for-fun: global is not cloneable"
+                                             (n-nid con))
+                                    (unreachable-node)))))
+                    (None []
+                          (do
+                            (panic-i "gcm-clone-global-for-fun: global is not a machine node"
+                                     (n-nid con))
+                            (unreachable-node))))]
+            ;; Memoize before following inputs: global materialization chains need cycle safety for
+            ;; the same reason as Simple's IdentityHashMap-based recursive clone.
+            (gcm-memo-set! (n-nid con) copy)
+            (gcm-clear-clone-inputs! copy)
+            (n-add-def! copy (Some fun))
+            ;; This clone is created after schedEarly. Our graph caches Simple's cfg0-derived early
+            ;; placement explicitly, so install the same fact that the new control edge represents.
+            (n-set-block-nid! copy (n-nid fun))
+            (n-set-early-nid! copy (n-nid fun))
+            (let [(mut i) 1]
+              (loop (if (>= (load i) (n-nins con))
+                        (break 0)
+                        (do
+                          (match (n-in con (load i))
+                            (Some [def_]
+                                  (n-add-def! copy
+                                              (Some (gcm-clone-input-for-fun def_
+                                                                             fun
+                                                                             (mut memo)))))
+                            (None [] (n-add-def! copy (None [(dyn NodeOps)]))))
+                          (set! (mut i) (+ (load i) 1))
+                          (continue)))))
+            copy))))
+
+(defn gcm-global-users-splittable? [(con (dyn NodeOps))] (-> bool)
+  ;; Final Simple's `breakUpGlobalConstantSingle` returns immediately when an unowned user is not
+  ;; another explicitly Start-pinned global. Preserve that result across this separate scan instead
+  ;; of merely breaking the loop and then continuing with function reparenting.
+  ;;
+  ;; A dependent global is split first, and Simple then takes it as owned. It is not necessarily:
+  ;; it stays at Start when one of ITS users is an unowned node that is not a global (a Start-level
+  ;; instruction of the entry), or when it has no function user at all. Moving `con` into the one
+  ;; function that uses it directly would then put a Start-level user outside its dominance (found
+  ;; by the test262 campaign: the boxed global object, used at Start and in one function, once a
+  ;; folded `if` let the Box be shared). A dependent that remains at Start keeps `con` at Start.
+  (let [(mut i) 0
+        (mut splittable) true]
+    (loop (if (or (>= (load i) (n-nouts con)) (not (load splittable)))
+              (break 0)
+              (do
+                (match (n-out con (load i))
+                  (Some [use_]
+                        (match (gcm-use-fun use_)
+                          (Some [_] 0)
+                          (None []
+                                (if (gcm-start-pinned-global? use_)
+                                    (do
+                                      (gcm-break-up-global! use_)
+                                      (if (gcm-start-pinned-global? use_)
+                                          (set! (mut splittable) false)
+                                          0))
+                                    (set! (mut splittable) false)))))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load splittable)))
+
+(defn gcm-break-up-global! [(con (dyn NodeOps))] (-> i64)
+  (if (not (gcm-global-users-splittable? con))
+      0
+      (do
+        (loop (let [(mut fun) (None [(dyn NodeOps)])
+                    (mut shared) false
+                    (mut i) 0]
+                (loop (if (or (>= (load i) (n-nouts con)) (load shared))
+                          (break 0)
+                          (do
+                            (match (n-out con (load i))
+                              (Some [use_]
+                                    (match (gcm-use-fun use_)
+                                      (Some [owner]
+                                            (match (load fun)
+                                              (Some [first]
+                                                    (if (n-same? first owner)
+                                                        0
+                                                        (set! (mut shared) true)))
+                                              (None []
+                                                    (set! (mut fun)
+                                                          (Some owner)))))
+                                      (None [] 0)))
+                              (None [] 0))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (match (load fun)
+                  (None [] (break 0))
+                  (Some [owner]
+                        (if (not (load shared))
+                            (do
+                              (n-set-def! con 0 (Some owner))
+                              (n-set-block-nid! con (n-nid owner))
+                              (n-set-early-nid! con (n-nid owner))
+                              (break 0))
+                            (let [(mut memo) (gcm-memo-scratch!)
+                                  (mut j) 0]
+                              (let [copy
+                                      (gcm-clone-global-for-fun con
+                                                                owner
+                                                                (mut memo))]
+                                (set! (mut j) 0)
+                                (loop (if (>= (load j) (n-nouts con))
+                                          (break 0)
+                                          (match (n-out con (load j))
+                                            (Some [use_]
+                                                  (match (gcm-use-fun use_)
+                                                    (Some [use-owner]
+                                                          (if (n-same? use-owner
+                                                                       owner)
+                                                              (let [(mut k) 0]
+                                                                (loop (if (>= (load k)
+                                                                              (n-nins use_))
+                                                                          (break 0)
+                                                                          (match (n-in use_
+                                                                                       (load k))
+                                                                            (Some [input]
+                                                                                  (if (n-same? input
+                                                                                               con)
+                                                                                      (do
+                                                                                        (n-set-def! use_
+                                                                                                    (load k)
+                                                                                                    (Some copy))
+                                                                                        (break 0))
+                                                                                      (do
+                                                                                        (set! (mut k)
+                                                                                              (+ (load k)
+                                                                                                 1))
+                                                                                        (continue))))
+                                                                            (None []
+                                                                                  (do
+                                                                                    (set! (mut k)
+                                                                                          (+ (load k)
+                                                                                             1))
+                                                                                    (continue)))))))
+                                                              (set! (mut j)
+                                                                    (+ (load j)
+                                                                       1))))
+                                                    (None []
+                                                          (set! (mut j)
+                                                                (+ (load j) 1)))))
+                                            (None []
+                                                  (set! (mut j) (+ (load j) 1)))))))))))))
+        0)))
+
+(defn gcm-break-up-start-globals! [(start (dyn NodeOps))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (n-nouts start))
+              (break 0)
+              (match (n-out start (load i))
+                (Some [con]
+                      (if (gcm-start-pinned-global? con)
+                          (let [before (n-nins con)]
+                            (gcm-break-up-global! con)
+                            (if (or (= (n-nins con) 0)
+                                    (not (gcm-start-pinned-global? con))
+                                    (!= before (n-nins con)))
+                                0
+                                (set! (mut i) (+ (load i) 1))))
+                          (set! (mut i) (+ (load i) 1))))
+                (None [] (set! (mut i) (+ (load i) 1))))))
+    0))
+
+(defn gcm-break-up-globals! [] (-> i64)
+  (let [limit (+ (arena-node-count) 1)
+        (mut nid) 1]
+    ;; Simple has one compilation Start. This compiler also has library-declaration Starts whose
+    ;; pure constants can remain reachable after their functions are attached to the unit Start.
+    ;; Treat every selected Start as the same global-placement boundary.
+    (loop (if (>= (load nid) limit)
+              (break 0)
+              (do
+                (match (arena-node (load nid))
+                  (Some [n]
+                        (if (= (gcm-ideal-op n) OP-START)
+                            (gcm-break-up-start-globals! n)
+                            0))
+                  (None [] 0))
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))
+    0))

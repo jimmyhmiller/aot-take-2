@@ -1,0 +1,257 @@
+;; Literal islands: planning, placing and emitting f64 pools within load range of their uses.
+
+(module aot.codegen.encoding.literal)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.codegen.encoding"
+        :use
+        [ENCODER-HANDLE
+         ENC-LITERAL-CODE-SPAN
+         enc-state
+         enc-ensure-node-capacity!
+         enc-literal-count
+         enc-add8!
+         enc-byte-count
+         enc-add1!
+         enc-add4!
+         enc-read4
+         enc-patch4!
+         enc-op-start
+         enc-ideal-op])
+
+(defn enc-literal-plan-reset! [] (-> i64)
+  (let [state (enc-state)
+        (mut i) 0]
+    (loop (if (>= (load i) (len (.literal-sources state)))
+              (break 0)
+              (do
+                (set! (mut (.literal-indices state))
+                      (get (.literal-sources state) (load i))
+                      -1)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (al-clear! [i64] (mut (.literal-sources state)))
+    (al-clear! [i64] (mut (.literal-bits state)))
+    (al-clear! [i64] (mut (.literal-offsets state)))
+    (al-clear! [bool] (mut (.literal-emitted state)))
+    (al-clear! [i64] (mut (.island-before-sources state)))
+    (al-clear! [i64] (mut (.island-first-literals state)))
+    (al-clear! [i64] (mut (.island-literal-counts state)))
+    (al-clear! [i64] (mut (.island-offsets state)))
+    (al-clear! [i64] (mut (.island-sizes state)))
+    0))
+
+(defn enc-plan-literal! [(source (dyn NodeOps)) (bits i64)] (-> i64)
+  (let [state (enc-state)
+        idx (len (.literal-sources state))]
+    (enc-ensure-node-capacity! source)
+    (if (>= (get (.literal-indices state) (n-nid source)) 0)
+        (panic-i "enc-plan-literal!: machine node requests several literals"
+                 (n-nid source))
+        0)
+    (set! (mut (.literal-indices state)) (n-nid source) idx)
+    (push! [i64] (mut (.literal-sources state)) (n-nid source))
+    (push! [i64] (mut (.literal-bits state)) bits)
+    (push! [i64] (mut (.literal-offsets state)) -1)
+    (push! [bool] (mut (.literal-emitted state)) false)
+    0))
+
+(defn enc-plan-literal-island! [(before-source i64)
+                                (first-literal i64)
+                                (cursor (mut i64))
+                                (seen (mut (HashMap i64 i64)))] (-> i64)
+  (let [state (enc-state)
+        start (load cursor)
+        end (len (.literal-sources state))
+        (mut data) (+ start 4)
+        (mut i) first-literal]
+    (if (>= first-literal end)
+        (panic-i "enc-plan-literal-island!: empty island" first-literal)
+        0)
+    (hm-clear! [i64 i64] (mut seen))
+    (if (!= (& (load data) 7) 0) (set! (mut data) (+ (load data) 4)) 0)
+    (loop (if (>= (load i) end)
+              (break 0)
+              (let [bits (get (.literal-bits state) (load i))]
+                (match (get (load seen) bits)
+                  (Some [offset]
+                        (set! (mut (.literal-offsets state)) (load i) offset))
+                  (None []
+                        (do
+                          (set! (mut (.literal-offsets state))
+                                (load i)
+                                (load data))
+                          (set! (mut seen) bits (load data))
+                          (set! (mut data) (+ (load data) 8)))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (push! [i64] (mut (.island-before-sources state)) before-source)
+    (push! [i64] (mut (.island-first-literals state)) first-literal)
+    (push! [i64] (mut (.island-literal-counts state)) (- end first-literal))
+    (push! [i64] (mut (.island-offsets state)) start)
+    (push! [i64] (mut (.island-sizes state)) (- (load data) start))
+    (set! cursor (load data))
+    0))
+
+(defn enc-layout-maybe-literal-island! [(before (dyn NodeOps))
+                                        (cursor (mut i64))
+                                        (pending-first (mut i64))
+                                        (first-source-offset (mut i64))
+                                        (seen (mut (HashMap i64 i64)))] (-> i64)
+  (if (and (>= (load pending-first) 0)
+           (or (= (enc-ideal-op before) OP-FUN)
+               (>= (- (load cursor) (load first-source-offset))
+                   ENC-LITERAL-CODE-SPAN)))
+      (do
+        (enc-plan-literal-island! (n-nid before)
+                                  (load pending-first)
+                                  (mut cursor)
+                                  (mut seen))
+        (set! pending-first -1)
+        (set! first-source-offset -1))
+      0))
+
+(defn enc-literal-island-count [] (-> i64)
+  (len (.island-offsets (enc-state))))
+
+(defn enc-literal-island-offset [(i i64)] (-> i64)
+  (get (.island-offsets (enc-state)) i))
+
+(defn enc-literal-island-size [(i i64)] (-> i64)
+  (get (.island-sizes (enc-state)) i))
+
+(defn enc-emit-literal-island! [(i i64)] (-> i64)
+  (let [state (enc-state)
+        start (get (.island-offsets state) i)
+        size (get (.island-sizes state) i)
+        first (get (.island-first-literals state) i)
+        end (+ first (get (.island-literal-counts state) i))
+        (mut request) first]
+    (if (!= (enc-byte-count) start)
+        (panic-i "enc-emit-literal-island!: emitted offset disagrees with layout"
+                 i)
+        0)
+    (if (or (!= (& size 3) 0) (<= size 4) (> (/ size 4) 33554431))
+        (panic-i "enc-emit-literal-island!: invalid branch-over size" size)
+        0)
+    (enc-add4! ENCODER-HANDLE (| 0x14000000 (/ size 4)))
+    (loop (if (= (& (enc-byte-count) 7) 0)
+              (break 0)
+              (do (enc-add1! ENCODER-HANDLE 0) (continue))))
+    (loop (if (>= (load request) end)
+              (break 0)
+              (let [offset (get (.literal-offsets state) (load request))]
+                ;; The first occurrence of each bit pattern owns the monotonically increasing slot;
+                ;; duplicates point backward to an already-emitted slot in this same island.
+                (if (= offset (enc-byte-count))
+                    (enc-add8! ENCODER-HANDLE
+                               (get (.literal-bits state) (load request)))
+                    (if (> offset (enc-byte-count))
+                        (panic-i "enc-emit-literal-island!: literal plan has a gap"
+                                 offset)
+                        0))
+                (set! (mut request) (+ (load request) 1))
+                (continue))))
+    (if (!= (enc-byte-count) (+ start size))
+        (panic-i "enc-emit-literal-island!: emitted size disagrees with layout"
+                 i)
+        0)
+    0))
+
+(defn enc-emit-literal-islands-before! [(source-nid i64) (next (mut i64))] (-> i64)
+  (loop (if (or (>= (load next) (enc-literal-island-count))
+                (!= (get (.island-before-sources (enc-state)) (load next))
+                    source-nid))
+            (break 0)
+            (do
+              (enc-emit-literal-island! (load next))
+              (set! next (+ (load next) 1))
+              (continue)))))
+
+(defn enc-literal-pools! [] (-> i64)
+  (let [state (enc-state)
+        (mut i) 0]
+    (if (.laid-out state)
+        ;; Complete layout emitted every island in place. Check that every selected LDR registered
+        ;; its planned request instead of silently tolerating an encoder/layout disagreement.
+        (loop (if (>= (load i) (enc-literal-count))
+                  (break 0)
+                  (do
+                    (if (or (not (get (.literal-emitted state) (load i)))
+                            (< (get (.literal-offsets state) (load i)) 0))
+                        (panic-i "enc-literal-pools!: planned literal was not emitted"
+                                 (load i))
+                        0)
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        ;; Isolated instruction encoding has no layout plan. Retain one compact trailing pool per
+        ;; distinct bit pattern for that diagnostic mode; production emission never takes this path.
+        (loop (if (>= (load i) (enc-literal-count))
+                  (break 0)
+                  (let [(mut j) 0
+                        (mut prior) -1
+                        bits (get (.literal-bits state) (load i))]
+                    (loop (if (>= (load j) (load i))
+                              (break 0)
+                              (do
+                                (if (and (= (load prior) -1)
+                                         (= (get (.literal-bits state) (load j))
+                                            bits))
+                                    (set! (mut prior)
+                                          (get (.literal-offsets state)
+                                               (load j)))
+                                    0)
+                                (set! (mut j) (+ (load j) 1))
+                                (continue))))
+                    (if (>= (load prior) 0)
+                        (set! (mut (.literal-offsets state))
+                              (load i)
+                              (load prior))
+                        (do
+                          (loop (if (= (& (enc-byte-count) 7) 0)
+                                    (break 0)
+                                    (do (enc-add1! ENCODER-HANDLE 0) (continue))))
+                          (set! (mut (.literal-offsets state))
+                                (load i)
+                                (enc-byte-count))
+                          (enc-add8! ENCODER-HANDLE bits)))
+                    (set! (mut i) (+ (load i) 1))
+                    (continue)))))
+    ;; LDR (literal), 64-bit SIMD/FP: signed imm19 is scaled by four from the opcode start.
+    (set! (mut i) 0)
+    (loop (if (>= (load i) (enc-literal-count))
+              (break 0)
+              (let [source-nid (get (.literal-sources state) (load i))
+                    source
+                      (match (arena-node source-nid)
+                        (Some [n] n)
+                        (None []
+                              (do
+                                (panic-i "enc-literal-pools!: missing source"
+                                         source-nid)
+                                (unreachable-node))))
+                    at (enc-op-start source)
+                    delta (- (get (.literal-offsets state) (load i)) at)
+                    scaled (/ delta 4)
+                    old (enc-read4 at)]
+                (if (or (!= (* scaled 4) delta)
+                        (< scaled -262144)
+                        (> scaled 262143))
+                    (panic-i "enc-literal-pools!: floating literal is out of range"
+                             delta)
+                    (enc-patch4! ENCODER-HANDLE
+                                 at
+                                 (primitive/ior (primitive/iand old
+                                                                (primitive/ixor (primitive/ishl 0x7ffff
+                                                                                                5)
+                                                                                -1))
+                                                (primitive/ishl (primitive/iand scaled
+                                                                                0x7ffff)
+                                                                5))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))

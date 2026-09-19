@@ -1,0 +1,591 @@
+;; Inlining: size accounting, candidate selection, deferral, and the trivial and cloning inliners' entry points.
+
+(module aot.node.inline)
+(import "aot.util.arena" :use [compiler-state CompilerStateSlot])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.str" :as str)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.property" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.type.type" :use *)
+(import "aot.node.call"
+        :use
+        [call-ctrl
+         call-fptr
+         call-nargs
+         call-arg
+         call-cend
+         CallEndNode
+         cend-call
+         cend-folding?
+         cend-set-folding!
+         call-has-external-target?
+         call-linked?])
+(import "aot.node.fun" :use *)
+
+;; The inline decision, matching Simple's byte return exactly.
+(const INLINE-NEVER -2)
+
+(const INLINE-DEFER -1)
+
+(const INLINE-TRIVIAL 1)
+
+(const INLINE-CLONE 2)
+
+;; Simple's size caps.
+(const INLINE-MAX-SIZE 100)
+
+(const INLINE-MAX-SIZE-INIT 200)
+
+;; A JSL body this small (a boxing shim, a one-test guard) inlines without evidence: the call
+;; would cost more than the body.
+(const INLINE-TINY-SIZE 12)
+
+;; Body ownership lives in `aot.node.copy`, which imports this module. Register its cleaned-body
+;; cardinality query at boot instead of creating a cyclic import. Candidate selection must not fall
+;; back to the construction span: optimizer-created growth can make that historical number stale.
+(defstruct FunBodySizeExt
+  [(f (fnptr c [(ref (dyn NodeOps))] i64)) (installed bool)])
+
+(defn fun-body-size-ext [] (-> (ptr FunBodySizeExt))
+  (compiler-state [FunBodySizeExt] (primitive/alloc-static CompilerStateSlot)))
+
+(defn set-fun-body-size-ext! [(f (fnptr c [(ref (dyn NodeOps))] i64))] (-> i64)
+  (do
+    (set! (.f (fun-body-size-ext)) f)
+    (set! (.installed (fun-body-size-ext)) true)
+    0))
+
+;; The inlining epoch: bumped after every inline that fires. A body's live size is walked at most
+;; once per epoch per Fun — every deferred candidate asks again each round, and the walk is the
+;; body's size; asking per candidate made the inline decision a third of a whole compile. A size
+;; measured earlier in the epoch can only be stale upward (peepholes shrink bodies), which delays
+;; an inline to the next epoch and never admits one wrongly.
+(defn fun-size-epoch [] (-> (ptr i64))
+  (compiler-state [i64] (primitive/alloc-static CompilerStateSlot)))
+
+(defn fun-size-epoch-bump! [] (-> i64)
+  (do (set! (fun-size-epoch) (+ (load (fun-size-epoch)) 1)) 0))
+
+(defn fun-live-body-size [(fun (dyn NodeOps))] (-> i64)
+  (if (.installed (fun-body-size-ext))
+      (let [p (primitive/cast (ptr FunNode) (hdr fun))
+            epoch (+ (load (fun-size-epoch)) 1)]
+        (if (= (.live-size-epoch p) epoch)
+            (.live-size p)
+            (let [size (primitive/call-ptr (.f (fun-body-size-ext)) fun)]
+              (set! (.live-size p) size)
+              (set! (.live-size-epoch p) epoch)
+              size)))
+      (do
+        (panic "fun-live-body-size: body-selection extension was not installed at boot")
+        0)))
+
+(defstruct CloneInlineExt
+  [(f (fnptr c [(ref (dyn NodeOps)) (ref (dyn NodeOps))] i64)) (installed bool)])
+
+;; A frontend may specialize a retained semantic definition from its source instead of cloning its
+;; generic graph. That decision answers INLINE-UNHANDLED when the site is not the specializer's
+;; business, and the ordinary inliner then decides.
+;;
+;; Called at an iter-run! round boundary after the peephole worklist drains. The implementation
+;; admits at most one replacement so later candidates cannot consume stale pre-expansion facts.
+;; Type-preserving forwarding and non-widening call linkage remain independent requirements.
+;;
+;; It answers the number of sites it admitted, which the round loop treats exactly like a fired
+;; inline: the graph grew, so clean up and ask again. No JavaScript operation names or semantics
+;; enter this module.
+(const INLINE-UNHANDLED -3)
+
+(defstruct SpecializeRoundExt [(f (fnptr c [] i64)) (installed bool)])
+
+(defn specialize-round-ext [] (-> (ptr SpecializeRoundExt))
+  (compiler-state [SpecializeRoundExt]
+                  (primitive/alloc-static CompilerStateSlot)))
+
+(defn set-specialize-round-ext! [(f (fnptr c [] i64))] (-> i64)
+  (do
+    (set! (.f (specialize-round-ext)) f)
+    (set! (.installed (specialize-round-ext)) true)
+    0))
+
+;; Admit every proven site for this round. Zero when no frontend installed a specializer, when the
+;; measurement switch turned re-lowering off, or when nothing was proven.
+(defn specialize-admit-round! [] (-> i64)
+  (if (and (.installed (specialize-round-ext)) (call-specialize-enabled?))
+      (primitive/call-ptr (.f (specialize-round-ext)))
+      0))
+
+;; A/B harness for the specialization seam (docs/SPECIALIZE.md §11). Source re-lowering and body
+;; cloning are two mechanisms for the same job, and the only honest way to compare them is to run
+;; the same program through each. Read once, like every other switch in this compiler.
+;;
+;;   AOT_NO_SPECIALIZE      do not admit re-lowering at all; proven sites take the clone path
+;;                          instead, so a JSL body is specialized by copying its graph.
+;;   AOT_INLINE_UNCAPPED    a JSL callee skips the evidence gate and both size caps. A generic
+;;                          body is a dispatch tree that collapses once its argument types are
+;;                          known, so its CONSTRUCTION size says nothing about its residual size;
+;;                          the caps exist for source functions, which have no such collapse.
+;;
+;; Both are PRESENCE switches, following `AOT_INLINE_TRACE`: any value, including `0`, turns them
+;; on, so they are named for what setting them does. Neither is a supported mode — both exist to
+;; measure, and the measurements belong in docs/SPECIALIZE.md. Unset, behaviour is unchanged.
+(defstruct CallAbFlags [(no-specialize i64) (uncapped i64)])
+
+(defn call--ab-flags [] (-> (ptr CallAbFlags))
+  (compiler-state [CallAbFlags] (primitive/alloc-static CompilerStateSlot)))
+
+(defn call--ab-flag [(state i64) (name (ptr i8))] (-> i64)
+  (if (= state 0)
+      (if (!= (primitive/cast i64 (os/getenv name)) 0) 1 2)
+      state))
+
+(defn call-specialize-enabled? [] (-> bool)
+  (let [f (call--ab-flags)]
+    (set! (.no-specialize f)
+          (call--ab-flag (.no-specialize f) c"AOT_NO_SPECIALIZE"))
+    (= (.no-specialize f) 2)))
+
+(defn call-inline-uncapped? [] (-> bool)
+  (let [f (call--ab-flags)]
+    (set! (.uncapped f) (call--ab-flag (.uncapped f) c"AOT_INLINE_UNCAPPED"))
+    (= (.uncapped f) 1)))
+
+(defn clone-inline-ext [] (-> (ptr CloneInlineExt))
+  (compiler-state [CloneInlineExt] (primitive/alloc-static CompilerStateSlot)))
+
+(defn set-clone-inline-ext! [(f (fnptr c
+                                       [(ref (dyn NodeOps)) (ref (dyn NodeOps))]
+                                       i64))] (-> i64)
+  (do
+    (set! (.f (clone-inline-ext)) f)
+    (set! (.installed (clone-inline-ext)) true)
+    0))
+
+(defn callend-do-clone-inline-ext! [(e (dyn NodeOps)) (fun (dyn NodeOps))] (-> i64)
+  (if (.installed (clone-inline-ext))
+      (primitive/call-ptr (.f (clone-inline-ext)) e fun)
+      (do
+        (panic "callend-do-clone-inline-ext!: graph-copy extension was not installed at boot")
+        0)))
+
+;; ---------------------------------------------------------------------------
+;; THE INLINE DECISION  —  Simple's `CallEndNode.maybeInline` / `inlineCandidate`
+;;
+;; A TRI-STATE that DEFERS rather than declines:
+;;
+;;   INLINE-TRIVIAL ( 1)  inline now, by folding
+;;   INLINE-CLONE   ( 2)  clone the body first, then fold
+;;   INLINE-DEFER   (-1)  NOT NOW, but might become one — re-queued when the blocker changes
+;;   INLINE-NEVER   (-2)  never; stop asking
+;;
+;; `-1` is our "deferred, never declined" law appearing in Simple's own code. Each deferral registers
+;; a dependency on whatever blocked it, so nothing has to remember to come back.
+
+;; Decide WITHOUT acting, setting no flags. Split out because the expensive-assert path must be able
+;; to ask the question with no side effects.
+(defn callend-inline-candidate [(e (dyn NodeOps))] (-> i64)
+  (callend-inline-candidate-ordinary e))
+
+(defn callend-inline-candidate-ordinary [(e (dyn NodeOps))] (-> i64)
+  (if (.never-inline (primitive/cast (ptr CallEndNode) (hdr e)))
+      INLINE-NEVER
+      (if (cend-folding? e)
+          INLINE-NEVER  ; already folding, and will collapse anyway
+          (match (n-in-safe e 0)
+            (None [] INLINE-NEVER)  ; malformed, mid-death
+            (Some [c]
+                  (if (!= (n-op c) OP-CALL)
+                      INLINE-NEVER
+                      ;; Not exactly ONE linked target yet. SCCP may still link one, so DEFER.
+                      (if (or (!= (n-nins e) 2) (call-has-external-target? c))
+                          (inline-defer c"not-exactly-one-linked-target")
+                          (callend--candidate-with-target e c (n-in! e 1)))))))))
+
+;; Under `AOT_INLINE_UNCAPPED`, a JSL body answers neither to the evidence gate nor to the size
+;; caps: the measurement being made is what the clone path does when policy stops pre-empting it.
+(defn call--jsl-uncapped? [(fun (dyn NodeOps))] (-> bool)
+  (and (fun-jsl? fun) (call-inline-uncapped?)))
+
+;; WHY a site deferred. A tri-state that deferred tells you nothing about which guard stopped it,
+;; and a site that defers FOREVER is indistinguishable from one that is merely waiting. Rather than
+;; a second copy of the decision logic in the tracer, each DEFER names itself here on the way out;
+;; `AOT_INLINE_TRACE` prints the last name recorded. Purely diagnostic: nothing reads it to decide.
+(defstruct InlineDeferReason [(name (ptr i8))])
+
+;; ONE accessor, as every other singleton in this compiler: `alloc/static` allocates a fresh slot
+;; per call site, so repeating the `compiler-state` form gives each caller its own private state.
+(defn inline--defer-state [] (-> (ptr InlineDeferReason))
+  (compiler-state [InlineDeferReason]
+                  (primitive/alloc-static CompilerStateSlot)))
+
+(defn inline-defer-reason [] (-> (slice u8))
+  (let [p (.name (inline--defer-state))]
+    ;; Zero-initialized state means no DEFER on this query named itself: the deferral came from a
+    ;; path that does not go through `inline-defer`, which is itself the interesting answer.
+    (if (= (primitive/cast i64 p) 0)
+        (str/cstr->str c"unnamed")
+        (str/cstr->str p))))
+
+(defn inline-defer [(name (ptr i8))] (-> i64)
+  (do (set! (.name (inline--defer-state)) name) INLINE-DEFER))
+
+;; Cleared before each query, so a printed reason always belongs to the query it is printed beside
+;; rather than to whichever site last deferred.
+(defn inline-defer-clear! [] (-> i64)
+  (do (set! (.name (inline--defer-state)) (primitive/cast (ptr i8) 0)) 0))
+
+;; Evidence that inlining a JSL body can fold something: an argument whose type is strictly
+;; sharper than the formal it meets (a discharged annotation, a literal, a known shape, a constant),
+;; or a body too small to be worth a call. Without evidence every argument and the Fun are
+;; registered as dependencies, so the question is reasked when SCCP or an outer inline sharpens one.
+;; Final Simple's inlineCandidate checks argument compatibility against the declared signature
+;; and applies its size bound before choosing trivial versus clone. Our additional JSL gate must
+;; distinguish new caller facts from facts SCCP already propagated into a shared body. For a
+;; clone, compare with the live Parm type: a constant key shared by the callers is not new evidence,
+;; and an eliminated Parm cannot benefit from substitution. Depend on both sides of the comparison.
+;; The single-caller path retains the declaration test because it moves, rather than clones, code.
+(defn callend--inline-evidence? [(c (dyn NodeOps))
+                                 (fun (dyn NodeOps))
+                                 (e (dyn NodeOps))] (-> bool)
+  (let [sig (fun-sig fun)
+        n (ty-sig-nargs sig)
+        (mut i) 0
+        (mut evidence) false]
+    ;; The tiny-body test first, then the arguments in order, depending on each one that is not
+    ;; yet sharper than its formal. Measured on the harness realm: this order reaches the inline
+    ;; fixpoint fastest (the retries it registers sharpen sites earlier than the alternatives).
+    (if (and (= (call-nargs c) n)
+             (<= (fun-live-body-size fun) INLINE-TINY-SIZE))
+        (set! (mut evidence) true)
+        0)
+    (loop (if (or (>= (load i) n) (load evidence) (!= (call-nargs c) n))
+              (break 0)
+              (let [arg (call-arg c (load i))
+                    at (n-ty arg)
+                    formal (ty-sig-arg sig (load i))
+                    known
+                      (if (> (n-nins fun) 2)
+                          (match (fun-parm fun (load i))
+                            (Some [p] (do (n-add-dep! p e) (n-ty p)))
+                            (None [] at))
+                          formal)]
+                (if (and (!= at TY-INVALID)
+                         (!= known TY-INVALID)
+                         (ty-isa? at formal)
+                         (ty-isa? at known)
+                         (!= at known))
+                    (set! (mut evidence) true)
+                    (n-add-dep! arg e))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (if (load evidence) 0 (n-add-dep! fun e))
+    (load evidence)))
+
+(defn callend--candidate-with-target [(e (dyn NodeOps))
+                                      (c (dyn NodeOps))
+                                      (ret (dyn NodeOps))] (-> i64)
+  ;; A linked Return can finish folding one worklist turn before the CallEnd and its projections.
+  ;; Its arena identity remains available as ownership metadata, but it is not an inline target.
+  (if (= (n-ty ret) TY-INVALID)
+      (inline-defer c"return-not-yet-typed")
+      (match (return-fun ret)
+        (None [] (inline-defer c"return-has-no-fun"))
+        (Some [fun]
+              ;; A value-taken function inlines like any other: every call through its object is a
+              ;; linked site in the closed world, and a Fun left without callers is a dead target
+              ;; whose code word names the runtime trap.
+              (if (fun-no-inline? fun)
+                  INLINE-NEVER
+                  ;; A JSL definition is a generic abstract operation: its body is a type dispatch,
+                  ;; and inlining it where no argument is sharper than its formal buys the dispatch
+                  ;; tree at the site instead of a call to the same tree (docs/DECISIONS.md, the
+                  ;; compile-time architecture, decision 3). Defer on the arguments and the Fun so a
+                  ;; sharpening reasks; a site that never earns its inline stays a call to the one
+                  ;; shared body. Asked first: it is cheap, and the deferred set is reasked often.
+                  (if (and (fun-jsl? fun)
+                           (not (call--jsl-uncapped? fun))
+                           (not (callend--inline-evidence? c fun e)))
+                      (inline-defer c"no-evidence")
+                      (if (not (call-linked? c fun))
+                          (do (n-add-dep! fun e) (inline-defer c"not-linked"))
+                          ;; SELF-RECURSION is never inlined — that is loop unrolling by another name. But the
+                          ;; recursive edge might yet disappear, so DEFER rather than refuse forever, and depend on
+                          ;; the Fun so the question is reasked if its callers change.
+                          (if (fun-self-recursive? fun)
+                              (do
+                                (n-add-dep! fun e)
+                                (inline-defer c"self-recursive"))
+                              (let [fptr (call-fptr c)
+                                    ft (n-ty fptr)]
+                                ;; The function pointer must be a CONSTANT, non-empty, singleton set. Anything else
+                                ;; may still sharpen, so depend on it and defer.
+                                (if (or (= ft TY-INVALID)
+                                        (not (and (ty-funptr? ft)
+                                                  (ty-funptr-single? ft))))
+                                    (do
+                                      (n-add-dep! fptr e)
+                                      (inline-defer c"fptr-not-a-singleton"))
+                                    ;; Arguments must match the formals. `call-good-args?` depends on any that do
+                                    ;; not yet.
+                                    (if (not (call-good-args? c (fun-sig fun) e))
+                                        (inline-defer c"args-do-not-match-formals")
+                                        ;; SIZE. Over the hard cap: never. Under it: trivial when this is the only
+                                        ;; caller, otherwise the clone path.
+                                        (if (and (not (call--jsl-uncapped? fun))
+                                                 (>= (fun-approx-size fun)
+                                                     INLINE-MAX-SIZE))
+                                            INLINE-NEVER
+                                            (if (and (not (call--jsl-uncapped? fun))
+                                                     (>= (fun-live-body-size fun)
+                                                         INLINE-MAX-SIZE))
+                                                (do
+                                                  (n-add-dep! fun e)
+                                                  (inline-defer c"live-body-over-cap"))
+                                                ;; Simple ends here: `fun.nIns() > 2` is CLONE and
+                                                ;; anything else is TRIVIAL, with no unknown-caller
+                                                ;; question asked. The unknown-caller HOOK is one of
+                                                ;; those inputs, so a Fun that keeps it reaches
+                                                ;; `nIns() > 2` and clones — which is sound, because
+                                                ;; a clone is a PRIVATE copy and leaves the shared
+                                                ;; body standing for the callers we cannot see.
+                                                ;; Only the TRIVIAL fold destroys that body, so only
+                                                ;; the trivial arm may refuse. Asking before the
+                                                ;; split (as this did) deferred every shared JSL
+                                                ;; provider definition forever: `jsl-close-world!`
+                                                ;; deliberately keeps their hook, so they could
+                                                ;; never be specialized by cloning at all.
+                                                ;; Measured (docs/SPECIALIZE.md §12): cloning shared
+                                                ;; definitions today COSTS nodes, because the copy
+                                                ;; brings the whole dispatch tree and the arms that
+                                                ;; fold last contain a self-recursive chain walk
+                                                ;; that no inline can collapse. It pays only once
+                                                ;; the copy folds as it goes, so it stays behind the
+                                                ;; measurement switch until that lands.
+                                                (if (and (call-inline-uncapped?)
+                                                         (> (n-nins fun) 2))
+                                                    INLINE-CLONE
+                                                    (if (fun-unknown-callers? fun)
+                                                        (do
+                                                          (n-add-dep! fun e)
+                                                          (inline-defer c"unknown-callers-no-clone"))
+                                                        (if (> (n-nins fun) 2)
+                                                            INLINE-CLONE
+                                                            INLINE-TRIVIAL))))))))))))))))
+
+;; The Fun a Return belongs to is metadata, not an input edge. Simple likewise keeps `_fun`
+;; separately from input 3, which is the RPC edge cleared during inlining.
+(defn return-fun [(ret (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [nid (return-fun-nid ret)]
+    (if (= nid 0)
+        (None [(dyn NodeOps)])
+        (match (arena-node nid)
+          (Some [f] (if (= (n-op f) OP-FUN) (Some f) (None [(dyn NodeOps)])))
+          (None [] (None [(dyn NodeOps)]))))))
+
+;; Does this Fun call itself? Simple walks the Fun's caller inputs looking for one inside the Fun.
+;; Our call graph is linked by the same worklist that asks the inline question, so a direct self
+;; FunPtr can be visible one turn before its Call has become a Fun input. Inspecting the Fun's sparse
+;; FunPtr outputs closes that ordering window without scanning the arena or inventing a second call
+;; graph. Once linked, the first loop remains the authoritative Simple path.
+(defn fun-self-recursive? [(f (dyn NodeOps))] (-> bool)
+  ;; Never memoized. A caller can be linked between two inline epochs (`opto-link-cg!` links value
+  ;; calls lazily), and a stale "not recursive" admits an inline wrongly: the clone keeps the
+  ;; body-local self call as a caller, and the trivial fold then bypasses the wrong edge. Simple
+  ;; recomputes this on every candidate check; the walk is the Fun's callers and its pointer uses.
+  (fun--self-recursive-walk? f))
+
+(defn fun--self-recursive-walk? [(f (dyn NodeOps))] (-> bool)
+  (let [cnt (n-nins f)
+        (mut i) 1
+        (mut yes) false]
+    (loop (if (or (>= (load i) cnt) (load yes))
+              (break 0)
+              (do
+                (match (n-in f (load i))
+                  (Some [caller]
+                        (if (= (n-op caller) OP-CALL)
+                            (match (call-cend caller)
+                              (Some [ce]
+                                    (if (fun--reaches? f ce)
+                                        (set! (mut yes) true)
+                                        0))
+                              (None [] 0))
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (set! (mut i) 0)
+    (loop (if (or (>= (load i) (n-nouts f)) (load yes))
+              (break 0)
+              (do
+                (match (n-out f (load i))
+                  (Some [fp]
+                        (if (= (n-op fp) OP-FUNPTR)
+                            (let [(mut oi) 0]
+                              (loop (if (or (>= (load oi) (n-nouts fp))
+                                            (load yes))
+                                        (break 0)
+                                        (do
+                                          (match (n-out fp (load oi))
+                                            (Some [use_]
+                                                  (if (= (n-op use_) OP-CALL)
+                                                      (match (cfg-owner-fun (call-ctrl use_)
+                                                                            (primitive/fnptr-of call--fun-op?))
+                                                        (Some [owner]
+                                                              (if (n-same? owner
+                                                                           f)
+                                                                  (set! (mut yes)
+                                                                        true)
+                                                                  0))
+                                                        (None [] 0))
+                                                      0))
+                                            (None [] 0))
+                                          (set! (mut oi) (+ (load oi) 1))
+                                          (continue)))))
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load yes)))
+
+;; Is `ce` inside `f`'s body? The owning Fun of its control (memoized dominator walk).
+(defn call--fun-op? [(n (dyn NodeOps))] (-> bool)
+  (= (n-op n) OP-FUN))
+
+(defn fun--reaches? [(f (dyn NodeOps)) (ce (dyn NodeOps))] (-> bool)
+  (match (cfg-owner-fun ce (primitive/fnptr-of call--fun-op?))
+    (Some [owner] (n-same? owner f))
+    (None [] false)))
+
+;; Does every argument's type `isa` its formal? Depends on any that does not yet, so the candidate is
+;; retried when it sharpens.
+(defn call-good-args? [(c (dyn NodeOps)) (sig i64) (dep (dyn NodeOps))] (-> bool)
+  (let [n (ty-sig-nargs sig)]
+    (if (!= (call-nargs c) n)
+        false  ; arity mismatch: an error, never inlinable
+        (let [(mut i) 0
+              (mut ok) true]
+          (loop (if (or (>= (load i) n) (not (load ok)))
+                    (break 0)
+                    (do
+                      (let [arg (call-arg c (load i))
+                            formal (ty-sig-arg sig (load i))]
+                        (if (= (n-ty arg) TY-INVALID)
+                            (set! (mut ok) false)
+                            (if (ty-isa? (n-ty arg) formal)
+                                0
+                                (do
+                                  (n-add-dep! arg dep)
+                                  (set! (mut ok) false)
+                                  0))))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (load ok)))))
+
+;; ---------------------------------------------------------------------------
+;; TRIVIAL INLINING — read this twice: it CLONES NOTHING
+;;
+;; Simple's comment: "Inlining does not need to clone code, merely triggers folding the Call/Fun and
+;; Return/CallEnd away." The entire operation is:
+;;
+;;     cend.folding = true
+;;     fun.folding  = true
+;;     fun.setDef(1, call.ctrl())    ; the Fun's control now BYPASSES the Call
+;;     fun.ret().setDef(3, null)     ; the Return's RPC edge is consumed by the inline
+;;     re-queue fun, cend, their neighbours, and the Parms' users one layer down
+;;     invalidate the idepth caches
+;;
+;; ...and then it STOPS. The ORDINARY peepholes do the rest, because a Fun is a Region and a Parm is
+;; a Phi:
+;;
+;;     the Fun now has ONE input   -> Region rule 3 collapses it into the caller's control
+;;     each Parm has ONE value     -> Phi rule 1 collapses it into the caller's argument
+;;
+;; Argument substitution, control splicing and return merging are all just those two existing rules
+;; firing. There is no inliner body to write.
+;;
+;; The Parms' users must be re-queued one layer down, because a Parm collapsing changes the types of
+;; everything reading it and those nodes are two steps from the Fun.
+(defn callend-do-trivial-inline! [(e (dyn NodeOps)) (fun (dyn NodeOps))] (-> i64)
+  (let [c (cend-call e)]
+    ;; The fold below rewrites input 1 as THE caller edge. That is only true when this call is the
+    ;; Fun's one and only caller (a clone made for this call included: a body-local self call kept
+    ;; by the copy would sit at input 1 and be silently bypassed, leaving the entering call as a
+    ;; second input and a Fun that never collapses). Refuse to corrupt the graph.
+    (if (or (!= (n-nins fun) 2)
+            (not (match (n-in fun 1)
+                   (Some [caller] (n-same? caller c))
+                   (None [] false))))
+        (broken "callend-do-trivial-inline!: the folding call is not the callee's only caller")
+        0)
+    (cend-set-folding! e true)
+    (fun-set-folding! fun true)
+    ;; Bypass the Call: the Fun's single caller edge becomes the caller's own control.
+    (n-set-def! fun 1 (Some (call-ctrl c)))
+    ;; Clear Return's RPC exactly when the call is folded into its caller. Fun ownership metadata
+    ;; remains intact.
+    (match (fun-ret fun)
+      (Some [ret] (n-set-def! ret RETURN-RPC (None [(dyn NodeOps)])))
+      (None [] 0))
+    ;; Re-queue the neighbourhood, and the Parms' users one layer down.
+    (code-add! fun)
+    (code-add! e)
+    (code-add-outputs! fun)
+    (let [cnt (n-nouts fun)
+          (mut i) 0]
+      (loop (if (>= (load i) cnt)
+                (break 0)
+                (do
+                  (match (n-out fun (load i))
+                    (Some [u]
+                          (if (= (n-op u) OP-PARM)
+                              (do
+                                ;; Queue the changing Phi itself as well as its users. Relying on
+                                ;; the generic Fun-output enqueue is insufficient when that entry
+                                ;; was already present before the inline worklist interrupts the
+                                ;; ordinary worklist; the sparse set would otherwise consume the
+                                ;; old entry and never revisit the now-folding Parm.
+                                (code-add! u)
+                                (code-add-outputs! u))
+                              0))
+                    (None [] 0))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    (code-add-outputs! e)
+    (code-add-inputs! e)
+    ;; Inlining blows every cached idepth past the inline point. Bump the version rather than hunting
+    ;; for the stale ones.
+    (invalidate-cfg!)
+    0))
+
+;; Decide and ACT. The clone implementation lives in the graph copier, which imports this module;
+;; its boot-installed callback preserves an acyclic module graph while keeping this public contract
+;; complete for direct callers and IterPeeps alike.
+(defn callend-maybe-inline! [(e (dyn NodeOps))] (-> i64)
+  (inline-defer-clear!)
+  (callend-maybe-inline-ordinary! e))
+
+(defn callend-maybe-inline-ordinary! [(e (dyn NodeOps))] (-> i64)
+  (let [d (callend-inline-candidate-ordinary e)]
+    (if (mid-assert?)
+        d  ; an expensive assert must not mutate
+        (do
+          (set! (.decision (primitive/cast (ptr CallEndNode) (hdr e))) d)
+          (if (> d 0)
+              (match (n-in e 1)
+                (Some [ret]
+                      (match (return-fun ret)
+                        (Some [fun]
+                              (if (= d INLINE-TRIVIAL)
+                                  (callend-do-trivial-inline! e fun)
+                                  (callend-do-clone-inline-ext! e fun)))
+                        (None [] 0)))
+                (None [] 0))
+              0)
+          d))))

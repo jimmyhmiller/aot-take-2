@@ -1,0 +1,414 @@
+;; The image scan's state: entry sets per node, escapes, prototype closure, and reads and writes of image words.
+
+(module aot.node.imagefacts.scan)
+(import "aot.util.arena"
+        :use
+        [compiler-allocator compiler-state CompilerStateSlot])
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.os" :as os)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.call" :use *)
+(import "aot.heap" :use *)
+(import "aot.shape" :use *)
+(import "aot.facts" :use *)
+
+(defstruct ImageWritePair [(owner (dyn NodeOps)) (key (dyn NodeOps))])
+
+(defstruct ImageScan
+  [(trace bool)  ; `AOT_FACTS_TRACE=1` narrates each escape and each named store
+   (top (ArrayList bool))  ; per nid
+   (storage (ArrayList bool))  ; per nid: the value is an object's backing store
+   (set-id (ArrayList i64))  ; per nid: an index into `sets`, or -1
+   (sets (ArrayList (ArrayList i64)))
+   (protos (ArrayList i64))  ; P
+   (callers (HashMap i64 (ArrayList (dyn NodeOps))))
+   (writes (HashMap i64 (ArrayList ImageWritePair)))
+   (changed bool)
+   (rounds i64)
+   (assume-closed bool)  ; the surface scan: callers are those the closed world will keep
+   (open-funs (HashMap i64 bool))])  ; with `assume-closed`, the Funs whose unknown callers survive closing
+
+(defn imagescan [] (-> (ptr ImageScan))
+  (compiler-state [ImageScan] (primitive/alloc-static CompilerStateSlot)))
+
+(defn scan--reset! [(node-count i64)] (-> i64)
+  (let [s (imagescan)
+        a (compiler-allocator)
+        (mut i) 0]
+    (set! (.top s) (al-new [bool] a))
+    (set! (.storage s) (al-new [bool] a))
+    (set! (.set-id s) (al-new [i64] a))
+    (set! (.sets s) (al-new [(ArrayList i64)] a))
+    (set! (.protos s) (al-new [i64] a))
+    (set! (.callers s) (hm-new [i64 (ArrayList (dyn NodeOps))] a (i64-keyops)))
+    (set! (.writes s) (hm-new [i64 (ArrayList ImageWritePair)] a (i64-keyops)))
+    (set! (.changed s) false)
+    (set! (.rounds s) 0)
+    (set! (.assume-closed s) false)
+    (set! (.open-funs s) (hm-new [i64 bool] a (i64-keyops)))
+    (set! (.trace s) (!= (primitive/cast i64 (os/getenv c"AOT_FACTS_TRACE")) 0))
+    (loop (if (> (load i) node-count)
+              (break 0)
+              (do
+                (push! [bool] (mut (.top s)) false)
+                (push! [bool] (mut (.storage s)) false)
+                (push! [i64] (mut (.set-id s)) -1)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+;; Whether a Fun has callers outside the analysed program. Once the world closes, exactly the Funs
+;; that kept the unknown-caller hook. The surface scan runs before closing, while every Fun still
+;; has the hook, and asks instead which Funs the closed world will leave open.
+(defn scan--fun-open? [(fun (dyn NodeOps))] (-> bool)
+  (let [s (imagescan)]
+    (if (.assume-closed s)
+        (and (fun-unknown-callers? fun)
+             (hm-contains? (.open-funs s) (n-nid fun)))
+        (fun-unknown-callers? fun))))
+
+(defn scan--note! [(changed bool)] (-> i64)
+  (do (if changed (set! (.changed (imagescan)) true) 0) 0))
+
+(defn scan--top? [(nid i64)] (-> bool)
+  (get (.top (imagescan)) nid))
+
+(defn scan--storage? [(nid i64)] (-> bool)
+  (get (.storage (imagescan)) nid))
+
+(defn scan--set-top! [(nid i64)] (-> i64)
+  (let [s (imagescan)]
+    (if (get (.top s) nid)
+        0
+        (do (set! (mut (.top s)) nid true) (scan--note! true)))))
+
+(defn scan--set-storage! [(nid i64)] (-> i64)
+  (let [s (imagescan)]
+    (if (get (.storage s) nid)
+        0
+        (do (set! (mut (.storage s)) nid true) (scan--note! true)))))
+
+(defn scan--count [(nid i64)] (-> i64)
+  (let [s (imagescan)
+        id (get (.set-id s) nid)]
+    (if (< id 0) 0 (len (get (.sets s) id)))))
+
+(defn scan--entry-at [(nid i64) (i i64)] (-> i64)
+  (let [s (imagescan)]
+    (get (get (.sets s) (get (.set-id s) nid)) i)))
+
+(defn scan--has? [(nid i64) (entry i64)] (-> bool)
+  (let [n (scan--count nid)
+        (mut i) 0
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) n))
+              (break (load found))
+              (do
+                (if (= (scan--entry-at nid (load i)) entry)
+                    (set! (mut found) true)
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn scan--add! [(nid i64) (entry i64)] (-> i64)
+  (let [s (imagescan)]
+    (if (< entry 0)
+        (panic-i "imagefacts: adding a non-entry to a value set" entry)
+        0)
+    (if (scan--has? nid entry)
+        0
+        (do
+          (if (< (get (.set-id s) nid) 0)
+              (do
+                (set! (mut (.set-id s)) nid (len (.sets s)))
+                (push! [(ArrayList i64)]
+                       (mut (.sets s))
+                       (al-new [i64] (compiler-allocator))))
+              0)
+          (push! [i64]
+                 (mut (al-elem [(ArrayList i64)]
+                               (mut (.sets s))
+                               (get (.set-id s) nid)))
+                 entry)
+          (scan--note! true)))))
+
+;; `dst` denotes at least what `src` denotes.
+(defn scan--copy-into! [(dst i64) (src i64)] (-> i64)
+  (let [n (scan--count src)
+        (mut i) 0]
+    (if (scan--top? src) (scan--set-top! dst) 0)
+    (if (scan--storage? src) (scan--set-storage! dst) 0)
+    (loop (if (>= (load i) n)
+              (break 0)
+              (do
+                (scan--add! dst (scan--entry-at src (load i)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+;; The value at `nid` reached a position the transfer does not follow.
+(defn scan--escape! [(nid i64)] (-> i64)
+  (let [n (scan--count nid)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break 0)
+              (do
+                (if (scan--storage? nid)
+                    ;; A backing store handed out whole: any of its words may change.
+                    (scan--note! (facts-mark-any-key! (scan--entry-at nid
+                                                                      (load i))))
+                    (if (facts-mark-escaped! (scan--entry-at nid (load i)))
+                        (do
+                          (if (.trace (imagescan))
+                              (match (arena-node nid)
+                                (Some [v]
+                                      (do
+                                        (println "imagefacts: entry {} escapes as {s}"
+                                                 (scan--entry-at nid (load i))
+                                                 (n-text v))
+                                        0))
+                                (None [] 0))
+                              0)
+                          (scan--note! true))
+                        0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn scan--escape-node! [(n (dyn NodeOps))] (-> i64)
+  (scan--escape! (n-nid n)))
+
+;; The value at `v` escapes at input `i` of `user`; narrated under the trace flag when it names
+;; an entry not yet escaped.
+(defn scan--escape-at! [(user (dyn NodeOps)) (i i64) (v (dyn NodeOps))] (-> i64)
+  (do
+    (if (and (.trace (imagescan)) (> (scan--count (n-nid v)) 0))
+        (let [k (scan--count (n-nid v))
+              (mut j) 0]
+          (loop (if (>= (load j) k)
+                    (break 0)
+                    (do
+                      (if (facts-escaped? (scan--entry-at (n-nid v) (load j)))
+                          0
+                          (do
+                            (println "imagefacts:   at input {} of {s}"
+                                     i
+                                     (n-text user))
+                            0))
+                      (set! (mut j) (+ (load j) 1))
+                      (continue)))))
+        0)
+    (scan--escape-node! v)))
+
+(defn scan--escape-inputs-from! [(n (dyn NodeOps)) (first i64)] (-> i64)
+  (let [(mut i) first]
+    (loop (if (>= (load i) (n-nins n))
+              (break 0)
+              (do
+                (match (n-in n (load i))
+                  (Some [v] (scan--escape-at! n (load i) v))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+;; ---------------------------------------------------------------------------
+;; Image words
+;; An entry the abstraction names: an object, never a string or a backing store (whose words are
+;; property values, not a prototype and a properties word).
+(defn scan--object-entry? [(entry i64)] (-> bool)
+  (and (>= entry 0) (heap-entry-object? entry)))
+
+;; The index of X's own property `key` in its backing store, or -1.
+(defn scan--own-index [(entry i64) (key i64)] (-> i64)
+  (let [storage (heap-entry-storage entry)]
+    (if (< storage 0)
+        -1
+        (let [shape (heap-entry-shape storage)]
+          (if (shape-has-key? shape key)
+              (/ (shape-offset-key shape key) HEAP-WORD-BYTES)
+              -1)))))
+
+;; The value read as `X.K` (own step only): the image word's entry, and TOP when a store may have
+;; replaced it.
+(defn scan--add-own-word-into! [(nid i64) (entry i64) (key i64)] (-> i64)
+  (do
+    (if (facts-written? entry key) (scan--set-top! nid) 0)
+    (let [k (scan--own-index entry key)]
+      (if (< k 0)
+          0
+          (let [storage (heap-entry-storage entry)
+                target
+                  (image-word-object-entry (heap-entry-word storage k)
+                                           (heap-entry-word-kind storage k))]
+            (if (>= target 0) (scan--add! nid target) 0))))))
+
+;; Every REF word of X's backing store, and TOP: a read whose key is a runtime value.
+(defn scan--add-all-words-into! [(nid i64) (entry i64)] (-> i64)
+  (let [storage (heap-entry-storage entry)]
+    (scan--set-top! nid)
+    (if (< storage 0)
+        0
+        (let [n (heap-entry-word-count storage)
+              (mut k) 0]
+          (loop (if (>= (load k) n)
+                    (break 0)
+                    (let [target
+                            (image-word-object-entry (heap-entry-word storage
+                                                                      (load k))
+                                                     (heap-entry-word-kind storage
+                                                                           (load k)))]
+                      (if (>= target 0) (scan--add! nid target) 0)
+                      (set! (mut k) (+ (load k) 1))
+                      (continue))))))))
+
+;; A read on an owner the analysis does not name: the word of every escaped entry.
+(defn scan--add-escaped-words-into! [(nid i64) (key i64)] (-> i64)
+  (let [n (heap-count)
+        (mut e) 0]
+    (scan--set-top! nid)
+    (loop (if (>= (load e) n)
+              (break 0)
+              (do
+                (if (and (scan--object-entry? (load e))
+                         (facts-escaped? (load e)))
+                    (if (< key 0)
+                        (scan--add-all-words-into! nid (load e))
+                        (scan--add-own-word-into! nid (load e) key))
+                    0)
+                (set! (mut e) (+ (load e) 1))
+                (continue))))))
+
+(defn scan--add-prototype-into! [(nid i64) (entry i64)] (-> i64)
+  (let [target
+          (image-word-object-entry (heap-entry-word entry
+                                                    HEAP-OFFSET-PROTOTYPE-WORD)
+                                   (heap-entry-word-kind entry
+                                                         HEAP-OFFSET-PROTOTYPE-WORD))]
+    (if (facts-prototypes-written?) (scan--set-top! nid) 0)
+    (if (>= target 0) (scan--add! nid target) 0)))
+
+(defn scan--add-all-prototypes-into! [(nid i64)] (-> i64)
+  (let [s (imagescan)
+        n (len (.protos s))
+        (mut i) 0]
+    (scan--set-top! nid)
+    (loop (if (>= (load i) n)
+              (break 0)
+              (do
+                (scan--add! nid (get (.protos s) (load i)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn scan--protos-push! [(entry i64)] (-> i64)
+  (let [s (imagescan)
+        n (len (.protos s))
+        (mut i) 0
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) n))
+              (break 0)
+              (do
+                (if (= (get (.protos s) (load i)) entry)
+                    (set! (mut found) true)
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (if (load found) 0 (do (push! [i64] (mut (.protos s)) entry) 0))))
+
+;; P: every entry that is some entry's prototype, and every registered intrinsic.
+(defn scan--compute-protos! [] (-> i64)
+  (let [n (heap-count)
+        (mut e) 0]
+    (loop (if (>= (load e) n)
+              (break 0)
+              (do
+                (if (scan--object-entry? (load e))
+                    (let [target
+                            (image-word-object-entry (heap-entry-word (load e)
+                                                                      HEAP-OFFSET-PROTOTYPE-WORD)
+                                                     (heap-entry-word-kind (load e)
+                                                                           HEAP-OFFSET-PROTOTYPE-WORD))]
+                      (if (>= target 0) (scan--protos-push! target) 0))
+                    0)
+                (set! (mut e) (+ (load e) 1))
+                (continue))))
+    (let [k (heap-intrinsic-count)
+          (mut i) 0]
+      (loop (if (>= (load i) k)
+                (break 0)
+                (do
+                  (scan--protos-push! (heap-intrinsic-entry-at (load i)))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))))
+
+;; ---------------------------------------------------------------------------
+;; The transfer
+
+;; A property read `owner.key` (own step) into `nid`; key -1 is a runtime key.
+(defn scan--read-into! [(nid i64) (owner i64) (key i64)] (-> i64)
+  (let [n (scan--count owner)
+        (mut i) 0]
+    (if (scan--top? owner) (scan--add-escaped-words-into! nid key) 0)
+    (loop (if (>= (load i) n)
+              (break 0)
+              (do
+                (if (< key 0)
+                    (scan--add-all-words-into! nid
+                                               (scan--entry-at owner (load i)))
+                    (scan--add-own-word-into! nid
+                                              (scan--entry-at owner (load i))
+                                              key))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+;; A read of `key` that may continue up the prototype chain: the owner's own word, and the word of
+;; every prototype in the program (the chain of an unknown owner is any of them).
+(defn scan--read-chain-into! [(nid i64) (owner i64) (key i64)] (-> i64)
+  (let [s (imagescan)
+        n (len (.protos s))
+        (mut i) 0]
+    (scan--read-into! nid owner key)
+    (loop (if (>= (load i) n)
+              (break 0)
+              (do
+                (if (< key 0)
+                    (scan--add-all-words-into! nid (get (.protos s) (load i)))
+                    (scan--add-own-word-into! nid
+                                              (get (.protos s) (load i))
+                                              key))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+;; A store of `key` on `owner`; key -1 is a runtime key.
+(defn scan--write! [(owner i64) (key i64)] (-> i64)
+  (let [n (scan--count owner)
+        (mut i) 0]
+    (if (and (.trace (imagescan)) (or (> n 0) (scan--top? owner)))
+        (match (arena-node owner)
+          (Some [o]
+                (do
+                  (println "imagefacts: store of key {} on {s} (top {}, {} named)"
+                           key
+                           (n-text o)
+                           (scan--top? owner)
+                           n)
+                  0))
+          (None [] 0))
+        0)
+    (if (scan--top? owner)
+        (scan--note! (if (< key 0)
+                         (facts-mark-unknown-owner-any!)
+                         (facts-mark-unknown-owner-key! key)))
+        0)
+    (loop (if (>= (load i) n)
+              (break 0)
+              (do
+                (scan--note! (if (< key 0)
+                                 (facts-mark-any-key! (scan--entry-at owner
+                                                                      (load i)))
+                                 (facts-mark-written! (scan--entry-at owner
+                                                                      (load i))
+                                                      key)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))

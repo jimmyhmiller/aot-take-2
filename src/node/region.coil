@@ -1,0 +1,732 @@
+;; Region and Loop: merge points, their dead-path and diamond peepholes, and dominators over them.      RegionNode, LoopNode
+
+(module aot.node.region)
+(import "aot.util.arena"
+        :use
+        [compiler-allocator compiler-state CompilerStateSlot])
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.cfg" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.type.type" :use *)
+(import "aot.node.control" :use [xctrl-make])
+(import "aot.node.cfgof" :use *)
+
+;; ---------------------------------------------------------------------------
+;; REGION — the control merge, and the most peephole-dense node in the graph
+;;
+;; Inputs 1..n are the incoming control paths. Input 0 is unused (it is where a data node keeps its
+;; control, and a Region has none).
+(defstruct RegionNode [(hdr NodeHdr) (pad i64)])
+
+;; A Region is IN PROGRESS while its LAST input is null.
+;;
+;; While in progress it reports CONTROL unconditionally, its Phis report their DECLARED types, and
+;; it is never GVN-equal to anything. A loop body must be built AND PEEPHOLED inside that window;
+;; loop finalization then closes control and immediately fills every Phi backedge.
+(defn region-in-progress? [(r (dyn NodeOps))] (-> bool)
+  (if (<= (n-nins r) 1)
+      false
+      (match (n-in r (- (n-nins r) 1)) (Some [_] false) (None [] true))))
+
+(defn region-has-phi? [(r (dyn NodeOps))] (-> bool)
+  (let [cnt (n-nouts r)
+        (mut i) 0
+        (mut yes) false]
+    (loop (if (or (>= (load i) cnt) (load yes))
+              (break 0)
+              (do
+                (match (n-out r (load i))
+                  (Some [u]
+                        ;; Parm is the Phi family attached to Fun. Omitting it lets a folding Fun
+                        ;; collapse first and rewires the still-live Parm's region edge to the
+                        ;; caller, after which it can no longer perform argument substitution.
+                        (if (or (= (n-op u) OP-PHI)
+                                (= (n-op u) OP-MEMPHI)
+                                (= (n-op u) OP-PARM))
+                            (set! (mut yes) true)
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load yes)))
+
+;; Seed with XCONTROL and meet up: a Region is reachable exactly when SOME path reaching it is.
+;;
+;; >>> THE PROVEN-TYPE TRAP IN CONCRETE FORM <<<
+;; Seeding with XCONTROL means a merge NOBODY HAS ANALYSED reports "provably unreachable" out of
+;; nothing. `~ctrl` is merely the high element of the control axis, not a claim anyone computed. Any
+;; IRREVERSIBLE rewrite acting on it must first prove the type.
+(defn region-compute [(r (dyn NodeOps))] (-> i64)
+  (if (region-in-progress? r)
+      TY-CTRL
+      (let [cnt (n-nins r)
+            (mut i) 1
+            (mut t) TY-XCTRL]
+        (loop (if (>= (load i) cnt)
+                  (break 0)
+                  (do
+                    (match (n-in r (load i))
+                      (Some [v]
+                            ;; Edge surgery can kill an impossible CProj before the owning Region's
+                            ;; dead-path peephole removes the matching path/Phi arm. A killed path is
+                            ;; semantically XCONTROL during that transient window; meeting its
+                            ;; TY-INVALID sentinel is never a lattice operation.
+                            (if (!= (n-ty v) TY-INVALID)
+                                (set! (mut t) (ty-meet (load t) (n-ty v)))
+                                0))
+                      (None [] 0))
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        (load t))))
+
+;; Find an input whose type is XCONTROL, starting at `from`. 0 means every input is live.
+(defn region--find-dead-input [(r (dyn NodeOps)) (from i64)] (-> i64)
+  (let [cnt (n-nins r)
+        (mut i) from
+        (mut found) 0]
+    (loop (if (or (>= (load i) cnt) (!= (load found) 0))
+              (break 0)
+              (do
+                (match (n-in r (load i))
+                  (Some [v]
+                        (if (or (= (n-ty v) TY-XCTRL) (= (n-ty v) TY-INVALID))
+                            (set! (mut found) (load i))
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
+;; Drop path `i` from `r` AND the matching value from every Phi on `r`, in ONE operation.
+;;
+;; Region arity and Phi arity are a single invariant. Diverging for even one peephole gives a Phi
+;; reading the wrong arm — a miscompile that typechecks cleanly. That is why there is deliberately
+;; no path-removal entry point that does not also touch the Phis.
+;;
+;; The repeat-until-stable scan is Simple's, and the reason is subtle: deleting a Phi input can
+;; recursively delete the PHI ITSELF, which shuffles the output array and makes a single pass skip
+;; an unrelated Phi. Simple: "on rare occasions we repeat the loop to get all the Phis."
+(defn region-del-path! [(r (dyn NodeOps)) (path i64)] (-> i64)
+  (do
+    (let [(mut prev) -1]
+      (loop (if (= (load prev) (n-nouts r))
+                (break 0)
+                (do
+                  (set! (mut prev) (n-nouts r))
+                  (let [(mut i) 0]
+                    (loop (if (>= (load i) (n-nouts r))
+                              (break 0)
+                              (do
+                                (match (n-out r (load i))
+                                  (Some [u]
+                                        (if (and (phi-like? (n-op u))
+                                                 (= (n-nins u) (n-nins r)))
+                                            (do (n-del-def! u path) 0)
+                                            0))
+                                  (None [] 0))
+                                (set! (mut i) (+ (load i) 1))
+                                (continue)))))
+                  (continue)))))
+    (n-del-def! r path)
+    0))
+
+;; Simple's `deadPath`. `skip-start` skips input 1, which a Loop needs: removing a Loop's ENTRY path
+;; would promote the back edge to entry and corrupt the loop structure. Removing the BACK edge is
+;; fine — it leaves a single-entry Region, which then folds away.
+(defn region-dead-path! [(r (dyn NodeOps)) (skip-entry bool)] (-> (Option (dyn NodeOps)))
+  (let [path (region--find-dead-input r (if skip-entry 2 1))]
+    (if (= path 0)
+        (None [(dyn NodeOps)])
+        (do
+          (region-del-path! r path)
+          ;; Slot zero is the reserved null control input. Reaching one input means every real path
+          ;; was dead; replace the Region immediately instead of leaving a zero-path Region whose
+          ;; next idealization would read input 1.
+          (if (= (n-nins r) 1) (Some (xctrl-make)) (Some r))))))
+
+(defn region-idealize [(r (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  ;; 1. IN PROGRESS: bail before every other rule.
+  (if (region-in-progress? r)
+      (None [(dyn NodeOps)])
+      ;; 2. DEAD PATH.
+      (match (region-dead-path! r false)
+        (Some [x] (Some x))
+        (None []
+              ;; 3. SINGLE INPUT: become that input.
+              ;;
+              ;; >>> THIS RULE IS WHAT MAKES INLINING WORK. A Fun IS a Region and a Parm IS a Phi,
+              ;; >>> so inlining is: bypass the Call, leave the Fun with one input, and let THIS rule
+              ;; >>> collapse it while the Parms collapse into the caller's arguments. Nothing is
+              ;; >>> cloned. Weaken this and inlining silently stops happening.
+              ;;
+              ;; Guarded on having no Phis: a one-input Phi collapses on its own, and doing both at
+              ;; once races.
+              (if (and (= (n-nins r) 2) (not (region-has-phi? r)))
+                  (n-in r 1)
+                  ;; 4. EMPTY DIAMOND: `if (pred) {} else {}` — no Phi users, and paths 1 and 2 are
+                  ;; CProjs of the SAME If. Both arms reach here, so the If contributes exactly its
+                  ;; own control, once.
+                  ;;
+                  ;; >>> A DIVERGENCE FROM SIMPLE, DELIBERATE AND RECORDED. <<<
+                  ;;
+                  ;; Simple guards this rule with `nIns()>3` — three or more paths — and then opens
+                  ;; with `if (nIns()==3) return iff.ctrl();`, which under that guard is UNREACHABLE.
+                  ;; So Simple's live path only ever handles the FAT case, and the two-path diamond
+                  ;; its own code describes never fires. That reads as an off-by-one (`>3` for
+                  ;; `>=3`) rather than intent.
+                  ;;
+                  ;; Both cases are individually correct, so we implement BOTH:
+                  ;;   two paths  -> the Region IS the If's control; become it
+                  ;;   fat        -> rewrite path 1 to the If's control and delete path 2
+                  (if (and (not (region-has-phi? r)) (region--empty-diamond? r))
+                      (if (= (n-nins r) 3)
+                          ;; CProj -> If -> the If's own control. Simple: `p1.in(0)` is the If,
+                          ;; and `iff.ctrl()` is ITS input 0.
+                          (Some (n-in! (n-in! (n-in! r 1) 0) 0))
+                          (region--collapse-fat-diamond! r))
+                      ;; 5. FLATTEN STACKED REGIONS. Loops and Funs are excluded by requiring the
+                      ;; exact Region opcode on both sides. `region--has-mid-user?` is the safety
+                      ;; guard: a value consumed between the inner and outer merges cannot be
+                      ;; distributed correctly by this local rewrite.
+                      (region--flatten-stacked! r)))))))
+
+;; Is `p` a Phi-like node whose controlling Region is `r`?
+(defn region--phi-on? [(p (dyn NodeOps)) (r (dyn NodeOps))] (-> bool)
+  (and (phi-like? (n-op p))
+       (match (n-in p 0) (Some [pr] (n-same? pr r)) (None [] false))))
+
+;; Simple's `hasMidUser`. Every output of the inner Region must be either the outer Region itself,
+;; or a Phi whose every data user is another Phi on the outer Region. Anything else consumes a
+;; value in-between the merges. Register dependencies on the blockers so the outer Region is
+;; retried if later graph rewrites remove them.
+(defn region--has-mid-user? [(outer (dyn NodeOps)) (inner (dyn NodeOps))] (-> bool)
+  (let [cnt (n-nouts inner)
+        (mut i) 0
+        (mut found) false]
+    (loop (if (or (>= (load i) cnt) (load found))
+              (break 0)
+              (do
+                (match (n-out inner (load i))
+                  (None [] 0)
+                  (Some [use]
+                        (if (n-same? use outer)
+                            0
+                            (if (phi-like? (n-op use))
+                                (let [dcnt (n-nouts use)
+                                      (mut j) 0]
+                                  (loop (if (or (>= (load j) dcnt) (load found))
+                                            (break 0)
+                                            (do
+                                              (match (n-out use (load j))
+                                                (None [] 0)
+                                                (Some [data]
+                                                      (if (region--phi-on? data
+                                                                           outer)
+                                                          0
+                                                          (do
+                                                            (n-add-dep! use
+                                                                        outer)
+                                                            (n-add-dep! data
+                                                                        outer)
+                                                            (set! (mut found)
+                                                                  true)
+                                                            0))))
+                                              (set! (mut j) (+ (load j) 1))
+                                              (continue)))))
+                                (do
+                                  (n-add-dep! use outer)
+                                  (set! (mut found) true)
+                                  0)))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
+;; Flatten the first eligible Region input, matching Simple's rule order and doing one rewrite per
+;; visit. Outer Phis either splice the matching inner Phi's values or duplicate the outer value
+;; across every inner path. The old outer slot becomes XCtrl; the ordinary dead-path rule removes
+;; it and the matching old Phi value on the next visit.
+(defn region--flatten-stacked! [(outer (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (if (or (!= (n-op outer) OP-REGION) (<= (n-nins outer) 2))
+      (None [(dyn NodeOps)])
+      (let [cnt (n-nins outer)
+            (mut i) 1
+            (mut inner) (None [(dyn NodeOps)])]
+        (loop (if (or (>= (load i) cnt)
+                      (match (load inner) (Some [_] true) (None [] false)))
+                  (break 0)
+                  (do
+                    (match (n-in outer (load i))
+                      (Some [candidate]
+                            (if (and (= (n-op candidate) OP-REGION)
+                                     (and (> (n-nins candidate) 2)
+                                          (not (region--has-mid-user? outer
+                                                                      candidate))))
+                                (set! (mut inner) (Some candidate))
+                                0))
+                      (None [] 0))
+                    (if (match (load inner) (Some [_] true) (None [] false))
+                        0
+                        (set! (mut i) (+ (load i) 1)))
+                    (continue))))
+        (match (load inner)
+          (None [] (None [(dyn NodeOps)]))
+          (Some [r]
+                (do
+                  (let [outcnt (n-nouts outer)
+                        (mut oi) 0]
+                    (loop (if (>= (load oi) outcnt)
+                              (break 0)
+                              (do
+                                (match (n-out outer (load oi))
+                                  (Some [phi]
+                                        (if (phi-like? (n-op phi))
+                                            (let [old (n-in! phi (load i))
+                                                  splice (region--phi-on? old r)
+                                                  (mut j) 1]
+                                              (loop (if (>= (load j) (n-nins r))
+                                                        (break 0)
+                                                        (do
+                                                          (n-add-def! phi
+                                                                      (Some (if splice
+                                                                                (n-in! old
+                                                                                       (load j))
+                                                                                old)))
+                                                          (set! (mut j)
+                                                                (+ (load j) 1))
+                                                          (continue))))
+                                              (code-add! phi))
+                                            0))
+                                  (None [] 0))
+                                (set! (mut oi) (+ (load oi) 1))
+                                (continue)))))
+                  (let [(mut j) 1]
+                    (loop (if (>= (load j) (n-nins r))
+                              (break 0)
+                              (do
+                                (region-add-path! outer (n-in! r (load j)))
+                                (set! (mut j) (+ (load j) 1))
+                                (continue)))))
+                  (n-set-def! outer (load i) (Some (xctrl-make)))
+                  (Some outer)))))))
+
+;; The fat case: paths 1 and 2 are both arms of one If, and there are other paths besides. Replace
+;; path 1 with the If's own control and drop path 2 — the If reaches here exactly once.
+;;
+;; `region-del-path!` rather than a raw delete, because a Phi on this Region must lose the same arm
+;; in the same operation. There are no Phis here by the guard above, but routing through the one
+;; entry point is what keeps that invariant true by construction rather than by argument.
+(defn region--collapse-fat-diamond! [(r (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [iff (n-in! (n-in! r 1) 0)]
+    (n-set-def! r 1 (n-in iff 0))
+    (region-del-path! r 2)
+    (Some r)))
+
+;; Are inputs 1 and 2 both CProjs of the same If?
+(defn region--empty-diamond? [(r (dyn NodeOps))] (-> bool)
+  (match (n-in r 1)
+    (None [] false)
+    (Some [p1]
+          (match (n-in r 2)
+            (None [] false)
+            (Some [p2]
+                  (if (and (= (n-op p1) OP-CPROJ) (= (n-op p2) OP-CPROJ))
+                      (match (n-in p1 0)
+                        (None [] false)
+                        (Some [m1]
+                              (match (n-in p2 0)
+                                (None [] false)
+                                (Some [m2]
+                                      (and (n-same? m1 m2) (= (n-op m1) OP-IF))))))
+                      false))))))
+
+;; Region's idepth is the MAX over its inputs, not one-plus-parent: a merge is as deep as its
+;; deepest predecessor.
+(defn region-idepth [(r (dyn NodeOps))] (-> i64)
+  (if (n-idepth-valid? r)
+      (n-idepth-cached r)
+      (let [cnt (n-nins r)
+            (mut i) 0
+            (mut d) 0]
+        ;; Seed the cache BEFORE recursing, so a cycle through the back edge terminates instead of
+        ;; recursing forever. Simple gets this from its own lazy-cache discipline.
+        (n-set-idepth! r 0)
+        (loop (if (>= (load i) cnt)
+                  (break 0)
+                  (do
+                    (match (n-in r (load i))
+                      (Some [v]
+                            (let [vd (cfg-idepth-of v)]
+                              (if (> vd (load d)) (set! (mut d) vd) 0)))
+                      (None [] 0))
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        (n-set-idepth! r (+ (load d) 1)))))
+
+(impl NodeOps RegionNode
+  (hdr [(self (ptr RegionNode))]
+       (-> (ptr NodeHdr))
+       (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr RegionNode))] (-> (slice u8)) "Region")
+  (is-const? [(self (ptr RegionNode))] (-> bool) false)
+  ;; While in progress a Region reports CONTROL, which is not high-or-constant, so no guard is
+  ;; needed for that. But a Region that folds to XCTRL must become the XCtrl node through
+  ;; `idealize`, not through constant replacement, so refuse the fold here.
+  (no-const-fold? [(self (ptr RegionNode))] (-> bool) true)
+  (is-pinned? [(self (ptr RegionNode))] (-> bool) true)
+  (binop-copy [(self (ptr RegionNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)]))
+  (compute [(self (ptr RegionNode))]
+           (-> i64)
+           (region-compute (primitive/make-dyn NodeOps self)))
+  (idealize [(self (ptr RegionNode))]
+            (-> (Option (dyn NodeOps)))
+            (region-idealize (primitive/make-dyn NodeOps self)))
+  ;; NEVER equal while in progress: two half-built merges are not interchangeable.
+  (eq-extra [(self (ptr RegionNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (if (!= (n-op other) OP-REGION)
+                false
+                (not (region-in-progress? (primitive/make-dyn NodeOps self)))))
+  (hash-extra [(self (ptr RegionNode))] (-> i64) 109))
+
+(impl CFGOps RegionNode
+  (cfg-node [(self (ptr RegionNode))]
+            (-> (dyn NodeOps))
+            (primitive/make-dyn NodeOps self))
+  (block-head? [(self (ptr RegionNode))] (-> bool) true)
+  (cfg-idom [(self (ptr RegionNode))]
+            (-> (Option (dyn NodeOps)))
+            (region-idom (primitive/make-dyn NodeOps self)))
+  (cfg-idepth [(self (ptr RegionNode))]
+              (-> i64)
+              (region-idepth (primitive/make-dyn NodeOps self))))
+
+;; A Region's immediate dominator is the LCA of all its LIVE inputs. High inputs are skipped, as in
+;; Simple's `RegionNode.idom`: a path nobody has proven reachable does not constrain dominance.
+;;
+;; A path whose dominator chain ends without meeting the others is skipped too. Simple's XCtrl hangs
+;; off Start, so every chain there reaches the one root; ours has no input, so the chain under a
+;; branch whose control was just replaced by XCtrl ends at that XCtrl until its subtree is retyped
+;; and removed. Simple's fold (`_idom` returning null, and the next input restarting the LCA) would
+;; then compute the LCA over the *remaining* paths only — the dominator of a merge of both arms of an
+;; If came out inside one arm, and the dominating-test hunt folded the other arm's test to the wrong
+;; constant. `region-lca-path` tells which side ended and keeps the side that reached the root.
+;;
+;; Cached per control edit version (aot.node.node, the region idom cache): Simple recomputes this
+;; on every request, which made the dominating-test hunt quadratic in chain depth here.
+(defn region-idom [(r (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (if (n-idom-cache-valid? r)
+      (n-idom-cached r)
+      (if (> (n-nins r) 3)
+          (region-idom-wide r)
+          (let [cnt (n-nins r)
+                (mut i) 1
+                (mut lca) (None [(dyn NodeOps)])]
+            (loop (if (>= (load i) cnt)
+                      (break 0)
+                      (do
+                        (match (n-in r (load i))
+                          (Some [v]
+                                (if (ty-high? (n-ty v))
+                                    0
+                                    (set! (mut lca)
+                                          (region-lca-path v (load lca)))))
+                          (None [] 0))
+                        (set! (mut i) (+ (load i) 1))
+                        (continue))))
+            (n-set-idom-cache! r (load lca))
+            (load lca)))))
+
+;; A multi-path merge is one N-way intersection, not N independent two-path queries.
+;; Simple folds Region inputs with CFGNode._idom's parallel chain walk. After each fold,
+;; every traversed node is dominated by the new LCA. Remember that covered subtree: when
+;; the next path reaches any covered node, its intersection is the running LCA immediately.
+;; This avoids rewalking the shared normal path for every exception exit in a long Script.
+;; Two-path Regions retain the allocation-free ordinary walk. Disconnected transient paths
+;; use the existing dead-root rule and clear coverage; no fact crosses into another tree.
+(defstruct RegionLcaStats [(steps i64) (paths i64)])
+
+(defn region-lca-stats [] (-> (ptr RegionLcaStats))
+  (compiler-state [RegionLcaStats] (primitive/alloc-static CompilerStateSlot)))
+
+(defn region-lca-covered [(path (dyn NodeOps))
+                          (prior (dyn NodeOps))
+                          (covered (mut (HashMap i64 bool)))
+                          (pending (mut (ArrayList i64)))] (-> (Option (dyn NodeOps)))
+  (let [(mut lhs) (Some path)
+        (mut rhs) (Some prior)
+        (mut answer) (None [(dyn NodeOps)])
+        (mut connected) false]
+    (al-clear! (mut pending))
+    (set! (.paths (region-lca-stats)) (+ (.paths (region-lca-stats)) 1))
+    (loop (match (load lhs)
+            (None [] (break 0))
+            (Some [l]
+                  (if (hm-contains? (load covered) (n-nid l))
+                      (do
+                        (set! (mut answer) (Some prior))
+                        (set! (mut connected) true)
+                        (break 0))
+                      (match (load rhs)
+                        (None [] (break 0))
+                        (Some [r]
+                              (if (n-same? l r)
+                                  (do
+                                    (set! (mut answer) (Some l))
+                                    (set! (mut connected) true)
+                                    (break 0))
+                                  (let [ld (cfg-idepth-of l)
+                                        rd (cfg-idepth-of r)]
+                                    (if (>= ld rd)
+                                        (do
+                                          (push! [i64] (mut pending) (n-nid l))
+                                          (set! (mut lhs) (cfg-idom-of l)))
+                                        0)
+                                    (if (<= ld rd)
+                                        (do
+                                          (push! [i64] (mut pending) (n-nid r))
+                                          (set! (mut rhs) (cfg-idom-of r)))
+                                        0)
+                                    (set! (.steps (region-lca-stats))
+                                          (+ (.steps (region-lca-stats)) 1))
+                                    (if (> (len (load pending))
+                                           (* 2 (+ (arena-node-count) 1)))
+                                        (broken "region-lca-covered: cyclic dominator chain")
+                                        0)
+                                    (continue)))))))))
+    (if (load connected)
+        (do
+          (al-for [id (load pending)] (set! (mut covered) id true))
+          (match (load answer)
+            (Some [n] (set! (mut covered) (n-nid n) true))
+            (None [] 0))
+          (load answer))
+        (do (hm-clear! (mut covered)) (region-lca-path path (Some prior))))))
+
+(defn region-idom-wide [(r (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [a (compiler-allocator)
+        (mut covered) (hm-new [i64 bool] a (i64-keyops))
+        (mut pending) (al-new [i64] a)
+        (mut lca) (None [(dyn NodeOps)])
+        (mut i) 1]
+    (loop (if (>= (load i) (n-nins r))
+              (break 0)
+              (do
+                (match (n-in r (load i))
+                  (Some [v]
+                        (if (ty-high? (n-ty v))
+                            0
+                            (set! (mut lca)
+                                  (match (load lca)
+                                    (None []
+                                          (do
+                                            (set! (mut covered) (n-nid v) true)
+                                            (Some v)))
+                                    (Some [prior]
+                                          (region-lca-covered v
+                                                              prior
+                                                              (mut covered)
+                                                              (mut pending)))))))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (n-set-idom-cache! r (load lca))
+    (hm-free! (mut covered))
+    (al-free! (mut pending))
+    (load lca)))
+
+;; The LCA of one more live path with the running answer. When the two chains never meet, at least
+;; one of them ended at a root that is not Start — a dead subtree not yet retyped, whose chain ends
+;; at an XCtrl — and that side is dropped: the side whose chain reached Start stands. Both chains
+;; end in the same step when they have the same depth, so each side remembers the root it reached.
+(defn region-lca-path [(path (dyn NodeOps)) (lca (Option (dyn NodeOps)))] (-> (Option (dyn NodeOps)))
+  (match lca
+    (None [] (Some path))
+    (Some [b0]
+          (let [(mut lhs) (Some path)
+                (mut rhs) (Some b0)
+                (mut last-l-op) (n-op path)
+                (mut last-r-op) (n-op b0)
+                (mut out) (Some b0)
+                (mut guard) 0]
+            (loop (if (> (load guard) 1000000)
+                      (do
+                        (broken "region-lca-path: dominator walk did not converge")
+                        (break 0))
+                      (match (load lhs)
+                        (None []
+                              (do
+                                ;; The path's chain ended. Unless the answer's chain ended at the same
+                                ;; time on a dead root while the path reached Start, the path is dead.
+                                (if (and (match (load rhs)
+                                           (Some [_] false)
+                                           (None [] true))
+                                         (and (= (load last-l-op) OP-START)
+                                              (!= (load last-r-op) OP-START)))
+                                    (set! (mut out) (Some path))
+                                    0)
+                                (break 0)))
+                        (Some [l]
+                              (match (load rhs)
+                                (None []
+                                      (do
+                                        (set! (mut out) (Some path))
+                                        (break 0)))  ; the answer's chain ended
+                                (Some [r]
+                                      (if (n-same? l r)
+                                          (do
+                                            (set! (mut out) (Some l))
+                                            (break 0))
+                                          (let [ld (cfg-idepth-of l)
+                                                rd (cfg-idepth-of r)]
+                                            (do
+                                              (if (>= ld rd)
+                                                  (do
+                                                    (set! (mut last-l-op)
+                                                          (n-op l))
+                                                    (set! (mut lhs)
+                                                          (cfg-idom-of l)))
+                                                  0)
+                                              (if (<= ld rd)
+                                                  (do
+                                                    (set! (mut last-r-op)
+                                                          (n-op r))
+                                                    (set! (mut rhs)
+                                                          (cfg-idom-of r)))
+                                                  0)
+                                              (set! (mut guard)
+                                                    (+ (load guard) 1))
+                                              (continue))))))))))
+            (load out)))))
+
+(defn region-make [] (-> (dyn NodeOps))
+  (let [a (compiler-allocator)
+        p (alloc/unwrap-ptr [RegionNode] (alloc/create [RegionNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.pad p) 0)
+    (n-init! d OP-REGION)
+    (n-add-def! d (None [(dyn NodeOps)]))  ; slot 0 unused
+    (n-set-ty! d TY-CTRL)
+    d))
+
+(defn region-add-path! [(r (dyn NodeOps)) (path (dyn NodeOps))] (-> i64)
+  (do (n-add-def! r (Some path)) 0))
+
+;; Open the in-progress window: append a null final input.
+(defn region-open! [(r (dyn NodeOps))] (-> i64)
+  (do (n-add-def! r (None [(dyn NodeOps)])) 0))
+
+;; Close it by filling that null with the real final path.
+(defn region-close! [(r (dyn NodeOps)) (path (dyn NodeOps))] (-> i64)
+  (if (not (region-in-progress? r))
+      (broken "region-close!: the region is not in progress")
+      (do (n-set-def! r (- (n-nins r) 1) (Some path)) 0)))
+
+;; ---------------------------------------------------------------------------
+;; LOOP — a Region whose input 1 is the entry and input 2 is the BACK EDGE
+;;
+;; Everything Region does applies. The differences:
+;;   - `compute` reports the ENTRY's type, not the meet: a loop is reachable exactly when its entry
+;;     is. The back edge cannot make a loop reachable that nothing enters.
+;;   - the entry path is never deleted by dead-path removal (removing it would promote the back edge
+;;     to entry and corrupt the loop structure); the BACK edge may be, leaving a single-entry Region
+;;     that then folds away.
+;;   - `idom` is the ENTRY directly, bypassing Region's LCA: the back edge dominates nothing.
+(defstruct LoopNode [(hdr NodeHdr) (pad i64)])
+
+(defn loop-entry [(l (dyn NodeOps))] (-> (dyn NodeOps))
+  (n-in! l 1))
+
+(defn loop-back [(l (dyn NodeOps))] (-> (dyn NodeOps))
+  (n-in! l 2))
+
+(defn loop-compute [(l (dyn NodeOps))] (-> i64)
+  (if (region-in-progress? l)
+      TY-CTRL
+      (match (n-in l 1) (Some [e] (n-ty e)) (None [] TY-CTRL))))
+
+(defn loop-idealize [(l (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (if (region-in-progress? l)
+      (None [(dyn NodeOps)])
+      ;; Dead-path removal, skipping the ENTRY.
+      (match (region-dead-path! l true)
+        (Some [x] (Some x))
+        (None []
+              ;; A Loop that lost its back edge is an ordinary single-entry Region.
+              (if (and (= (n-nins l) 2) (not (region-has-phi? l)))
+                  (n-in l 1)
+                  (None [(dyn NodeOps)]))))))
+
+(impl NodeOps LoopNode
+  (hdr [(self (ptr LoopNode))]
+       (-> (ptr NodeHdr))
+       (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr LoopNode))] (-> (slice u8)) "Loop")
+  (is-const? [(self (ptr LoopNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr LoopNode))] (-> bool) true)
+  (is-pinned? [(self (ptr LoopNode))] (-> bool) true)
+  (binop-copy [(self (ptr LoopNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)]))
+  (compute [(self (ptr LoopNode))]
+           (-> i64)
+           (loop-compute (primitive/make-dyn NodeOps self)))
+  (idealize [(self (ptr LoopNode))]
+            (-> (Option (dyn NodeOps)))
+            (loop-idealize (primitive/make-dyn NodeOps self)))
+  (eq-extra [(self (ptr LoopNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (if (!= (n-op other) OP-LOOP)
+                false
+                (not (region-in-progress? (primitive/make-dyn NodeOps self)))))
+  (hash-extra [(self (ptr LoopNode))] (-> i64) 113))
+
+(impl CFGOps LoopNode
+  (cfg-node [(self (ptr LoopNode))]
+            (-> (dyn NodeOps))
+            (primitive/make-dyn NodeOps self))
+  (block-head? [(self (ptr LoopNode))] (-> bool) true)
+  ;; The ENTRY, bypassing Region's LCA: a back edge dominates nothing.
+  (cfg-idom [(self (ptr LoopNode))]
+            (-> (Option (dyn NodeOps)))
+            (n-in-safe (primitive/make-dyn NodeOps self) 1))
+  (cfg-idepth [(self (ptr LoopNode))]
+              (-> i64)
+              (cfg-idepth-default (primitive/make-dyn NodeOps self))))
+
+;; Build a Loop over `entry`, OPEN: input 2 is null until `loop-close!` wires the back edge.
+;;
+;; THE PROTOCOL:
+;;   1. `loop-make` the loop over its entry
+;;   2. build the body INSIDE this window
+;;   3. peephole the body — still inside the window
+;;   4. final Simple's `endLoop` calls `loop-close!`
+;;   5. it immediately closes every materialized Phi before any peephole can run
+;;
+;; `scope-end-loop!` owns steps 4 and 5. The low-level mutation remains public for graph tests, but
+;; frontend lowering must not split finalization or expose its intermediate state.
+(defn loop-make [(entry (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [a (compiler-allocator)
+        p (alloc/unwrap-ptr [LoopNode] (alloc/create [LoopNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.pad p) 0)
+    (n-init! d OP-LOOP)
+    (n-add-def! d (None [(dyn NodeOps)]))  ; slot 0 unused
+    (n-add-def! d (Some entry))  ; slot 1 entry
+    (n-add-def! d (None [(dyn NodeOps)]))  ; slot 2 back edge — OPEN
+    (n-set-ty! d TY-CTRL)
+    d))
+
+(defn loop-in-progress? [(l (dyn NodeOps))] (-> bool)
+  (region-in-progress? l))
+
+(defn loop-close! [(l (dyn NodeOps)) (back (dyn NodeOps))] (-> i64)
+  (if (not (region-in-progress? l))
+      (broken "loop-close!: the loop is not in progress — control was closed twice")
+      (do (n-set-def! l 2 (Some back)) 0)))

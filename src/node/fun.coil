@@ -1,0 +1,752 @@
+;; Fun, Parm and FunPtr: a function's header, its parameters as phis over call sites, and a first-class function value.      FunNode, ParmNode
+
+(module aot.node.fun)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.str" :as str)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.property" :use *)
+(import "aot.node.cfg" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.type.type" :use *)
+(import "aot.node.call"
+        :use
+        [CALL-MEM CALL-ARG0 call-nargs call-arg call-unlink!])
+
+;; ---------------------------------------------------------------------------
+;; FUN — a Region whose inputs are the CALL SITES that reach it
+;;
+;; Input 1 is either `Start` — the UNKNOWN-CALLER hook, meaning "anyone at all might call this" — or
+;; a real call site. Inputs 2.. are the linked callers.
+(defstruct FunNode
+  [(hdr NodeHdr)
+   (sig i64)  ; the signature; sharpens over time as the Return's type improves
+   (name (slice u8))
+   (folding bool)  ; set while this Fun is being trivially inlined away
+   (escapes bool)  ; its pointer was materialized as a value: the address must stay defined
+   (approx-size i64)  ; approximate body size, the inlining heuristic
+   (live-size i64)  ; the last measured live body size (see `fun-live-body-size`)
+   (live-size-epoch i64)  ; the inlining epoch that measurement belongs to; 0 = never
+   (jsl bool)  ; a JSL definition: a generic abstract operation, inlined only on evidence
+   (ret-nid i64)])  ; the Return, by nid — a back-pointer that survives edge surgery
+
+(defn fun-sig [(f (dyn NodeOps))] (-> i64)
+  (.sig (primitive/cast (ptr FunNode) (hdr f))))
+
+(defn fun-name [(f (dyn NodeOps))] (-> (slice u8))
+  (.name (primitive/cast (ptr FunNode) (hdr f))))
+
+(defn fun-no-inline? [(f (dyn NodeOps))] (-> bool)
+  (let [name (fun-name f)
+        suffix "_noInline"
+        n (len name)
+        sn (len suffix)
+        (mut i) 0
+        (mut same) (>= n sn)]
+    (loop (if (or (not (load same)) (>= (load i) sn))
+              (break 0)
+              (do
+                (if (!= (get name (+ (- n sn) (load i))) (get suffix (load i)))
+                    (set! (mut same) false)
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load same)))
+
+;; A function whose pointer escaped into a value. Simple inlines a function only when "its
+;; function pointer is only used here"; an escaped pointer is used elsewhere by definition, and the
+;; body must remain emitted so the relocated address resolves.
+;; JSL ownership (docs/DECISIONS.md, the compile-time architecture, decision 3).
+(defn fun-jsl? [(f (dyn NodeOps))] (-> bool)
+  (.jsl (primitive/cast (ptr FunNode) (hdr f))))
+
+(defn fun-set-jsl! [(f (dyn NodeOps))] (-> i64)
+  (do (set! (.jsl (primitive/cast (ptr FunNode) (hdr f))) true) 0))
+
+(defn fun-escapes? [(f (dyn NodeOps))] (-> bool)
+  (.escapes (primitive/cast (ptr FunNode) (hdr f))))
+
+(defn fun-set-escapes! [(f (dyn NodeOps))] (-> i64)
+  (do (set! (.escapes (primitive/cast (ptr FunNode) (hdr f))) true) 0))
+
+(defn fun-folding? [(f (dyn NodeOps))] (-> bool)
+  (.folding (primitive/cast (ptr FunNode) (hdr f))))
+
+(defn fun-approx-size [(f (dyn NodeOps))] (-> i64)
+  (.approx-size (primitive/cast (ptr FunNode) (hdr f))))
+
+;; Hoisted frontends declare every Fun header before lowering any body. Their nid span therefore
+;; includes unrelated headers and is not the construction-size estimate final Simple gets from
+;; parsing one function at a time. Those frontends overwrite the provisional span with the exact
+;; number of nodes allocated while lowering this body.
+(defn fun-set-approx-size! [(f (dyn NodeOps)) (size i64)] (-> i64)
+  (if (< size 0)
+      (panic-i "fun-set-approx-size!: negative body size" size)
+      (do
+        (set! (.approx-size (primitive/cast (ptr FunNode) (hdr f))) size)
+        0)))
+
+(defn fun-set-folding! [(f (dyn NodeOps)) (v bool)] (-> i64)
+  (do (set! (.folding (primitive/cast (ptr FunNode) (hdr f))) v) 0))
+
+;; The signature only ever SHARPENS. `n-unlock!` first: the signature participates in nothing today,
+;; but the Fun is a Region whose GVN identity depends on its edges, and Simple unlocks here too.
+(defn fun-set-sig! [(f (dyn NodeOps)) (sig i64)] (-> i64)
+  (if (= (fun-sig f) sig)
+      0
+      (do
+        (n-unlock! f)
+        (set! (.sig (primitive/cast (ptr FunNode) (hdr f))) sig)
+        (funptr-refresh-from-fun! f sig)
+        (code-add! f)
+        (code-add-outputs! f)
+        0)))
+
+(defn fun-ret [(f (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (arena-node (.ret-nid (primitive/cast (ptr FunNode) (hdr f)))))
+
+(defn fun-linkable? [(f (dyn NodeOps))] (-> bool)
+  ;; Final Simple's `CodeGen.link(fidx)` is statically typed to return a FunNode. Here a FunPtr keeps
+  ;; the target as an ordinary graph edge, and inlining can rewrite that edge one worklist turn
+  ;; before every former Call has disappeared. Establish the same type guarantee before touching
+  ;; Fun-only payload; a stale non-Fun target is simply no longer linkable.
+  (and (= (n-op f) OP-FUN)
+       (and (not (n-dead? f))
+            (and (not (fun-folding? f))
+                 (match (fun-ret f)
+                   (Some [ret]
+                         (and (!= (n-ty ret) TY-INVALID) (not (n-dead? ret))))
+                   (None [] false))))))
+
+;; Replace optimization-only caller edges with a runtime entry and architectural RPC parameter.
+;; Source and JSL functions share this final-Simple handoff so their backend invariants cannot
+;; drift apart.
+(defn fun-prepare-codegen! [(fun (dyn NodeOps)) (start (dyn NodeOps))] (-> i64)
+  (if (or (n-dead? fun) (fun-folding? fun) (ty-high? (n-ty fun)))
+      0
+      (do
+        (if (not (fun-unknown-callers? fun))
+            (do
+              (n-insert-def! fun 1 (Some start))
+              (let [cnt (n-nouts fun)
+                    (mut i) 0]
+                (loop (if (>= (load i) cnt)
+                          (break 0)
+                          (do
+                            (match (n-out fun (load i))
+                              (Some [u]
+                                    (if (= (n-op u) OP-PARM)
+                                        (n-insert-def! u
+                                                       1
+                                                       (None [(dyn NodeOps)]))
+                                        0))
+                              (None [] 0))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))))
+            0)
+        (match (fun-rpc-parm fun)
+          (Some [rpc]
+                (match (fun-ret fun)
+                  (Some [ret] (n-set-def! ret RETURN-RPC (Some rpc)))
+                  (None []
+                        (panic "fun-prepare-codegen!: live Fun has no Return"))))
+          (None []
+                (let [rpc (parm-make-slot fun 0 (ty-int-bot) "$rpc")]
+                  (match (fun-ret fun)
+                    (Some [ret] (n-set-def! ret RETURN-RPC (Some rpc)))
+                    (None []
+                          (panic "fun-prepare-codegen!: live Fun has no Return"))))))
+        1)))
+
+;; Cannot build the Return and the Fun at once; one has to come first. So the link is a second step,
+;; exactly as in Simple.
+(defn fun-set-ret! [(f (dyn NodeOps)) (ret (dyn NodeOps))] (-> i64)
+  (let [p (primitive/cast (ptr FunNode) (hdr f))]
+    (set! (.ret-nid p) (n-nid ret))
+    ;; Simple records the parser UID delta from Fun creation through Return creation. Node IDs are
+    ;; that same dense construction clock here, so this includes every node built while the body was
+    ;; open (including nested functions) without needing ownership metadata on every floating node.
+    (set! (.approx-size p) (+ 1 (- (n-nid ret) (n-nid f))))
+    0))
+
+;; >>> THE UNKNOWN-CALLER HOOK <<<
+;;
+;; While input 1 is `Start`, this function might be called by ANYONE. Its parameters can be anything,
+;; so it reports CONTROL unconditionally and its Parms report their declared types.
+;;
+;; Removing that hook is what the closed world buys: once SCCP has proven the complete set of callers
+;; and the function does not escape, the hook goes and the parameter types become the meet of what
+;; the actual callers pass. That is the moment a TypeScript annotation becomes provable.
+(defn fun-unknown-callers? [(f (dyn NodeOps))] (-> bool)
+  (and (>= (n-nins f) 2)
+       (match (n-in f 1) (Some [v] (= (n-op v) OP-START)) (None [] false))))
+
+;; Simple's `FunNode.compute`: CONTROL while callers are unknown, else the meet over real callers.
+;; The Start hook is SKIPPED in the meet — it is a hook, not a caller.
+(defn fun-compute [(f (dyn NodeOps))] (-> i64)
+  (if (fun-unknown-callers? f)
+      TY-CTRL
+      (let [cnt (n-nins f)
+            (mut i) 1
+            (mut t) TY-XCTRL]
+        (loop (if (>= (load i) cnt)
+                  (break 0)
+                  (do
+                    (match (n-in f (load i))
+                      (Some [v]
+                            (if (= (n-op v) OP-START)
+                                0
+                                (set! (mut t) (ty-meet (load t) (n-ty v)))))
+                      (None [] 0))
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        (load t))))
+
+;; A concrete call-graph link has two inseparable halves: Call->Fun (plus aligned Parm arms) and
+;; Return->CallEnd. Generic Region dead-path deletion only knows about the first half, leaving a
+;; stale Return on CallEnd that can later trigger inlining after the caller edge is gone. Remove a
+;; dead concrete caller through `call-unlink!`, which updates both halves atomically. The Start hook
+;; remains governed solely by closed-world transition code.
+(defn fun--dead-caller! [(f (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [path (region--find-dead-input f (if (fun-unknown-callers? f) 2 1))]
+    (if (= path 0)
+        (None [(dyn NodeOps)])
+        (let [caller (n-in! f path)]
+          (if (= (n-op caller) OP-CALL)
+              (call-unlink! caller f)
+              (region-del-path! f path))
+          (if (= (n-nins f) 1) (Some (xctrl-make)) (Some f))))))
+
+(defn fun-idealize [(f (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  ;; 1. A linked caller died. Skip input 1 while it is the unknown-caller hook: dropping the hook is
+  ;; a separate, deliberate decision (see below), not something dead-path removal may do. Concrete
+  ;; callers unlink atomically with their CallEnd Return edge.
+  (match (fun--dead-caller! f)
+    (Some [x] (Some x))
+    (None []
+          ;; 2. Upgrade the signature from the actual return type, when it sharpened.
+          (match (fun-ret f)
+            (Some [ret]
+                  (let [rt (n-ty ret)]
+                    ;; Return can finish folding one worklist turn before its Fun. Its arena slot
+                    ;; remains addressable for ownership metadata, but TY-INVALID is not a lattice
+                    ;; value and must not be inspected as one; proceed directly to Fun collapse.
+                    (if (= rt TY-INVALID)
+                        (fun--maybe-collapse f)
+                        (if (and (ty-tuple? rt)
+                                 (> (ty-tuple-len rt) RETURN-VALUE))
+                            (let [actual (ty-tuple-at rt RETURN-VALUE)
+                                  declared (ty-sig-ret (fun-sig f))]
+                              (if (= actual TY-INVALID)
+                                  (panic-i "fun-idealize: return tuple contains TY_INVALID; fun nid"
+                                           (n-nid f))
+                                  0)
+                              (if (and (!= actual declared)
+                                       (ty-isa? actual declared))
+                                  (do
+                                    (fun-set-sig! f
+                                                  (fun--sig-with-ret (fun-sig f)
+                                                                     actual))
+                                    (Some f))
+                                  (fun--maybe-collapse f)))
+                            (fun--maybe-collapse f)))))
+            (None [] (fun--maybe-collapse f))))))
+
+;; >>> THE COLLAPSE THAT IS INLINING <<<
+;;
+;; A Fun that is FOLDING and down to one input, with no Phis (its Parms having collapsed already),
+;; becomes that input. This is Region rule 3, and it is the second half of what makes trivial
+;; inlining work: the Fun's control becomes the caller's control.
+;;
+;; Guarded on `folding`, because a Fun with one caller that is NOT being inlined must keep its shape —
+;; it is still a function, and something may call it again.
+(defn fun--detach-folding-fptrs! [(f (dyn NodeOps))] (-> i64)
+  ;; FunPtr's target input is an implementation-only identity link. Final Simple carries only the
+  ;; fidx constant and resolves it through CodeGen; therefore a collapsing Fun cannot rewrite a
+  ;; pointer's target to the caller control. Leaving that edge attached lets a not-yet-collected
+  ;; folding Call observe a caller Fun under the old fidx and install a bogus call-graph edge.
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (n-nouts f))
+              (break 0)
+              (match (n-out f (load i))
+                (Some [use]
+                      (if (and (= (n-op use) OP-FUNPTR)
+                               (match (n-in use 0)
+                                 (Some [target] (n-same? target f))
+                                 (None [] false)))
+                          (do
+                            (n-del-def! use 0)
+                            (code-add! use)
+                            (code-add-outputs! use)
+                            ;; The Fun's output list compressed; inspect this slot again.
+                            (continue))
+                          (do (set! (mut i) (+ (load i) 1)) (continue))))
+                (None [] (do (set! (mut i) (+ (load i) 1)) (continue))))))))
+
+(defn fun--maybe-collapse [(f (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (if (fun-unknown-callers? f)
+      (None [(dyn NodeOps)])
+      (if (and (and (fun-folding? f) (= (n-nins f) 2))
+               (not (region-has-phi? f)))
+          (do
+            (fun--detach-folding-fptrs! f)
+            (n-in f 1))
+          (None [(dyn NodeOps)]))))
+
+;; Replace the return member of a signature tuple.
+(defn fun--sig-with-ret [(sig i64) (ret i64)] (-> i64)
+  (let [n (ty-tuple-len sig)
+        a (compiler-allocator)
+        (mut members) (al-new [i64] a)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break 0)
+              (do
+                (push! [i64]
+                       (mut members)
+                       (if (= (load i) 0) ret (ty-tuple-at sig (load i))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (let [answer (ty-tuple (al-slice (load members)))]
+      (al-free! [i64] (mut members))
+      answer)))
+
+(impl NodeOps FunNode
+  (hdr [(self (ptr FunNode))]
+       (-> (ptr NodeHdr))
+       (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr FunNode))] (-> (slice u8)) (.name self))
+  (is-const? [(self (ptr FunNode))] (-> bool) false)
+  (no-const-fold? [(self (ptr FunNode))] (-> bool) true)
+  (is-pinned? [(self (ptr FunNode))] (-> bool) true)
+  (binop-copy [(self (ptr FunNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)]))
+  (compute [(self (ptr FunNode))]
+           (-> i64)
+           (fun-compute (primitive/make-dyn NodeOps self)))
+  (idealize [(self (ptr FunNode))]
+            (-> (Option (dyn NodeOps)))
+            (fun-idealize (primitive/make-dyn NodeOps self)))
+  ;; Function control identities never GVN. Final Simple carries the closed-world fidx in the
+  ;; function signature, which distinguishes equal-shaped functions and inline clones. Our fidx
+  ;; currently lives on FunPtr, so nid is the equivalent identity until compunit moves it onto Fun.
+  ;; Comparing only the value signature incorrectly merges JsAdd/JsMul/JsSub after their Start
+  ;; hooks close, because their control edges and tuple signatures are otherwise identical.
+  (eq-extra [(self (ptr FunNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (do self other false))
+  (hash-extra [(self (ptr FunNode))] (-> i64) (.nid (.hdr self))))
+
+(impl CFGOps FunNode
+  (cfg-node [(self (ptr FunNode))]
+            (-> (dyn NodeOps))
+            (primitive/make-dyn NodeOps self))
+  (block-head? [(self (ptr FunNode))] (-> bool) true)
+  ;; Final Simple deliberately bypasses Region dominance for a Fun.  Call edges can be recursive,
+  ;; so taking their LCA would walk a cyclic interprocedural CFG.  A function is its own CFG root
+  ;; except during an inline fold, when input 1 is the one caller being spliced into its body.
+  (cfg-idom [(self (ptr FunNode))]
+            (-> (Option (dyn NodeOps)))
+            (if (.folding self)
+                (n-in-safe (primitive/make-dyn NodeOps self) 1)
+                (None [(dyn NodeOps)])))
+  (cfg-idepth [(self (ptr FunNode))]
+              (-> i64)
+              (if (.folding self)
+                  (region-idepth (primitive/make-dyn NodeOps self))
+                  1)))
+
+;; Build a Fun with the unknown-caller hook already installed.
+(defn fun-make [(start (dyn NodeOps)) (sig i64) (name (slice u8))] (-> (dyn NodeOps))
+  (let [a (compiler-allocator)
+        p (alloc/unwrap-ptr [FunNode] (alloc/create [FunNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.sig p) sig)
+    (set! (.name p) name)
+    (set! (.folding p) false)
+    (set! (.escapes p) false)
+    (set! (.jsl p) false)
+    (set! (.approx-size p) 0)
+    (set! (.ret-nid p) 0)
+    (n-init! d OP-FUN)
+    (n-add-def! d (None [(dyn NodeOps)]))  ; slot 0 unused, as in Region
+    (n-add-def! d (Some start))  ; slot 1: the unknown-caller hook
+    (n-set-ty! d TY-CTRL)
+    d))
+
+;; Drop the unknown-caller hook. THE closed-world move: from here the parameter types are the meet of
+;; what the actual callers pass, rather than "anything at all".
+(defn fun-drop-unknown-callers! [(f (dyn NodeOps))] (-> i64)
+  (if (not (fun-unknown-callers? f))
+      (broken "fun-drop-unknown-callers!: there is no unknown-caller hook to drop")
+      (do (region-del-path! f 1) 0)))
+
+;; ---------------------------------------------------------------------------
+;; PARM — a Phi on a Fun, with a declared parameter type
+;;
+;; Input 0 is the Fun. Inputs 1.. are the matching argument from each caller, positionally aligned
+;; with the Fun's inputs — which is why `region-del-path!` must count a Parm as a Phi.
+;;
+;; `_idx` maps one-to-one onto Call input indices. Slot 0 is RPC, slot 1 is memory, and source
+;; arguments begin at slot 2. Public source-argument lookup subtracts CALL-ARG0; the stored identity
+;; never uses a second numbering scheme.
+;;
+;; ## Why interprocedural inference is not a pass
+;;
+;; A Parm is a Phi, so its type is the MEET of what every reaching caller passes — computed by the
+;; SAME `compute` every Phi uses. There is no separate propagation step. That is the entire payoff of
+;; the Fun-is-a-Region design, and it is what makes the closed-world argument affordable.
+;;
+;; `constrain` joins with the DECLARED type: a parameter is never wider than its annotation says,
+;; and never narrower than the callers justify. Where those two agree the annotation is discharged.
+(defstruct ParmNode [(hdr NodeHdr) (idx i64) (declared i64) (name (slice u8))])
+
+(defn parm-idx [(p (dyn NodeOps))] (-> i64)
+  (- (.idx (primitive/cast (ptr ParmNode) (hdr p))) CALL-ARG0))
+
+(defn parm-call-slot [(p (dyn NodeOps))] (-> i64)
+  (.idx (primitive/cast (ptr ParmNode) (hdr p))))
+
+(defn parm-declared [(p (dyn NodeOps))] (-> i64)
+  (.declared (primitive/cast (ptr ParmNode) (hdr p))))
+
+(defn parm-fun [(p (dyn NodeOps))] (-> (dyn NodeOps))
+  (n-in! p 0))
+
+;; A Parm is IN PROGRESS exactly while its Fun has unknown callers. Simple: "Always in-progress until
+;; we run out of unknown callers."
+(defn parm-in-progress? [(p (dyn NodeOps))] (-> bool)
+  (match (n-in p 0)
+    (Some [f] (if (= (n-op f) OP-FUN) (fun-unknown-callers? f) false))
+    (None [] true)))
+
+(defn parm-compute [(p (dyn NodeOps))] (-> i64)
+  (match (n-in p 0)
+    (None [] TY-TOP)
+    (Some [f]
+          (if (!= (n-op f) OP-FUN)
+              ;; The Fun has collapsed during inlining but this Parm has not yet taken its turn.
+              ;; Preserve the aligned argument type until `parm-idealize` replaces the Parm; TOP
+              ;; here would widen an SCCP-sharpened parameter in that intentional transient. If
+              ;; the aligned arm was removed in the same fold, there is no value evidence left.
+              (if (= (n-nins p) 1)
+                  TY-TOP
+                  (match (n-in p 1)
+                    (Some [v]
+                          (if (= (n-ty v) TY-INVALID)
+                              (parm-declared p)
+                              (ty-join (n-ty v) (parm-declared p))))
+                    (None [] TY-TOP)))
+              (if (parm-in-progress? p)
+                  ;; Unknown callers: the parameter could be anything the annotation allows.
+                  (parm-declared p)
+                  ;; During trivial inlining the Fun's sole control input has already been
+                  ;; rewritten from Call to caller control. It can still be provisionally TOP
+                  ;; under SCCP, but the Parm's aligned value is concrete and is about to replace
+                  ;; the Parm through the ordinary single-input Phi rule. Final Simple gets this
+                  ;; from Parm inheriting Phi.compute while Fun is folding; spell it out here
+                  ;; because Coil's Parm compute owns its call-aware live-path filtering.
+                  (if (fun-folding? f)
+                      (if (= (n-nins p) 1)
+                          TY-TOP
+                          (match (n-in p 1)
+                            (Some [v]
+                                  (if (= (n-ty v) TY-INVALID)
+                                      (parm-declared p)
+                                      (ty-join (n-ty v) (parm-declared p))))
+                            (None [] TY-TOP)))
+                      ;; Otherwise the meet over LIVE callers, joined with the declared type.
+                      (let [cnt (n-nins p)
+                            (mut i) 1
+                            (mut t) TY-TOP]
+                        (loop (if (>= (load i) cnt)
+                                  (break 0)
+                                  (do
+                                    (match (n-in f (load i))
+                                      (Some [caller]
+                                            (do
+                                              (n-add-dep! caller p)
+                                              (if (or (= (n-ty caller) TY-XCTRL)
+                                                      (= (n-ty caller) TY-TOP))
+                                                  0
+                                                  (match (n-in p (load i))
+                                                    (Some [v]
+                                                          (if (= (n-ty v)
+                                                                 TY-INVALID)
+                                                              0
+                                                              (set! (mut t)
+                                                                    (ty-meet (load t)
+                                                                             (n-ty v)))))
+                                                    (None [] 0)))))
+                                      (None [] 0))
+                                    (set! (mut i) (+ (load i) 1))
+                                    (continue))))
+                        ;; `constrain`: never wider than the annotation. During inlining a Call can
+                        ;; disappear one worklist turn before this Parm idealizes to its aligned
+                        ;; argument. With no remaining live Call control, the fresh meet is TOP; keep
+                        ;; the already-proven type for that transient instead of widening back to the
+                        ;; declaration and violating the pessimistic monotonicity contract.
+                        (let [constrained (ty-join (load t) (parm-declared p))
+                              old (n-ty p)]
+                          (if (and (= (load t) TY-TOP)
+                                   (and (!= old TY-INVALID)
+                                        (ty-isa? old constrained)))
+                              old
+                              ;; A recursive call is a back edge: a falling integer range widens
+                              ;; toward the declared type instead of falling one value per
+                              ;; iteration (aot.node.phi, loop widening).
+                              (phi-widen-falling old
+                                                 constrained
+                                                 (phi-widen-bound p
+                                                                  constrained
+                                                                  (parm-declared p))))))))))))
+
+(defn parm-idealize [(p (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (match (n-in p 0)
+    (None [] (None [(dyn NodeOps)]))
+    (Some [f]
+          (if (!= (n-op f) OP-FUN)
+              ;; The Fun collapsed. A dead function can lose every caller before the Parm is removed,
+              ;; and in that transient form there is no replacement input at all.
+              (if (= (n-nins p) 1) (None [(dyn NodeOps)]) (n-in p 1))
+              ;; >>> THE OTHER HALF OF INLINING <<<
+              ;; While the Fun is FOLDING, run the full Phi rules — which is how a Parm collapses
+              ;; into the caller's actual argument. Argument substitution IS Phi rule 1.
+              (if (fun-folding? f)
+                  (phi-single-unique-input p)
+                  ;; Otherwise skip the Phi optimisations: a Parm's inputs are call sites, and most
+                  ;; Phi rewrites would push work into every caller.
+                  (None [(dyn NodeOps)]))))))
+
+(impl NodeOps ParmNode
+  (hdr [(self (ptr ParmNode))]
+       (-> (ptr NodeHdr))
+       (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr ParmNode))] (-> (slice u8)) (.name self))
+  (is-const? [(self (ptr ParmNode))] (-> bool) false)
+  ;; While the Fun has unknown callers the Parm reports its DECLARED type, which may well be
+  ;; constant. Folding it then would replace a parameter with one caller's value — the engine's
+  ;; in-progress hook, reserved for exactly this.
+  (no-const-fold? [(self (ptr ParmNode))]
+                  (-> bool)
+                  (parm-in-progress? (primitive/make-dyn NodeOps self)))
+  (is-pinned? [(self (ptr ParmNode))] (-> bool) true)
+  (binop-copy [(self (ptr ParmNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)]))
+  (compute [(self (ptr ParmNode))]
+           (-> i64)
+           (parm-compute (primitive/make-dyn NodeOps self)))
+  (idealize [(self (ptr ParmNode))]
+            (-> (Option (dyn NodeOps)))
+            (parm-idealize (primitive/make-dyn NodeOps self)))
+  (eq-extra [(self (ptr ParmNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (if (!= (n-op other) OP-PARM)
+                false
+                (= (.idx self)
+                   (.idx (primitive/cast (ptr ParmNode) (hdr other))))))
+  (hash-extra [(self (ptr ParmNode))] (-> i64) (+ 179 (.idx self))))
+
+(defn parm-make-slot [(fun (dyn NodeOps))
+                      (slot i64)
+                      (declared i64)
+                      (name (slice u8))] (-> (dyn NodeOps))
+  (let [a (compiler-allocator)
+        p (alloc/unwrap-ptr [ParmNode] (alloc/create [ParmNode] a))
+        d (primitive/make-dyn NodeOps p)]
+    (set! (.idx p) slot)
+    (set! (.declared p) declared)
+    (set! (.name p) name)
+    (n-init! d OP-PARM)
+    (n-add-def! d (Some fun))
+    ;; The Fun already has its unknown-caller hook at input 1, so the Parm needs a matching
+    ;; placeholder to stay positionally aligned.
+    (n-add-def! d (None [(dyn NodeOps)]))
+    (n-set-ty! d declared)
+    d))
+
+(defn parm-make [(fun (dyn NodeOps)) (idx i64) (declared i64) (name (slice u8))] (-> (dyn NodeOps))
+  (parm-make-slot fun (+ CALL-ARG0 idx) declared name))
+
+(defn parm-set-unknown-input! [(p (dyn NodeOps)) (v (dyn NodeOps))] (-> i64)
+  (n-set-def! p 1 (Some v)))
+
+;; Find the Parm with this index on a Fun. There is at most one.
+;; A Parm is the meet over its callers, so linking a NEW caller whose argument lies outside that meet
+;; WIDENS it. Types fall in the optimistic pass — every Parm starts at TOP there and a new caller is one
+;; more fall — but they rise in the pessimistic one, where a widening type is not at least as specific as
+;; before and the monotone node types reject it (docs/SPECIALIZE.md §3.2).
+;;
+;; Simple links in exactly the same place — `CallNode.idealize` links during its pessimistic peephole —
+;; and is safe for two reasons we share only the first of. Before Opto, a Fun carries its unknown-caller
+;; hook, so its Parms hold their declared types and nothing can widen them; `unlinkStart` removes the
+;; hook inside Opto, as `parser-close-world!` does here. After that Simple runs a pessimistic iterate
+;; too, but it never MANUFACTURES a call: its inlining clones a body, and a clone's links carry argument
+;; types already in the meet. JSL specialization does manufacture calls — re-lowering a body at a site
+;; brings that body's own calls with it — so the pessimistic pass declines a widening link and depends on
+;; the Parm; the next optimistic pass performs it.
+(defn call--link-would-widen? [(c (dyn NodeOps)) (fun (dyn NodeOps))] (-> bool)
+  (if (optimistic-pass?)
+      false
+      (let [n (call-nargs c)
+            (mut widens) false
+            (mut i) 0]
+        (loop (if (or (>= (load i) n) (load widens))
+                  (break 0)
+                  (do
+                    (match (fun-parm fun (load i))
+                      (Some [p]
+                            (let [at (n-ty (call-arg c (load i)))
+                                  pt (n-ty p)]
+                              (n-add-dep! p c)
+                              (if (and (!= at TY-INVALID)
+                                       (and (!= pt TY-INVALID)
+                                            (and (not (ty-high? pt))
+                                                 (not (ty-isa? at pt)))))
+                                  (set! (mut widens) true)
+                                  0)))
+                      (None [] 0))
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        (load widens))))
+
+(defn fun-parm [(f (dyn NodeOps)) (idx i64)] (-> (Option (dyn NodeOps)))
+  (let [cnt (n-nouts f)
+        (mut i) 0
+        (mut found) (None [(dyn NodeOps)])]
+    (loop (if (>= (load i) cnt)
+              (break 0)
+              (do
+                (match (n-out f (load i))
+                  (Some [u]
+                        (if (and (= (n-op u) OP-PARM)
+                                 (= (parm-call-slot u) (+ CALL-ARG0 idx)))
+                            (set! (mut found) (Some u))
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
+(defn fun-mem-parm [(f (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [cnt (n-nouts f)
+        (mut i) 0
+        (mut found) (None [(dyn NodeOps)])]
+    (loop (if (>= (load i) cnt)
+              (break 0)
+              (do
+                (match (n-out f (load i))
+                  (Some [u]
+                        (if (and (= (n-op u) OP-PARM)
+                                 (= (parm-call-slot u) CALL-MEM))
+                            (set! (mut found) (Some u))
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
+;; The return-program-counter parameter occupies Call slot 0. It is not a source-language
+;; argument, so keep its lookup separate from `fun-parm`, whose index is deliberately source based.
+(defn fun-rpc-parm [(f (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [cnt (n-nouts f)
+        (mut i) 0
+        (mut found) (None [(dyn NodeOps)])]
+    (loop (if (>= (load i) cnt)
+              (break 0)
+              (do
+                (match (n-out f (load i))
+                  (Some [u]
+                        (if (and (= (n-op u) OP-PARM) (= (parm-call-slot u) 0))
+                            (set! (mut found) (Some u))
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
+;; ---------------------------------------------------------------------------
+;; FUNPTR — a constant naming a Fun
+;;
+;; Its type is a `TypeFunPtr` carrying the signature and a SINGLETON function-index set, so a call
+;; through it is a direct call.
+(defstruct FunPtrNode [(hdr NodeHdr) (fptr-ty i64)])
+
+(impl NodeOps FunPtrNode
+  (hdr [(self (ptr FunPtrNode))]
+       (-> (ptr NodeHdr))
+       (primitive/cast (ptr NodeHdr) self))
+  (label [(self (ptr FunPtrNode))] (-> (slice u8)) "FunPtr")
+  ;; It IS a constant — of function-pointer type. Saying so stops the engine trying to replace it
+  ;; with a Con, which would loop.
+  (is-const? [(self (ptr FunPtrNode))] (-> bool) true)
+  (no-const-fold? [(self (ptr FunPtrNode))] (-> bool) false)
+  (is-pinned? [(self (ptr FunPtrNode))] (-> bool) true)
+  (binop-copy [(self (ptr FunPtrNode)) (lhs (dyn NodeOps)) (rhs (dyn NodeOps))]
+              (-> (Option (dyn NodeOps)))
+              (None [(dyn NodeOps)]))
+  (compute [(self (ptr FunPtrNode))] (-> i64) (.fptr-ty self))
+  (idealize [(self (ptr FunPtrNode))]
+            (-> (Option (dyn NodeOps)))
+            (None [(dyn NodeOps)]))
+  (eq-extra [(self (ptr FunPtrNode)) (other (dyn NodeOps))]
+            (-> bool)
+            (if (!= (n-op other) OP-FUNPTR)
+                false
+                (= (.fptr-ty self)
+                   (.fptr-ty (primitive/cast (ptr FunPtrNode) (hdr other))))))
+  (hash-extra [(self (ptr FunPtrNode))] (-> i64) (* (.fptr-ty self) 181)))
+
+;; Our FunPtr has a real Fun input, so signature sharpening can update every pointer directly when
+;; `fun-set-sig!` changes the owner. This is the same cached-constant update Simple performs in
+;; FunPtr idealization, while preserving the last valid identity if the function body later dies.
+(defn funptr-refresh-from-fun! [(fun (dyn NodeOps)) (sig i64)] (-> i64)
+  (let [cnt (n-nouts fun)
+        (mut i) 0]
+    (loop (if (>= (load i) cnt)
+              (break 0)
+              (do
+                (match (n-out fun (load i))
+                  (Some [use]
+                        (if (= (n-op use) OP-FUNPTR)
+                            (let [p (primitive/cast (ptr FunPtrNode) (hdr use))
+                                  prior (.fptr-ty p)]
+                              (if (= prior TY-INVALID)
+                                  (panic-i "funptr-refresh-from-fun!: FunPtr payload is TY_INVALID; nid"
+                                           (n-nid use))
+                                  0)
+                              (let [fresh
+                                      (ty-funptr sig (ty-funptr-fidxs prior))]
+                                (if (= fresh (.fptr-ty p))
+                                    0
+                                    (do
+                                      (n-unlock! use)
+                                      (set! (.fptr-ty p) fresh)
+                                      (n-force-ty! use fresh)
+                                      (code-add! use)
+                                      (code-add-outputs! use)
+                                      0))))
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))
+
+(defn funptr-make [(fun (dyn NodeOps)) (fidx i64)] (-> (dyn NodeOps))
+  (let [a (compiler-allocator)
+        p (alloc/unwrap-ptr [FunPtrNode] (alloc/create [FunPtrNode] a))
+        d (primitive/make-dyn NodeOps p)
+        t (ty-funptr-singleton (fun-sig fun) (reserve-fidx! fidx))]
+    (arena-register-function! fidx fun)
+    (set! (.fptr-ty p) t)
+    (n-init! d OP-FUNPTR)
+    (n-add-def! d (Some fun))
+    (n-set-ty! d t)
+    d))

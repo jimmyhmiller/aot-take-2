@@ -1,0 +1,468 @@
+;; Lowering of JSL primitives: unary and binary operators, property stores, runtime calls, pending throws and the argument vector.
+
+(module aot.jsl.lower.primitive)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "aot.codegen.callabi" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.str" :as str)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.reader" :as rd)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.node.arith" :use *)
+(import "aot.node.bits" :use *)
+(import "aot.node.compare" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.property" :use *)
+(import "aot.rt.abi" :use *)
+(import "aot.node.gc" :use *)
+(import "aot.node.jsops" :use *)
+(import "aot.shape" :use *)
+(import "aot.type.type" :use *)
+(import "aot.jsl.lower.expr" :use *)
+
+(defn jsl-unary-primitive? [(name (slice u8))] (-> bool)
+  (or (= name "%Box")
+      (= name "%BoxInt")
+      (= name "%BoxBool")
+      (= name "%Not")
+      (= name "%Neg")
+      (= name "%UnboxInt")
+      (= name "%UnboxBool")
+      (= name "%UnboxFlt")
+      (= name "%UnboxNumber")
+      (= name "%UnboxString")
+      (= name "%UnboxObject")
+      (= name "%UnboxObjectLike")
+      (= name "%UnboxArray")
+      (= name "%UnboxSymbol")
+      (= name "%ToInteger")
+      (= name "%ToFloat")))
+
+(defn jsl-lower-unary-primitive [(name (slice u8))
+                                 (value (dyn NodeOps))
+                                 (ctrl (dyn NodeOps))] (-> (dyn NodeOps))
+  ;; The enclosing JslExprResult still owns this control after the value folds. Box attaches
+  ;; control temporarily; folding Box(TOP) can otherwise kill a fresh CallEnd CProj before the
+  ;; enclosing branch wires it into its Region. Keep borrowed operands across eager peepholing.
+  (n-keep! ctrl)
+  (n-keep! value)
+  (let [result (jsl-lower-unary-primitive-inner name value ctrl)]
+    (n-unkeep! value)
+    (n-unkeep! ctrl)
+    result))
+
+(defn jsl-lower-unary-primitive-inner [(name (slice u8))
+                                       (value (dyn NodeOps))
+                                       (ctrl (dyn NodeOps))] (-> (dyn NodeOps))
+  (if (= name "%Box")
+      (n-peephole! (box-make-at (Some ctrl) value))
+      (if (= name "%BoxInt")
+          (n-peephole! (box-make-rep-at (Some ctrl) value REP-INT))
+          (if (= name "%BoxBool")
+              (n-peephole! (box-make-rep-at (Some ctrl) value REP-BOOL))
+              (if (or (= name "%Not") (= name "%Neg"))
+                  (n-peephole! (if (= name "%Neg")
+                                   (minus-make value)
+                                   (not-make value)))
+                  (if (= name "%UnboxInt")
+                      (n-peephole! (unbox-make value REP-INT))
+                      (if (= name "%UnboxBool")
+                          (n-peephole! (unbox-make value REP-BOOL))
+                          (if (= name "%UnboxFlt")
+                              (n-peephole! (unbox-make value REP-DOUBLE))
+                              (if (= name "%UnboxNumber")
+                                  (n-peephole! (unbox-make value REP-NUMBER))
+                                  (if (= name "%UnboxString")
+                                      (n-peephole! (unbox-make value REP-STRING))
+                                      (if (= name "%UnboxObject")
+                                          (n-peephole! (unbox-make value
+                                                                   REP-OBJECT))
+                                          (if (= name "%UnboxObjectLike")
+                                              (n-peephole! (unbox-make value
+                                                                       REP-OBJECT-LIKE))
+                                              (if (= name "%UnboxArray")
+                                                  (n-peephole! (unbox-make value
+                                                                           REP-ARRAY))
+                                                  (if (= name "%UnboxSymbol")
+                                                      (n-peephole! (unbox-make value
+                                                                               REP-SYMBOL))
+                                                      (if (= name "%ToFloat")
+                                                          (n-peephole! (to-float-make value))
+                                                          (if (= name
+                                                                 "%ToInteger")
+                                                              (n-peephole! (to-int-make value))
+                                                              (do
+                                                                (panic "jsl-lower-unary-primitive: checker/lowerer drift")
+                                                                (unreachable-node))))))))))))))))))
+
+(defn jsl-lower-binary-primitive [(name (slice u8))
+                                  (lhs (dyn NodeOps))
+                                  (rhs (dyn NodeOps))] (-> (dyn NodeOps))
+  (n-peephole! (if (= name "%Sub")
+                   (sub-make lhs rhs)
+                   (if (= name "%Add")
+                       (add-make lhs rhs)
+                       (if (= name "%Mul")
+                           (mul-make lhs rhs)
+                           (if (= name "%Div")
+                               (div-make lhs rhs)
+                               (if (or (= name "%Eq") (= name "%SameBits"))
+                                   (if (= name "%SameBits")
+                                       (eq-word-make lhs rhs)
+                                       (eq-make lhs rhs))
+                                   (if (= name "%Ne")
+                                       (ne-make lhs rhs)
+                                       (if (= name "%Lt")
+                                           (lt-make lhs rhs)
+                                           (if (= name "%Le")
+                                               (le-make lhs rhs)
+                                               (if (= name "%And")
+                                                   (and-make lhs rhs)
+                                                   (do
+                                                     (panic "jsl-lower-binary-primitive: checker/lowerer drift")
+                                                     (unreachable-node)))))))))))))
+
+(defn jsl-lower-property-store-primitive [(x (ptr rd/Sexp))
+                                          (params (ptr rd/Sexp))
+                                          (values (ArrayList (dyn NodeOps)))
+                                          (local-names (mut (ArrayList (slice u8))))
+                                          (local-values (mut (ArrayList (dyn NodeOps))))
+                                          (ctrl (dyn NodeOps))
+                                          (mem (dyn NodeOps))
+                                          (with-attrs bool)] (-> JslExprResult)
+  (let [object
+          (jsl-lower-expr (rd/sexp-nth x 1)
+                          params
+                          values
+                          (mut local-names)
+                          (mut local-values)
+                          ctrl
+                          mem)
+        key
+          (jsl-lower-expr (rd/sexp-nth x 2)
+                          params
+                          values
+                          (mut local-names)
+                          (mut local-values)
+                          (.ctrl object)
+                          (.mem object))
+        value
+          (jsl-lower-expr (rd/sexp-nth x 3)
+                          params
+                          values
+                          (mut local-names)
+                          (mut local-values)
+                          (.ctrl key)
+                          (.mem key))
+        key-id (keyref-local (.value key))
+        ;; The attributes operand must be a constant: the transition it names is compile-time.
+        attrs
+          (if with-attrs
+              (let [a
+                      (jsl-lower-expr (rd/sexp-nth x 4)
+                                      params
+                                      values
+                                      (mut local-names)
+                                      (mut local-values)
+                                      (.ctrl value)
+                                      (.mem value))
+                    at (n-ty (.value a))]
+                (if (and (ty-int? at) (ty-constant? at))
+                    (ty-int-lo at)
+                    (do
+                      (panic "%PropStoreOwnNamedAttrs: the attributes are not a constant")
+                      0)))
+              SHAPE-ATTRS-DEFAULT)]
+    ;; A runtime key (ToPropertyKey's result) takes the runtime shape-tree store directly; with
+    ;; attributes, the store whose added key takes them.
+    (if (< key-id 0)
+        (let [stored
+                (if (= attrs SHAPE-ATTRS-DEFAULT)
+                    (property-generic-access (.ctrl value)
+                                             (.mem value)
+                                             (.value object)
+                                             (.value key)
+                                             (Some (.value value))
+                                             JS-PROP-SET-OWN)
+                    (property-store-generic-owner-attrs (.ctrl value)
+                                                        (.mem value)
+                                                        (.value object)
+                                                        (.value key)
+                                                        (.value value)
+                                                        attrs))]
+          (jsl-expr-result (.value stored) (.ctrl stored) (.mem stored)))
+        ;; A statically visible backing store — a literal under construction — takes the static
+        ;; transition now; any other owner is a PropStore node that resolves or expands later.
+        (let [stored
+                (match (prop-static-storage (.mem value) (.value object))
+                  (PropUnknown []
+                               (prop-access-emit-attrs (.ctrl value)
+                                                       (.mem value)
+                                                       (.value object)
+                                                       (Some (.value value))
+                                                       key-id
+                                                       PROP-STORE
+                                                       attrs))
+                  (_ (property-store-known-owner (.ctrl value)
+                                                 (.mem value)
+                                                 (.value object)
+                                                 key-id
+                                                 (.value value)
+                                                 attrs)))]
+          (jsl-expr-result (.value stored) (.ctrl stored) (.mem stored))))))
+
+;; (%PropSetNamed object key value): OrdinarySet's fast cases as one PROP-SET access — it folds to
+;; a store where the owner and its chain are known and expands to the runtime's `rt-prop-set`
+;; otherwise; a runtime key is that call directly.
+(defn jsl-lower-property-set-primitive [(x (ptr rd/Sexp))
+                                        (params (ptr rd/Sexp))
+                                        (values (ArrayList (dyn NodeOps)))
+                                        (local-names (mut (ArrayList (slice u8))))
+                                        (local-values (mut (ArrayList (dyn NodeOps))))
+                                        (ctrl (dyn NodeOps))
+                                        (mem (dyn NodeOps))] (-> JslExprResult)
+  (let [object
+          (jsl-lower-expr (rd/sexp-nth x 1)
+                          params
+                          values
+                          (mut local-names)
+                          (mut local-values)
+                          ctrl
+                          mem)
+        key
+          (jsl-lower-expr (rd/sexp-nth x 2)
+                          params
+                          values
+                          (mut local-names)
+                          (mut local-values)
+                          (.ctrl object)
+                          (.mem object))
+        value
+          (jsl-lower-expr (rd/sexp-nth x 3)
+                          params
+                          values
+                          (mut local-names)
+                          (mut local-values)
+                          (.ctrl key)
+                          (.mem key))
+        key-id (keyref-local (.value key))
+        stored
+          (if (>= key-id 0)
+              (prop-access-emit (.ctrl value)
+                                (.mem value)
+                                (.value object)
+                                (Some (.value value))
+                                key-id
+                                PROP-SET)
+              (property-set-generic (.ctrl value)
+                                    (.mem value)
+                                    (.value object)
+                                    (.value key)
+                                    (.value value)))]
+    (jsl-expr-result (.value stored) (.ctrl stored) (.mem stored))))
+
+(defn jsl-lower-runtime-primitive [(x (ptr rd/Sexp))
+                                   (prim i64)
+                                   (params (ptr rd/Sexp))
+                                   (values (ArrayList (dyn NodeOps)))
+                                   (local-names (mut (ArrayList (slice u8))))
+                                   (local-values (mut (ArrayList (dyn NodeOps))))
+                                   (ctrl (dyn NodeOps))
+                                   (mem (dyn NodeOps))] (-> JslExprResult)
+  (let [(mut ctrl-nid) (n-nid ctrl)
+        (mut mem-nid) (n-nid mem)
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))
+        (mut i) 1]
+    (loop (if (>= (load i) (rd/sexp-count x))
+              (break 0)
+              (let [arg
+                      (jsl-lower-expr (rd/sexp-nth x (load i))
+                                      params
+                                      values
+                                      (mut local-names)
+                                      (mut local-values)
+                                      (jsl-node (load ctrl-nid))
+                                      (jsl-node (load mem-nid)))]
+                (push! [(dyn NodeOps)] (mut args) (.value arg))
+                (set! (mut ctrl-nid) (n-nid (.ctrl arg)))
+                (set! (mut mem-nid) (n-nid (.mem arg)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (let [op
+            (jsop-make (jsl-node (load ctrl-nid))
+                       (jsl-node (load mem-nid))
+                       prim)
+          (mut arg) 0]
+      (loop (if (>= (load arg) (len (load args)))
+                (break 0)
+                (do
+                  (jsop-add-arg! op (get (load args) (load arg)))
+                  (set! (mut arg) (+ (load arg) 1))
+                  (continue))))
+      (jsl-expr-result (proj-make op 2 "jsl.primitive.value")
+                       (jsl-node (load ctrl-nid))
+                       (proj-make op 1 "jsl.primitive.mem")))))
+
+;; `(%SetPendingException v)`: the throw half of an abrupt completion from JSL — the pending word of
+;; the runtime heap record takes the value and the result is the exception sentinel
+;; (docs/DECISIONS.md, exceptions are a sentinel completion), which the definition returns and its
+;; caller tests.
+(defn jsl-lower-pending-throw-primitive [(x (ptr rd/Sexp))
+                                         (params (ptr rd/Sexp))
+                                         (values (ArrayList (dyn NodeOps)))
+                                         (local-names (mut (ArrayList (slice u8))))
+                                         (local-values (mut (ArrayList (dyn NodeOps))))
+                                         (ctrl (dyn NodeOps))
+                                         (mem (dyn NodeOps))] (-> JslExprResult)
+  (let [value
+          (jsl-lower-expr (rd/sexp-nth x 1)
+                          params
+                          values
+                          (mut local-names)
+                          (mut local-values)
+                          ctrl
+                          mem)
+        after-value
+          (jsl-pending-store (.ctrl value)
+                             (.mem value)
+                             RT-HEAP-OFFSET-EXCEPTION-VALUE
+                             ALIAS-EXCEPTION-VALUE
+                             (.value value))]
+    (jsl-expr-result (dyn-exception-make) (.ctrl value) after-value)))
+
+(defn jsl-pending-store [(ctrl (dyn NodeOps))
+                         (mem (dyn NodeOps))
+                         (offset i64)
+                         (alias i64)
+                         (value (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [stored
+          (store-make ctrl
+                      mem
+                      (heapstate-make)
+                      (con-int offset)
+                      value
+                      alias
+                      (ty-dyn TAG-ANY))
+        merged (memmerge-make)]
+    (memmerge-set-alias! merged ALIAS-BULK (mem-effective mem ALIAS-BULK))
+    (if (= (n-op mem) OP-MEMMERGE)
+        (let [(mut a) 2]
+          (loop (if (>= (load a) (n-nins mem))
+                    (break 0)
+                    (do
+                      (match (n-in mem (load a))
+                        (Some [slice]
+                              (if (= (load a) alias)
+                                  0
+                                  (memmerge-set-alias! merged (load a) slice)))
+                        (None [] 0))
+                      (set! (mut a) (+ (load a) 1))
+                      (continue)))))
+        0)
+    (memmerge-set-alias! merged alias stored)
+    merged))
+
+(defn jsl-lower-prototype-store-primitive [(x (ptr rd/Sexp))
+                                           (params (ptr rd/Sexp))
+                                           (values (ArrayList (dyn NodeOps)))
+                                           (local-names (mut (ArrayList (slice u8))))
+                                           (local-values (mut (ArrayList (dyn NodeOps))))
+                                           (ctrl (dyn NodeOps))
+                                           (mem (dyn NodeOps))] (-> JslExprResult)
+  (let [object
+          (jsl-lower-expr (rd/sexp-nth x 1)
+                          params
+                          values
+                          (mut local-names)
+                          (mut local-values)
+                          ctrl
+                          mem)
+        prototype
+          (jsl-lower-expr (rd/sexp-nth x 2)
+                          params
+                          values
+                          (mut local-names)
+                          (mut local-values)
+                          (.ctrl object)
+                          (.mem object))
+        stored
+          (store-make (.ctrl prototype)
+                      (.mem prototype)
+                      (.value object)
+                      (con-int OFFSET-OBJECT-PROTOTYPE)
+                      (.value prototype)
+                      ALIAS-OBJECT-PROTOTYPE
+                      (ty-dyn (+ TAG-NULL
+                                 (+ TAG-OBJECT (+ TAG-FUNCTION TAG-ARRAY)))))
+        merged (memmerge-make)]
+    (memmerge-set-alias! merged
+                         ALIAS-BULK
+                         (mem-effective (.mem prototype) ALIAS-BULK))
+    (memmerge-set-alias! merged ALIAS-OBJECT-PROTOTYPE stored)
+    (memmerge-set-alias! merged
+                         ALIAS-OBJECT-PROPERTIES
+                         (mem-effective (.mem prototype)
+                                        ALIAS-OBJECT-PROPERTIES))
+    (jsl-expr-result (.value object) (.ctrl prototype) merged)))
+
+;; The callable ABI's arguments as values a body can compute with (aot.codegen.callabi):
+;; `(%ArgumentCountInt count)` is the count itself; `(%ArrayArgumentCount raw)` an array's length as a
+;; count; `(%ArgumentAt vector index)` the overflow actual at `index` (3 or more, below the count the
+;; body tested), one word of the managed vector.
+(defn jsl-lower-argument-primitive [(x (ptr rd/Sexp))
+                                    (params (ptr rd/Sexp))
+                                    (values (ArrayList (dyn NodeOps)))
+                                    (local-names (mut (ArrayList (slice u8))))
+                                    (local-values (mut (ArrayList (dyn NodeOps))))
+                                    (ctrl (dyn NodeOps))
+                                    (mem (dyn NodeOps))] (-> JslExprResult)
+  (let [name (rd/sexp-sym (rd/sexp-nth x 0))
+        first
+          (jsl-lower-expr (rd/sexp-nth x 1)
+                          params
+                          values
+                          (mut local-names)
+                          (mut local-values)
+                          ctrl
+                          mem)]
+    (if (= name "%ArgumentCountInt")
+        first
+        (if (= name "%ArrayArgumentCount")
+            (jsl-expr-result (load-make (.ctrl first)
+                                        (.mem first)
+                                        (.value first)
+                                        (con-int OFFSET-ARRAY-LENGTH)
+                                        ALIAS-ARRAY-LENGTH
+                                        (ty-int-range 0 CALL-ABI-MAX-ARGUMENTS))
+                             (.ctrl first)
+                             (.mem first))
+            (do
+              (n-keep! (.value first))
+              (let [index
+                      (jsl-lower-expr (rd/sexp-nth x 2)
+                                      params
+                                      values
+                                      (mut local-names)
+                                      (mut local-values)
+                                      (.ctrl first)
+                                      (.mem first))
+                    offset
+                      (n-peephole! (mul-make (n-peephole! (sub-make (.value index)
+                                                                    (con-int CALL-ABI-DIRECT-COUNT)))
+                                             (con-int 8)))]
+                (n-unkeep! (.value first))
+                (jsl-expr-result (load-make-mode (.ctrl index)
+                                                 (.mem index)
+                                                 (.value first)
+                                                 offset
+                                                 ALIAS-CALL-ARGUMENTS
+                                                 (ty-dyn TAG-ANY)
+                                                 true)
+                                 (.ctrl index)
+                                 (.mem index))))))))

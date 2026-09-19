@@ -1,0 +1,344 @@
+;; The node arena: dense node ids, the function-index registry, external functions, and the iterate and inline worklists.
+
+(module aot.node.arena)
+(import "aot.util.arena"
+        :use
+        [compiler-allocator compiler-state CompilerStateSlot])
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.slice" :use *)
+(import "coil.os" :as os)
+(import "coil.str" :use [sb-new sb-push-str! sb-str str-keyops-borrowed])
+(import "aot.util.panic" :use *)
+(import "aot.util.worklist" :use *)
+(import "aot.type.type" :use *)
+(import "aot.node.node" :use [NodeOps n-nid n-op n-nins n-nouts n-in n-out])
+(import "aot.node.op" :use *)
+(import "aot.node.origin" :use *)
+(import "aot.node.cfgcache" :use *)
+
+;; ---------------------------------------------------------------------------
+;; The compilation arena, the GVN table, and the worklist
+;;
+;; Simple keeps these on its `CodeGen` god-object, which makes `Node` and `CodeGen` mutually
+;; dependent. Coil resolves forward references within a file but not across a module cycle, so the
+;; part the graph itself needs lives here and the phase driver imports this one-way.
+;; Simple CodeGen keeps external FIDX declarations separate from local Fun owners. The declared
+;; signature is a contract, not a body sharpened by this compilation. Imported calls may read or
+;; write public memory, allocate, throw and call back; no narrower effect summary is assumed.
+(defstruct ExternalFunction [(name (slice u8)) (signature i64)])
+
+(defstruct NodeArena
+  [(next-nid i64)
+   (nodes (ArrayList (Option (dyn NodeOps))))  ; every node ever made, indexed by nid
+   (gvn-index (HashMap i64 i64))  ; structural hash -> head nid of a chain
+   (gvn-next (ArrayList i64))  ; nid -> next nid with the same hash, 0 = end
+   (work WorkList)
+   (inline-work WorkList)  ; Simple's second worklist, of CallEnd nodes
+   (deferred (ArrayList i64))  ; candidates that answered DEFER, retried after any inline fires
+   ;; Every (dep, watcher) pair currently in some node's `deps`, so adding one is a lookup and not
+   ;; a scan of the dep's lists: a Fun watched by hundreds of CallEnds made that scan half of Opto.
+   (dep-pairs (HashMap i64 bool))
+   (mid-assert bool)  ; true while an expensive assert is running: no side effects allowed
+   (optimistic bool)  ; true during the optimistic SCCP pass, when every `pesi-ty` is the pass's sound bound
+   (ctrl-version i64)  ; bumped at inlining and phase boundaries; guards the idepth cache
+   (cfg-edit-version i64)  ; bumped by every control-node edge edit; guards the region idom cache
+   (next-fidx i64)  ; compilation-local function identity; inline clones reserve from this space
+   (function-nids (ArrayList i64))  ; fidx -> owner nid; metadata, not a liveness edge
+   (external-functions (HashMap i64 ExternalFunction))
+   (external-names (HashMap (slice u8) i64))
+   (source-lo i64)  ; active parser range inherited by newly constructed nodes
+   (source-hi i64)
+   (booted bool)])
+
+(defn arena [] (-> (ptr NodeArena))
+  (compiler-state [NodeArena] (primitive/alloc-static CompilerStateSlot)))
+
+(defn arena-boot! [] (-> i64)
+  (let [t (arena)]
+    (if (.booted t)
+        0
+        (let [a (compiler-allocator)]
+          (set! (.nodes t) (al-new [(Option (dyn NodeOps))] a))
+          (set! (.gvn-index t) (hm-new [i64 i64] a (i64-keyops)))
+          (set! (.gvn-next t) (al-new [i64] a))
+          (set! (.work t) (wl-new 1))
+          (set! (.inline-work t) (wl-new 1))
+          (set! (.deferred t) (al-new [i64] a))
+          (set! (.dep-pairs t) (hm-new [i64 bool] a (i64-keyops)))
+          (set! (.next-nid t) 1)
+          (set! (.mid-assert t) false)
+          (set! (.optimistic t) false)
+          (set! (.ctrl-version t) 1)
+          (set! (.cfg-edit-version t) 1)
+          (set! (.next-fidx t) 0)
+          (set! (.function-nids t) (al-new [i64] a))
+          (set! (.external-functions t)
+                (hm-new [i64 ExternalFunction] a (i64-keyops)))
+          (set! (.external-names t)
+                (hm-new [(slice u8) i64] a (str-keyops-borrowed)))
+          (set! (.source-lo t) -1)
+          (set! (.source-hi t) -1)
+          (set! (.booted t) true)
+          ;; nid 0 is never handed out, so a zeroed header is recognisably not a node.
+          (push! [(Option (dyn NodeOps))] (mut (.nodes t)) (None))
+          (push! [i64] (mut (.gvn-next t)) 0)
+          0))))
+
+;; Reset the whole compilation.
+;;
+;; Tests call this explicitly rather than relying on `coil test` forking each case. Cross-test
+;; leakage should be a visible bug here, not a mystery — and a real compiler run compiles more than
+;; one thing in one process, so this path has to work anyway.
+(defn arena-reset! [(seed i64)] (-> i64)
+  (do
+    (arena-boot!)
+    (n-origin-reset!)
+    (let [t (arena)
+          a (compiler-allocator)]
+      (set! (.nodes t) (al-new [(Option (dyn NodeOps))] a))
+      (set! (.gvn-index t) (hm-new [i64 i64] a (i64-keyops)))
+      (set! (.gvn-next t) (al-new [i64] a))
+      (set! (.work t) (wl-new seed))
+      (set! (.inline-work t) (wl-new seed))
+      (set! (.deferred t) (al-new [i64] a))
+      (set! (.dep-pairs t) (hm-new [i64 bool] a (i64-keyops)))
+      (set! (.ctrl-version t) 1)
+      (set! (.cfg-edit-version t) 1)
+      (set! (.next-nid t) 1)
+      (set! (.next-fidx t) 0)
+      (set! (.function-nids t) (al-new [i64] a))
+      (set! (.external-functions t)
+            (hm-new [i64 ExternalFunction] a (i64-keyops)))
+      (set! (.external-names t)
+            (hm-new [(slice u8) i64] a (str-keyops-borrowed)))
+      (set! (.source-lo t) -1)
+      (set! (.source-hi t) -1)
+      (set! (.mid-assert t) false)
+      (set! (.optimistic t) false)
+      (push! [(Option (dyn NodeOps))] (mut (.nodes t)) (None))
+      (push! [i64] (mut (.gvn-next t)) 0)
+      0)))
+
+;; Function indices share one compilation-local dense namespace. Frontends may reserve explicit
+;; indices while loading a unit; clone inlining takes the next unused identity from the same source.
+(defn reserve-fidx! [(fidx i64)] (-> i64)
+  (do
+    (arena-boot!)
+    (if (< fidx 0) (panic-i "reserve-fidx!: negative function index" fidx) 0)
+    (if (>= fidx (.next-fidx (arena))) (set! (.next-fidx (arena)) (+ fidx 1)) 0)
+    fidx))
+
+(defn next-inline-fidx! [] (-> i64)
+  (do
+    (arena-boot!)
+    (let [fidx (.next-fidx (arena))]
+      (set! (.next-fidx (arena)) (+ fidx 1))
+      fidx)))
+
+;; Final Simple CodeGen._linker maps each closed-world fidx to its Fun. Its lookupFun deliberately
+;; does not purge temporarily dead targets: SCCP may revive them when a new call becomes live.
+;; This registry accompanies the existing identity allocator in NodeArena to preserve the graph's
+;; one-way dependency on compilation state. Cross-unit resolution must publish into this same map;
+;; there is no symbol-name fallback and registration never keeps a function alive by itself.
+(defn arena-register-function! [(fidx i64) (fun (dyn NodeOps))] (-> i64)
+  (do
+    (reserve-fidx! fidx)
+    (match (arena-external-function fidx)
+      (Some [_]
+            (panic "arena-register-function!: identity already declares an import"))
+      (None [] 0))
+    (if (!= (n-op fun) OP-FUN)
+        (panic "arena-register-function!: owner is not a Fun")
+        0)
+    (loop (if (> (len (.function-nids (arena))) fidx)
+              (break 0)
+              (do (push! [i64] (mut (.function-nids (arena))) 0) (continue))))
+    (let [prior (get (.function-nids (arena)) fidx)]
+      (if (and (!= prior 0) (!= prior (n-nid fun)))
+          (panic-i "arena-register-function!: conflicting owner for function index"
+                   fidx)
+          (set! (mut (.function-nids (arena))) fidx (n-nid fun))))))
+
+;; The closed-world index registered for `fun`, or -1: the registry is the authoritative owner
+;; map, whether a FunPtr filled it or the static heap image did.
+(defn arena-function-fidx [(fun (dyn NodeOps))] (-> i64)
+  (do
+    (arena-boot!)
+    (let [nids (.function-nids (arena))
+          (mut i) 0
+          (mut found) -1]
+      (loop (if (or (>= (load i) (len nids)) (>= (load found) 0))
+                (break 0)
+                (do
+                  (if (= (get nids (load i)) (n-nid fun))
+                      (set! (mut found) (load i))
+                      0)
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      (load found))))
+
+(defn arena-function [(fidx i64)] (-> (Option (dyn NodeOps)))
+  (do
+    (arena-boot!)
+    (if (or (< fidx 0) (>= fidx (len (.function-nids (arena)))))
+        (None [(dyn NodeOps)])
+        (arena-node (get (.function-nids (arena)) fidx)))))
+
+(defn arena-external-function [(fidx i64)] (-> (Option ExternalFunction))
+  (arena-boot!)
+  (get (.external-functions (arena)) fidx))
+
+(defn arena-declare-external! [(fidx i64) (name (slice u8)) (signature i64)] (-> i64)
+  (reserve-fidx! fidx)
+  (if (or (= (len name) 0)
+          (not (ty-tuple? signature))
+          (= (ty-tuple-len signature) 0))
+      (panic "arena-declare-external!: empty name or invalid signature")
+      0)
+  (match (arena-function fidx)
+    (Some [_]
+          (panic "arena-declare-external!: identity already has a local owner"))
+    (None [] 0))
+  (match (arena-external-named name)
+    (Some [prior]
+          (let [p prior]
+            (if (!= (.signature p) signature)
+                (panic "arena-declare-external!: symbol has conflicting signatures")
+                0)))
+    (None [] 0))
+  (match (arena-external-function fidx)
+    (Some [prior]
+          (let [p prior]
+            (if (or (!= (.name p) name) (!= (.signature p) signature))
+                (panic "arena-declare-external!: conflicting declaration")
+                0)))
+    (None []
+          (let [(mut owned) (sb-new (compiler-allocator))]
+            (sb-push-str! (mut owned) name)
+            (let [spelling (sb-str (load owned))]
+              (set! (mut (.external-functions (arena)))
+                    fidx
+                    (ExternalFunction :name spelling :signature signature))
+              (set! (mut (.external-names (arena))) spelling fidx)))))
+  fidx)
+
+(defn arena-external-named [(name (slice u8))] (-> (Option ExternalFunction))
+  (arena-boot!)
+  (match (get (.external-names (arena)) name)
+    (Some [fidx] (arena-external-function fidx))
+    (None [] (None [ExternalFunction]))))
+
+;; Read accessors do not boot: an unbooted arena has no nodes, count zero, and version zero.
+(defn arena-node-count [] (-> i64)
+  (let [t (arena)] (if (.booted t) (- (.next-nid t) 1) 0)))
+
+;; The node with this nid, or None if it was never made.
+(defn arena-node [(id i64)] (-> (Option (dyn NodeOps)))
+  (do
+    (if (or (<= id 0) (>= id (len (.nodes (arena)))))
+        (None)
+        (get (.nodes (arena)) id))))
+
+;; ---------------------------------------------------------------------------
+;; Worklist access
+;;
+;; Simple spells these `CODE.add(n)` / `CODE.addAll(...)`. Every peephole that changes something
+;; re-queues the neighbourhood through these.
+(defn code-add! [(n (dyn NodeOps))] (-> i64)
+  (do
+    (arena-boot!)
+    (if (.mid-assert (arena))
+        0
+        (wl-push! (mut (.work (arena))) (n-nid n)))))
+
+(defn code-add-outputs! [(n (dyn NodeOps))] (-> i64)
+  (let [cnt (n-nouts n)
+        (mut i) 0]
+    (loop (if (>= (load i) cnt)
+              (break 0)
+              (do
+                (match (n-out n (load i)) (Some [v] (code-add! v)) (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn code-add-inputs! [(n (dyn NodeOps))] (-> i64)
+  (let [cnt (n-nins n)
+        (mut i) 0]
+    (loop (if (>= (load i) cnt)
+              (break 0)
+              (do
+                (match (n-in n (load i)) (Some [v] (code-add! v)) (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn code-work-empty? [] (-> bool)
+  (do (arena-boot!) (wl-empty? (.work (arena)))))
+
+(defn code-work-pop! [] (-> (Option i64))
+  (do (arena-boot!) (wl-pop! (mut (.work (arena))))))
+
+(defn code-clear-worklists! [] (-> i64)
+  (do
+    (arena-boot!)
+    (wl-clear! (mut (.work (arena))))
+    (wl-clear! (mut (.inline-work (arena))))
+    (al-clear! [i64] (mut (.deferred (arena))))
+    0))
+
+(defn code-seed [] (-> i64)
+  (do (arena-boot!) (wl-seed0 (.work (arena)))))
+
+;; ---------------------------------------------------------------------------
+;; Node construction
+(defn arena-register! [(n (dyn NodeOps))] (-> i64)
+  (do
+    (arena-boot!)
+    (let [t (arena)
+          id (.next-nid t)]
+      (set! (.nid (hdr n)) id)
+      (set! (.next-nid t) (+ id 1))
+      (push! [(Option (dyn NodeOps))] (mut (.nodes t)) (Some n))
+      (push! [i64] (mut (.gvn-next t)) 0)
+      id)))
+
+;; ---------------------------------------------------------------------------
+;; The INLINE worklist — Simple's `IterPeeps._workInline`
+;;
+;; A second worklist, of CallEnd nids, plus a deferred list. It lives here rather than in
+;; `aot.codegen.iterpeeps` for the same reason the node worklist does: `peepholeOpt` pushes onto it
+;; and cannot import the driver.
+(defn code-inline-push! [(id i64)] (-> i64)
+  (do
+    (arena-boot!)
+    (if (.mid-assert (arena)) 0 (wl-push! (mut (.inline-work (arena))) id))))
+
+(defn code-inline-pop! [] (-> (Option i64))
+  (do (arena-boot!) (wl-pop! (mut (.inline-work (arena))))))
+
+;; Is this nid already waiting for an inline decision?  The expensive IterPeeps fixpoint check
+;; needs the same membership test Simple's `progressOnList` uses: a CallEnd may still be a valid
+;; inline candidate only while it is represented on this second worklist.
+(defn code-on-inline-worklist? [(id i64)] (-> bool)
+  (do (arena-boot!) (wl-on? (.inline-work (arena)) id)))
+
+;; Park a candidate that answered DEFER. It is retried only after some OTHER inline actually fired.
+(defn code-defer-inline! [(id i64)] (-> i64)
+  (do (arena-boot!) (push! [i64] (mut (.deferred (arena))) id) 0))
+
+(defn code-requeue-deferred! [] (-> i64)
+  (do
+    (arena-boot!)
+    (let [t (arena)
+          cnt (len (.deferred t))
+          (mut i) 0]
+      (loop (if (>= (load i) cnt)
+                (break 0)
+                (do
+                  (code-inline-push! (get (.deferred t) (load i)))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      (al-clear! [i64] (mut (.deferred t)))
+      cnt)))

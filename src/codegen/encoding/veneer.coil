@@ -1,0 +1,386 @@
+;; Branch veneers: planning hubs and routes for transfers out of B26 range, emitting them, and verifying every route.
+
+(module aot.codegen.encoding.veneer)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.codegen.codegen" :use *)
+(import "aot.codegen.machine" :use *)
+(import "aot.codegen.encoding"
+        :use
+        [ENCODER-HANDLE
+         ENC-VENEER-HUB-SPAN
+         ENC-VENEER-ROUTE-SPAN
+         enc-state
+         enc-layout-block-count
+         enc-layout-block-at
+         enc-layout-jump-at
+         enc-byte-count
+         enc-add4!
+         enc-read4
+         enc-patch4!
+         enc-op-start
+         enc-ideal-op])
+
+(defn enc-b26-fits? [(delta i64)] (-> bool)
+  (and (= (% delta 4) 0) (and (>= delta -134217728) (<= delta 134217724))))
+
+(defn enc-clear-veneer-plan! [] (-> i64)
+  (let [state (enc-state)
+        (mut i) 0]
+    (loop (if (>= (load i) (len (.veneer-hub-before-sources state)))
+              (break 0)
+              (do
+                (set! (mut (.veneer-hub-indices state))
+                      (get (.veneer-hub-before-sources state) (load i))
+                      -1)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (set! (mut i) 0)
+    (loop (if (>= (load i) (len (.veneer-route-sources state)))
+              (break 0)
+              (do
+                (set! (mut (.veneer-first-by-source state))
+                      (get (.veneer-route-sources state) (load i))
+                      -1)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (al-clear! [i64] (mut (.veneer-hub-before-sources state)))
+    (al-clear! [i64] (mut (.veneer-hub-offsets state)))
+    (al-clear! [i64] (mut (.veneer-hub-sizes state)))
+    (al-clear! [i64] (mut (.veneer-hub-entry-counts state)))
+    (al-clear! [i64] (mut (.veneer-hub-first-entries state)))
+    (al-clear! [i64] (mut (.veneer-hub-last-entries state)))
+    (al-clear! [i64] (mut (.veneer-entry-hubs state)))
+    (al-clear! [i64] (mut (.veneer-entry-ordinals state)))
+    (al-clear! [i64] (mut (.veneer-entry-in-hub-next state)))
+    (al-clear! [i64] (mut (.veneer-entry-next state)))
+    (al-clear! [i64] (mut (.veneer-entry-targets state)))
+    (al-clear! [i64] (mut (.veneer-route-sources state)))
+    0))
+
+(defn enc-plan-veneer-hub-before! [(n (dyn NodeOps)) (last-offset (mut i64))] (-> i64)
+  (let [state (enc-state)
+        at (enc-op-start n)]
+    (if (>= (- at (load last-offset)) ENC-VENEER-HUB-SPAN)
+        (let [idx (len (.veneer-hub-before-sources state))]
+          (push! [i64] (mut (.veneer-hub-before-sources state)) (n-nid n))
+          (push! [i64] (mut (.veneer-hub-offsets state)) at)
+          (push! [i64] (mut (.veneer-hub-sizes state)) 0)
+          (push! [i64] (mut (.veneer-hub-entry-counts state)) 0)
+          (push! [i64] (mut (.veneer-hub-first-entries state)) -1)
+          (push! [i64] (mut (.veneer-hub-last-entries state)) -1)
+          (set! (mut (.veneer-hub-indices state)) (n-nid n) idx)
+          (set! last-offset at))
+        0)
+    0))
+
+(defn enc-add-veneer-entry! [(hub i64)] (-> i64)
+  (let [state (enc-state)
+        idx (len (.veneer-entry-hubs state))
+        ordinal (get (.veneer-hub-entry-counts state) hub)
+        prior-in-hub (get (.veneer-hub-last-entries state) hub)]
+    (push! [i64] (mut (.veneer-entry-hubs state)) hub)
+    (push! [i64] (mut (.veneer-entry-ordinals state)) ordinal)
+    (push! [i64] (mut (.veneer-entry-in-hub-next state)) -1)
+    (push! [i64] (mut (.veneer-entry-next state)) -1)
+    (push! [i64] (mut (.veneer-entry-targets state)) 0)
+    (if (>= prior-in-hub 0)
+        (set! (mut (.veneer-entry-in-hub-next state)) prior-in-hub idx)
+        (set! (mut (.veneer-hub-first-entries state)) hub idx))
+    (set! (mut (.veneer-hub-last-entries state)) hub idx)
+    (set! (mut (.veneer-hub-entry-counts state)) hub (+ ordinal 1))
+    idx))
+
+(defn enc-plan-veneer-route! [(source (dyn NodeOps)) (target (dyn NodeOps))] (-> i64)
+  (let [state (enc-state)
+        addend (if (= (enc-ideal-op source) OP-IF) 4 0)
+        source-at (+ (enc-op-start source) addend)
+        target-at (enc-op-start target)
+        forward (> target-at source-at)
+        (mut hub) (if forward 0 (- (len (.veneer-hub-offsets state)) 1))
+        (mut first) -1
+        (mut prior) -1]
+    (if (>= (get (.veneer-first-by-source state) (n-nid source)) 0)
+        (panic-i "enc-plan-veneer-route!: source already has a route"
+                 (n-nid source))
+        0)
+    (loop (if (if forward
+                  (>= (load hub) (len (.veneer-hub-offsets state)))
+                  (< (load hub) 0))
+              (break 0)
+              (let [at (get (.veneer-hub-offsets state) (load hub))
+                    between
+                      (if forward
+                          (and (> at source-at) (< at target-at))
+                          (and (< at source-at) (> at target-at)))]
+                (if between
+                    (let [entry (enc-add-veneer-entry! (load hub))]
+                      (if (< (load first) 0) (set! (mut first) entry) 0)
+                      (if (>= (load prior) 0)
+                          (set! (mut (.veneer-entry-next state))
+                                (load prior)
+                                entry)
+                          0)
+                      (set! (mut prior) entry))
+                    0)
+                (set! (mut hub) (+ (load hub) (if forward 1 -1)))
+                (continue))))
+    (if (< (load first) 0)
+        (panic-i "enc-plan-veneer-route!: no hub lies between far transfer and target"
+                 (n-nid source))
+        (do
+          (set! (mut (.veneer-entry-targets state)) (load prior) (n-nid target))
+          (set! (mut (.veneer-first-by-source state))
+                (n-nid source)
+                (load first))
+          (push! [i64] (mut (.veneer-route-sources state)) (n-nid source))))
+    0))
+
+(defn enc-plan-veneer-transfer-target! [(source (dyn NodeOps))
+                                        (target (dyn NodeOps))] (-> i64)
+  (let [addend (if (= (enc-ideal-op source) OP-IF) 4 0)
+        delta (- (enc-op-start target) (+ (enc-op-start source) addend))]
+    (if (or (> delta ENC-VENEER-ROUTE-SPAN)
+            (< delta (- 0 ENC-VENEER-ROUTE-SPAN)))
+        (enc-plan-veneer-route! source target)
+        0)))
+
+(defn enc-plan-veneer-transfer! [(source (dyn NodeOps))
+                                 (definitions (HashMap i64 i64))] (-> i64)
+  (match (mach-layout-long-target source)
+    (Some [target] (enc-plan-veneer-transfer-target! source target))
+    (None []
+          (match (mach-layout-call-fidx source)
+            (Some [fidx]
+                  (match (get definitions fidx)
+                    (Some [nid]
+                          (match (arena-node nid)
+                            (Some [target]
+                                  (enc-plan-veneer-transfer-target! source
+                                                                    target))
+                            (None [] 0)))
+                    (None [] 0)))
+            (None [] 0)))))
+
+(defn enc-plan-veneers! [] (-> i64)
+  (let [a (compiler-allocator)
+        (mut definitions) (hm-new [i64 i64] a (i64-keyops))
+        state (enc-state)
+        (mut ci) 0
+        (mut last-hub) 0]
+    (enc-clear-veneer-plan!)
+    ;; First collect sparse hubs in final block order.
+    (loop (if (>= (load ci) (enc-layout-block-count))
+              (break 0)
+              (let [block (enc-layout-block-at (load ci))
+                    (mut i) 0]
+                (loop (if (>= (load i) (code-schedule-count block))
+                          (break 0)
+                          (let [n (code-schedule-at block (load i))]
+                            (match (mach-of n)
+                              (Some [_]
+                                    (do
+                                      (enc-plan-veneer-hub-before! n
+                                                                   (mut last-hub))
+                                      (match (mach-layout-definition-fidx n)
+                                        (Some [fidx]
+                                              (set! (mut definitions)
+                                                    fidx
+                                                    (n-nid n)))
+                                        (None [] 0))))
+                              (None [] 0))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (match (enc-layout-jump-at (load ci))
+                  (Some [jump]
+                        (enc-plan-veneer-hub-before! jump (mut last-hub)))
+                  (None [] 0))
+                (set! (mut ci) (+ (load ci) 1))
+                (continue))))
+    ;; Then route only transfers long enough to need the reserved headroom.
+    (set! (mut ci) 0)
+    (loop (if (>= (load ci) (enc-layout-block-count))
+              (break 0)
+              (let [block (enc-layout-block-at (load ci))
+                    (mut i) 0]
+                (loop (if (>= (load i) (code-schedule-count block))
+                          (break 0)
+                          (let [n (code-schedule-at block (load i))]
+                            (match (mach-of n)
+                              (Some [_]
+                                    (enc-plan-veneer-transfer! n
+                                                               (load definitions)))
+                              (None [] 0))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (match (enc-layout-jump-at (load ci))
+                  (Some [jump]
+                        (enc-plan-veneer-transfer! jump (load definitions)))
+                  (None [] 0))
+                (set! (mut ci) (+ (load ci) 1))
+                (continue))))
+    (let [(mut hub) 0]
+      (loop (if (>= (load hub) (len (.veneer-hub-sizes state)))
+                (break 0)
+                (do
+                  (let [count (get (.veneer-hub-entry-counts state) (load hub))]
+                    (set! (mut (.veneer-hub-sizes state))
+                          (load hub)
+                          (if (> count 0) (+ 4 (* count 4)) 0)))
+                  (set! (mut hub) (+ (load hub) 1))
+                  (continue)))))
+    (len (.veneer-entry-hubs state))))
+
+(defn enc-layout-veneer-hub-before! [(n (dyn NodeOps)) (cursor (mut i64))] (-> i64)
+  (let [state (enc-state)
+        hub (get (.veneer-hub-indices state) (n-nid n))]
+    (if (>= hub 0)
+        (do
+          (set! (mut (.veneer-hub-offsets state)) hub (load cursor))
+          (set! cursor (+ (load cursor) (get (.veneer-hub-sizes state) hub))))
+        0)
+    0))
+
+(defn enc-veneer-entry-offset [(entry i64)] (-> i64)
+  (let [state (enc-state)
+        hub (get (.veneer-entry-hubs state) entry)]
+    (+ (get (.veneer-hub-offsets state) hub)
+       (+ 4 (* (get (.veneer-entry-ordinals state) entry) 4)))))
+
+(defn enc-verify-veneer-routes! [] (-> i64)
+  (let [state (enc-state)
+        (mut route) 0]
+    (loop (if (>= (load route) (len (.veneer-route-sources state)))
+              (break 0)
+              (let [source-nid (get (.veneer-route-sources state) (load route))
+                    source
+                      (match (arena-node source-nid)
+                        (Some [n] n)
+                        (None []
+                              (do
+                                (panic-i "enc-verify-veneer-routes!: missing source"
+                                         source-nid)
+                                (unreachable-node))))
+                    addend (if (= (enc-ideal-op source) OP-IF) 4 0)
+                    (mut at) (+ (enc-op-start source) addend)
+                    (mut entry) (get (.veneer-first-by-source state) source-nid)
+                    (mut guard) 0]
+                (loop (if (< (load entry) 0)
+                          (break 0)
+                          (let [entry-at (enc-veneer-entry-offset (load entry))
+                                next
+                                  (get (.veneer-entry-next state) (load entry))]
+                            (if (not (enc-b26-fits? (- entry-at (load at))))
+                                (panic-i "enc-verify-veneer-routes!: source or hop is out of range"
+                                         (- entry-at (load at)))
+                                0)
+                            (set! (mut at) entry-at)
+                            (if (>= next 0)
+                                (set! (mut entry) next)
+                                (let [target-nid
+                                        (get (.veneer-entry-targets state)
+                                             (load entry))
+                                      target
+                                        (match (arena-node target-nid)
+                                          (Some [n] n)
+                                          (None []
+                                                (do
+                                                  (panic-i "enc-verify-veneer-routes!: missing target"
+                                                           target-nid)
+                                                  (unreachable-node))))]
+                                  (if (not (enc-b26-fits? (- (enc-op-start target)
+                                                             (load at))))
+                                      (panic-i "enc-verify-veneer-routes!: final hop is out of range"
+                                               (- (enc-op-start target)
+                                                  (load at)))
+                                      0)
+                                  (set! (mut entry) -1)))
+                            (set! (mut guard) (+ (load guard) 1))
+                            (if (> (load guard)
+                                   (len (.veneer-entry-hubs state)))
+                                (panic "enc-verify-veneer-routes!: entry chain did not converge")
+                                (continue)))))
+                (set! (mut route) (+ (load route) 1))
+                (continue))))
+    0))
+
+(defn enc-veneer-hub-count [] (-> i64)
+  (len (.veneer-hub-offsets (enc-state))))
+
+(defn enc-veneer-route-count [] (-> i64)
+  (len (.veneer-route-sources (enc-state))))
+
+(defn enc-veneer-entry-count [] (-> i64)
+  (len (.veneer-entry-hubs (enc-state))))
+
+(defn enc-emit-veneer-hub-before! [(n (dyn NodeOps))] (-> i64)
+  (let [state (enc-state)
+        hub (get (.veneer-hub-indices state) (n-nid n))]
+    (if (and (>= hub 0) (> (get (.veneer-hub-sizes state) hub) 0))
+        (let [start (get (.veneer-hub-offsets state) hub)
+              size (get (.veneer-hub-sizes state) hub)
+              (mut entry) (get (.veneer-hub-first-entries state) hub)]
+          (if (!= (enc-byte-count) start)
+              (panic-i "enc-emit-veneer-hub-before!: offset disagrees with layout"
+                       hub)
+              0)
+          ;; Fallthrough skips the hub. Transfers target individual B entries after this first B.
+          (enc-add4! ENCODER-HANDLE (| 0x14000000 (/ size 4)))
+          (loop (if (< (load entry) 0)
+                    (break 0)
+                    (do
+                      (if (!= (enc-byte-count)
+                              (enc-veneer-entry-offset (load entry)))
+                          (panic-i "enc-emit-veneer-hub-before!: entry order is inconsistent"
+                                   (load entry))
+                          0)
+                      (enc-add4! ENCODER-HANDLE 0x14000000)
+                      (set! (mut entry)
+                            (get (.veneer-entry-in-hub-next state) (load entry)))
+                      (continue))))
+          (if (!= (enc-byte-count) (+ start size))
+              (panic-i "enc-emit-veneer-hub-before!: size disagrees with layout"
+                       hub)
+              0))
+        0)
+    0))
+
+(defn enc-veneer-fixups! [] (-> i64)
+  (let [state (enc-state)
+        (mut entry) 0]
+    (loop (if (>= (load entry) (len (.veneer-entry-hubs state)))
+              (break 0)
+              (let [at (enc-veneer-entry-offset (load entry))
+                    next (get (.veneer-entry-next state) (load entry))
+                    target-nid (get (.veneer-entry-targets state) (load entry))
+                    destination
+                      (if (>= next 0)
+                          (enc-veneer-entry-offset next)
+                          (match (arena-node target-nid)
+                            (Some [target] (enc-op-start target))
+                            (None []
+                                  (do
+                                    (panic-i "enc-veneer-fixups!: missing final target"
+                                             target-nid)
+                                    0))))
+                    delta (- destination at)
+                    scaled (/ delta 4)
+                    old (enc-read4 at)]
+                (if (or (!= (* scaled 4) delta) (not (enc-b26-fits? delta)))
+                    (panic-i "enc-veneer-fixups!: planned hop is out of B26 range"
+                             delta)
+                    (enc-patch4! ENCODER-HANDLE
+                                 at
+                                 (primitive/ior (primitive/iand old
+                                                                (primitive/ixor 0x3ffffff
+                                                                                -1))
+                                                (primitive/iand scaled
+                                                                0x3ffffff))))
+                (set! (mut entry) (+ (load entry) 1))
+                (continue))))
+    0))

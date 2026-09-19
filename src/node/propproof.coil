@@ -1,0 +1,391 @@
+;; Property proofs: what a shape, an image holder and the memory position prove about one property.
+
+(module aot.node.propproof)
+(import "aot.util.arena"
+        :use
+        [compiler-allocator compiler-state CompilerStateSlot])
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
+(import "coil.arraylist" :use *)
+(import "coil.str" :use [cstr->str])
+(import "coil.os" :as os)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.type.type" :use *)
+(import "aot.shape" :use *)
+(import "aot.heap" :use *)
+(import "aot.facts" :use *)
+(import "aot.node.property"
+        :use
+        [PROP-STORE
+         PROP-SET
+         PROP-MEM
+         PROP-RESULT-MEM
+         prop-access-kind
+         prop-storage-pointer
+         prop-holder-drop!])
+
+;; What the memory SSA says about an owner's backing store at a program point.
+(defsum PropStatic
+  (PropUnknown)
+  (PropNoStorage)
+  ;; storage zero means the exact shape is known across memory paths but no single SSA pointer
+  ;; names its backing store. Consumers load the properties word at their own memory position.
+  (PropStorage [(storage i64) (shape i64)]))
+
+;; Simple LoadNode follows memory definitions, bypasses only proven unrelated stores, and records
+;; dependencies on every inspected blocker. Its Phi rule requires a profitable arm and protects
+;; loop termination. Our extra query asks for a complete property shape at the same memory point.
+;; A join retains a shape only when every reachable arm proves that exact shape; cycles and open
+;; merges conservatively return unknown. No provisional dead arm is used as a proof here.
+;; Calls are barriers. Initial-image facts enter only through START-INITIAL-MEM, never arbitrary
+;; Start memory or an unknown caller. This query does not change the heap image or create nodes.
+(defn prop-state-shape [(state PropStatic)] (-> i64)
+  (match state
+    (PropUnknown [] -1)
+    (PropNoStorage [] SHAPE-EMPTY)
+    (PropStorage [_ shape] shape)))
+
+;; A per-key proof. Absence is distinct from a present property containing undefined. `exact`
+;; says the entire backing shape is known, as required to allocate a transition; a whole-program
+;; invariant can prove this key absent without knowing which other keys have been added.
+;; A present property's image value is reusable only when image-value-entry is nonnegative.
+(defsum PropOwn
+  (OwnUnknown)
+  (OwnAbsent [(shape i64) (exact bool)])
+  (OwnPresent [(shape i64) (storage i64) (image-value-entry i64)]))
+
+(defn prop-own-in-shape [(shape i64) (storage i64) (key i64)] (-> PropOwn)
+  (if (shape-has-key? shape key)
+      (OwnPresent
+        :shape shape
+        :storage storage
+        :image-value-entry -1)
+      (OwnAbsent shape true)))
+
+;; The sole authority for an own-property proof. Local memory evidence is strongest. When that
+;; is unknown, a conservative closed-world invariant may still hold across every memory state.
+;; Consumers never infer current presence directly from the image, or inspect receiver opcodes.
+(defn prop-own-state [(mem (dyn NodeOps))
+                      (object (dyn NodeOps))
+                      (key i64)
+                      (dep (dyn NodeOps))] (-> PropOwn)
+  (match (prop-memory-state mem object dep)
+    (PropNoStorage [] (OwnAbsent SHAPE-EMPTY true))
+    (PropStorage [storage shape] (prop-own-in-shape shape storage key))
+    (PropUnknown []
+                 (let [entry (ty-image-entry (n-ty object))]
+                   (if (and (mem-identity-reference? (n-ty object))
+                            (facts-ready?)
+                            (>= entry 0)
+                            (not (heap-entry-string? entry)))
+                       (let [shape (heap-storage-shape entry)
+                             written (facts-written? entry key)]
+                         (if (facts-layout-unknown? entry key)
+                             (OwnUnknown)
+                             (if (shape-has-key? shape key)
+                                 (OwnPresent
+                                   :shape shape
+                                   :storage 0
+                                   :image-value-entry (if written -1 entry))
+                                 (if written
+                                     (OwnUnknown)
+                                     (OwnAbsent shape false)))))
+                       (OwnUnknown))))))
+
+(defn prop-own-read [(ctrl (dyn NodeOps))
+                     (mem (dyn NodeOps))
+                     (object (dyn NodeOps))
+                     (key i64)
+                     (state PropOwn)
+                     (get? bool)] (-> (Option (dyn NodeOps)))
+  (match state
+    (OwnUnknown [] (None [(dyn NodeOps)]))
+    (OwnAbsent [_ _] (Some (dyn-undefined-make)))
+    (OwnPresent [shape storage image-entry]
+                (if (and get?
+                         (!= (& (shape-key-attrs shape key) SHAPE-ATTR-ACCESSOR)
+                             0))
+                    (Some (dyn-exception-make))
+                    (if (>= image-entry 0)
+                        (let [backing (heap-entry-storage image-entry)
+                              slot
+                                (/ (shape-offset-key shape key) HEAP-WORD-BYTES)]
+                          (image-word-node (heap-entry-word backing slot)
+                                           (heap-entry-word-kind backing slot)))
+                        (Some (load-make ctrl
+                                         mem
+                                         (prop-storage-pointer ctrl
+                                                               mem
+                                                               object
+                                                               storage)
+                                         (con-int (shape-offset-key shape key))
+                                         (shape-alias-key shape key)
+                                         (ty-dyn TAG-ANY))))))))
+
+(defn prop-memory-state [(mem (dyn NodeOps))
+                         (object (dyn NodeOps))
+                         (dep (dyn NodeOps))] (-> PropStatic)
+  (let [(mut path) (al-new [i64] (compiler-allocator))
+        (mut fuel) 1024
+        answer (prop-memory-state-walk mem object dep (mut path) (mut fuel))]
+    (al-free! (mut path))
+    answer))
+
+(defn prop-memory-state-walk [(mem (dyn NodeOps))
+                              (object (dyn NodeOps))
+                              (dep (dyn NodeOps))
+                              (path (mut (ArrayList i64)))
+                              (fuel (mut i64))] (-> PropStatic)
+  (let [(mut seen) false]
+    (n-add-dep! mem dep)
+    (n-add-dep! object dep)
+    (al-for [id (load path)] (if (= id (n-nid mem)) (set! (mut seen) true) 0))
+    (if (or (load seen) (<= (load fuel) 0) (>= (len (load path)) 256))
+        (PropUnknown)
+        (do
+          (set! (mut fuel) (- (load fuel) 1))
+          (push! (mut path) (n-nid mem))
+          (let [answer
+                  (prop-memory-state-step mem object dep (mut path) (mut fuel))]
+            (pop! (mut path))
+            answer)))))
+
+(defn prop-memory-state-step [(mem (dyn NodeOps))
+                              (object (dyn NodeOps))
+                              (dep (dyn NodeOps))
+                              (path (mut (ArrayList i64)))
+                              (fuel (mut i64))] (-> PropStatic)
+  (let [op (n-op mem)]
+    (if (= op OP-MEMMERGE)
+        (prop-memory-state-walk (memmerge-alias mem ALIAS-OBJECT-PROPERTIES)
+                                object
+                                dep
+                                (mut path)
+                                (mut fuel))
+        (if (= op OP-STORE)
+            (let [ptr_ (n-in! mem MEM-PTR)]
+              (n-add-dep! ptr_ dep)
+              (if (or (!= (mem-alias-of-node mem) ALIAS-OBJECT-PROPERTIES)
+                      (mem-provably-distinct? ptr_ object))
+                  (prop-memory-state-walk (n-in! mem MEM-STATE)
+                                          object
+                                          dep
+                                          (mut path)
+                                          (mut fuel))
+                  (if (mem-same-object? ptr_ object)
+                      (prop-storage-word-state (n-in! mem STORE-VAL) dep)
+                      (PropUnknown))))
+            (if (or (= op OP-PHI) (= op OP-MEMPHI) (= op OP-PARM))
+                (let [region (n-in! mem 0)
+                      (mut shape) -1
+                      (mut first) true
+                      (mut valid) true
+                      (mut i) 1]
+                  (n-add-dep! region dep)
+                  (if (phi-in-progress? mem)
+                      (PropUnknown)
+                      (do
+                        (loop (if (>= (load i) (n-nins mem))
+                                  (break 0)
+                                  (let [ctrl (n-in! region (load i))]
+                                    (n-add-dep! ctrl dep)
+                                    ;; Include even currently dead arms: no dependence on provisional reachability.
+                                    (let [state
+                                            (match (n-in mem (load i))
+                                              (Some [input]
+                                                    (prop-memory-state-walk input
+                                                                            object
+                                                                            dep
+                                                                            (mut path)
+                                                                            (mut fuel)))
+                                              (None [] (PropUnknown)))
+                                          next (prop-state-shape state)]
+                                      (if (or (< next 0)
+                                              (and (not (load first))
+                                                   (!= next (load shape))))
+                                          (set! (mut valid) false)
+                                          0)
+                                      (set! (mut first) false)
+                                      (set! (mut shape) next))
+                                    (set! (mut i) (+ (load i) 1))
+                                    (continue))))
+                        (if (and (load valid) (not (load first)))
+                            (PropStorage 0 (load shape))
+                            (PropUnknown)))))
+                (if (= op OP-PROJ)
+                    (let [source (n-in! mem 0)]
+                      (n-add-dep! source dep)
+                      (if (and (= (n-op source) OP-START)
+                               (= (proj-idx mem) START-INITIAL-MEM))
+                          (let [entry (ty-image-entry (n-ty object))]
+                            (if (and (mem-identity-reference? (n-ty object))
+                                     (>= entry 0)
+                                     (not (heap-entry-string? entry)))
+                                (if (< (heap-entry-storage entry) 0)
+                                    (PropNoStorage)
+                                    (PropStorage 0 (heap-storage-shape entry)))
+                                (PropUnknown)))
+                          (if (and (= (n-op source) OP-NEW)
+                                   (= (proj-idx mem) 1))
+                              (prop-memory-state-walk (new-memory source)
+                                                      object
+                                                      dep
+                                                      (mut path)
+                                                      (mut fuel))
+                              (if (and (or (= (n-op source) OP-PROPLOAD)
+                                           (= (n-op source) OP-PROPSTORE))
+                                       (= (proj-idx mem) PROP-RESULT-MEM)
+                                       (not (or (= (prop-access-kind source)
+                                                   PROP-STORE)
+                                                (= (prop-access-kind source)
+                                                   PROP-SET))))
+                                  (prop-memory-state-walk (n-in! source
+                                                                 PROP-MEM)
+                                                          object
+                                                          dep
+                                                          (mut path)
+                                                          (mut fuel))
+                                  (PropUnknown)))))
+                    (PropUnknown)))))))
+
+(defn prop-storage-word-state [(word (dyn NodeOps)) (dep (dyn NodeOps))] (-> PropStatic)
+  (do
+    (n-add-dep! word dep)
+    (if (= (n-ty word) (ty-dyn TAG-NULL))
+        (PropNoStorage)
+        (if (= (n-op word) OP-BOX)
+            (let [storage (n-in! word 1)]
+              (n-add-dep! storage dep)
+              (if (and (= (n-op storage) OP-PROJ)
+                       (= (n-op (n-in! storage 0)) OP-NEW))
+                  (PropStorage (n-nid storage) (new-shape (n-in! storage 0)))
+                  (PropUnknown)))
+            (PropUnknown)))))
+
+;; Walk an invariant image prototype chain, asking the same per-key memory proof at each holder.
+;; Calls can invalidate property state without changing the identity or prototype of the holder.
+(defn prop-image-holder [(mem (dyn NodeOps))
+                         (word i64)
+                         (key i64)
+                         (dep (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (if (or (not (facts-ready?)) (facts-prototypes-written?))
+      (None [(dyn NodeOps)])
+      (let [(mut current) word
+            (mut steps) 0
+            (mut answer) (None [(dyn NodeOps)])]
+        (loop (if (>= (load steps) (heap-count))
+                  (break 0)
+                  (let [entry (heap-ref-entry (load current))
+                        holder
+                          (match (image-word-node (load current) HEAP-WORD-REF)
+                            (Some [value] value)
+                            (None []
+                                  (do
+                                    (panic "prop-image-holder: invalid prototype word")
+                                    (unreachable-node))))
+                        object (n-in! holder 1)]
+                    (n-keep! holder)
+                    (let [state (prop-own-state mem object key dep)]
+                      (n-unkeep! holder)
+                      (match state
+                        (OwnUnknown []
+                                    (do (prop-holder-drop! holder) (break 0)))
+                        (OwnPresent [_ _ _]
+                                    (do
+                                      (set! (mut answer) (Some holder))
+                                      (break 0)))
+                        (OwnAbsent [_ _]
+                                   (let [next-word
+                                           (heap-entry-word entry
+                                                            HEAP-OFFSET-PROTOTYPE-WORD)
+                                         next
+                                           (image-word-object-entry next-word
+                                                                    (heap-entry-word-kind entry
+                                                                                          HEAP-OFFSET-PROTOTYPE-WORD))]
+                                     (prop-holder-drop! holder)
+                                     (if (< next 0)
+                                         (do
+                                           (set! (mut answer)
+                                                 (Some (dyn-null-make)))
+                                           (break 0))
+                                         (do
+                                           (set! (mut current) next-word)
+                                           (set! (mut steps) (+ (load steps) 1))
+                                           (continue))))))))))
+        (load answer))))
+
+;; The attributes a fresh-object shape answers for `key`: the field's bits, or -1/-2 by extensibility.
+;; Eligibility only: reuse the same owner/storage and image facts as PropAccess. This function
+;; creates no graph and grants no assumption. The actual access still proves/folds itself when
+;; JSL is lowered. Simple's typed field access already knows its offset; JavaScript must establish
+;; an own data descriptor first. A broad object tag does not establish that descriptor.
+;; `AOT_SPECIALIZE_TRACE=1`, read once. The property proof has seven ways to fail and answers one
+;; bool, so without this the only way to learn which one fired is a build per guess. Reads the same
+;; variable as the JSL-side refusal trace; the two flags are independent and that is harmless.
+(defstruct PropProofTraceFlag [(state i64)])
+
+(defn prop--proof-trace? [] (-> bool)
+  (let [f
+          (compiler-state [PropProofTraceFlag]
+                          (primitive/alloc-static CompilerStateSlot))]
+    (if (= (.state f) 0)
+        (set! (.state f)
+              (if (!= (primitive/cast i64 (os/getenv c"AOT_SPECIALIZE_TRACE"))
+                      0)
+                  1
+                  2))
+        0)
+    (= (.state f) 1)))
+
+(defn prop--proof-no [(why (ptr i8))] (-> bool)
+  (do
+    (if (prop--proof-trace?)
+        (do (println "prop-proof: no: {s}" (cstr->str why)) 0)
+        0)
+    false))
+
+(defn property-specialization-proven? [(mem (dyn NodeOps))
+                                       (boxed (dyn NodeOps))
+                                       (key i64)
+                                       (write? bool)
+                                       (dep (dyn NodeOps))] (-> bool)
+  (if (< key 0)
+      (prop--proof-no c"key is not a constant")
+      (let [object (if (= (n-op boxed) OP-BOX) (n-in! boxed 1) (load boxed))]
+        (match (prop-own-state mem object key dep)
+          (OwnPresent [shape _ _] (prop-shape-data-proof? shape key write?))
+          (OwnAbsent [_ _]
+                     (prop--proof-no c"property absent at this memory position"))
+          (OwnUnknown []
+                      (prop--proof-no c"receiver state unknown to memory SSA"))))))
+
+;; Absence is useful evidence for lowering OrdinarySet, but grants no right to create a property:
+;; the residual PropSet must still prove extensibility and the inherited descriptor. Requiring
+;; the exact shape here limits admission to sites where that residual can make a direct transition.
+(defn property-specialization-absent? [(mem (dyn NodeOps))
+                                       (boxed (dyn NodeOps))
+                                       (key i64)
+                                       (dep (dyn NodeOps))] (-> bool)
+  (if (< key 0)
+      false
+      (let [object (if (= (n-op boxed) OP-BOX) (n-in! boxed 1) (load boxed))]
+        (match (prop-own-state mem object key dep)
+          (OwnAbsent [_ exact] exact)
+          (_ false)))))
+
+(defn prop-shape-data-proof? [(shape i64) (key i64) (write? bool)] (-> bool)
+  (and (shape-has-key? shape key)
+       (= (& (shape-key-attrs shape key) SHAPE-ATTR-ACCESSOR) 0)
+       (or (not write?)
+           (!= (& (shape-key-attrs shape key) SHAPE-ATTR-WRITABLE) 0))))
+
+(defn prop-shape-attrs [(shape i64) (key i64)] (-> i64)
+  (if (shape-has-key? shape key)
+      (shape-key-attrs shape key)
+      (if (shape-extensible? shape) -1 -2)))

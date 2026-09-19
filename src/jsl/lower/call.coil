@@ -1,0 +1,235 @@
+;; Lowering of calls between JSL definitions, calls of function values, and closure creation.
+
+(module aot.jsl.lower.call)
+(import "aot.util.arena"
+        :use
+        [compiler-allocator compiler-state CompilerStateSlot])
+(import "aot.codegen.callabi" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.str" :as str)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.reader" :as rd)
+(import "coil.slice" :use [slice-data])
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.shape" :use *)
+(import "aot.jsl.reader" :use *)
+(import "aot.jsl.lower" :use [jsl-call-target jsl-closure-maker])
+(import "aot.jsl.lower.expr" :use *)
+
+(defn jsl-lower-call [(x (ptr rd/Sexp))
+                      (name (slice u8))
+                      (params (ptr rd/Sexp))
+                      (values (ArrayList (dyn NodeOps)))
+                      (local-names (mut (ArrayList (slice u8))))
+                      (local-values (mut (ArrayList (dyn NodeOps))))
+                      (ctrl (dyn NodeOps))
+                      (mem (dyn NodeOps))] (-> JslExprResult)
+  (let [(mut ctrl-nid) (n-nid ctrl)
+        (mut mem-nid) (n-nid mem)
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))
+        (mut i) 1]
+    (loop (if (>= (load i) (rd/sexp-count x))
+              (break 0)
+              (let [arg
+                      (jsl-lower-expr (rd/sexp-nth x (load i))
+                                      params
+                                      values
+                                      (mut local-names)
+                                      (mut local-values)
+                                      (jsl-node (load ctrl-nid))
+                                      (jsl-node (load mem-nid)))]
+                (push! [(dyn NodeOps)] (mut args) (.value arg))
+                (set! (mut ctrl-nid) (n-nid (.ctrl arg)))
+                (set! (mut mem-nid) (n-nid (.mem arg)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (match (jsl-definition-form name)
+      (None []
+            (do
+              (panic "jsl-lower-call: checker admitted an unknown definition")
+              (jsl-expr-result (unreachable-node) ctrl mem)))
+      (Some [form]
+            (if (jsl-form-macro? form)
+                (jsl-lower-macro-values name
+                                        (load args)
+                                        (jsl-node (load ctrl-nid))
+                                        (jsl-node (load mem-nid)))
+                (let [target (jsl-call-target name)
+                      c
+                        (call-make-with-mem (jsl-node (load ctrl-nid))
+                                            (jsl-node (load mem-nid)))
+                      (mut arg) 0]
+                  (loop (if (>= (load arg) (len (load args)))
+                            (break 0)
+                            (do
+                              (call-add-arg! c (get (load args) (load arg)))
+                              (set! (mut arg) (+ (load arg) 1))
+                              (continue))))
+                  (call-set-fptr! c target)
+                  (let [end (callend-make c)]
+                    (if (jsl-noinline? name) (callend-set-never-inline! end) 0)
+                    (jsl-expr-result (proj-make end
+                                                RETURN-VALUE
+                                                "jsl.call.value")
+                                     (cproj-make end
+                                                 RETURN-CTRL
+                                                 "jsl.call.ctrl")
+                                     (proj-make end RETURN-MEM "jsl.call.mem")))))))))
+
+;; The closed-program target set for `%CallFunction`. Code words name fixed-signature callable
+;; adapters, independent of the program's local formal slots. The frontend installs this set
+;; before demanding JSL bodies (aot.parse.parser, parse-program-sources).
+(defstruct JslValueCallAbi [(funptr-ty i64) (set bool)])
+
+(defn jsl-value-call-abi [] (-> (ptr JslValueCallAbi))
+  (compiler-state [JslValueCallAbi] (primitive/alloc-static CompilerStateSlot)))
+
+(defn jsl-set-value-call-abi! [(funptr-ty i64)] (-> i64)
+  (let [abi (jsl-value-call-abi)]
+    (set! (.funptr-ty abi) funptr-ty)
+    (set! (.set abi) true)
+    0))
+
+;; (%CallFunction callee this arg...): the same call the frontend builds for `f(...)` through a
+;; value (aot.parse.parser, lower-value-call-with-receiver), minus the callable guard — the checker
+;; required the callee narrowed to a function — and minus the completion test — the result IS the
+;; completion, tested by the body. The code word is loaded from the function object and the call
+;; carries callee, `this`, undefined `new.target`, actual count and a managed vector. The adapter
+;; supplies undefined for missing formals; it does not change the caller's actual count.
+(defn jsl-lower-call-function [(x (ptr rd/Sexp))
+                               (params (ptr rd/Sexp))
+                               (values (ArrayList (dyn NodeOps)))
+                               (local-names (mut (ArrayList (slice u8))))
+                               (local-values (mut (ArrayList (dyn NodeOps))))
+                               (ctrl (dyn NodeOps))
+                               (mem (dyn NodeOps))] (-> JslExprResult)
+  (let [abi (jsl-value-call-abi)
+        packed-call (rd/sexp-sym-is (rd/sexp-nth x 0) "%CallFunctionPacked")
+        (mut ctrl-nid) (n-nid ctrl)
+        (mut mem-nid) (n-nid mem)
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))
+        (mut i) 1]
+    (if (not (.set abi))
+        (panic "jsl-lower-call-function: the value-call ABI is not settled (the frontend installs it before bodies are lowered)")
+        0)
+    (loop (if (>= (load i) (rd/sexp-count x))
+              (break 0)
+              (let [arg
+                      (jsl-lower-expr (rd/sexp-nth x (load i))
+                                      params
+                                      values
+                                      (mut local-names)
+                                      (mut local-values)
+                                      (jsl-node (load ctrl-nid))
+                                      (jsl-node (load mem-nid)))]
+                (push! [(dyn NodeOps)] (mut args) (.value arg))
+                (set! (mut ctrl-nid) (n-nid (.ctrl arg)))
+                (set! (mut mem-nid) (n-nid (.mem arg)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (let [c (jsl-node (load ctrl-nid))
+          m (jsl-node (load mem-nid))
+          callee (get (load args) 0)
+          receiver (get (load args) 1)
+          raw (unbox-make callee REP-FUNCTION)
+          code
+            (load-make c
+                       m
+                       raw
+                       (con-int OFFSET-FUNCTION-CODE)
+                       ALIAS-FUNCTION-CODE
+                       (.funptr-ty abi))
+          (mut actuals) (al-new [(dyn NodeOps)] (compiler-allocator))
+          (mut k) (if packed-call 5 2)]
+      (loop (if (>= (load k) (len (load args)))
+                (break 0)
+                (do
+                  (push! [(dyn NodeOps)]
+                         (mut actuals)
+                         (get (load args) (load k)))
+                  (set! (mut k) (+ (load k) 1))
+                  (continue))))
+      (let [packed
+              (if packed-call
+                  (load (CallArguments
+                          :vector (get (load args) 4)
+                          :count (get (load args) 3)
+                          :memory m
+                          :direct (load actuals)))
+                  (callabi-pack! c m (load actuals)))
+            end
+              (callabi-invoke! c
+                               (.memory packed)
+                               code
+                               callee
+                               receiver
+                               (if packed-call
+                                   (get (load args) 2)
+                                   (dyn-undefined-make))
+                               packed)]
+        (al-free! (mut actuals))
+        (al-free! (mut args))
+        (jsl-expr-result (proj-make end RETURN-VALUE "jsl.value-call.value")
+                         (cproj-make end RETURN-CTRL "jsl.value-call.ctrl")
+                         (proj-make end RETURN-MEM "jsl.value-call.mem"))))))
+
+(defn jsl-lower-make-closure [(x (ptr rd/Sexp))
+                              (params (ptr rd/Sexp))
+                              (values (ArrayList (dyn NodeOps)))
+                              (local-names (mut (ArrayList (slice u8))))
+                              (local-values (mut (ArrayList (dyn NodeOps))))
+                              (ctrl (dyn NodeOps))
+                              (mem (dyn NodeOps))] (-> JslExprResult)
+  (let [maker (jsl-closure-maker)]
+    (if (not (.installed maker))
+        (panic "jsl-lower-make-closure: no frontend installed the closure maker (%MakeClosure needs a realm)")
+        0)
+    (let [proto
+            (jsl-lower-expr (rd/sexp-nth x 2)
+                            params
+                            values
+                            (mut local-names)
+                            (mut local-values)
+                            ctrl
+                            mem)]
+      (n-keep! (.value proto))
+      (let [env
+              (jsl-lower-expr (rd/sexp-nth x 3)
+                              params
+                              values
+                              (mut local-names)
+                              (mut local-values)
+                              (.ctrl proto)
+                              (.mem proto))]
+        (n-keep! (.value env))
+        (let [flags
+                (jsl-lower-expr (rd/sexp-nth x 4)
+                                params
+                                values
+                                (mut local-names)
+                                (mut local-values)
+                                (.ctrl env)
+                                (.mem env))
+              name (rd/sexp-str (rd/sexp-nth x 1))]
+          (n-unkeep! (.value env))
+          (n-unkeep! (.value proto))
+          (let [made
+                  (primitive/call-ptr (.f maker)
+                                      (slice-data [u8] name)
+                                      (len name)
+                                      (n-nid (.ctrl flags))
+                                      (n-nid (.mem flags))
+                                      (n-nid (.value proto))
+                                      (n-nid (.value env))
+                                      (n-nid (.value flags)))]
+            (jsl-expr-result (jsl-node made)
+                             (.ctrl flags)
+                             (jsl-node (.memory maker)))))))))

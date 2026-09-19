@@ -1,0 +1,182 @@
+;; The peephole driver: compute, constant replacement, idealize, GVN, dead code elimination.      Node.peephole, Node.peepholeOpt
+
+(module aot.node.peephole)
+(import "aot.util.arena" :use [compiler-state CompilerStateSlot])
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.slice" :use *)
+(import "coil.os" :as os)
+(import "aot.util.panic" :use *)
+(import "aot.util.worklist" :use *)
+(import "aot.type.type" :use *)
+(import "aot.node.node"
+        :use
+        [NodeOps
+         n-ty
+         n-hash-of
+         n-same?
+         n-nins
+         n-in
+         n-unused?
+         n-dead?
+         unreachable-node
+         n-set-ty!
+         n-keep!
+         n-unkeep!
+         n-kill!])
+(import "aot.node.arena" :use *)
+(import "aot.node.origin" :use *)
+(import "aot.node.gvn" :use *)
+
+;; ---------------------------------------------------------------------------
+;; THE PEEPHOLE ENGINE
+;;
+;; `n-peephole!` always returns a node — often `self`. `n-peephole-opt!` returns None for
+;; no-progress, which is what the worklist needs in order to reach a fixpoint.
+
+;; A hook the Constant family provides, so the engine can build a Constant without importing it.
+;; Set once at boot; a null here is a wiring bug, not a fallback.
+(defstruct ConHook [(make (fnptr c [i64] (dyn NodeOps))) (set bool)])
+
+(defn con-hook [] (-> (ptr ConHook))
+  (compiler-state [ConHook] (primitive/alloc-static CompilerStateSlot)))
+
+(defn set-con-hook! [(f (fnptr c [i64] (dyn NodeOps)))] (-> i64)
+  (do (set! (.make (con-hook)) f) (set! (.set (con-hook)) true) 0))
+
+(defn n-make-constant [(t i64)] (-> (dyn NodeOps))
+  (if (not (.set (con-hook)))
+      (do
+        (panic "n-make-constant: the Constant hook was never installed — call set-con-hook! at boot")
+        (unreachable-node))
+      (primitive/call-ptr (.make (con-hook)) t)))
+
+(defn n-peephole! [(n (dyn NodeOps))] (-> (dyn NodeOps))
+  (match (n-peephole-opt! n) (Some [m] m) (None [] n)))
+
+;; Simple's `peepholeOpt`, step for step:
+;;
+;;   1. compute a type and record it
+;;   2. if the type is HIGH-OR-CONSTANT and this is not already a Constant and the node does not
+;;      refuse constant folding, replace it with a Constant
+;;   3. probe the GVN table; on a hit, return the existing node — this is CSE
+;;   4. ask the node to idealize itself
+;;   5. otherwise report progress iff the type improved
+(defn n-peephole-opt! [(n (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [prior (.current (node-origins))]
+    (set! (.current (node-origins)) (.origin (hdr n)))
+    (let [answer (n-peephole-opt-inner! n)]
+      (set! (.current (node-origins)) prior)
+      answer)))
+
+(defn n-peephole-opt-inner! [(n (dyn NodeOps))] (-> (Option (dyn NodeOps)))
+  (let [old (n-ty n)
+        now (compute n)]
+    (n-set-ty! n now)
+    (if (and (and (not (is-const? n)) (not (no-const-fold? n)))
+             (ty-high-or-const? now))
+        ;; Replace with a Constant. The Constant is peepholed, then this node is dead-code
+        ;; eliminated against it.
+        (Some (n-dead-code-elim! n (n-peephole! (n-make-constant now))))
+        (if (and (= (n-hash-of n) 0) (n-gvn-probe! n))
+            ;; The probe found an equal node and returned it through the arena; re-resolve it.
+            (match (n-gvn-find n)
+              (Some [other]
+                    ;; Both types are valid by monotonicity, so the survivor takes the BEST of the
+                    ;; two. Losing that join is how a random worklist order changes the answer.
+                    (do
+                      (n-set-ty! other (ty-join (n-ty other) now))
+                      (Some (n-dead-code-elim! n other))))
+              (None [] (n--after-gvn n old now)))
+            (n--after-gvn n old now)))))
+
+;; Probe the table. Returns true when an equal node already exists; inserts `n` when it does not.
+(defn n-gvn-probe! [(n (dyn NodeOps))] (-> bool)
+  (match (n-gvn-find n)
+    (Some [_] true)
+    (None [] (do (n-gvn-insert! n) false))))
+
+(defn n--after-gvn [(n (dyn NodeOps)) (old i64) (now i64)] (-> (Option (dyn NodeOps)))
+  (match (idealize n)
+    (Some [m] (Some m))
+    (None [] (if (!= old now) (Some n) (None)))))
+
+;; `m` is the replacement, `n` the old node. Returns `m`, which may have no uses yet and is alive
+;; nonetheless.
+;;
+;; If `n` is going dead and is not itself the replacement, kill it — and since killing recursively
+;; kills its inputs, that cascade might reach `m`. So `m` is KEPT across the kill.
+(defn n-dead-code-elim! [(n (dyn NodeOps)) (m (dyn NodeOps))] (-> (dyn NodeOps))
+  (do
+    ;; Replacements and GVN survivors represent every source expression previously represented by
+    ;; the eliminated node. This metadata does not participate in structural equality.
+    (n-source-merge! m n)
+    (if (and (and (not (n-same? m n)) (n-unused? n)) (not (n-dead? n)))
+        (do
+          (n-keep! m)
+          (n-kill! n)
+          (n-unkeep! m)
+          0)
+        0)
+    m))
+
+;; ---------------------------------------------------------------------------
+;; Peephole utilities
+
+;; Swap inputs 1 and 2 without letting either go dead during the swap.
+;;
+;; Simple's comment: "Hash is order dependent" — hence the unlock. And the swap is done by reading
+;; both, then writing both, rather than through `n-set-def!`: routing it through the edge machinery
+;; would momentarily drop one operand's last use and kill it.
+(defn n-swap12! [(n (dyn NodeOps))] (-> (dyn NodeOps))
+  (do
+    (n-unlock! n)
+    (let [ins_ (field (hdr n) ins)
+          a (get (load ins_) 1)
+          b (get (load ins_) 2)]
+      (set! (mut ins_) 1 b)
+      (set! (mut ins_) 2 a)
+      n)))
+
+;; Does every input from index 1 up carry a constant type? Simple ignores in(0), which is control.
+(defn n-all-const? [(n (dyn NodeOps))] (-> bool)
+  (let [cnt (n-nins n)
+        (mut i) 1
+        (mut all) true]
+    (loop (if (or (>= (load i) cnt) (not (load all)))
+              (break 0)
+              (do
+                (match (n-in n (load i))
+                  (Some [v]
+                        (if (ty-constant? (n-ty v)) 0 (set! (mut all) false)))
+                  (None [] (do (set! (mut all) false) 0)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load all)))
+
+;; ---------------------------------------------------------------------------
+;; The expensive-assert flag
+;;
+;; Simple's `_midAssert`. While set, `code-add!` and `n-add-dep!` do nothing, so the invariant check
+;; can call `peepholeOpt` on every node without perturbing the graph it is checking. A check with
+;; side effects is not a check.
+(defn set-mid-assert! [(on bool)] (-> i64)
+  (do (arena-boot!) (set! (.mid-assert (arena)) on) 0))
+
+(defn mid-assert? [] (-> bool)
+  (do (arena-boot!) (.mid-assert (arena))))
+
+;; The optimistic-pass flag. `aot.codegen.opto` sets it for exactly the span of its SCCP worklist:
+;; the graph is frozen there, so each live node's `pesi-ty` is the sound bottom-up type it had when
+;; the pass began, and loop widening may jump to it (aot.node.phi, `phi-widen-bound`).
+(defn set-optimistic-pass! [(on bool)] (-> i64)
+  (do (arena-boot!) (set! (.optimistic (arena)) on) 0))
+
+(defn optimistic-pass? [] (-> bool)
+  (do (arena-boot!) (.optimistic (arena))))
+
+;; Is this nid currently on the worklist?
+(defn code-on-worklist? [(id i64)] (-> bool)
+  (do (arena-boot!) (wl-on? (.work (arena)) id)))
