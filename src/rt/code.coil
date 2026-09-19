@@ -1,0 +1,272 @@
+;; The code registry: which text ranges are ours, their stack maps and unit identities, and frame walking.
+
+(module aot.rt.code)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.mem" :as mem)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.io" :as io)
+(import "coil.os" :as os)
+(import "coil.time" :as time)
+(import "aot.util.panic" :use *)
+(import "aot.rt.abi" :use *)
+(import "aot.rt.layout" :use *)
+(import "aot.rt.heap" :use *)
+(import "aot.rt.stackmap" :use *)
+
+;; Installed code outlives individual realms. Each range borrows immutable map bytes from its
+;; installation until unregister; no compiler-arena pointer enters this registry. Mutations are
+;; allowed only between executions, before a realm has live frames or function objects.
+;; Simple's runtime is the host JVM and does not supply a native moving-GC code registry. This is
+;; our runtime boundary: qualify the first map by installation, subsequent maps by actual PCs.
+(defstruct RtCodeRange
+  [(id i64)
+   (text i64)
+   (text-bytes i64)
+   (maps (ptr u8))
+   (map-bytes i64)
+   (dependents i64)
+   (unit-slot i64)
+   (key-count i64)
+   (shape-count i64)])
+
+(defstruct RtCodeRegistry
+  [(ranges (ArrayList RtCodeRange)) (next-id i64) (ready bool)])
+
+(defn rt-code-registry [] (-> (ptr RtCodeRegistry))
+  (let [r (primitive/alloc-static RtCodeRegistry)]
+    (if (not (.ready r))
+        (do
+          (set! (.ranges r) (al-new [RtCodeRange] (alloc/malloc-allocator)))
+          (set! (.next-id r) 1)
+          (set! (.ready r) true)
+          0)
+        0)
+    r))
+
+(defn rt-code-count [] (-> i64)
+  (len (.ranges (rt-code-registry))))
+
+(defn rt-code-find [(id i64)] (-> (Option RtCodeRange))
+  (let [(mut i) 0
+        ranges (.ranges (rt-code-registry))]
+    (loop (if (>= (load i) (len ranges))
+              (break (None [RtCodeRange]))
+              (let [r (get ranges (load i))]
+                (if (= (.id r) id)
+                    (break (Some r))
+                    (do (set! (mut i) (+ (load i) 1)) (continue))))))))
+
+(defn rt-code-for-return-pc [(pc i64)] (-> (Option RtCodeRange))
+  (let [(mut i) 0
+        ranges (.ranges (rt-code-registry))]
+    (loop (if (>= (load i) (len ranges))
+              (break (None [RtCodeRange]))
+              (let [r (get ranges (load i))]
+                ;; A return PC names the byte after its call, including a call at a range's end.
+                (if (and (> pc (.text r)) (<= (- pc (.text r)) (.text-bytes r)))
+                    (break (Some r))
+                    (do (set! (mut i) (+ (load i) 1)) (continue))))))))
+
+(defn rt-code-maps-valid? [(maps (ptr u8)) (bytes i64) (text-bytes i64)] (-> bool)
+  (if (or (= (primitive/cast i64 maps) 0)
+          (not (rt-stackmap-header-valid? maps bytes)))
+      false
+      (let [(mut ids) (hm-new [i64 bool] (alloc/malloc-allocator) (i64-keyops))
+            (mut at) RT-STACKMAP-HEADER-BYTES
+            (mut i) 0
+            (mut valid) true]
+        (loop (if (or (not (load valid)) (>= (load i) (rt-read-u32 maps 12)))
+                  (break 0)
+                  (if (> (load at) (- bytes RT-STACKMAP-RECORD-BYTES))
+                      (do (set! (mut valid) false) (break 0))
+                      (let [id (rt-read-u64 maps (load at))
+                            pc (rt-read-u64 maps (+ (load at) 8))
+                            slots (rt-read-u32 maps (+ (load at) 16))
+                            size
+                              (+ RT-STACKMAP-RECORD-BYTES
+                                 (* slots RT-STACKMAP-SLOT-BYTES))]
+                        (if (or (<= id 0)
+                                (> id RT-LOCAL-MAP-ID-LIMIT)
+                                (< pc 0)
+                                (> pc text-bytes)
+                                (> size (- bytes (load at)))
+                                (match (get (load ids) id)
+                                  (Some [_] true)
+                                  (None [] false)))
+                            (do (set! (mut valid) false) (break 0))
+                            (do
+                              (set! (mut ids) id true)
+                              (set! (mut at) (+ (load at) size))
+                              (set! (mut i) (+ (load i) 1))
+                              (continue)))))))
+        (hm-free! (mut ids))
+        (and (load valid) (= (load at) bytes)))))
+
+;; Slots can be reused only after unregistration, when no realm or dependent code can refer to
+;; the old installation. Code identities themselves are never reused. Table size depends on live
+;; installations rather than the number of tests this worker has processed.
+(defn rt-code-slot-used? [(slot i64)] (-> bool)
+  (let [ranges (.ranges (rt-code-registry))
+        (mut i) 0]
+    (loop (if (>= (load i) (len ranges))
+              (break false)
+              (let [r (get ranges (load i))]
+                (if (= (.unit-slot r) slot)
+                    (break true)
+                    (do (set! (mut i) (+ (load i) 1)) (continue))))))))
+
+(defn rt-code-next-slot [] (-> i64)
+  (let [(mut slot) 1]
+    (loop (if (rt-code-slot-used? (load slot))
+              (do (set! (mut slot) (+ (load slot) 1)) (continue))
+              (break (load slot))))))
+
+(defn rt-code-unit-slot [(id i64)] (-> i64)
+  (if (= id 0)
+      0
+      (match (rt-code-find id)
+        (Some [range] (let [r range] (.unit-slot r)))
+        (None [] (panic "rt-code-unit-slot: unknown code installation")))))
+
+(defn rt-code-unit-count [] (-> i64)
+  (let [(mut count) 1]
+    (al-for [range (.ranges (rt-code-registry))]
+            (let [r range]
+              (if (>= (.unit-slot r) (load count))
+                  (set! (mut count) (+ (.unit-slot r) 1))
+                  0)))
+    (load count)))
+
+(defn rt-code-register-identities! [(text i64)
+                                    (text-bytes i64)
+                                    (maps (ptr u8))
+                                    (map-bytes i64)
+                                    (key-count i64)
+                                    (shape-count i64)] (-> i64)
+  (if (.booted (rt-heap)) (panic "rt-code-register!: a realm is active") 0)
+  (if (or (<= text 0)
+          (<= text-bytes 0)
+          (> text-bytes (- 0x7fffffffffffffff text))
+          (not (rt-code-maps-valid? maps map-bytes text-bytes)))
+      (panic "rt-code-register!: invalid code range or stack maps")
+      0)
+  (if (or (< key-count 1)
+          (> key-count 0xffffffff)
+          (< shape-count 2)
+          (> shape-count 0xffffffff))
+      (panic "rt-code-register-identities!: invalid unit namespace counts")
+      0)
+  (let [registry (rt-code-registry)
+        id (.next-id registry)]
+    (if (> id RT-CODE-ID-LIMIT)
+        (panic "rt-code-register!: code identity space exhausted")
+        0)
+    (al-for [range (.ranges registry)]
+            (let [r range]
+              (if (and (< text (+ (.text r) (.text-bytes r)))
+                       (< (.text r) (+ text text-bytes)))
+                  (panic "rt-code-register!: overlapping code ranges")
+                  0)))
+    (push! [RtCodeRange]
+           (mut (.ranges registry))
+           (RtCodeRange
+             :id id
+             :text text
+             :text-bytes text-bytes
+             :maps maps
+             :map-bytes map-bytes
+             :dependents 0
+             :unit-slot (rt-code-next-slot)
+             :key-count key-count
+             :shape-count shape-count))
+    (set! (.next-id registry) (+ id 1))
+    id))
+
+;; Register code with no unit metadata references (the GC registry's standalone client).
+(defn rt-code-register! [(text i64)
+                         (text-bytes i64)
+                         (maps (ptr u8))
+                         (map-bytes i64)] (-> i64)
+  (rt-code-register-identities! text text-bytes maps map-bytes 1 2))
+
+(defn rt-code-pin! [(id i64) (retain bool)] (-> i64)
+  (if (.booted (rt-heap)) (panic "rt-code-pin!: a realm is active") 0)
+  (let [registry (rt-code-registry)
+        (mut i) 0]
+    (loop (if (>= (load i) (len (.ranges registry)))
+              (break (panic "rt-code-pin!: unknown code identity"))
+              (let [r (al-elem [RtCodeRange] (mut (.ranges registry)) (load i))]
+                (if (= (.id r) id)
+                    (do
+                      (if (or (and retain
+                                   (= (.dependents r) 0x7fffffffffffffff))
+                              (and (not retain) (= (.dependents r) 0)))
+                          (panic "rt-code-pin!: invalid dependency count")
+                          0)
+                      (set! (.dependents r)
+                            (+ (.dependents r) (if retain 1 -1)))
+                      (break 0))
+                    (do (set! (mut i) (+ (load i) 1)) (continue))))))))
+
+(defn rt-code-unregister! [(id i64)] (-> i64)
+  (if (.booted (rt-heap)) (panic "rt-code-unregister!: a realm is active") 0)
+  (let [registry (rt-code-registry)
+        (mut i) 0]
+    (loop (if (>= (load i) (len (.ranges registry)))
+              (break (panic "rt-code-unregister!: unknown code identity"))
+              (let [r (get (.ranges registry) (load i))]
+                (if (= (.id r) id)
+                    (let [last
+                            (get (.ranges registry)
+                                 (- (len (.ranges registry)) 1))]
+                      (if (> (.dependents r) 0)
+                          (panic "rt-code-unregister!: installed code still imports this range")
+                          0)
+                      (set! (mut (.ranges registry)) (load i) last)
+                      (pop! (mut (.ranges registry)))
+                      (if (= (len (.ranges registry)) 0)
+                          (al-free! (mut (.ranges registry)))
+                          0)
+                      (break 0))
+                    (do (set! (mut i) (+ (load i) 1)) (continue))))))))
+
+(defstruct RtFrameCursor
+  [(maps (ptr u8)) (map-bytes i64) (text i64) (record i64) (sp i64)])
+
+;; One walker supplies both tracing and verification, so crossing an image boundary cannot
+;; update one pass while leaving the other on the previous image's map table.
+(defn rt-frame-next! [(cursor (ptr RtFrameCursor))] (-> i64)
+  (let [pc
+          (load (primitive/cast (ptr i64)
+                                (+ (.sp cursor)
+                                   (rt-stackmap-rpc-offset (.maps cursor)
+                                                           (.record cursor)))))
+        size (rt-stackmap-frame-size (.maps cursor) (.record cursor))]
+    (if (or (<= size 0) (> size (- 0x7fffffffffffffff (.sp cursor))))
+        (panic "rt-frame-next!: a frame record does not advance the walk")
+        0)
+    (set! (.sp cursor) (+ (.sp cursor) size))
+    (match (rt-code-for-return-pc pc)
+      (Some [range]
+            (let [r range
+                  record
+                    (rt-stackmap-find-return-pc (.maps r)
+                                                (.map-bytes r)
+                                                (- pc (.text r)))]
+              (if (< record 0)
+                  (panic "rt-frame-next!: registered caller has no stack map")
+                  0)
+              (set! (.maps cursor) (.maps r))
+              (set! (.map-bytes cursor) (.map-bytes r))
+              (set! (.text cursor) (.text r))
+              (set! (.record cursor) record)
+              0))
+      (None []
+            (do
+              (set! (.record cursor)
+                    (rt-stackmap-find-return-pc (.maps cursor)
+                                                (.map-bytes cursor)
+                                                (- pc (.text cursor))))
+              0)))))

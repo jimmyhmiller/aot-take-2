@@ -1,0 +1,365 @@
+;; String primitives: code units, comparison, concatenation, substrings, UTF-8 and key interning.
+
+(module aot.rt.string)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.mem" :as mem)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.io" :as io)
+(import "coil.os" :as os)
+(import "coil.time" :as time)
+(import "aot.util.panic" :use *)
+(import "aot.rt.shapes" :use *)
+(import "aot.rt.layout" :use *)
+(import "aot.rt.heap" :use *)
+(import "aot.rt.gc" :use *)
+
+(defn rt-string-length [(string i64)] (-> i64)
+  (load (primitive/cast (ptr i64) string)))
+
+(defn rt-string-code-unit [(string i64) (index i64)] (-> i64)
+  (primitive/cast i64
+                  (load (primitive/index (primitive/cast (ptr u16) string)
+                                         (+ 4 index)))))
+
+(defn rt-string-set-code-unit! [(string i64) (index i64) (unit i64)] (-> i64)
+  (do
+    (set! (primitive/index (primitive/cast (ptr u16) string) (+ 4 index))
+          (primitive/cast u16 unit))
+    unit))
+
+(defn rt-string-eq [(left i64) (right i64)] (-> i64)
+  (let [left-length (rt-string-length left)
+        right-length (rt-string-length right)]
+    (if (!= left-length right-length)
+        0
+        (let [(mut i) 0
+              (mut equal) 1]
+          (loop (if (or (= (load equal) 0) (>= (load i) left-length))
+                    (break 0)
+                    (do
+                      (if (!= (rt-string-code-unit left (load i))
+                              (rt-string-code-unit right (load i)))
+                          (set! (mut equal) 0)
+                          0)
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (load equal)))))
+
+;; ECMA-262's abstract relational comparison on two strings is lexicographic over UTF-16 code
+;; units. Return -1/0/1 so JSL decides which relational operator it is implementing.
+(defn rt-string-compare [(left i64) (right i64)] (-> i64)
+  (let [left-length (rt-string-length left)
+        right-length (rt-string-length right)
+        limit (if (< left-length right-length) left-length right-length)
+        (mut i) 0
+        (mut answer) 0]
+    (loop (if (or (!= (load answer) 0) (>= (load i) limit))
+              (break 0)
+              (let [a (rt-string-code-unit left (load i))
+                    b (rt-string-code-unit right (load i))]
+                (if (< a b)
+                    (set! (mut answer) -1)
+                    (if (> a b) (set! (mut answer) 1) 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (if (!= (load answer) 0)
+        (load answer)
+        (if (< left-length right-length)
+            -1
+            (if (> left-length right-length) 1 0)))))
+
+(defn rt-string-concat [(left i64)
+                        (right i64)
+                        (shape i64)
+                        (map-id i64)
+                        (caller-sp i64)] (-> i64)
+  (let [left-root (primitive/alloc-stack i64)
+        right-root (primitive/alloc-stack i64)]
+    (set! left-root left)
+    (set! right-root right)
+    (rt-heap-boot!)
+    (if (and (.stress (rt-heap)) (> map-id 0))
+        (rt-collect-linked-with-roots! map-id
+                                       caller-sp
+                                       left-root
+                                       right-root
+                                       false)
+        0)
+    (let [left-length (rt-string-length left)
+          right-length (rt-string-length right)
+          length (+ left-length right-length)]
+      (if (or (< length left-length)
+              (> length (/ (- RT-MAX-PAYLOAD-BYTES 8) 2)))
+          (alloc/oom-at c"aot_rt_string_concat: string is too large" length)
+          0)
+      (let [bytes (+ 8 (* length 2))
+            large
+              (> (rt-align8 (+ bytes RT-HEADER-BYTES)) (.capacity (rt-heap)))
+            initial
+              (if large
+                  (rt-heap-allocate-old bytes shape)
+                  (rt-heap-allocate-active bytes shape))
+            result
+              (if (!= initial 0)
+                  initial
+                  (do
+                    (if large (set! (.force-major (rt-heap)) true) 0)
+                    (rt-collect-linked-with-roots! map-id
+                                                   caller-sp
+                                                   left-root
+                                                   right-root
+                                                   false)
+                    (let [retry
+                            (if large
+                                (rt-heap-allocate-old bytes shape)
+                                (rt-heap-allocate-active bytes shape))]
+                      (if (= retry 0)
+                          (alloc/oom-at c"aot_rt_string_concat: object exceeds generation"
+                                        bytes)
+                          retry))))]
+        (set! (primitive/cast (ptr i64) result) length)
+        (let [(mut i) 0]
+          (loop (if (>= (load i) left-length)
+                    (break 0)
+                    (do
+                      (rt-string-set-code-unit! result
+                                                (load i)
+                                                (rt-string-code-unit (load left-root)
+                                                                     (load i)))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (set! (mut i) 0)
+          (loop (if (>= (load i) right-length)
+                    (break 0)
+                    (do
+                      (rt-string-set-code-unit! result
+                                                (+ left-length (load i))
+                                                (rt-string-code-unit (load right-root)
+                                                                     (load i)))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue)))))
+        result))))
+
+;; A fresh string of `length` code units, zero-filled, with `root` (a raw string payload the caller
+;; still needs) kept alive and re-read across any collection the allocation triggers.
+(defn rt-alloc-string [(length i64)
+                       (shape i64)
+                       (map-id i64)
+                       (caller-sp i64)
+                       (root (ptr i64))] (-> i64)
+  (do
+    (if (> length (/ (- RT-MAX-PAYLOAD-BYTES 8) 2))
+        (alloc/oom-at c"aot_rt_alloc_string: string is too large" length)
+        0)
+    (let [result
+            (rt-alloc-rooted (+ 8 (* length 2))
+                             shape
+                             map-id
+                             caller-sp
+                             root
+                             (primitive/cast (ptr i64) 0)
+                             false)]
+      (set! (primitive/cast (ptr i64) result) length)
+      result)))
+
+;; The runtime capability behind `%Substring`: the code units of [start, end), which the caller
+;; has already clamped into the string.
+(defn rt-substring [(string i64)
+                    (start i64)
+                    (end i64)
+                    (shape i64)
+                    (map-id i64)
+                    (caller-sp i64)] (-> i64)
+  (let [root (primitive/alloc-stack i64)]
+    (set! root string)
+    (rt-heap-boot!)
+    (if (or (< start 0) (> start end) (> end (rt-string-length string)))
+        (panic-i "aot_rt_substring: bounds outside the string" end)
+        0)
+    (let [length (- end start)
+          result (rt-alloc-string length shape map-id caller-sp root)
+          (mut i) 0]
+      (loop (if (>= (load i) length)
+                (break 0)
+                (do
+                  (rt-string-set-code-unit! result
+                                            (load i)
+                                            (rt-string-code-unit (load root)
+                                                                 (+ start
+                                                                    (load i))))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      result)))
+
+;; The runtime capability behind `%StringFromCharCode`: a one-unit string of the code unit.
+(defn rt-string-from-code [(unit i64) (shape i64) (map-id i64) (caller-sp i64)] (-> i64)
+  (let [none (primitive/alloc-stack i64)]
+    (set! none 0)
+    (rt-heap-boot!)
+    (let [result (rt-alloc-string 1 shape map-id caller-sp none)]
+      (rt-string-set-code-unit! result 0 (& unit 0xffff))
+      result)))
+
+;; The runtime capability behind `%InternKey`: a string's property-key id (ToPropertyKey's
+;; identity step). The string's UTF-16 code units are encoded as UTF-8 for the key table, whose
+;; names are the compiler's source spellings.
+(defn rt-utf8-push! [(out (mut (ArrayList u8))) (cp i64)] (-> i64)
+  (do
+    (if (< cp 0x80)
+        (push! [u8] (mut out) (primitive/cast u8 cp))
+        (if (< cp 0x800)
+            (do
+              (push! [u8]
+                     (mut out)
+                     (primitive/cast u8 (| 0xc0 (primitive/ishr cp 6))))
+              (push! [u8] (mut out) (primitive/cast u8 (| 0x80 (& cp 0x3f)))))
+            (if (< cp 0x10000)
+                (do
+                  (push! [u8]
+                         (mut out)
+                         (primitive/cast u8 (| 0xe0 (primitive/ishr cp 12))))
+                  (push! [u8]
+                         (mut out)
+                         (primitive/cast u8
+                                         (| 0x80 (& (primitive/ishr cp 6) 0x3f))))
+                  (push! [u8]
+                         (mut out)
+                         (primitive/cast u8 (| 0x80 (& cp 0x3f)))))
+                (do
+                  (push! [u8]
+                         (mut out)
+                         (primitive/cast u8 (| 0xf0 (primitive/ishr cp 18))))
+                  (push! [u8]
+                         (mut out)
+                         (primitive/cast u8
+                                         (| 0x80
+                                            (& (primitive/ishr cp 12) 0x3f))))
+                  (push! [u8]
+                         (mut out)
+                         (primitive/cast u8
+                                         (| 0x80 (& (primitive/ishr cp 6) 0x3f))))
+                  (push! [u8]
+                         (mut out)
+                         (primitive/cast u8 (| 0x80 (& cp 0x3f))))))))
+    0))
+
+(defn rt-intern-key [(string i64)] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        (mut bytes) (al-new [u8] a)
+        length (rt-string-length string)
+        (mut i) 0]
+    (rt-heap-boot!)
+    (loop (if (>= (load i) length)
+              (break 0)
+              (let [unit (rt-string-code-unit string (load i))]
+                ;; A surrogate pair is one code point; a lone surrogate keeps its own encoding.
+                (if (and (>= unit 0xd800)
+                         (< unit 0xdc00)
+                         (< (+ (load i) 1) length))
+                    (let [low (rt-string-code-unit string (+ (load i) 1))]
+                      (if (and (>= low 0xdc00) (< low 0xe000))
+                          (do
+                            (rt-utf8-push! (mut bytes)
+                                           (+ 0x10000
+                                              (+ (* (- unit 0xd800) 0x400)
+                                                 (- low 0xdc00))))
+                            (set! (mut i) (+ (load i) 2)))
+                          (do
+                            (rt-utf8-push! (mut bytes) unit)
+                            (set! (mut i) (+ (load i) 1)))))
+                    (do
+                      (rt-utf8-push! (mut bytes) unit)
+                      (set! (mut i) (+ (load i) 1))))
+                (continue))))
+    (let [key (shapes-intern-key (al-slice (load bytes)))]
+      (al-free! [u8] (mut bytes))
+      key)))
+
+;; A fresh string holding a key's UTF-8 name decoded to UTF-16, with `root` kept alive.
+(defn rt-string-from-utf8 [(name (slice u8))
+                           (map-id i64)
+                           (caller-sp i64)
+                           (root (ptr i64))] (-> i64)
+  (let [(mut units) (al-new [i64] (alloc/malloc-allocator))
+        (mut i) 0
+        n (len name)]
+    (loop (if (>= (load i) n)
+              (break 0)
+              (let [b0 (primitive/cast i64 (get name (load i)))]
+                (if (< b0 0x80)
+                    (do
+                      (push! [i64] (mut units) b0)
+                      (set! (mut i) (+ (load i) 1)))
+                    (if (< b0 0xe0)
+                        (do
+                          (push! [i64]
+                                 (mut units)
+                                 (+ (primitive/ishl (& b0 0x1f) 6)
+                                    (& (primitive/cast i64
+                                                       (get name (+ (load i) 1)))
+                                       0x3f)))
+                          (set! (mut i) (+ (load i) 2)))
+                        (if (< b0 0xf0)
+                            (do
+                              (push! [i64]
+                                     (mut units)
+                                     (+ (primitive/ishl (& b0 0x0f) 12)
+                                        (+ (primitive/ishl (& (primitive/cast i64
+                                                                              (get name
+                                                                                   (+ (load i)
+                                                                                      1)))
+                                                              0x3f)
+                                                           6)
+                                           (& (primitive/cast i64
+                                                              (get name
+                                                                   (+ (load i)
+                                                                      2)))
+                                              0x3f))))
+                              (set! (mut i) (+ (load i) 3)))
+                            (let [cp
+                                    (+ (primitive/ishl (& b0 0x07) 18)
+                                       (+ (primitive/ishl (& (primitive/cast i64
+                                                                             (get name
+                                                                                  (+ (load i)
+                                                                                     1)))
+                                                             0x3f)
+                                                          12)
+                                          (+ (primitive/ishl (& (primitive/cast i64
+                                                                                (get name
+                                                                                     (+ (load i)
+                                                                                        2)))
+                                                                0x3f)
+                                                             6)
+                                             (& (primitive/cast i64
+                                                                (get name
+                                                                     (+ (load i)
+                                                                        3)))
+                                                0x3f))))]
+                              (push! [i64]
+                                     (mut units)
+                                     (+ 0xd800
+                                        (primitive/ishr (- cp 0x10000) 10)))
+                              (push! [i64]
+                                     (mut units)
+                                     (+ 0xdc00 (& (- cp 0x10000) 0x3ff)))
+                              (set! (mut i) (+ (load i) 4))))))
+                (continue))))
+    (let [result
+            (rt-alloc-string (len (load units))
+                             RT-SHAPE-STRING
+                             map-id
+                             caller-sp
+                             root)
+          (mut k) 0]
+      (loop (if (>= (load k) (len (load units)))
+                (break 0)
+                (do
+                  (rt-string-set-code-unit! result
+                                            (load k)
+                                            (get (load units) (load k)))
+                  (set! (mut k) (+ (load k) 1))
+                  (continue))))
+      (al-free! [i64] (mut units))
+      result)))

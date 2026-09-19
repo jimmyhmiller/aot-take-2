@@ -1,0 +1,563 @@
+;; Generic own-property access over the runtime shape tree: get, set, define, delete, integrity levels.
+
+(module aot.rt.property)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.mem" :as mem)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.io" :as io)
+(import "coil.os" :as os)
+(import "coil.time" :as time)
+(import "aot.rt.shapes" :use *)
+(import "aot.rt.layout" :use *)
+(import "aot.rt.heap" :use *)
+(import "aot.rt.gc" :use *)
+(import "aot.rt.string" :use *)
+
+(defn rt-box-string [(payload i64)] (-> i64)
+  (| (primitive/ishl RT-DYNAMIC-PREFIX-STRING 48) payload))
+
+(defn rt-box-object [(payload i64)] (-> i64)
+  (| (primitive/ishl RT-DYNAMIC-PREFIX-OBJECT 48) payload))
+
+;; The backing-store payload of an ordinary object, or zero when it has none yet.
+(defn rt-storage-of [(obj i64)] (-> i64)
+  (let [word
+          (load (primitive/cast (ptr i64) (+ obj RT-OFFSET-OBJECT-PROPERTIES)))]
+    (if (= (rt-word-prefix word) RT-DYNAMIC-PREFIX-OBJECT)
+        (& word RT-DYNAMIC-PAYLOAD-MASK)
+        0)))
+
+;; The byte offset of `key` in `obj`'s backing store, or -1 when `obj` has no such own property.
+(defn rt-prop-offset [(obj i64) (key i64)] (-> i64)
+  (let [storage (rt-storage-of obj)]
+    (if (= storage 0)
+        -1
+        (shapes-lookup-offset (rt-payload-shape storage) key))))
+
+(defn rt-prop-get-own [(obj i64) (key i64)] (-> i64)
+  (do
+    (rt-heap-boot!)
+    (let [off (rt-prop-offset obj key)]
+      (if (< off 0)
+          RT-DYNAMIC-UNDEFINED-WORD
+          (load (primitive/cast (ptr i64) (+ (rt-storage-of obj) off)))))))
+
+(defn rt-prop-has-own [(obj i64) (key i64)] (-> i64)
+  (do
+    (rt-heap-boot!)
+    (if (< (rt-prop-offset obj key) 0) 0 1)))
+
+;; The first object on `obj`'s prototype chain (the receiver excluded) with an own `key`, as the
+;; boxed word its predecessor's [[Prototype]] slot holds (`%PropChainHolder`); null when none.
+(defn rt-prop-chain-holder [(obj i64) (key i64)] (-> i64)
+  (do
+    (rt-heap-boot!)
+    (let [(mut current) obj
+          (mut answer) RT-DYNAMIC-NULL-WORD
+          (mut walking) true]
+      (loop (if (not (load walking))
+                (break 0)
+                (let [word
+                        (load (primitive/cast (ptr i64) (+ (load current) 0)))]
+                  (if (rt-word-object? word)
+                      (let [proto (& word RT-DYNAMIC-PAYLOAD-MASK)]
+                        ;; An Array exotic prototype stops the walk whatever the key: its `length` and
+                        ;; elements are own properties no shape records, so the JSL asks it.
+                        (if (or (= (rt-word-prefix word)
+                                   RT-DYNAMIC-PREFIX-ARRAY)
+                                (>= (rt-prop-offset proto key) 0))
+                            (do
+                              (set! (mut answer) word)
+                              (set! (mut walking) false))
+                            (set! (mut current) proto))
+                        (continue))
+                      (do (set! (mut walking) false) (continue))))))
+      (load answer))))
+
+;; Ordinary [[Get]] of a data property (`%PropGetNamed`, JS-PROP-GET): the own word, else the first
+;; prototype's holding the key, else undefined. An accessor found anywhere answers the exception
+;; sentinel, and the JSL reads the pair itself.
+(defn rt-prop-get [(obj i64) (key i64)] (-> i64)
+  (do
+    (rt-heap-boot!)
+    (let [(mut current) obj
+          (mut answer) RT-DYNAMIC-UNDEFINED-WORD
+          (mut walking) true]
+      (loop (if (not (load walking))
+                (break 0)
+                (let [storage (rt-storage-of (load current))
+                      shape
+                        (if (= storage 0)
+                            SHAPES-ROOT
+                            (rt-payload-shape storage))
+                      off (if (= storage 0) -1 (shapes-lookup-offset shape key))]
+                  (if (>= off 0)
+                      (do
+                        (set! (mut answer)
+                              (if (= (& (shapes-lookup-attrs shape key)
+                                        SHAPES-ATTR-ACCESSOR)
+                                     0)
+                                  (load (primitive/cast (ptr i64)
+                                                        (+ storage off)))
+                                  RT-DYNAMIC-EXCEPTION-WORD))
+                        (set! (mut walking) false)
+                        (continue))
+                      (let [word
+                              (load (primitive/cast (ptr i64)
+                                                    (+ (load current) 0)))]
+                        (if (rt-word-object? word)
+                            ;; An Array exotic prototype's own properties include `length` and its
+                            ;; elements, which no shape records: the sentinel hands the read to the JSL.
+                            (if (= (rt-word-prefix word)
+                                   RT-DYNAMIC-PREFIX-ARRAY)
+                                (do
+                                  (set! (mut answer) RT-DYNAMIC-EXCEPTION-WORD)
+                                  (set! (mut walking) false)
+                                  (continue))
+                                (do
+                                  (set! (mut current)
+                                        (& word RT-DYNAMIC-PAYLOAD-MASK))
+                                  (continue)))
+                            (do (set! (mut walking) false) (continue))))))))
+      (load answer))))
+
+;; The fast cases of OrdinarySet with `obj` as receiver (`%PropSetNamed`, JS-PROP-SET): an own
+;; writable data property takes the value; an absent key is added to an extensible object when no
+;; prototype holds it as an accessor or a read-only property (an inherited writable data property
+;; is shadowed, ECMA-262 §10.1.9.2). Everything else — an own accessor or read-only property, an
+;; inherited accessor or read-only property, a non-extensible object — answers the exception
+;; sentinel and is the JSL's to decide. The value word on success.
+(defn rt-prop-set [(obj i64)
+                   (key i64)
+                   (value i64)
+                   (map-id i64)
+                   (caller-sp i64)] (-> i64)
+  (let [obj-root (primitive/alloc-stack i64)
+        value-root (primitive/alloc-stack i64)]
+    (set! obj-root obj)
+    (set! value-root value)
+    (rt-heap-boot!)
+    (let [storage (rt-storage-of obj)
+          shape (if (= storage 0) SHAPES-ROOT (rt-payload-shape storage))
+          off (if (= storage 0) -1 (shapes-lookup-offset shape key))]
+      (if (>= off 0)
+          (if (= (& (shapes-lookup-attrs shape key)
+                    (| SHAPES-ATTR-ACCESSOR SHAPES-ATTR-WRITABLE))
+                 SHAPES-ATTR-WRITABLE)
+              (do
+                (set! (primitive/cast (ptr i64) (+ storage off)) value)
+                (aot-rt-write-barrier storage value RT-BARRIER-BOXED)
+                value)
+              RT-DYNAMIC-EXCEPTION-WORD)
+          (if (not (shapes-extensible? shape))
+              RT-DYNAMIC-EXCEPTION-WORD
+              (let [holder (rt-prop-chain-holder obj key)]
+                (if (and (!= holder RT-DYNAMIC-NULL-WORD)
+                         (or (= (rt-word-prefix holder) RT-DYNAMIC-PREFIX-ARRAY)
+                             (!= (& (rt-prop-attributes (& holder
+                                                           RT-DYNAMIC-PAYLOAD-MASK)
+                                                        key)
+                                    (| SHAPES-ATTR-ACCESSOR
+                                       SHAPES-ATTR-WRITABLE))
+                                 SHAPES-ATTR-WRITABLE)))
+                    RT-DYNAMIC-EXCEPTION-WORD
+                    (rt--prop-add! obj-root
+                                   value-root
+                                   shape
+                                   key
+                                   SHAPES-ATTRS-DEFAULT
+                                   map-id
+                                   caller-sp))))))))
+
+;; The attributes of `obj`'s own `key` (`%PropAttributes`): SHAPES-ATTR-* bits; -1 when absent and
+;; the object is extensible, -2 when absent and it is not.
+(defn rt-prop-attributes [(obj i64) (key i64)] (-> i64)
+  (do
+    (rt-heap-boot!)
+    (let [storage (rt-storage-of obj)
+          shape (if (= storage 0) SHAPES-ROOT (rt-payload-shape storage))
+          attrs (shapes-lookup-attrs shape key)]
+      (if (>= attrs 0)
+          attrs
+          (if (shapes-extensible? shape) -1 -2)))))
+
+;; [[DefineOwnProperty]] of a data property on an ordinary object at run time. A present key is a
+;; store in place; a new key is a transition: a fresh backing store of the child shape receives the
+;; old fields and the value, then replaces the object's properties word. Both writes pass the
+;; generational barrier, as generated stores do.
+(defn rt-prop-set-own [(obj i64)
+                       (key i64)
+                       (value i64)
+                       (map-id i64)
+                       (caller-sp i64)] (-> i64)
+  (rt-prop-set-own-attrs obj key value SHAPES-ATTRS-DEFAULT map-id caller-sp))
+
+;; The store with the attributes an added key takes (`%PropStoreOwnNamedAttrs`): a present
+;; writable data property takes the value and keeps its own attributes, as under `rt-prop-set-own`.
+(defn rt-prop-set-own-attrs [(obj i64)
+                             (key i64)
+                             (value i64)
+                             (attrs i64)
+                             (map-id i64)
+                             (caller-sp i64)] (-> i64)
+  (let [obj-root (primitive/alloc-stack i64)
+        value-root (primitive/alloc-stack i64)]
+    (set! obj-root obj)
+    (set! value-root value)
+    (rt-heap-boot!)
+    (let [storage (rt-storage-of obj)
+          shape (if (= storage 0) SHAPES-ROOT (rt-payload-shape storage))
+          off (if (= storage 0) -1 (shapes-lookup-offset shape key))]
+      (if (>= off 0)
+          (do
+            (set! (primitive/cast (ptr i64) (+ storage off)) value)
+            (aot-rt-write-barrier storage value RT-BARRIER-BOXED)
+            value)
+          ;; JSL asks the attributes first, so a non-extensible object never reaches this store; a
+          ;; caller that did keeps the object as it is rather than corrupt a shape.
+          (if (shapes-extensible? shape)
+              (rt--prop-add! obj-root
+                             value-root
+                             shape
+                             key
+                             attrs
+                             map-id
+                             caller-sp)
+              value)))))
+
+;; Add `key` with `attrs` to the object at `obj-root`, whose backing store has `shape` (the root
+;; when it has none): a fresh store one word longer under the child shape, the old words copied,
+;; the value in the new word, the store installed. The roots are re-read after the allocation,
+;; which may have moved both. The value word.
+(defn rt--prop-add! [(obj-root (ptr i64))
+                     (value-root (ptr i64))
+                     (shape i64)
+                     (key i64)
+                     (attrs i64)
+                     (map-id i64)
+                     (caller-sp i64)] (-> i64)
+  (let [child (shapes-transition-attrs shape key attrs)
+        fields (shapes-field-count shape)
+        fresh
+          (rt-alloc-rooted (* (+ fields 1) SHAPES-WORD-BYTES)
+                           child
+                           map-id
+                           caller-sp
+                           obj-root
+                           value-root
+                           true)
+        moved-obj (load obj-root)
+        moved-value (load value-root)
+        old (rt-storage-of moved-obj)
+        (mut i) 0]
+    (loop (if (>= (load i) fields)
+              (break 0)
+              (do
+                (set! (primitive/cast (ptr i64)
+                                      (+ fresh (* (load i) SHAPES-WORD-BYTES)))
+                      (load (primitive/cast (ptr i64)
+                                            (+ old
+                                               (* (load i) SHAPES-WORD-BYTES)))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (set! (primitive/cast (ptr i64) (+ fresh (* fields SHAPES-WORD-BYTES)))
+          moved-value)
+    (aot-rt-write-barrier fresh moved-value RT-BARRIER-BOXED)
+    (let [boxed (rt-box-object fresh)]
+      (set! (primitive/cast (ptr i64) (+ moved-obj RT-OFFSET-OBJECT-PROPERTIES))
+            boxed)
+      (aot-rt-write-barrier moved-obj boxed RT-BARRIER-BOXED)
+      moved-value)))
+
+;; A backing store's shape word (the payload's header word), rewritten when a define changes an
+;; attribute or the object stops being extensible: the layout is the same, the id is not.
+(defn rt-storage-set-shape! [(storage i64) (shape i64)] (-> i64)
+  (do (set! (primitive/index (primitive/cast (ptr i64) storage) -1) shape) 0))
+
+;; [[IsExtensible]] (`%IsExtensible`): 1 or 0.
+(defn rt-object-extensible [(obj i64)] (-> i64)
+  (do
+    (rt-heap-boot!)
+    (let [storage (rt-storage-of obj)]
+      (if (= storage 0)
+          1
+          (if (shapes-extensible? (rt-payload-shape storage)) 1 0)))))
+
+;; [[PreventExtensions]] (`%PreventExtensions`): the store takes the marker shape; an object with no
+;; store yet gets an empty one so the flag has somewhere to live. Always succeeds (1).
+(defn rt-object-prevent-extensions [(obj i64) (map-id i64) (caller-sp i64)] (-> i64)
+  (let [obj-root (primitive/alloc-stack i64)
+        value-root (primitive/alloc-stack i64)]
+    (set! obj-root obj)
+    (set! value-root RT-DYNAMIC-UNDEFINED-WORD)
+    (rt-heap-boot!)
+    (let [storage (rt-storage-of obj)]
+      (if (= storage 0)
+          (let [fresh
+                  (rt-alloc-rooted SHAPES-WORD-BYTES
+                                   (shapes-prevent-extensions SHAPES-ROOT)
+                                   map-id
+                                   caller-sp
+                                   obj-root
+                                   value-root
+                                   true)
+                moved-obj (load obj-root)]
+            (set! (primitive/cast (ptr i64) fresh) RT-DYNAMIC-UNDEFINED-WORD)
+            (let [boxed (rt-box-object fresh)]
+              (set! (primitive/cast (ptr i64)
+                                    (+ moved-obj RT-OFFSET-OBJECT-PROPERTIES))
+                    boxed)
+              (aot-rt-write-barrier moved-obj boxed RT-BARRIER-BOXED)
+              1))
+          (do
+            (rt-storage-set-shape! storage
+                                   (shapes-prevent-extensions (rt-payload-shape storage)))
+            1)))))
+
+;; SetIntegrityLevel (§7.3.15; `%ObjectIntegrity`): level 1 seals (every property non-configurable),
+;; level 2 freezes (data properties also non-writable); then [[PreventExtensions]].
+(defn rt-object-integrity [(obj i64) (level i64) (map-id i64) (caller-sp i64)] (-> i64)
+  (do
+    (rt-heap-boot!)
+    (let [storage (rt-storage-of obj)]
+      (if (!= storage 0)
+          (let [(mut keys) (al-new [i64] (alloc/malloc-allocator))
+                (mut shape) (rt-payload-shape storage)
+                (mut s) (load shape)]
+            (loop (if (or (= (load s) 0) (= (load s) SHAPES-ROOT))
+                      (break 0)
+                      (do
+                        (if (!= (shapes-key (load s)) 0)
+                            (push! [i64] (mut keys) (shapes-key (load s)))
+                            0)
+                        (set! (mut s) (shapes-parent (load s)))
+                        (continue))))
+            (al-for [key (load keys)]
+                    (let [cur (shapes-lookup-attrs (load shape) key)
+                          next
+                            (& cur
+                               (primitive/inot (if (and (= level 2)
+                                                        (= (& cur
+                                                              SHAPES-ATTR-ACCESSOR)
+                                                           0))
+                                                   (+ SHAPES-ATTR-CONFIGURABLE
+                                                      SHAPES-ATTR-WRITABLE)
+                                                   SHAPES-ATTR-CONFIGURABLE)))]
+                      (if (!= next cur)
+                          (set! (mut shape)
+                                (shapes-reshape-attrs (load shape) key next))
+                          0)))
+            (al-free! [i64] (mut keys))
+            (rt-storage-set-shape! storage (load shape))
+            0)
+          0)
+      (rt-object-prevent-extensions obj map-id caller-sp))))
+
+;; TestIntegrityLevel (§7.3.16; `%TestIntegrity`): 1 when the object is not extensible and every
+;; own property is non-configurable (level 1) or also non-writable data (level 2).
+(defn rt-object-test-integrity [(obj i64) (level i64)] (-> i64)
+  (do
+    (rt-heap-boot!)
+    (if (= (rt-object-extensible obj) 1)
+        0
+        (let [storage (rt-storage-of obj)
+              (mut ok) true
+              (mut s) (if (= storage 0) SHAPES-ROOT (rt-payload-shape storage))]
+          (loop (if (or (not (load ok)) (= (load s) 0) (= (load s) SHAPES-ROOT))
+                    (break 0)
+                    (let [attrs (shapes-attrs (load s))]
+                      (if (!= (shapes-key (load s)) 0)
+                          (if (or (!= (& attrs SHAPES-ATTR-CONFIGURABLE) 0)
+                                  (and (= level 2)
+                                       (and (= (& attrs SHAPES-ATTR-ACCESSOR) 0)
+                                            (!= (& attrs SHAPES-ATTR-WRITABLE)
+                                                0))))
+                              (set! (mut ok) false)
+                              0)
+                          0)
+                      (set! (mut s) (shapes-parent (load s)))
+                      (continue))))
+          (if (load ok) 1 0)))))
+
+;; SameValue (§7.2.10) over words: strings by content, everything else by word — the Number word
+;; is canonical (a compact integer is never spelled as binary64 bits), so equal Numbers are equal
+;; words, NaN included; +0 and -0 differ.
+(defn rt-same-value [(a i64) (b i64)] (-> bool)
+  (if (and (= (rt-word-prefix a) RT-DYNAMIC-PREFIX-STRING)
+           (= (rt-word-prefix b) RT-DYNAMIC-PREFIX-STRING))
+      (!= (rt-string-eq (& a RT-DYNAMIC-PAYLOAD-MASK)
+                        (& b RT-DYNAMIC-PAYLOAD-MASK))
+          0)
+      (= a b)))
+
+;; The fields a property descriptor named (`%PropDefine`'s mask).
+(const RT-DEFINE-HAS-VALUE 1)
+
+(const RT-DEFINE-HAS-WRITABLE 2)
+
+(const RT-DEFINE-HAS-ENUMERABLE 4)
+
+(const RT-DEFINE-HAS-CONFIGURABLE 8)
+
+(const RT-DEFINE-ACCESSOR 16)
+
+;; ValidateAndApplyPropertyDescriptor (§10.1.6.3) for an ordinary object (`%PropDefine`): `attrs`
+;; carries the named attributes' values, `mask` which were named (an accessor descriptor names
+;; ACCESSOR and passes the accessor pair as `value`). The answer: 0 applied, 1 rejected by a
+;; non-configurable current property, 2 rejected because the object is not extensible.
+(defn rt-prop-define [(obj i64)
+                      (key i64)
+                      (value i64)
+                      (attrs i64)
+                      (mask i64)
+                      (map-id i64)
+                      (caller-sp i64)] (-> i64)
+  (let [obj-root (primitive/alloc-stack i64)
+        value-root (primitive/alloc-stack i64)]
+    (set! obj-root obj)
+    (set! value-root value)
+    (rt-heap-boot!)
+    (let [storage (rt-storage-of obj)
+          shape (if (= storage 0) SHAPES-ROOT (rt-payload-shape storage))
+          cur (shapes-lookup-attrs shape key)
+          accessor (!= (& mask RT-DEFINE-ACCESSOR) 0)
+          names-data
+            (or (!= (& mask RT-DEFINE-HAS-VALUE) 0)
+                (!= (& mask RT-DEFINE-HAS-WRITABLE) 0))]
+      (if (< cur 0)
+          ;; A new property: absent attribute fields default to false.
+          (if (not (shapes-extensible? shape))
+              2
+              (let [new-attrs
+                      (+ (if accessor
+                             SHAPES-ATTR-ACCESSOR
+                             (if (!= (& mask RT-DEFINE-HAS-WRITABLE) 0)
+                                 (& attrs SHAPES-ATTR-WRITABLE)
+                                 0))
+                         (+ (if (!= (& mask RT-DEFINE-HAS-ENUMERABLE) 0)
+                                (& attrs SHAPES-ATTR-ENUMERABLE)
+                                0)
+                            (if (!= (& mask RT-DEFINE-HAS-CONFIGURABLE) 0)
+                                (& attrs SHAPES-ATTR-CONFIGURABLE)
+                                0)))
+                    word
+                      (if (or accessor (!= (& mask RT-DEFINE-HAS-VALUE) 0))
+                          value
+                          RT-DYNAMIC-UNDEFINED-WORD)]
+                (set! value-root word)
+                (rt--prop-add! obj-root
+                               value-root
+                               shape
+                               key
+                               new-attrs
+                               map-id
+                               caller-sp)
+                0))
+          (if (= mask 0)
+              0
+              (let [off (shapes-lookup-offset shape key)
+                    current (load (primitive/cast (ptr i64) (+ storage off)))
+                    cur-accessor (!= (& cur SHAPES-ATTR-ACCESSOR) 0)
+                    configurable (!= (& cur SHAPES-ATTR-CONFIGURABLE) 0)
+                    kind-changes
+                      (if accessor
+                          (not cur-accessor)
+                          (and names-data cur-accessor))
+                    rejected
+                      (and (not configurable)
+                           (or (and (!= (& mask RT-DEFINE-HAS-CONFIGURABLE) 0)
+                                    (!= (& attrs SHAPES-ATTR-CONFIGURABLE) 0))
+                               (and (!= (& mask RT-DEFINE-HAS-ENUMERABLE) 0)
+                                    (!= (& attrs SHAPES-ATTR-ENUMERABLE)
+                                        (& cur SHAPES-ATTR-ENUMERABLE)))
+                               kind-changes
+                               (if cur-accessor
+                                   ;; A non-configurable accessor: the pair may not change.
+                                   (and accessor
+                                        (not (rt-same-value value current)))
+                                   (and (= (& cur SHAPES-ATTR-WRITABLE) 0)
+                                        (or (and (!= (& mask
+                                                        RT-DEFINE-HAS-WRITABLE)
+                                                     0)
+                                                 (!= (& attrs
+                                                        SHAPES-ATTR-WRITABLE)
+                                                     0))
+                                            (and (!= (& mask
+                                                        RT-DEFINE-HAS-VALUE)
+                                                     0)
+                                                 (not (rt-same-value value
+                                                                     current))))))))]
+                (if rejected
+                    1
+                    (let [kept
+                            (& cur
+                               (+ SHAPES-ATTR-ENUMERABLE
+                                  SHAPES-ATTR-CONFIGURABLE))
+                          enumerable
+                            (if (!= (& mask RT-DEFINE-HAS-ENUMERABLE) 0)
+                                (& attrs SHAPES-ATTR-ENUMERABLE)
+                                (& kept SHAPES-ATTR-ENUMERABLE))
+                          configurable-bit
+                            (if (!= (& mask RT-DEFINE-HAS-CONFIGURABLE) 0)
+                                (& attrs SHAPES-ATTR-CONFIGURABLE)
+                                (& kept SHAPES-ATTR-CONFIGURABLE))
+                          new-kind-accessor
+                            (if accessor
+                                true
+                                (if names-data false cur-accessor))
+                          writable
+                            (if new-kind-accessor
+                                0
+                                (if (!= (& mask RT-DEFINE-HAS-WRITABLE) 0)
+                                    (& attrs SHAPES-ATTR-WRITABLE)
+                                    (if cur-accessor
+                                        0
+                                        (& cur SHAPES-ATTR-WRITABLE))))
+                          new-attrs
+                            (+ (if new-kind-accessor
+                                   SHAPES-ATTR-ACCESSOR
+                                   writable)
+                               (+ enumerable configurable-bit))
+                          word
+                            (if accessor
+                                value
+                                (if (!= (& mask RT-DEFINE-HAS-VALUE) 0)
+                                    value
+                                    (if kind-changes
+                                        RT-DYNAMIC-UNDEFINED-WORD
+                                        current)))]
+                      (if (!= new-attrs cur)
+                          (rt-storage-set-shape! storage
+                                                 (shapes-reshape-attrs shape
+                                                                       key
+                                                                       new-attrs))
+                          0)
+                      (set! (primitive/cast (ptr i64) (+ storage off)) word)
+                      (aot-rt-write-barrier storage word RT-BARRIER-BOXED)
+                      0))))))))
+
+;; OrdinaryDelete (§10.1.10.1) of an ordinary object's own named property (`%PropDelete`): 0 when
+;; the object no longer has the property — it had none, or it was configurable and is removed — and
+;; 1 when a non-configurable property refuses. The store keeps its words and takes the shape with a
+;; hole where the field was (`shapes-delete`), so every other field keeps its offset; the freed word
+;; is cleared so it retains nothing. No allocation, so no safepoint.
+(defn rt-prop-delete [(obj i64) (key i64)] (-> i64)
+  (do
+    (rt-heap-boot!)
+    (let [storage (rt-storage-of obj)]
+      (if (= storage 0)
+          0
+          (let [shape (rt-payload-shape storage)
+                row (shapes-find-row shape key)]
+            (if (= row 0)
+                0
+                (if (= (& (shapes-attrs row) SHAPES-ATTR-CONFIGURABLE) 0)
+                    1
+                    (do
+                      (set! (primitive/cast (ptr i64)
+                                            (+ storage (shapes-offset row)))
+                            RT-DYNAMIC-UNDEFINED-WORD)
+                      (rt-storage-set-shape! storage (shapes-delete shape key))
+                      0))))))))

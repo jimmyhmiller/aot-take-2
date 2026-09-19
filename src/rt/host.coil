@@ -1,0 +1,263 @@
+;; The host boundary: libc declarations, output, time, and how an uncaught value is rendered.
+
+(module aot.rt.host)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.mem" :as mem)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.str" :use [sb-new sb-push-str! sb-push-i64! sb-str sb-free!])
+(import "coil.io" :as io)
+(import "coil.os" :as os)
+(import "coil.time" :as time)
+(import "aot.util.panic" :use *)
+(import "aot.rt.abi" :use *)
+(import "aot.rt.shapes" :use *)
+(import "aot.rt.layout" :use *)
+(import "aot.rt.gc" :use *)
+(import "aot.rt.string" :use *)
+(import "aot.rt.property" :use *)
+
+;; Darwin publishes the main executable header and libSystem's section lookup routine. This keeps
+;; stack-map discovery inside Coil while avoiding an unresolved generated-data symbol in the
+;; separately compiled runtime object. The generated object already contributes the authoritative
+;; `__DATA,__aot_stackmaps` section.
+(extern getsectiondata
+        :cc
+        c
+        [(ptr u8) (ptr i8) (ptr i8) (ptr u64)]
+        (-> (ptr u8)))
+
+(extern getenv :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern strtoll :cc c [(ptr i8) (ptr (ptr i8)) i32] (-> i64))
+
+(extern snprintf :cc c [(ptr i8) i64 (ptr i8) ...] (-> i32))
+
+(extern atexit :cc c [(fnptr c [] i64)] (-> i32))
+
+;; `struct tm` as the platform lays it out, for the one field a Date needs: `tm_gmtoff`, the local
+;; offset east of UTC in seconds AT A GIVEN INSTANT — which is what makes daylight saving correct
+;; rather than a fixed offset applied to every date. Only the offset is read; the broken-down
+;; fields are the calendar's job, and the calendar is arithmetic in JSL (docs/DECISIONS.md, Date).
+(defstruct RtTm
+  [(sec i32)
+   (min i32)
+   (hour i32)
+   (mday i32)
+   (mon i32)
+   (year i32)
+   (wday i32)
+   (yday i32)
+   (isdst i32)
+   (gmtoff i64)
+   (zone (ptr i8))])
+
+(extern localtime_r :cc c [(ptr i64) (ptr RtTm)] (-> (ptr RtTm)))
+
+;; A string's code units as UTF-8, the same pairing `rt-intern-key` performs.
+(defn rt-string-utf8! [(string i64) (out (mut (ArrayList u8)))] (-> i64)
+  (let [length (rt-string-length string)
+        (mut i) 0]
+    (loop (if (>= (load i) length)
+              (break 0)
+              (let [unit (rt-string-code-unit string (load i))]
+                (if (and (>= unit 0xd800)
+                         (< unit 0xdc00)
+                         (< (+ (load i) 1) length))
+                    (let [low (rt-string-code-unit string (+ (load i) 1))]
+                      (if (and (>= low 0xdc00) (< low 0xe000))
+                          (do
+                            (rt-utf8-push! (mut out)
+                                           (+ 0x10000
+                                              (+ (* (- unit 0xd800) 0x400)
+                                                 (- low 0xdc00))))
+                            (set! (mut i) (+ (load i) 2)))
+                          (do
+                            (rt-utf8-push! (mut out) unit)
+                            (set! (mut i) (+ (load i) 1)))))
+                    (do
+                      (rt-utf8-push! (mut out) unit)
+                      (set! (mut i) (+ (load i) 1))))
+                (continue))))
+    0))
+
+;; [[Get]] of an ASCII-named property along an object's prototype chain, for the runtime's own
+;; reports: own storage first, then the prototype word at the payload's first slot. Undefined when
+;; no object on the chain has it. Bounded, so a cyclic chain cannot hang the report.
+(defn rt-report-get [(payload i64) (name (slice u8))] (-> i64)
+  (let [key (shapes-intern-key name)
+        (mut current) payload
+        (mut answer) RT-DYNAMIC-UNDEFINED-WORD
+        (mut depth) 0
+        (mut done) false]
+    (loop (if (or (load done) (> (load depth) 64))
+              (break 0)
+              (let [off (rt-prop-offset (load current) key)]
+                (if (>= off 0)
+                    (do
+                      (set! (mut answer)
+                            (load (primitive/cast (ptr i64)
+                                                  (+ (rt-storage-of (load current))
+                                                     off))))
+                      (set! (mut done) true))
+                    (let [proto (load (primitive/cast (ptr i64) (load current)))]
+                      (if (or (= (rt-word-prefix proto)
+                                 RT-DYNAMIC-PREFIX-OBJECT)
+                              (= (rt-word-prefix proto)
+                                 RT-DYNAMIC-PREFIX-FUNCTION)
+                              (= (rt-word-prefix proto) RT-DYNAMIC-PREFIX-ARRAY))
+                          (set! (mut current) (& proto RT-DYNAMIC-PAYLOAD-MASK))
+                          (set! (mut done) true))))
+                (set! (mut depth) (+ (load depth) 1))
+                (continue))))
+    (load answer)))
+
+;; The host's output (`%HostWrite`): a string's code units as UTF-8 on stdout (`stream` 0) or
+;; stderr (1). This is the whole host surface a program has today — what a value looks like when it
+;; is printed is decided in JSL, where ToString lives, not here (docs/DECISIONS.md, the console).
+(defn rt-host-write [(string i64) (stream i64)] (-> i64)
+  (try (let [(mut out) (al-new [u8] (alloc/malloc-allocator))
+             _ (rt-string-utf8! string (mut out))
+             target (if (= stream 0) (io/stdout) (io/stderr))
+             _ (try-or! (io/print-str target (al-slice (load out))) 0)]
+         (al-free! [u8] (mut out))
+         0)))
+
+;; The host's clock (`%DateNow`): milliseconds since the epoch, which is what `Date.now()` answers
+;; and what `new Date()` records. A clock that cannot be read is 0 rather than a failure: a program
+;; that asks the time on a host without one gets the epoch, not a crash.
+(defn rt-date-now [] (-> i64)
+  (try (let [ms (try-or! (time/wall-now-ms) 0)] ms)))
+
+;; The local time zone's offset east of UTC, in milliseconds, at the instant `ms`. The offset is
+;; asked of the platform per instant because it is not constant: a zone with daylight saving has two
+;; offsets a year, and a date's local calendar depends on which one was in force then.
+(defn rt-local-tz-offset [(ms i64)] (-> i64)
+  (let [(mut seconds) (rt-floor-div ms 1000)
+        (mut broken) (primitive/zeroed RtTm)
+        answered (localtime_r (mut seconds) (mut broken))]
+    (if (= (primitive/cast i64 (primitive/cast (ptr u8) answered)) 0)
+        0
+        (* (.gmtoff (mut broken)) 1000))))
+
+;; Floor division, which is what a timeline needs: an instant before the epoch is negative, and
+;; truncation toward zero would put it in the wrong second.
+(defn rt-floor-div [(a i64) (b i64)] (-> i64)
+  (let [q (/ a b)]
+    (if (and (!= (* q b) a) (!= (< a 0) (< b 0))) (- q 1) q)))
+
+;; A JavaScript value rendered for a report, the way an engine prints an uncaught value: a string
+;; as itself, a number, the literals, and an object by its `name` and `message` when it has them
+;; (an Error), else `[object]`, `[function]` or `[array]`. Anything not a tagged word is a double,
+;; shown by its bit pattern.
+(defn rt-render-value! [(value i64) (out (mut (ArrayList u8)))] (-> i64)
+  (let [prefix (rt-word-prefix value)
+        payload (& value RT-DYNAMIC-PAYLOAD-MASK)]
+    (if (= prefix RT-DYNAMIC-PREFIX-STRING)
+        (rt-string-utf8! payload (mut out))
+        (if (= prefix RT-DYNAMIC-PREFIX-INT)
+            (let [signed
+                    (if (>= payload 0x800000000000)
+                        (- payload 0x1000000000000)
+                        payload)
+                  (mut sb) (sb-new (alloc/malloc-allocator))]
+              (sb-push-i64! (mut sb) signed)
+              (rt-push-bytes! (mut out) (sb-str (mut sb)))
+              (sb-free! (mut sb))
+              0)
+            (if (= value RT-DYNAMIC-UNDEFINED-WORD)
+                (rt-push-bytes! (mut out) "undefined")
+                (if (= prefix 0x7ffb)
+                    (rt-push-bytes! (mut out) "null")
+                    (if (= prefix 0x7ffc)
+                        (rt-push-bytes! (mut out)
+                                        (if (= payload 0) "false" "true"))
+                        (if (= prefix 0x7ffe)
+                            (rt-push-bytes! (mut out) "[symbol]")
+                            (if (or (= prefix RT-DYNAMIC-PREFIX-OBJECT)
+                                    (= prefix RT-DYNAMIC-PREFIX-FUNCTION)
+                                    (= prefix RT-DYNAMIC-PREFIX-ARRAY))
+                                (let [name (rt-report-get payload "name")
+                                      message (rt-report-get payload "message")]
+                                  (if (= (rt-word-prefix name)
+                                         RT-DYNAMIC-PREFIX-STRING)
+                                      (do
+                                        (rt-string-utf8! (& name
+                                                            RT-DYNAMIC-PAYLOAD-MASK)
+                                                         (mut out))
+                                        (if (= (rt-word-prefix message)
+                                               RT-DYNAMIC-PREFIX-STRING)
+                                            (do
+                                              (rt-push-bytes! (mut out) ": ")
+                                              (rt-string-utf8! (& message
+                                                                  RT-DYNAMIC-PAYLOAD-MASK)
+                                                               (mut out)))
+                                            0))
+                                      (do
+                                        (rt-push-bytes! (mut out)
+                                                        (if (= prefix
+                                                               RT-DYNAMIC-PREFIX-FUNCTION)
+                                                            "[function]"
+                                                            (if (= prefix
+                                                                   RT-DYNAMIC-PREFIX-ARRAY)
+                                                                "[array]"
+                                                                "[object]")))
+                                        ;; An error type without a `name` on its chain (test262's Test262Error) still
+                                        ;; carries its message.
+                                        (if (= (rt-word-prefix message)
+                                               RT-DYNAMIC-PREFIX-STRING)
+                                            (do
+                                              (rt-push-bytes! (mut out) ": ")
+                                              (rt-string-utf8! (& message
+                                                                  RT-DYNAMIC-PAYLOAD-MASK)
+                                                               (mut out)))
+                                            0))))
+                                ;; A double: its bit pattern reinterpreted. An integral value prints as an integer;
+                                ;; any other prints its integer part with a marker, which is enough for a report.
+                                (let [cell (primitive/alloc-stack i64)
+                                      (mut sb) (sb-new (alloc/malloc-allocator))]
+                                  (set! cell value)
+                                  (let [f (load (primitive/cast (ptr f64) cell))
+                                        truncated (primitive/cast i64 f)]
+                                    (sb-push-i64! (mut sb) truncated)
+                                    (if (primitive/fcmp-eq (primitive/cast f64
+                                                                           truncated)
+                                                           f)
+                                        0
+                                        (sb-push-str! (mut sb)
+                                                      " (non-integral number)"))
+                                    (rt-push-bytes! (mut out) (sb-str (mut sb)))
+                                    (sb-free! (mut sb))
+                                    0)))))))))
+    0))
+
+(defn rt-push-bytes! [(out (mut (ArrayList u8))) (text (slice u8))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len text))
+              (break 0)
+              (do
+                (push! [u8] (mut out) (get text (load i)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))
+
+;; The exception the program left uncaught after its last Script. Reported and fatal: status 3,
+;; distinct from the compiler's own exit classes. The value is rendered (an Error by name and
+;; message) so a failing program names its failure; the boxed word follows for the debugger.
+(defn rt-uncaught [(value i64)] (-> i64)
+  (do
+    (try (let [stream (io/stderr)
+               (mut text) (al-new [u8] (alloc/malloc-allocator))
+               _ (rt-render-value! value (mut text))
+               _ (try-or! (io/print-str stream "aot: uncaught exception: ") 0)
+               _ (try-or! (io/print-str stream (al-slice (load text))) 0)
+               _ (try-or! (io/print-str stream " (boxed word ") 0)
+               _ (try-or! (io/print-int stream value) 0)
+               _ (try-or! (io/print-str stream ")\n") 0)]
+           (al-free! (mut text))
+           0))
+    (if (= (primitive/cast i64 (.text (rt-program))) 0)
+        (do (os/_exit (primitive/cast i32 3)) 0)
+        0)
+    value))

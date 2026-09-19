@@ -1,0 +1,814 @@
+;; Static images: adopting the linked heap image, binding unit identities and objects, merging properties, scanning static roots.
+
+(module aot.rt.statics)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.mem" :as mem)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.str" :use [sb-new sb-push-str! sb-push-i64! sb-str sb-free!])
+(import "coil.io" :as io)
+(import "coil.os" :as os)
+(import "coil.time" :as time)
+(import "coil.slice" :use [slice-data])
+(import "aot.util.panic" :use *)
+(import "aot.rt.abi" :use *)
+(import "aot.rt.shapes" :use *)
+(import "aot.rt.layout" :use *)
+(import "aot.rt.host" :use *)
+(import "aot.rt.code" :use *)
+(import "aot.rt.heap" :use *)
+(import "aot.rt.gc" :use *)
+(import "aot.rt.verify" :use *)
+(import "aot.rt.stackmap" :use *)
+(import "aot.rt.property" :use *)
+
+;; ---------------------------------------------------------------------------
+;; Generic own-property access over the runtime shape tree (`aot.rt.shapes`).
+;;
+;; Generated code takes these when the owner's layout is not statically known: a raw ordinary
+;; object payload, a property-key id, and for a store the boxed value. An object's properties word
+;; (payload offset 8) is null or a boxed backing store whose header shape says where each key is.
+(defn rt-linked-shapes [(size (ptr u64))] (-> (ptr u8))
+  (if (!= (primitive/cast i64 (.text (rt-program))) 0)
+      (do (set! size (.shape-bytes (rt-program))) (.shapes (rt-program)))
+      (getsectiondata (primitive/cast (ptr u8)
+                                      (primitive/linker-address _mh_execute_header))
+                      c"__DATA"
+                      c"__aot_shapes"
+                      size)))
+
+(defn rt-shapes-boot! [] (-> i64)
+  (if (shapes-booted?)
+      0
+      (let [size (primitive/alloc-stack u64)]
+        (set! size 0)
+        (let [blob (rt-linked-shapes size)]
+          (shapes-boot! blob (primitive/cast i64 (load size)))))))
+
+(defn rt-linked-heap-image [(size (ptr u64))] (-> (ptr u8))
+  (if (!= (primitive/cast i64 (.text (rt-program))) 0)
+      (do (set! size (.image-bytes (rt-program))) (.image (rt-program)))
+      (getsectiondata (primitive/cast (ptr u8)
+                                      (primitive/linker-address _mh_execute_header))
+                      c"__DATA"
+                      c"__aot_heap"
+                      size)))
+
+(defn rt-image-magic? [(p (ptr u8))] (-> bool)
+  (and (= (primitive/cast i64 (load (primitive/index p 0))) 0x41)
+       (and (= (primitive/cast i64 (load (primitive/index p 1))) 0x4f)
+            (and (= (primitive/cast i64 (load (primitive/index p 2))) 0x54)
+                 (and (= (primitive/cast i64 (load (primitive/index p 3))) 0x48)
+                      (and (= (primitive/cast i64 (load (primitive/index p 4)))
+                              0x45)
+                           (and (= (primitive/cast i64
+                                                   (load (primitive/index p 5)))
+                                   0x41)
+                                (and (= (primitive/cast i64
+                                                        (load (primitive/index p
+                                                                               6)))
+                                        0x50)
+                                     (= (primitive/cast i64
+                                                        (load (primitive/index p
+                                                                               7)))
+                                        0)))))))))
+
+;; Adopt the static heap image (aot.heap documents the layout). Every REF word the header lists
+;; holds its tag prefix over a section offset; the section's load address is added once, here,
+;; and the boxed global object word the header carries becomes the realm root. Code words were
+;; relocated by the linker. Generated code runs only after the process entry has booted the heap,
+;; so no word is read before it is relocated.
+;; A realm may adopt multiple disjoint images. Adoption borrows writable bytes until teardown;
+;; callers supply a fresh copy, retain it, and resolve shape/key identities before execution.
+;; Only one image may publish the global root. Other units must bind that existing realm global.
+(defn rt-statics-adopt! [(blob (ptr u8)) (bytes i64)] (-> i64)
+  (let [heap (rt-heap)
+        base (primitive/cast i64 blob)]
+    (if (not (.booted heap)) (panic "rt-statics-adopt!: no active realm") 0)
+    (if (.object-bindings-finalized heap)
+        (panic "rt-statics-adopt!: realm object bindings are finalized")
+        0)
+    (if (or (<= base 0)
+            (!= (% base 8) 0)
+            (< bytes 0)
+            (> bytes (- RT-DYNAMIC-PAYLOAD-MASK base)))
+        (panic "rt-statics-adopt!: invalid image address range")
+        0)
+    (al-for [item (.static-images heap)]
+            (let [region item]
+              (if (and (< base (+ (.base region) (.bytes region)))
+                       (< (.base region) (+ base bytes)))
+                  (panic "rt-statics-adopt!: image overlaps an already adopted region")
+                  0)))
+    (if (< bytes RT-IMAGE-FIXED-BYTES)
+        (panic-i "rt-statics-adopt!: __aot_heap is shorter than its header"
+                 bytes)
+        0)
+    (if (not (rt-image-magic? blob))
+        (panic "rt-statics-adopt!: __aot_heap has the wrong magic")
+        0)
+    (if (!= (rt-read-u32 blob 8) RT-IMAGE-VERSION)
+        (panic-i "rt-statics-adopt!: unsupported __aot_heap version"
+                 (rt-read-u32 blob 8))
+        0)
+    (let [count (rt-read-u32 blob 12)
+          global (rt-read-u64 blob 16)
+          nrelocs (rt-read-u32 blob 24)
+          entries (rt-read-u32 blob 28)
+          (mut k) 0]
+      (if (and (!= global 0) (!= (.global-object heap) 0))
+          (panic "rt-statics-adopt!: a realm already has a global root")
+          0)
+      (if (> (+ RT-IMAGE-FIXED-BYTES (* 4 nrelocs)) entries)
+          (panic-i "rt-statics-adopt!: relocation list overruns the entries"
+                   nrelocs)
+          0)
+      (if (or (> entries bytes) (!= (% entries 8) 0) (!= (% bytes 8) 0))
+          (panic-i "rt-statics-adopt!: entries start past the section" entries)
+          0)
+      (loop (if (>= (load k) nrelocs)
+                (break 0)
+                (let [offset
+                        (rt-read-u32 blob
+                                     (+ RT-IMAGE-FIXED-BYTES (* 4 (load k))))]
+                  (if (or (< offset entries)
+                          (> (+ offset 8) bytes)
+                          (!= (% offset 8) 0))
+                      (panic-i "rt-statics-adopt!: relocation outside the entries"
+                               offset)
+                      0)
+                  (set! (mut k) (+ (load k) 1))
+                  (continue))))
+      ;; Walk the entries once: the count must land exactly on the section's end.
+      (let [(mut offset) entries
+            (mut seen) 0]
+        (loop (if (>= (load offset) bytes)
+                  (break 0)
+                  (do
+                    (if (> RT-HEADER-BYTES (- bytes (load offset)))
+                        (panic "rt-statics-adopt!: truncated entry header")
+                        0)
+                    (let [header
+                            (primitive/cast (ptr i64)
+                                            (primitive/index blob (load offset)))
+                          payload-bytes (load (primitive/index header 0))]
+                      (if (or (< payload-bytes 0)
+                              (> payload-bytes
+                                 (- (- bytes (load offset)) RT-HEADER-BYTES)))
+                          (panic-i "rt-statics-adopt!: an entry overruns the section"
+                                   (load offset))
+                          0)
+                      (set! (mut seen) (+ (load seen) 1))
+                      (set! (mut offset)
+                            (+ (load offset)
+                               (rt-align8 (+ payload-bytes RT-HEADER-BYTES))))
+                      (continue)))))
+        (if (!= (load seen) count)
+            (panic-i "rt-statics-adopt!: entry count disagrees with the walk"
+                     (load seen))
+            0))
+      ;; Bounds validation above is read-only. Relocate only after checking disjointness too.
+      (set! (mut k) 0)
+      (loop (if (>= (load k) nrelocs)
+                (break 0)
+                (let [offset
+                        (rt-read-u32 blob
+                                     (+ RT-IMAGE-FIXED-BYTES (* 4 (load k))))
+                      slot
+                        (primitive/cast (ptr i64) (primitive/index blob offset))
+                      word (load slot)]
+                  (set! slot
+                        (| (& word (primitive/inot RT-DYNAMIC-PAYLOAD-MASK))
+                           (+ base (& word RT-DYNAMIC-PAYLOAD-MASK))))
+                  (set! (mut k) (+ (load k) 1))
+                  (continue))))
+      (push! [RtStaticImage]
+             (mut (.static-images heap))
+             (RtStaticImage
+               :base base
+               :bytes bytes
+               :entries entries))
+      (if (!= global 0)
+          (set! (.global-object heap)
+                (| (& global (primitive/inot RT-DYNAMIC-PAYLOAD-MASK))
+                   (+ base (& global RT-DYNAMIC-PAYLOAD-MASK))))
+          0)
+      0)))
+
+;; Simple executes in the host JVM and has no per-realm native metadata bindings. Our installed
+;; code keeps a slot while each execution supplies its own canonical identity maps. Bindings are
+;; immutable until teardown. Explicit arrays belong to the program assembler and must outlive the
+;; realm; the identity fallback is allocated here once and shared by same-namespace units.
+(defn rt-unit-empty-table [(count i64)] (-> (ptr i64))
+  (let [p
+          (primitive/cast (ptr i64)
+                          (alloc/malloc (primitive/cast isize (* count 8))))]
+    (if (= (primitive/cast i64 p) 0)
+        (alloc/oom-at c"rt-unit-empty-table" count)
+        0)
+    (mem/mem-zero [i64] p count)
+    p))
+
+(defn rt-unit-identity-map [(count i64)] (-> (slice i64))
+  (let [(mut words) (al-new [i64] (alloc/malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) count)
+              (break 0)
+              (do
+                (push! [i64] (mut words) (load i))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (al-into-slice (mut words))))
+
+(defn rt-unit-identities-bind! [(code-id i64)
+                                (keys (slice i64))
+                                (shape-ids (slice i64))] (-> i64)
+  (let [h (rt-heap)
+        slot (rt-code-unit-slot code-id)]
+    (if (or (not (.booted h)) (not (shapes-booted?)) (>= slot (.unit-count h)))
+        (panic "rt-unit-identities-bind!: realm namespace or binding slot is unavailable")
+        0)
+    (if (or (!= (load (primitive/index (.unit-keys h) slot)) 0)
+            (!= (load (primitive/index (.unit-shapes h) slot)) 0))
+        (panic "rt-unit-identities-bind!: installation is already bound")
+        0)
+    (if (or (< (len keys) 1) (< (len shape-ids) 2))
+        (panic "rt-unit-identities-bind!: missing identity maps")
+        0)
+    (if (= code-id 0)
+        (if (or (< (len keys) (+ (shapes-key-count) 1))
+                (< (len shape-ids) (shapes-count)))
+            (panic "rt-unit-identities-bind!: linked namespace maps are incomplete")
+            0)
+        (match (rt-code-find code-id)
+          (Some [range]
+                (let [r range]
+                  (if (or (< (len keys) (.key-count r))
+                          (< (len shape-ids) (.shape-count r)))
+                      (panic "rt-unit-identities-bind!: maps do not cover the installed unit namespace")
+                      0)))
+          (None [] (panic "rt-unit-identities-bind!: code is not installed"))))
+    (if (or (!= (get keys 0) 0)
+            (!= (get shape-ids 0) 0)
+            (!= (get shape-ids 1) 1))
+        (panic "rt-unit-identities-bind!: invalid reserved identities")
+        0)
+    ;; Distinct canonical names in one unit must remain distinct after assembly. The optimizer
+    ;; may fold KeyRef equality without knowing the eventual words. Check injectivity in linear
+    ;; expected time and release scratch before publishing the borrowed map.
+    (let [(mut i) 1
+          (mut seen) (hm-new [i64 bool] (alloc/malloc-allocator) (i64-keyops))]
+      (loop (if (>= (load i) (len keys))
+                (break 0)
+                (let [key (get keys (load i))]
+                  (if (or (<= key 0) (> key (shapes-key-count)))
+                      (panic "rt-unit-identities-bind!: key is outside the realm namespace")
+                      0)
+                  (if (hm-contains? (load seen) key)
+                      (panic "rt-unit-identities-bind!: distinct local keys alias in the realm namespace")
+                      0)
+                  (set! (mut seen) key true)
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      (hm-free! (mut seen)))
+    (let [(mut i) 2]
+      (loop (if (>= (load i) (len shape-ids))
+                (break 0)
+                (let [shape (get shape-ids (load i))]
+                  (if (or (<= shape 1) (>= shape (shapes-count)))
+                      (panic "rt-unit-identities-bind!: shape is outside the realm namespace")
+                      0)
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    ;; Publish only after both complete maps pass validation.
+    (set! (primitive/index (.unit-keys h) slot)
+          (primitive/cast i64 (slice-data keys)))
+    (set! (primitive/index (.unit-shapes h) slot)
+          (primitive/cast i64 (slice-data shape-ids)))
+    0))
+
+(defn rt-unit-identities-bind-program! [(code-id i64)
+                                        (keys (slice i64))
+                                        (shape-ids (slice i64))] (-> i64)
+  (if (and (= (len keys) 0) (= (len shape-ids) 0))
+      (rt-unit-identities-bind! code-id
+                                (.default-keys (rt-heap))
+                                (.default-shapes (rt-heap)))
+      (rt-unit-identities-bind! code-id keys shape-ids)))
+
+(defn rt-unit-identities-boot! [] (-> i64)
+  (let [h (rt-heap)
+        program (rt-program)
+        units (.units program)
+        (mut i) 0]
+    (if (or (not (.booted h)) (not (shapes-booted?)))
+        (panic "rt-unit-identities-boot!: realm namespace is unavailable")
+        0)
+    (if (or (> (len (.default-keys h)) 0) (> (len (.default-shapes h)) 0))
+        (panic "rt-unit-identities-boot!: identity maps already exist")
+        0)
+    (set! (.default-keys h) (rt-unit-identity-map (+ (shapes-key-count) 1)))
+    (set! (.default-shapes h) (rt-unit-identity-map (shapes-count)))
+    (rt-unit-identities-bind-program! (.code-id program)
+                                      (.keys program)
+                                      (.shape-ids program))
+    (loop (if (>= (load i) (len units))
+              (break 0)
+              (let [unit (get units (load i))]
+                (rt-unit-identities-bind-program! (.code-id unit)
+                                                  (.keys unit)
+                                                  (.shape-ids unit))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn rt-unit-adopt! [(code-id i64) (blob (ptr u8)) (bytes i64)] (-> i64)
+  (let [heap (rt-heap)
+        slot (rt-code-unit-slot code-id)]
+    (if (or (not (.booted heap)) (>= slot (.unit-count heap)))
+        (panic "rt-unit-adopt!: no realm binding slot")
+        0)
+    (if (!= (load (primitive/index (.unit-bases heap) slot)) 0)
+        (panic "rt-unit-adopt!: unit already bound in this realm")
+        0)
+    (rt-statics-adopt! blob bytes)
+    ;; Adoption checked the complete entry walk before publishing the static region. Build the
+    ;; local-ordinal map from those payload boundaries, never from arbitrary data symbols. These
+    ;; addresses stay valid until realm teardown because adopted images are immovable GC roots.
+    (let [(mut objects) (al-new [i64] (alloc/malloc-allocator))
+          (mut offset) (rt-read-u32 blob 28)]
+      (loop (if (>= (load offset) bytes)
+                (break 0)
+                (let [header
+                        (primitive/cast (ptr i64)
+                                        (primitive/index blob (load offset)))]
+                  (push! [i64]
+                         (mut objects)
+                         (+ (primitive/cast i64 header) RT-HEADER-BYTES))
+                  (set! (mut offset)
+                        (+ (load offset)
+                           (rt-align8 (+ (load header) RT-HEADER-BYTES))))
+                  (continue))))
+      (let [owned (al-into-slice (mut objects))]
+        (push! [(slice i64)] (mut (.object-maps heap)) owned)
+        (set! (primitive/index (.unit-objects heap) slot)
+              (primitive/cast i64 (slice-data owned)))))
+    (set! (primitive/index (.unit-bases heap) slot) (primitive/cast i64 blob))
+    0))
+
+;; Apply a canonical binding to a raw address or a NaN-boxed reference, preserving its tag.
+(defn rt-object-bound-word [(aliases (HashMap i64 i64)) (word i64) (raw bool)] (-> i64)
+  (match (get aliases (rt-reference-payload word raw))
+    (Some [target]
+          (if raw
+              target
+              (| (& word (primitive/inot RT-DYNAMIC-PAYLOAD-MASK)) target)))
+    (None [] word)))
+
+;; This is a boot-time operation over adopted, immovable images. Validate the complete batch
+;; before changing any map or field. Simple has no native realm rebinding; our extra invariant
+;; is that code lookups and template-held references must observe the same canonical object.
+(defn rt-unit-bind-objects! [(bindings (slice RtObjectBinding))] (-> i64)
+  (let [heap (rt-heap)]
+    (if (or (not (.booted heap))
+            (.object-bindings-finalized heap)
+            (!= (.used heap) 0)
+            (!= (.to-used heap) 0))
+        (panic "rt-unit-bind-objects!: bindings require an unstarted realm")
+        0)
+    (if (> (len bindings) 0)
+        (let [a (alloc/malloc-allocator)
+              (mut payloads) (hm-new [i64 bool] a (i64-keyops))
+              (mut aliases) (hm-new [i64 i64] a (i64-keyops))
+              (mut seen) (hm-new [i64 bool] a (i64-keyops))
+              (mut i) 0]
+          ;; Exact payload starts, rather than the range-only static-region membership test.
+          (al-for [image (.static-images heap)]
+                  (let [region image
+                        (mut offset) (.entries region)]
+                    (loop (if (>= (load offset) (.bytes region))
+                              (break 0)
+                              (let [header
+                                      (primitive/cast (ptr i64)
+                                                      (+ (.base region)
+                                                         (load offset)))]
+                                (set! (mut payloads)
+                                      (+ (primitive/cast i64 header)
+                                         RT-HEADER-BYTES)
+                                      true)
+                                (set! (mut offset)
+                                      (+ (load offset)
+                                         (rt-align8 (+ (load header)
+                                                       RT-HEADER-BYTES))))
+                                (continue))))))
+          (loop (if (>= (load i) (len bindings))
+                    (break 0)
+                    (let [binding (get bindings (load i))
+                          source (.source binding)
+                          target (.target binding)]
+                      (if (or (= source target)
+                              (not (hm-contains? (load payloads) source))
+                              (not (hm-contains? (load payloads) target)))
+                          (panic "rt-unit-bind-objects!: binding must name distinct adopted payloads")
+                          0)
+                      (if (hm-contains? (load aliases) source)
+                          (panic "rt-unit-bind-objects!: duplicate source object")
+                          0)
+                      (let [s (primitive/cast (ptr i64) source)
+                            t (primitive/cast (ptr i64) target)]
+                        (if (or (!= (load (primitive/index s -3))
+                                    (load (primitive/index t -3)))
+                                (!= (load (primitive/index s -2))
+                                    (load (primitive/index t -2)))
+                                (!= (load (primitive/index s -1))
+                                    (load (primitive/index t -1))))
+                            (panic "rt-unit-bind-objects!: incompatible payload layout")
+                            0))
+                      (set! (mut aliases) source target)
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (set! (mut i) 0)
+          (loop (if (>= (load i) (len bindings))
+                    (break 0)
+                    (let [binding (get bindings (load i))]
+                      (if (hm-contains? (load aliases) (.target binding))
+                          (panic "rt-unit-bind-objects!: target is not a canonical object")
+                          0)
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (al-for [image (.static-images heap)]
+                  (let [region image
+                        (mut offset) (.entries region)]
+                    (hm-clear! (mut seen))
+                    (loop (if (>= (load offset) (.bytes region))
+                              (break 0)
+                              (let [header
+                                      (primitive/cast (ptr i64)
+                                                      (+ (.base region)
+                                                         (load offset)))
+                                    target
+                                      (rt-object-bound-word (load aliases)
+                                                            (+ (primitive/cast i64
+                                                                               header)
+                                                               RT-HEADER-BYTES)
+                                                            true)]
+                                (if (hm-contains? (load seen) target)
+                                    (panic "rt-unit-bind-objects!: distinct local objects would alias")
+                                    0)
+                                (set! (mut seen) target true)
+                                (set! (mut offset)
+                                      (+ (load offset)
+                                         (rt-align8 (+ (load header)
+                                                       RT-HEADER-BYTES))))
+                                (continue))))))
+          ;; Validation is complete. The same terminal mapping updates generated-code lookups,
+          ;; boxed reference relocations inside templates, and the published global root.
+          (al-for [objects (.object-maps heap)]
+                  (set! (mut i) 0)
+                  (loop (if (>= (load i) (len objects))
+                            (break 0)
+                            (do
+                              (set! (primitive/index (slice-data objects)
+                                                     (load i))
+                                    (rt-object-bound-word (load aliases)
+                                                          (get objects (load i))
+                                                          true))
+                              (set! (mut i) (+ (load i) 1))
+                              (continue)))))
+          (al-for [image (.static-images heap)]
+                  (let [region image
+                        blob (primitive/cast (ptr u8) (.base region))
+                        count (rt-read-u32 blob 24)]
+                    (set! (mut i) 0)
+                    (loop (if (>= (load i) count)
+                              (break 0)
+                              (let [offset
+                                      (rt-read-u32 blob
+                                                   (+ RT-IMAGE-FIXED-BYTES
+                                                      (* 4 (load i))))
+                                    slot
+                                      (primitive/cast (ptr i64)
+                                                      (primitive/index blob
+                                                                       offset))]
+                                (set! slot
+                                      (rt-object-bound-word (load aliases)
+                                                            (load slot)
+                                                            false))
+                                (set! (mut i) (+ (load i) 1))
+                                (continue))))))
+          (set! (.global-object heap)
+                (rt-object-bound-word (load aliases)
+                                      (.global-object heap)
+                                      false))
+          (hm-free! (mut seen))
+          (hm-free! (mut aliases))
+          (hm-free! (mut payloads)))
+        0)
+    (set! (.object-bindings-finalized heap) true)
+    0))
+
+(defn rt-statics-boot! [] (-> i64)
+  (let [size (primitive/alloc-stack u64)]
+    (set! size 0)
+    (let [blob (rt-linked-heap-image size)]
+      (if (= (primitive/cast i64 blob) 0)
+          0
+          (rt-unit-adopt! (.code-id (rt-program))
+                          blob
+                          (primitive/cast i64 (load size)))))
+    (let [units (.units (rt-program))
+          (mut i) 0]
+      (loop (if (>= (load i) (len units))
+                (break 0)
+                (let [unit (get units (load i))]
+                  (if (< (.image-bytes unit) 0)
+                      (panic "rt-statics-boot!: negative unit image extent")
+                      0)
+                  (if (> (.image-bytes unit) 0)
+                      (rt-unit-adopt! (.code-id unit)
+                                      (.image unit)
+                                      (.image-bytes unit))
+                      0)
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    (rt-unit-bind-objects! (.object-bindings (rt-program)))
+    (rt-unit-merge-object-properties! (.object-property-merges (rt-program)))
+    0))
+
+(defstruct RtInitialPropertyKey [(object i64) (key i64)])
+
+(defstruct RtInitialProperty [(object i64) (key i64) (value i64) (attrs i64)])
+
+(defn rt-initial-property-hash [(raw (ptr i8)) (bytes i64)] (-> i64)
+  (let [k (primitive/cast (ptr RtInitialPropertyKey) raw)]
+    (+ (* (.object k) 31) (.key k))))
+
+(defn rt-initial-property-eq [(left (ptr i8)) (right (ptr i8)) (bytes i64)] (-> bool)
+  (let [a (primitive/cast (ptr RtInitialPropertyKey) left)
+        b (primitive/cast (ptr RtInitialPropertyKey) right)]
+    (and (= (.object a) (.object b)) (= (.key a) (.key b)))))
+
+(defn rt-initial-property-keyops [] (-> (ptr KeyOps))
+  (let [ops (primitive/alloc-static KeyOps)]
+    (set! (.hash ops) (primitive/fnptr-of rt-initial-property-hash))
+    (set! (.eq ops) (primitive/fnptr-of rt-initial-property-eq))
+    (set! (.size ops) (primitive/sizeof RtInitialPropertyKey))
+    ops))
+
+;; What a merge conflict actually is, printed before the panic: which key, the two descriptors and
+;; the two values. Without this the panic names the pass and nothing else, and the pass runs at boot
+;; over images the source no longer explains.
+(defn rt-report-merge-conflict [(key i64)
+                                (a-attrs i64)
+                                (b-attrs i64)
+                                (a-value i64)
+                                (b-value i64)] (-> i64)
+  (try (let [(mut out) (al-new [u8] (alloc/malloc-allocator))]
+         (rt-render-value! a-value (mut out))
+         (let [(mut other) (al-new [u8] (alloc/malloc-allocator))]
+           (rt-render-value! b-value (mut other))
+           (let [(mut line) (sb-new (alloc/malloc-allocator))]
+             (sb-push-str! (mut line) "merge conflict: key ")
+             (sb-push-str! (mut line) (shapes-key-name key))
+             (sb-push-str! (mut line) " attrs ")
+             (sb-push-i64! (mut line) a-attrs)
+             (sb-push-str! (mut line) "/")
+             (sb-push-i64! (mut line) b-attrs)
+             (sb-push-str! (mut line) " values ")
+             (sb-push-str! (mut line) (al-slice (load out)))
+             (sb-push-str! (mut line) " / ")
+             (sb-push-str! (mut line) (al-slice (load other)))
+             (sb-push-str! (mut line) "\n")
+             (try-or! (io/print-str (io/stderr) (sb-str (mut line))) 0)
+             (sb-free! (mut line)))
+           (al-free! [u8] (mut other)))
+         (al-free! [u8] (mut out))
+         0)))
+
+;; Simple has no per-realm intrinsic snapshots. Our assembler supplies authorized object pairs
+;; after canonical identity binding. Validate the entire union before writing: exact adopted
+;; object starts, fixed object layouts, equal prototypes, and matching duplicate descriptors and
+;; SameValue values. Enumerate backing-store transitions in insertion order. Pending additions
+;; from earlier sources participate in conflict checks before any allocation or mutation.
+;; Only initial static references enter the plan; their adopted images root them across GC.
+(defn rt-unit-merge-object-properties! [(merges (slice RtObjectBinding))] (-> i64)
+  (let [h (rt-heap)]
+    (if (or (not (.booted h))
+            (not (.object-bindings-finalized h))
+            (.object-properties-finalized h)
+            (!= (.used h) 0)
+            (!= (.to-used h) 0))
+        (panic "rt-unit-merge-object-properties!: requires a bound, unstarted realm")
+        0)
+    (if (> (len merges) 0)
+        (let [a (alloc/malloc-allocator)
+              (mut objects) (hm-new [i64 bool] a (i64-keyops))
+              (mut pending) (al-new [RtInitialProperty] a)
+              (mut index)
+                (hm-new [RtInitialPropertyKey i64]
+                        a
+                        (rt-initial-property-keyops))
+              (mut rows) (al-new [i64] a)
+              (mut i) 0]
+          (al-for [image (.static-images h)]
+                  (let [region image
+                        (mut offset) (.entries region)]
+                    (loop (if (>= (load offset) (.bytes region))
+                              (break 0)
+                              (let [header
+                                      (primitive/cast (ptr i64)
+                                                      (+ (.base region)
+                                                         (load offset)))
+                                    bytes (load header)]
+                                (if (and (or (= bytes RT-OBJECT-PAYLOAD-BYTES)
+                                             (= bytes RT-FUNCTION-PAYLOAD-BYTES))
+                                         (= (load (primitive/index header 1))
+                                            RT-META-HAS-BOXED)
+                                         (= (load (primitive/index header 2))
+                                            SHAPES-ROOT))
+                                    (set! (mut objects)
+                                          (+ (primitive/cast i64 header)
+                                             RT-HEADER-BYTES)
+                                          true)
+                                    0)
+                                (set! (mut offset)
+                                      (+ (load offset)
+                                         (rt-align8 (+ bytes RT-HEADER-BYTES))))
+                                (continue))))))
+          (loop (if (>= (load i) (len merges))
+                    (break 0)
+                    (let [pair (get merges (load i))
+                          source (.source pair)
+                          target (.target pair)]
+                      (if (or (= source target)
+                              (not (hm-contains? (load objects) source))
+                              (not (hm-contains? (load objects) target)))
+                          (panic "rt-unit-merge-object-properties!: invalid adopted object pair")
+                          0)
+                      (if (or (!= (rt-payload-bytes source)
+                                  (rt-payload-bytes target))
+                              (!= (load (primitive/cast (ptr i64) source))
+                                  (load (primitive/cast (ptr i64) target))))
+                          (panic "rt-unit-merge-object-properties!: incompatible object kind or prototype")
+                          0)
+                      (al-clear! (mut rows))
+                      (let [storage (rt-storage-of source)
+                            (mut shape)
+                              (if (= storage 0)
+                                  SHAPES-ROOT
+                                  (rt-payload-shape storage))
+                            target-storage (rt-storage-of target)
+                            target-shape
+                              (if (= target-storage 0)
+                                  SHAPES-ROOT
+                                  (rt-payload-shape target-storage))]
+                        (if (!= (shapes-extensible? (load shape))
+                                (shapes-extensible? target-shape))
+                            (panic "rt-unit-merge-object-properties!: incompatible extensibility")
+                            0)
+                        (loop (if (<= (load shape) SHAPES-ROOT)
+                                  (break 0)
+                                  (do
+                                    (if (> (shapes-key (load shape)) 0)
+                                        (push! [i64] (mut rows) (load shape))
+                                        0)
+                                    (set! (mut shape)
+                                          (shapes-parent (load shape)))
+                                    (continue))))
+                        (let [(mut row-index) (len (load rows))]
+                          (loop (if (= (load row-index) 0)
+                                    (break 0)
+                                    (do
+                                      (set! (mut row-index)
+                                            (- (load row-index) 1))
+                                      (let [row
+                                              (get (load rows) (load row-index))
+                                            key (shapes-key row)
+                                            attrs (shapes-attrs row)
+                                            value
+                                              (load (primitive/cast (ptr i64)
+                                                                    (+ storage
+                                                                       (shapes-offset row))))
+                                            id
+                                              (RtInitialPropertyKey :object
+                                                                      target
+                                                :key key)
+                                            offset
+                                              (shapes-lookup-offset target-shape
+                                                                    key)]
+                                        (match (get (load index) id)
+                                          (Some [at]
+                                                (let [prior
+                                                        (get (load pending) at)]
+                                                  (if (or (!= attrs
+                                                              (.attrs prior))
+                                                          (not (rt-same-value value
+                                                                              (.value prior))))
+                                                      (panic "rt-unit-merge-object-properties!: conflicting pending property")
+                                                      0)))
+                                          (None []
+                                                (if (>= offset 0)
+                                                    (if (or (!= attrs
+                                                                (shapes-lookup-attrs target-shape
+                                                                                     key))
+                                                            (not (rt-same-value value
+                                                                                (load (primitive/cast (ptr i64)
+                                                                                                      (+ target-storage
+                                                                                                         offset))))))
+                                                        (do
+                                                          (rt-report-merge-conflict key
+                                                                                    attrs
+                                                                                    (shapes-lookup-attrs target-shape
+                                                                                                         key)
+                                                                                    value
+                                                                                    (load (primitive/cast (ptr i64)
+                                                                                                          (+ target-storage
+                                                                                                             offset))))
+                                                          (panic "rt-unit-merge-object-properties!: conflicting existing property"))
+                                                        0)
+                                                    (do
+                                                      (if (not (shapes-extensible? target-shape))
+                                                          (panic "rt-unit-merge-object-properties!: target is not extensible")
+                                                          0)
+                                                      (set! (mut index)
+                                                            id
+                                                            (len (load pending)))
+                                                      (push! [RtInitialProperty]
+                                                             (mut pending)
+                                                             (RtInitialProperty
+                                                               :object target
+                                                               :key key
+                                                               :value value
+                                                               :attrs attrs)))))))
+                                      (continue))))))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          ;; All inputs remain static roots; rt-prop-define roots the receiver and value while
+          ;; allocating each new backing store. No accessor function executes during definition.
+          (set! (.assembling-properties h) true)
+          (al-for [property (load pending)]
+                  (let [p property
+                        mask
+                          (if (= (& (.attrs p) SHAPES-ATTR-ACCESSOR) 0) 15 28)]
+                    (if (!= (rt-prop-define (.object p)
+                                            (.key p)
+                                            (.value p)
+                                            (.attrs p)
+                                            mask
+                                            0
+                                            0)
+                            0)
+                        (panic "rt-unit-merge-object-properties!: validated definition failed")
+                        0)))
+          (set! (.assembling-properties h) false)
+          (al-free! (mut rows))
+          (hm-free! (mut index))
+          (al-free! (mut pending))
+          (hm-free! (mut objects)))
+        0)
+    (set! (.object-properties-finalized h) true)
+    0))
+
+;; Image objects are roots: forward every reference word of every scanned entry, as
+;; `rt-scan-copied!` does for a copied object. Nothing here moves, so no card is dirtied — the
+;; whole image is rescanned by every collection, minor or major.
+(defn rt-scan-static-image! [(region RtStaticImage)] (-> i64)
+  (if (= (.base region) 0)
+      0
+      (let [(mut offset) (.entries region)]
+        (loop (if (>= (load offset) (.bytes region))
+                  (break 0)
+                  (let [header
+                          (primitive/cast (ptr i64)
+                                          (+ (.base region)
+                                             (load offset)))
+                        bytes (load (primitive/index header 0))
+                        meta (load (primitive/index header 1))
+                        shape (load (primitive/index header 2))
+                        payload
+                          (primitive/cast (ptr i64)
+                                          (+ (.base region)
+                                             (+ (load offset) RT-HEADER-BYTES)))
+                        words
+                          (if (!= (& shape RT-SHAPE-NOSCAN-BIT) 0)
+                              0
+                              (/ bytes 8))
+                        (mut i) 0]
+                    (loop (if (>= (load i) words)
+                              (break 0)
+                              (let [slot (primitive/index payload (load i))
+                                    word (load slot)]
+                                (if (and (!= (& meta RT-META-HAS-RAW) 0)
+                                         (rt-in-collect-space? word))
+                                    (set! slot (rt-forward word))
+                                    (set! slot (rt-forward-boxed word)))
+                                (set! (mut i) (+ (load i) 1))
+                                (continue))))
+                    (set! (mut offset)
+                          (+ (load offset)
+                             (rt-align8 (+ bytes RT-HEADER-BYTES))))
+                    (continue)))))))
+
+(defn rt-scan-static-roots! [] (-> i64)
+  (al-for [region (.static-images (rt-heap))] (rt-scan-static-image! region))
+  0)

@@ -1,0 +1,614 @@
+;; The generational copying collector: forwarding, scanning, remembered cards, root collection and the write barrier.
+
+(module aot.rt.gc)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.mem" :as mem)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.io" :as io)
+(import "coil.os" :as os)
+(import "coil.time" :as time)
+(import "aot.util.panic" :use *)
+(import "aot.rt.abi" :use *)
+(import "aot.rt.layout" :use *)
+(import "aot.rt.host" :use *)
+(import "aot.rt.code" :use *)
+(import "aot.rt.heap" :use *)
+(import "aot.rt.verify" :use *)
+(import "aot.rt.stackmap" :use *)
+(import "aot.rt.statics" :use *)
+
+(defn rt-forward [(payload i64)] (-> i64)
+  (if (or (= payload 0) (not (rt-in-collect-space? payload)))
+      payload
+      (let [heap (rt-heap)
+            old-header (primitive/index (primitive/cast (ptr i64) payload) -3)
+            bytes (load (primitive/index old-header 0))
+            shape (load (primitive/index old-header 2))]
+        (if (< shape 0)
+            (- 0 shape)
+            (let [total (rt-align8 (+ bytes RT-HEADER-BYTES))
+                  meta (load (primitive/index old-header 1))
+                  promote (or (.major heap) (!= (& meta RT-META-SURVIVED) 0))
+                  destination
+                    (if (.major heap)
+                        (.old-other heap)
+                        (if promote (.to heap) (.young-other heap)))
+                  destination-used
+                    (if promote (.copied-used heap) (.young-copied-used heap))
+                  destination-capacity
+                    (if promote (.old-capacity heap) (.capacity heap))]
+              (if (> (+ destination-used total) destination-capacity)
+                  (alloc/oom-at c"rt-forward: live objects exceed destination generation"
+                                total)
+                  0)
+              (let [new-base (primitive/index destination destination-used)
+                    new-payload (primitive/index new-base RT-HEADER-BYTES)]
+                (mem/mem-copy [u8]
+                              new-base
+                              (primitive/cast (ptr u8) old-header)
+                              total)
+                (if promote
+                    (set! (.copied-used heap) (+ (.copied-used heap) total))
+                    (do
+                      (set! (.young-copied-used heap)
+                            (+ (.young-copied-used heap) total))
+                      (set! (primitive/index (primitive/cast (ptr i64) new-base)
+                                             1)
+                            (| meta RT-META-SURVIVED))))
+                (if (and (.enabled (rt-stats))
+                         (and promote (not (.major heap))))
+                    (do
+                      (set! (.promoted-objects (rt-stats))
+                            (+ (.promoted-objects (rt-stats)) 1))
+                      (set! (.promoted-bytes (rt-stats))
+                            (+ (.promoted-bytes (rt-stats)) total))
+                      0)
+                    0)
+                (if promote
+                    (rt-register-old-object! (- (.copied-used heap) total)
+                                             total
+                                             (.major heap))
+                    0)
+                (set! (primitive/index old-header 2)
+                      (- 0 (primitive/cast i64 new-payload)))
+                (primitive/cast i64 new-payload)))))))
+
+;; The high 16 bits of a boxed word, as an unsigned prefix.
+(defn rt-word-prefix [(word i64)] (-> i64)
+  (& (primitive/ishr word 48) 0xffff))
+
+;; Whether a boxed word carries a heap reference: an object, a string, a function object, an array
+;; or a Symbol.
+(defn rt-word-object? [(word i64)] (-> bool)
+  (let [prefix (rt-word-prefix word)]
+    (or (= prefix RT-DYNAMIC-PREFIX-OBJECT)
+        (= prefix RT-DYNAMIC-PREFIX-STRING)
+        (= prefix RT-DYNAMIC-PREFIX-FUNCTION)
+        (= prefix RT-DYNAMIC-PREFIX-SYMBOL)
+        (= prefix RT-DYNAMIC-PREFIX-ARRAY))))
+
+(defn rt-forward-boxed [(word i64)] (-> i64)
+  (if (not (rt-word-object? word))
+      word
+      (| (primitive/ishl (rt-word-prefix word) 48)
+         (& (rt-forward (& word RT-DYNAMIC-PAYLOAD-MASK))
+            RT-DYNAMIC-PAYLOAD-MASK))))
+
+(defn rt-scan-copied! [] (-> i64)
+  (let [heap (rt-heap)]
+    (loop (if (and (>= (.young-scan heap) (.young-copied-used heap))
+                   (>= (.scan heap) (.copied-used heap)))
+              (break 0)
+              (let [scan-young
+                      (and (not (.major heap))
+                           (< (.young-scan heap) (.young-copied-used heap)))
+                    space
+                      (if scan-young
+                          (.young-other heap)
+                          (if (.major heap) (.old-other heap) (.to heap)))
+                    offset (if scan-young (.young-scan heap) (.scan heap))
+                    base (primitive/index space offset)
+                    header (primitive/cast (ptr i64) base)
+                    bytes (load (primitive/index header 0))
+                    payload
+                      (primitive/cast (ptr i64)
+                                      (primitive/index base RT-HEADER-BYTES))
+                    meta (load (primitive/index header 1))
+                    shape (load (primitive/index header 2))
+                    words
+                      (if (!= (& shape RT-SHAPE-NOSCAN-BIT) 0) 0 (/ bytes 8))
+                    (mut i) 0]
+                ;; Current ordinary-object payload slots are all JavaScript values. String and
+                ;; typed-array layouts will carry explicit scan descriptors before entering this
+                ;; collector, rather than being conservatively mistaken for boxed fields.
+                (loop (if (>= (load i) words)
+                          (break 0)
+                          (let [slot (primitive/index payload (load i))
+                                word (load slot)]
+                            (if (and (!= (& meta RT-META-HAS-RAW) 0)
+                                     (rt-in-collect-space? word))
+                                (let [forwarded (rt-forward word)]
+                                  (set! slot forwarded)
+                                  (if (and (not scan-young)
+                                           (and (not (.major heap))
+                                                (rt-in-young-destination? forwarded)))
+                                      (aot-rt-write-barrier (primitive/cast i64
+                                                                            payload)
+                                                            forwarded
+                                                            RT-BARRIER-RAW)
+                                      0))
+                                (let [forwarded (rt-forward-boxed word)]
+                                  (set! slot forwarded)
+                                  (if (and (not scan-young)
+                                           (and (not (.major heap))
+                                                (and (rt-word-object? forwarded)
+                                                     (rt-in-young-destination? (& forwarded
+                                                                                  RT-DYNAMIC-PAYLOAD-MASK)))))
+                                      (aot-rt-write-barrier (primitive/cast i64
+                                                                            payload)
+                                                            forwarded
+                                                            RT-BARRIER-BOXED)
+                                      0)))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (if scan-young
+                    (set! (.young-scan heap)
+                          (+ (.young-scan heap)
+                             (rt-align8 (+ bytes RT-HEADER-BYTES))))
+                    (set! (.scan heap)
+                          (+ (.scan heap) (rt-align8 (+ bytes RT-HEADER-BYTES)))))
+                (continue))))))
+
+(defn rt-scan-remembered! [] (-> i64)
+  (let [heap (rt-heap)
+        (mut card) 0]
+    (loop (if (>= (load card) (.card-count heap))
+              (break 0)
+              (let [dirty (primitive/index (.cards heap) (load card))
+                    start (load (primitive/index (.starts heap) (load card)))]
+                (if (and (!= (primitive/cast i64 (load dirty)) 0) (> start 0))
+                    (let [(mut cursor) (- start 1)
+                          ;; Keep the card dirty only while scanning observes an edge into the
+                          ;; survivor destination. Promotion itself records any new old-to-young
+                          ;; edges created while its fields are forwarded.
+                          (mut keep) 0
+                          limit (* (+ (load card) 1) RT-CARD-BYTES)]
+                      (if (.enabled (rt-stats))
+                          (set! (.remembered-cards (rt-stats))
+                                (+ (.remembered-cards (rt-stats)) 1))
+                          0)
+                      (loop (if (or (>= (load cursor) (.to-used heap))
+                                    (>= (load cursor) limit))
+                                (break 0)
+                                (let [base
+                                        (primitive/index (.to heap)
+                                                         (load cursor))
+                                      header (primitive/cast (ptr i64) base)
+                                      bytes (load (primitive/index header 0))
+                                      shape (load (primitive/index header 2))
+                                      payload
+                                        (primitive/cast (ptr i64)
+                                                        (primitive/index base
+                                                                         RT-HEADER-BYTES))
+                                      words
+                                        (if (!= (& shape RT-SHAPE-NOSCAN-BIT) 0)
+                                            0
+                                            (/ bytes 8))
+                                      (mut i) 0]
+                                  (loop (if (>= (load i) words)
+                                            (break 0)
+                                            (let [slot
+                                                    (primitive/index payload
+                                                                     (load i))
+                                                  word (load slot)]
+                                              (if (and (!= (& (primitive/cast i64
+                                                                              (load dirty))
+                                                              RT-CARD-DIRTY-RAW)
+                                                           0)
+                                                       (rt-in-from-space? word))
+                                                  (let [forwarded
+                                                          (rt-forward word)]
+                                                    (set! slot forwarded)
+                                                    (if (rt-in-young-destination? forwarded)
+                                                        (set! (mut keep)
+                                                              (| (load keep)
+                                                                 RT-CARD-DIRTY-RAW))
+                                                        0))
+                                                  (if (!= (& (primitive/cast i64
+                                                                             (load dirty))
+                                                             RT-CARD-DIRTY-BOXED)
+                                                          0)
+                                                      (let [forwarded
+                                                              (rt-forward-boxed word)]
+                                                        (set! slot forwarded)
+                                                        (if (and (rt-word-object? forwarded)
+                                                                 (rt-in-young-destination? (& forwarded
+                                                                                              RT-DYNAMIC-PAYLOAD-MASK)))
+                                                            (set! (mut keep)
+                                                                  (| (load keep)
+                                                                     RT-CARD-DIRTY-BOXED))
+                                                            0))
+                                                      0))
+                                              (set! (mut i) (+ (load i) 1))
+                                              (continue))))
+                                  (set! (mut cursor)
+                                        (+ (load cursor)
+                                           (rt-align8 (+ bytes RT-HEADER-BYTES))))
+                                  (continue))))
+                      (set! dirty (primitive/cast u8 (load keep))))
+                    0)
+                (if (and (!= (primitive/cast i64 (load dirty)) 0) (= start 0))
+                    (set! dirty 0)
+                    0)
+                (set! (mut card) (+ (load card) 1))
+                (continue))))))
+
+(defn rt-begin-collection! [] (-> i64)
+  (let [heap (rt-heap)
+        major
+          (or (.force-major heap)
+              (> (+ (.to-used heap) (.used heap)) (.old-capacity heap)))]
+    (set! (.major heap) major)
+    (if (.enabled (rt-stats))
+        (do
+          (set! (.collection-start (rt-stats)) (rt-stats-now))
+          (set! (.collection-old-used (rt-stats)) (.to-used heap))
+          0)
+        0)
+    (if major
+        (do
+          (mem/mem-zero [u8] (.other-cards heap) (.card-count heap))
+          (mem/mem-zero [u8]
+                        (primitive/cast (ptr u8) (.other-starts heap))
+                        (* (.card-count heap) 8))
+          0)
+        0)
+    (set! (.scan heap) (if major 0 (.to-used heap)))
+    (set! (.copied-used heap) (if major 0 (.to-used heap)))
+    (set! (.young-scan heap) 0)
+    (set! (.young-copied-used heap) 0)
+    0))
+
+(defn rt-finish-collection! [] (-> i64)
+  (let [heap (rt-heap)
+        was-major (.major heap)]
+    (if (.major heap)
+        (let [old-active (.to heap)
+              old-cards (.cards heap)
+              old-starts (.starts heap)]
+          (set! (.to heap) (.old-other heap))
+          (set! (.old-other heap) old-active)
+          (set! (.cards heap) (.other-cards heap))
+          (set! (.other-cards heap) old-cards)
+          (set! (.starts heap) (.other-starts heap))
+          (set! (.other-starts heap) old-starts))
+        (let [old-young (.from heap)]
+          (set! (.from heap) (.young-other heap))
+          (set! (.young-other heap) old-young)))
+    (set! (.to-used heap) (.copied-used heap))
+    (set! (.used heap) (if was-major 0 (.young-copied-used heap)))
+    (set! (.scan heap) 0)
+    (set! (.copied-used heap) 0)
+    (set! (.young-copied-used heap) 0)
+    (set! (.young-scan heap) 0)
+    (set! (.major heap) false)
+    (set! (.force-major heap) false)
+    (if (.enabled (rt-stats))
+        (let [elapsed (- (rt-stats-now) (.collection-start (rt-stats)))]
+          (if was-major
+              (do
+                (set! (.major-count (rt-stats)) (+ (.major-count (rt-stats)) 1))
+                (set! (.major-nanos (rt-stats))
+                      (+ (.major-nanos (rt-stats)) elapsed))
+                0)
+              (do
+                (set! (.minor-count (rt-stats)) (+ (.minor-count (rt-stats)) 1))
+                (set! (.minor-nanos (rt-stats))
+                      (+ (.minor-nanos (rt-stats)) elapsed))
+                0)))
+        0)
+    (.used heap)))
+
+;; The realm's global object root. Generated code publishes and reads it as ordinary memory through
+;; the heap-state register (`RtHeap.global-object`); the collector forwards it here.
+(defn rt-forward-realm-roots! [] (-> i64)
+  (let [heap (rt-heap)]
+    (set! (.global-object heap) (rt-forward-boxed (.global-object heap)))
+    (if (!= (.exception-value heap) 0)
+        (set! (.exception-value heap)
+              (rt-forward-boxed (.exception-value heap)))
+        0)
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (len (.global-lexicals heap)))
+                (break 0)
+                (let [cell (al-elem (field heap global-lexicals) (load i))]
+                  (if (.initialized cell)
+                      (set! (.value cell) (rt-forward-boxed (.value cell)))
+                      0)
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    0))
+
+(defn rt-collect-one-root! [(root (ptr i64))] (-> i64)
+  (let [heap (rt-heap)]
+    (rt-begin-collection!)
+    (rt-forward-realm-roots!)
+    (rt-scan-static-roots!)
+    (set! root (rt-forward (load root)))
+    (if (not (.major heap)) (rt-scan-remembered!) 0)
+    (rt-scan-copied!)
+    (rt-finish-collection!)
+    (+ (.to-used heap) (.used heap))))
+
+(defn rt-collect-from-maps! [(maps (ptr u8))
+                             (map-bytes i64)
+                             (map-id i64)
+                             (caller-sp i64)] (-> i64)
+  (rt-collect-from-maps-with-roots! maps
+                                    map-bytes
+                                    map-id
+                                    caller-sp
+                                    (primitive/cast (ptr i64) 0)
+                                    (primitive/cast (ptr i64) 0)))
+
+(defn rt-scan-stackmap-frame! [(maps (ptr u8)) (record i64) (sp i64)] (-> i64)
+  (let [slots (rt-stackmap-slot-count maps record)
+        (mut i) 0]
+    (loop (if (>= (load i) slots)
+              (break 0)
+              (let [root
+                      (primitive/cast (ptr i64)
+                                      (+ sp
+                                         (rt-stackmap-slot-location maps
+                                                                    record
+                                                                    (load i))))
+                    kind (rt-stackmap-slot-kind maps record (load i))]
+                (if (= kind 1)
+                    (set! root (rt-forward (load root)))
+                    (if (= kind 2)
+                        (set! root (rt-forward-boxed (load root)))
+                        (panic-i "rt-scan-stackmap-frame!: invalid root kind"
+                                 kind)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+;; Runtime helpers that allocate may hold raw managed arguments in their own Coil frame. Generated
+;; stack maps describe the caller but deliberately know nothing about that runtime frame, so the
+;; helper supplies up to two explicit root addresses to the same collection before scanning starts.
+;; A null address means no extra root. Keeping this inside the collector avoids a second collection
+;; protocol and ensures every root participates in one forwarding closure.
+(defn rt-collect-from-maps-with-roots! [(maps (ptr u8))
+                                        (map-bytes i64)
+                                        (map-id i64)
+                                        (caller-sp i64)
+                                        (root-a (ptr i64))
+                                        (root-b (ptr i64))] (-> i64)
+  (rt-collect-from-maps-with-roots-at! maps
+                                       map-bytes
+                                       map-id
+                                       caller-sp
+                                       root-a
+                                       root-b
+                                       false
+                                       0
+                                       false))
+
+(defn rt-collect-from-maps-with-roots-at! [(maps (ptr u8))
+                                           (map-bytes i64)
+                                           (map-id i64)
+                                           (caller-sp i64)
+                                           (root-a (ptr i64))
+                                           (root-b (ptr i64))
+                                           (boxed-b bool)
+                                           (text-base i64)
+                                           (walk-callers bool)] (-> i64)
+  (let [boot (.assembling-properties (rt-heap))
+        record (if boot -1 (rt-stackmap-find maps map-bytes map-id))]
+    (if (and boot (or (!= map-id 0) (!= caller-sp 0) walk-callers))
+        (panic "rt-collect-from-maps-with-roots-at!: boot collection cannot contain generated frames")
+        0)
+    (if (and (< record 0) (not boot))
+        (do
+          (panic-i "rt-collect-from-maps-with-roots!: missing safepoint map"
+                   map-id)
+          0)
+        (let [heap (rt-heap)]
+          (if (.verify heap)
+              (do
+                (if boot
+                    0
+                    (rt-verify-frames! maps
+                                       map-bytes
+                                       record
+                                       caller-sp
+                                       text-base
+                                       walk-callers
+                                       "before"))
+                (rt-verify-heap! "before"))
+              0)
+          (rt-begin-collection!)
+          (rt-forward-realm-roots!)
+          (rt-scan-static-roots!)
+          (if (!= (primitive/cast i64 root-a) 0)
+              (set! root-a (rt-forward (load root-a)))
+              0)
+          ;; `root-b` is a raw payload address, or a boxed word when `boxed-b` (the runtime helper
+          ;; holds a JavaScript value, whose prefix the forwarding keeps).
+          (if (!= (primitive/cast i64 root-b) 0)
+              (set! root-b
+                    (if boxed-b
+                        (rt-forward-boxed (load root-b))
+                        (rt-forward (load root-b))))
+              0)
+          (let [cursor (primitive/alloc-stack RtFrameCursor)]
+            (set! cursor
+                  (RtFrameCursor
+                    :maps maps
+                    :map-bytes map-bytes
+                    :text text-base
+                    :record record
+                    :sp caller-sp))
+            (loop (if (< (.record cursor) 0)
+                      (break 0)
+                      (do
+                        (rt-scan-stackmap-frame! (.maps cursor)
+                                                 (.record cursor)
+                                                 (.sp cursor))
+                        (if walk-callers
+                            (rt-frame-next! cursor)
+                            (do (set! (.record cursor) -1) 0))
+                        (continue)))))
+          (if (not (.major heap)) (rt-scan-remembered!) 0)
+          (rt-scan-copied!)
+          (let [used (rt-finish-collection!)]
+            (if (.verify heap)
+                (do
+                  (if boot
+                      0
+                      (rt-verify-frames! maps
+                                         map-bytes
+                                         record
+                                         caller-sp
+                                         text-base
+                                         walk-callers
+                                         "after"))
+                  (rt-verify-heap! "after"))
+                0)
+            used)))))
+
+(defn rt-linked-stackmaps [(size (ptr u64))] (-> (ptr u8))
+  (if (!= (primitive/cast i64 (.text (rt-program))) 0)
+      (do (set! size (.map-bytes (rt-program))) (.maps (rt-program)))
+      (getsectiondata (primitive/cast (ptr u8)
+                                      (primitive/linker-address _mh_execute_header))
+                      c"__DATA"
+                      c"__aot_stackmaps"
+                      size)))
+
+(defn rt-linked-text [(size (ptr u64))] (-> (ptr u8))
+  (if (!= (primitive/cast i64 (.text (rt-program))) 0)
+      (do (set! size (.text-bytes (rt-program))) (.text (rt-program)))
+      (getsectiondata (primitive/cast (ptr u8)
+                                      (primitive/linker-address _mh_execute_header))
+                      c"__TEXT"
+                      c"__text"
+                      size)))
+
+(defn rt-collect-linked! [(map-id i64) (caller-sp i64)] (-> i64)
+  (rt-collect-linked-with-roots! map-id
+                                 caller-sp
+                                 (primitive/cast (ptr i64) 0)
+                                 (primitive/cast (ptr i64) 0)
+                                 false))
+
+(defn rt-collect-linked-with-roots! [(map-id i64)
+                                     (caller-sp i64)
+                                     (root-a (ptr i64))
+                                     (root-b (ptr i64))
+                                     (boxed-b bool)] (-> i64)
+  (if (< map-id 0) (panic "rt-collect-linked-with-roots!: invalid map token") 0)
+  (if (.assembling-properties (rt-heap))
+      ;; Boot assembly has no generated frame. Use the same forwarding closure and verifier,
+      ;; with only realm/static roots and the runtime helper's explicit roots.
+      (rt-collect-from-maps-with-roots-at! (primitive/cast (ptr u8) 0)
+                                           0
+                                           map-id
+                                           caller-sp
+                                           root-a
+                                           root-b
+                                           boxed-b
+                                           0
+                                           false)
+      (rt-collect-generated-with-roots! map-id caller-sp root-a root-b boxed-b)))
+
+(defn rt-collect-generated-with-roots! [(map-id i64)
+                                        (caller-sp i64)
+                                        (root-a (ptr i64))
+                                        (root-b (ptr i64))
+                                        (boxed-b bool)] (-> i64)
+  (if (> (primitive/ishr map-id 32) 0)
+      (match (rt-code-find (primitive/ishr map-id 32))
+        (Some [range]
+              (let [r range]
+                (rt-collect-from-maps-with-roots-at! (.maps r)
+                                                     (.map-bytes r)
+                                                     (& map-id
+                                                        RT-LOCAL-MAP-ID-LIMIT)
+                                                     caller-sp
+                                                     root-a
+                                                     root-b
+                                                     boxed-b
+                                                     (.text r)
+                                                     true)))
+        (None []
+              (panic "rt-collect-linked-with-roots!: map token names unregistered code")))
+      (let [size (primitive/alloc-stack u64)
+            text-size (primitive/alloc-stack u64)
+            maps (rt-linked-stackmaps size)
+            linked-text (rt-linked-text text-size)]
+        (if (or (= (primitive/cast i64 maps) 0)
+                (= (primitive/cast i64 linked-text) 0))
+            (do
+              (panic "rt-collect-linked-with-roots!: executable has no __aot_stackmaps section")
+              0)
+            (rt-collect-from-maps-with-roots-at! maps
+                                                 (primitive/cast i64
+                                                                 (load size))
+                                                 map-id
+                                                 caller-sp
+                                                 root-a
+                                                 root-b
+                                                 boxed-b
+                                                 (primitive/cast i64
+                                                                 linked-text)
+                                                 true)))))
+
+(defn rt-collect [(map-id i64) (caller-sp i64)] (-> i64)
+  (rt-collect-linked! map-id caller-sp))
+
+;; Non-collecting post-write boundary. An old object that receives a young reference dirties its
+;; 512-byte address card with the compiler-proven raw/boxed value kind. Minor collection uses the
+;; parallel object-start table to rescan only objects intersecting dirty cards.
+(defn aot-rt-write-barrier [(obj i64) (val i64) (kind i64)] (-> i64)
+  (let [_
+          (if (.enabled (rt-stats))
+              (set! (.barrier-calls (rt-stats))
+                    (+ (.barrier-calls (rt-stats)) 1))
+              0)
+        payload (if (rt-word-object? obj) (& obj RT-DYNAMIC-PAYLOAD-MASK) obj)
+        value-payload
+          (if (= kind RT-BARRIER-RAW)
+              val
+              (if (= kind RT-BARRIER-BOXED)
+                  (if (rt-word-object? val) (& val RT-DYNAMIC-PAYLOAD-MASK) 0)
+                  (panic-i "aot-rt-write-barrier: invalid value kind" kind)))]
+    (if (and (rt-in-old-space? payload)
+             (or (rt-in-from-space? value-payload)
+                 (rt-in-young-destination? value-payload)))
+        (let [heap (rt-heap)
+              card (/ (- payload (primitive/cast i64 (.to heap))) RT-CARD-BYTES)
+              entry (primitive/index (.cards heap) card)
+              dirty
+                (if (= kind RT-BARRIER-RAW)
+                    RT-CARD-DIRTY-RAW
+                    RT-CARD-DIRTY-BOXED)]
+          (do
+            (if (and (.enabled (rt-stats))
+                     (= (primitive/cast i64 (load entry)) 0))
+                (set! (.barrier-dirties (rt-stats))
+                      (+ (.barrier-dirties (rt-stats)) 1))
+                0)
+            (set! entry
+                  (primitive/cast u8
+                                  (| (primitive/cast i64 (load entry)) dirty)))))
+        0)
+    (if (or (rt-in-from-space? payload)
+            (rt-in-old-space? payload)
+            (rt-static-payload? payload))
+        (let [meta (primitive/index (primitive/cast (ptr i64) payload) -2)
+              bit (if (= kind RT-BARRIER-RAW) RT-META-HAS-RAW RT-META-HAS-BOXED)]
+          (set! meta (| (load meta) bit)))
+        0)
+    0))
