@@ -1,0 +1,328 @@
+;; Running an installed program: fresh realm data, shared realm objects across units, and the native entry.
+
+(module aot.codegen.image.run)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.str" :use [str-keyops-borrowed])
+(import "coil.slice" :use [slice-data])
+(import "coil.mem" :as mem)
+(import "aot.util.panic" :use *)
+(import "aot.codegen.encoding" :use *)
+(import "aot.codegen.compunit"
+        :use
+        [CuShapeAssembly
+         CuIdentityMap
+         cu-shapes-compose
+         cu-remap-static-shapes!
+         cu-shapes-free!
+         cu-remap-key
+         CU-SCRIPT-FUNCTION
+         CU-SCRIPT-VAR
+         CU-SCRIPT-PROPERTY-WRITE
+         CU-SCRIPT-LET
+         CU-SCRIPT-CONST
+         CU-SCRIPT-CLASS])
+(import "aot.rt.abi" :use *)
+(import "aot.rt.rt"
+        :use
+        [RT-OFFSET-SYMBOL-KEY rt-realm-destroy! rt-heap rt-read-u64])
+(import "aot.codegen.image"
+        :use
+        [IMAGE-REALM-GLOBAL
+         IMAGE-REALM-SYMBOL
+         ImageRealmObject
+         CodeImage
+         image-copy])
+(import "aot.codegen.image.install" :use *)
+
+(defn image-instantiate-data [(loaded (ptr InstalledImage))] (-> (slice u8))
+  (if (.booted (rt-heap)) (panic "image-instantiate-data: a realm is active") 0)
+  (image-require-installed! loaded)
+  (let [im (.owner loaded)
+        data (image-copy (.data im))]
+    (al-for [site (.unit-sites im)]
+            (let [s site]
+              (if (and (= (len data) 0) (= (.kind s) ENC-UNIT-DATA))
+                  (panic "image-instantiate-data: static references require a data image")
+                  0)))
+    (al-for [fixup (.code-fixups im)]
+            (let [f fixup]
+              (if (or (< (.offset f) 0) (> (.offset f) (- (len data) 8)))
+                  (panic "image-instantiate-data: code pointer outside data")
+                  0)
+              (set! (primitive/cast (ptr i64)
+                                    (primitive/index (slice-data data)
+                                                     (.offset f)))
+                    (image-address im loaded (.symbol f)))))
+    data))
+
+(defn image-program-has-code? [(units (ArrayList (ptr InstalledImage)))
+                               (id i64)] (-> bool)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len units))
+              (break false)
+              (let [unit (get units (load i))]
+                (if (= (.code-id unit) id)
+                    (break true)
+                    (do (set! (mut i) (+ (load i) 1)) (continue))))))))
+
+;; A native program supplies its complete installed closure. Assemble the unit namespaces in the
+;; supplied order, then remap only fresh data copies and bind the corresponding immutable maps.
+;; Realm copies and their roots die after return; installed text and symbolic artifacts survive.
+(defn image-run-program! [(loaded (ptr InstalledImage))
+                          (units (ArrayList (ptr InstalledImage)))] (-> i64)
+  (image-run-program-mode! loaded units false))
+
+;; Shared source composition is explicit: ordinary native programs keep their private image
+;; semantics. Only retained external-boundary Scripts authorize realm object unification.
+(defn image-run-shared-program! [(loaded (ptr InstalledImage))
+                                 (units (ArrayList (ptr InstalledImage)))] (-> i64)
+  (image-run-program-mode! loaded units true))
+
+(defstruct ImageRealmTarget [(address i64) (callable bool) (kind i64)])
+
+(defn image-shared-object! [(index (mut (HashMap (slice u8) ImageRealmTarget)))
+                            (object ImageRealmObject)
+                            (copy (slice u8))
+                            (bindings (mut (ArrayList RtObjectBinding)))
+                            (merges (mut (ArrayList RtObjectBinding)))] (-> i64)
+  (let [address (+ (primitive/cast i64 (slice-data copy)) (.offset object))]
+    (match (get (load index) (.name object))
+      (Some [prior]
+            (let [p prior]
+              (if (or (!= (.callable p) (.callable object))
+                      (!= (.kind p) (.kind object)))
+                  (panic "image-shared-object!: conflicting intrinsic object kinds")
+                  0)
+              (push! [RtObjectBinding]
+                     (mut bindings)
+                     (RtObjectBinding :source address :target (.address p)))
+              ;; A Symbol is bound, so its later copies become the first, but it has no properties to
+              ;; union: its payload is a description and a key, and read as an object it would fail the
+              ;; merge's prototype check for no reason at all.
+              (if (= (.kind object) IMAGE-REALM-SYMBOL)
+                  0
+                  (push! [RtObjectBinding]
+                         (mut merges)
+                         (RtObjectBinding :source address :target (.address p))))
+              (if (= (.kind object) IMAGE-REALM-GLOBAL)
+                  (set! (primitive/cast (ptr i64)
+                                        (primitive/index (slice-data copy) 16))
+                        0)
+                  0)))
+      (None []
+            (do
+              (set! (mut index)
+                    (.name object)
+                    (ImageRealmTarget
+                      :address address
+                      :callable (.callable object)
+                      :kind (.kind object)))
+              0)))
+    0))
+
+;; Simple has no native realms. We assemble identities by owned semantic name, separately from
+;; code symbols and unit-local offsets. First occurrence supplies the canonical payload; the
+;; runtime validates and merges initial property sets after rewriting all template references.
+;; No closed-world artifact can enter this path merely because its native ABI happens to match.
+(defstruct ImageSharedBindings
+  [(bindings (ArrayList RtObjectBinding))  ; every canonical identity: objects, functions, Symbols
+   (merges (ArrayList RtObjectBinding))])  ; the pairs whose initial properties are unioned
+
+;; A well-known Symbol's payload holds the property key it IS, and that key was the compiling unit's
+;; own id. Header shapes are remapped into the assembled key space (compunit, cu-remap-static-shapes!)
+;; but payload words are not, so without this a Symbol keeps a unit-local id while every unit's code
+;; names the key through its own map: `o[Symbol.iterator] = f` and a for-of over `o` then read two
+;; different keys, and only a program assembled from several units can tell. The unit's published
+;; Symbol identities say exactly which payloads these are.
+(defn image-remap-symbol-keys! [(copy (slice u8))
+                                (im (ptr CodeImage))
+                                (map CuIdentityMap)] (-> i64)
+  (do
+    (al-for [object (.realm-objects im)]
+            (let [o object]
+              (if (= (.kind o) IMAGE-REALM-SYMBOL)
+                  (let [slot
+                          (primitive/cast (ptr i64)
+                                          (primitive/index (slice-data copy)
+                                                           (+ (.offset o)
+                                                              RT-OFFSET-SYMBOL-KEY)))
+                        key (load slot)]
+                    (if (= key 0)
+                        (panic "image-remap-symbol-keys!: a well-known Symbol without a key")
+                        (set! slot (cu-remap-key map key)))
+                    0)
+                  0)))
+    0))
+
+;; A closed program binds nothing: its one image is already the whole realm.
+(defn image-shared-bindings-none [] (-> ImageSharedBindings)
+  (let [a (alloc/malloc-allocator)]
+    (ImageSharedBindings :bindings (al-new [RtObjectBinding] a)
+      :merges (al-new [RtObjectBinding] a))))
+
+(defn image-shared-bindings [(units (ArrayList (ptr InstalledImage)))
+                             (copies (ArrayList (slice u8)))] (-> ImageSharedBindings)
+  (let [a (alloc/malloc-allocator)
+        (mut named)
+          (hm-new [(slice u8) ImageRealmTarget] a (str-keyops-borrowed))
+        (mut bindings) (al-new [RtObjectBinding] a)
+        (mut merges) (al-new [RtObjectBinding] a)
+        (mut i) 0]
+    (al-for [unit units]
+            (let [im (.owner unit)
+                  copy (get copies (load i))]
+              (if (= (len (.realm-objects im)) 0)
+                  (if (and (> (len copy) 0)
+                           (!= (rt-read-u64 (slice-data copy) 16) 0))
+                      (panic "image-shared-bindings: unnamed image cannot publish the shared global")
+                      0)
+                  (do
+                    (if (= (len (.scripts im)) 0)
+                        (panic "image-shared-bindings: realm identities require retained Scripts")
+                        0)
+                    (al-for [script (.scripts im)]
+                            (let [s script]
+                              (if (< (.initializer s) 0)
+                                  (panic "image-shared-bindings: closed-world Script cannot share its realm")
+                                  0)
+                              (al-for [declaration (.entries (.declarations s))]
+                                      (let [d declaration]
+                                        ;; A class binding is a Script lexical like `let` (its slot, its dead zone).
+                                        (if (not (or (= (.kind d) CU-SCRIPT-VAR)
+                                                     (= (.kind d)
+                                                        CU-SCRIPT-FUNCTION)
+                                                     (= (.kind d)
+                                                        CU-SCRIPT-PROPERTY-WRITE)
+                                                     (= (.kind d) CU-SCRIPT-LET)
+                                                     (= (.kind d)
+                                                        CU-SCRIPT-CONST)
+                                                     (= (.kind d)
+                                                        CU-SCRIPT-CLASS)))
+                                            (unimplemented "shared Script lexical environments"
+                                                           "docs/GAPS.md — lexical environments and closures")
+                                            0)))))
+                    (al-for [object (.realm-objects im)]
+                            (let [o object]
+                              (image-shared-object! (mut named)
+                                                    o
+                                                    copy
+                                                    (mut bindings)
+                                                    (mut merges))))
+                    0))
+              (set! (mut i) (+ (load i) 1))))
+    (if (not (hm-contains? (load named) ""))
+        (panic "image-shared-bindings: missing shared global")
+        0)
+    (hm-free! (mut named))
+    (ImageSharedBindings :bindings (load bindings) :merges (load merges))))
+
+(defn image-run-program-mode! [(loaded (ptr InstalledImage))
+                               (units (ArrayList (ptr InstalledImage)))
+                               (shared bool)] (-> i64)
+  (if (.booted (rt-heap))
+      (panic "image-run-program!: another realm is active")
+      0)
+  (image-require-installed! loaded)
+  (if (or (= (.entry loaded) 0)
+          (not (image-program-has-code? units (.code-id loaded))))
+      (panic "image-run-program!: missing platform entry installation")
+      0)
+  (let [im (.owner loaded)
+        (mut i) 0]
+    (al-for [unit units]
+            (image-require-installed! unit)
+            (al-for [dep (.dependencies unit)]
+                    (if (not (image-program-has-code? units dep))
+                        (panic "image-run-program!: missing imported code installation")
+                        0))
+            (let [(mut j) 0]
+              (loop (if (>= (load j) (load i))
+                        (break 0)
+                        (let [previous (get units (load j))]
+                          (if (= (.code-id previous) (.code-id unit))
+                              (panic "image-run-program!: duplicate code installation")
+                              0)
+                          (set! (mut j) (+ (load j) 1))
+                          (continue)))))
+            (set! (mut i) (+ (load i) 1)))
+    (let [a (alloc/malloc-allocator)
+          assembly (primitive/alloc-stack CuShapeAssembly)
+          (mut blobs) (al-new [(slice u8)] a)
+          (mut primary) -1
+          (mut copies) (al-new [(slice u8)] a)
+          (mut descriptors) (al-new [RtProgramUnit] a)]
+      (al-for [unit units]
+              (push! [(slice u8)] (mut blobs) (.shapes (.owner unit))))
+      (set! assembly (cu-shapes-compose (load blobs)))
+      (al-free! (mut blobs))
+      (set! (mut i) 0)
+      (al-for [unit units]
+              (let [copy (image-instantiate-data unit)
+                    map (get (.units assembly) (load i))]
+                (cu-remap-static-shapes! copy map)
+                (image-remap-symbol-keys! copy (.owner unit) map)
+                (push! [(slice u8)] (mut copies) copy)
+                (if (= (.code-id unit) (.code-id loaded))
+                    (set! (mut primary) (load i))
+                    (push! [RtProgramUnit]
+                           (mut descriptors)
+                           (RtProgramUnit
+                             :code-id (.code-id unit)
+                             :image (slice-data copy)
+                             :image-bytes (len copy)
+                             :keys (.keys map)
+                             :shape-ids (.shapes map))))
+                (set! (mut i) (+ (load i) 1))))
+      (if (< (load primary) 0)
+          (panic "image-run-program!: entry lost during assembly")
+          0)
+      (let [data (get (load copies) (load primary))
+            map (get (.units assembly) (load primary))
+            shared-set
+              (if shared
+                  (image-shared-bindings units (load copies))
+                  (image-shared-bindings-none))
+            (mut bindings) (.bindings shared-set)
+            (mut merges) (.merges shared-set)]
+        (set! (rt-program)
+              (RtProgram
+                :text (.text loaded)
+                :text-bytes (primitive/cast u64 (len (.text im)))
+                :maps (slice-data (.maps im))
+                :map-bytes (primitive/cast u64 (len (.maps im)))
+                :shapes (slice-data (.blob assembly))
+                :shape-bytes (primitive/cast u64 (len (.blob assembly)))
+                :image
+                  (if (= (len data) 0)
+                      (primitive/cast (ptr u8) 0)
+                      (slice-data data))
+                :image-bytes (primitive/cast u64 (len data))
+                :code-id (.code-id loaded)
+                :units (al-slice (load descriptors))
+                :keys (.keys map)
+                :shape-ids (.shapes map)
+                :object-bindings (al-slice (load bindings))
+                :object-property-merges (al-slice (load merges))))
+        (let [entry
+                (primitive/cast (fnptr c [] i64)
+                                (primitive/cast (ptr u8) (.entry loaded)))
+              result (primitive/call-ptr entry)]
+          (rt-realm-destroy!)
+          (al-free! (mut bindings))
+          (al-free! (mut merges))
+          (al-for [copy (load copies)] (alloc/free [u8] a copy))
+          (al-free! (mut copies))
+          (al-free! (mut descriptors))
+          (cu-shapes-free! assembly)
+          result)))))
+
+(defn image-run! [(im (ptr CodeImage)) (loaded (ptr InstalledImage))] (-> i64)
+  (if (!= im (.owner loaded)) (panic "image-run!: wrong artifact") 0)
+  (let [(mut units) (al-new [(ptr InstalledImage)] (alloc/malloc-allocator))]
+    (push! [(ptr InstalledImage)] (mut units) loaded)
+    (let [result (image-run-program! loaded (load units))]
+      (al-free! (mut units))
+      result)))

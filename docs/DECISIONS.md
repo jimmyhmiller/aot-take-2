@@ -4214,3 +4214,58 @@ an opaque round-level hook and still knows nothing about JavaScript.
 Measured: 912 tests green, node counts unchanged, fib(30) 5.16–5.22 ms against 5.21–5.29 ms before,
 binary trees 441 ms against 461 ms, compile time unchanged on richards and deltablue (a fixed
 +0.02 s on programs small enough for the per-round arena walk to show).
+
+## 2026-09-19 — A module is one concern; a large one is a facade over its parts
+
+Six files held most of the compiler: `parse/parser.coil` was 14,394 lines, `rt/rt.coil` 5,188,
+`codegen/regalloc.coil` 4,043, and `jsl/lower.coil`, `node/call.coil`, `jsl/check.coil`,
+`node/node.coil` and `codegen/encoding.coil` two thousand each. `docs/LAYOUT.md` named
+`type/scalar.coil`, `mem.coil`, `fun.coil` and `dyn.coil` from the first commit and none of them
+existed; the whole lattice was `type/type.coil`.
+
+A module that outgrows one concern is now a directory named after it. The original module keeps
+the entry points and its account of Simple's algorithm and imports each part with
+`:use * :reexport`, so it remains the public name and no importer — no test — changed. Parts import
+each other directly. Coil resolves module cycles, and the parts of one module rely on that:
+expression and statement lowering import each other. A cycle between layers remains a design
+error. The boundaries follow Simple's files wherever Simple has them (`regalloc/{lrg,build,ifg,
+colour}` for `LRG`, `BuildLRG`, `IFG`, `Color`; `node/fun.coil` for `FunNode` and `ParmNode`), and
+the concern otherwise (`parse/{grammar,analysis,lower,realm}`). `docs/LAYOUT.md` §5 states the
+convention and §6 has a row for each of the 120 new files.
+
+No function body changed. Forms were moved by `tools/refactor/split.coil`, a Coil metaprogram that
+works from the compiler's own parse, and the one behavioural hazard of moving code is a name that
+two files resolve differently from one: `rt.coil` declared `strtod` a second time and shadowed
+`aot.rt.number`'s, which its parts could not do. The duplicate declaration was deleted.
+
+**Imports state dependencies.** The compiler accepts an unused import silently, so import lists
+only grew. `aot.lint.unused-imports` is registered in `Coil.toml` and runs with every `coil lint`;
+it removed 81 imports before the split and narrowed every new module's copy of its parent's list
+after it. `coil.alloc` and `coil.primitive` are exempt — the first because the bundled modernize
+rule owns that import's shape and reports it again if a name is taken out, the second because
+library macro expansions reference it unqualified.
+
+**The tree is formatted.** `coil lint --fix` reformats every file it touches at the formatter's
+80 columns, so a one-line fix produced a thousand-line diff in a tree written at 100. The tree was
+formatted once with `coil fmt`; every later `--fix` diff shows only what the fix changed.
+
+**`docs/LAYOUT.md` is checked.** `aot.lint.layout` reads §6 and reports a source file with no row
+and a row with no file. Its first run found five rows for files that never existed
+(`node/cpus/machnode.coil`, `util/table.coil`, three tests) and thirteen test files with no row.
+
+**Where `impl` applies and where it does not.** Of 3,125 functions, about 900 take a
+`(dyn NodeOps)`, 940 take an interned id, 540 take nothing and reach a per-compilation singleton,
+and 250 take a struct. The node layer was already traits (`NodeOps`, `CFGOps`, `MemOps`,
+`MachNode`, `Machine`). The struct-receiver families are the ones that become `impl`s: `RegMask`
+(`RegMask::of`, `(union a b)`, `(has-reg? m r)`) and `WorkList`, which implements the ambient
+`Len`, `Push` and `Pop` rather than a vocabulary of its own. Id- and singleton-keyed code keeps
+prefixed function names, as Coil's own library does; turning `ty-meet` into a method would mean
+wrapping every interned id in a newtype, which is a representation change, not a reorganization.
+
+Not done, deliberately: the late-bound hooks (`set-con-hook!`, `set-cfg-ext!`,
+`jsl-set-closure-maker!`, …). Several exist only because a module cycle was assumed impossible, and
+could now be direct calls; others are the layering this file records ("`aot.node.call` … still
+knows nothing about JavaScript"). Telling the two apart is a design review per hook, not a move.
+
+Measured: 922 tests green after each stage, zero lint warnings, the exported symbol set of
+`aot-runtime.o` unchanged, `coil check` 6.2 s before and 7.9 s after over 264 modules instead of 144.

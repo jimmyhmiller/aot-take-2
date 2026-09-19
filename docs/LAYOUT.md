@@ -103,6 +103,58 @@ directory becomes ~16 files here, each owning a coherent family and all of its s
 peepholes together. Grouping by family is what makes the peepholes readable: `add-idealize`'s
 constant-sinking rule and `sub-idealize`'s are the same rule and belong on the same screen.
 
+**A family that outgrows one file splits along Simple's files.** `call.coil` holds Call and
+CallEnd and re-exports `fun.coil` (Fun, Parm, FunPtr) and `inline.coil`; `control.coil` re-exports
+`region.coil` and `cfgof.coil`. The family's account of Simple stays in the family's own file.
+
+### Modules: a facade and its parts
+
+A module is one concern. When a module outgrows that — roughly a thousand lines, or a second
+concern you can name — it is split into a directory named after it:
+
+```
+codegen/regalloc.coil         (module aot.codegen.regalloc)      the driver; re-exports the parts
+codegen/regalloc/lrg.coil     (module aot.codegen.regalloc.lrg)
+codegen/regalloc/ifg.coil     (module aot.codegen.regalloc.ifg)
+```
+
+- **The original module stays the public name.** It keeps the entry points and the header account
+  of Simple's algorithm, and imports each part with `:use * :reexport`. Importers, tests included,
+  keep importing `aot.codegen.regalloc` and never learn the parts exist.
+- **Parts import each other directly**, never through the facade: a part that did `:use *` of both
+  the facade and a sibling would see every moved name twice.
+- **Cycles between parts are legal and expected.** Coil resolves module cycles, so expression and
+  statement lowering, or grammar and cover grammar, are separate files that import each other.
+  A cycle between LAYERS is still a design error — `aot.node.*` does not import `aot.parse.*`.
+- **An import list states a dependency.** `aot.lint.unused-imports` runs with every `coil lint`
+  and removes an import the module does not use, so a module's imports are its real dependencies.
+
+`tools/refactor/split.coil` performs a split from the compiler's own parse; `docs/REFACTORING.md`
+is the workflow.
+
+### Functions, `impl`s and traits: which one
+
+Three shapes of code live here, and each has its form.
+
+- **A type with behaviour gets an `impl`.** Where a struct is passed as the receiver of a family of
+  functions — `RegMask`, `WorkList` — those functions are methods: `(impl RegMask …)`, constructed
+  with `RegMask::of`, `RegMask::range`, `WorkList::new`, and dispatched on the receiver
+  (`(union a b)`, `(has-reg? m r)`).
+- **A shared capability is a trait.** Node kinds implement `NodeOps`, `CFGOps`, `MemOps`; machine
+  nodes `MachNode`; a port `Machine`. A collection speaks the AMBIENT vocabulary instead of
+  inventing its own: `WorkList` implements `Len`, `Push` and `Pop`, so it is `(push! wl id)`,
+  `(pop! wl)`, `(empty? wl)` like every other collection in Coil.
+- **Everything keyed by an id or by the compilation singleton stays a prefixed function.** Most of
+  this compiler is: a type is an interned `i64`, a syntax node an arena index, an edge a
+  `(dyn NodeOps)`, and the parser, the arena and `CODE` are per-compilation singletons behind
+  zero-argument accessors. There is no struct receiver to hang a method on, and `ty-meet`,
+  `n-in`, `syntax-at`, `lower-ref-get!` say what they operate on in their names. That is also how
+  Coil's own library is written (`al-push!`, `hm-put!`, `sb-push-str!`).
+
+A short method name is a cost as well as a benefit: it can collide with a local (`word` did) and
+it cannot be searched for. Drop a prefix when the receiver makes the call obvious and keep it
+otherwise. `tools/refactor/rename.coil` and `tools/refactor/methods.coil` do the mechanical part.
+
 ### Types: an interned dense id over a `defsum`
 
 Types are values, not behaviour carriers — hashed, interned, compared — and a forgotten kind in
@@ -140,6 +192,7 @@ aot-take-2/
 │   ├── JSL.md           ; the runtime-library language
 │   ├── SPECIALIZE.md    ; proposal: a JSL definition carries its own idealization rules, and where to apply them
 │   ├── SEA-OF-NODES-AUDIT.md ; are we a proper sea of nodes: what was fixed, what remains, what the traces measured
+│   ├── REFACTORING.md   ; the refactoring and lint metaprograms in tools/, and the workflow that ties them together
 │   └── JOURNAL.md       ; why something looks the way it does
 ├── jsl/                 ; the JavaScript runtime library, in JSL — already written
 │   ├── index            ; load order IS the format (function indices, golden hashes)
@@ -186,44 +239,61 @@ aot-take-2/
 │   ├── util/
 │   │   ├── ary.coil         ; growable arrays: nodes, ints, bitsets     Ary/AryInt
 │   │   ├── sb.coil          ; string builder and byte sink              SB/BAOS
-│   │   ├── table.coil       ; int-keyed hash maps, the intern tables    IntHashMap
-│   │   ├── worklist.coil    ; the seeded random worklist                IterPeeps.WorkList
+│   │   ├── worklist.coil    ; the seeded random worklist: Len/Push/Pop over a set   IterPeeps.WorkList
+│   │   ├── panic.coil       ; named panics: unimplemented, unreachable, invariant
 │   │   └── arena.coil       ; compiler-region allocator and generation-scoped singleton ownership
 │   │
 │   ├── type/
-│   │   ├── type.coil        ; Ty sum, interning, meet/dual/join/isa, the xmeet dispatch
-│   │   ├── scalar.coil      ; int (with ranges), float, nil, ptr, scalar
-│   │   ├── mem.coil         ; memptr, mem, struct, field, const-array
-│   │   ├── fun.coil         ; funptr, tuple, RPC
-│   │   └── dyn.coil         ; ✦ the dynamic tag axis, shape sets, the JS string type
+│   │   ├── type.coil        ; Ty sum, interning, meet/dual/join/isa, the xmeet dispatch; re-exports the families
+│   │   ├── scalar.coil      ; int (with ranges), float, bool
+│   │   ├── mem.coil         ; ptr, memptr, mem, struct
+│   │   ├── fun.coil         ; tuple, function-index sets, funptr, signatures, RPC
+│   │   ├── dyn.coil         ; ✦ the dynamic tag axis, identity, shape sets, the JS string type
+│   │   └── text.coil        ; the printed form of every type
 │   │
 │   ├── shape.coil           ; ✦ the shape transition tree; alias classes and property attributes at the introducing edge; extensibility as a marker edge
 │   ├── heap.coil            ; ✦ the static heap image: the realm's initial objects and string literals as data (`__aot_heap`)
 │   ├── facts.coil           ; ✦ closed-world facts about image objects: escaped, written (entry, key), prototype writes
 │   │
 │   ├── node/
-│   │   ├── node.coil        ; NodeHdr, NodeOps, edges, peephole/peepholeOpt, GVN, deps,
-│   │   │                    ;   kill/subsume, the OP-* constants, the in-progress windows
+│   │   ├── node.coil        ; NodeHdr, NodeOps, header accessors, edges, deps, kill/subsume,
+│   │   │                    ;   the in-progress windows; re-exports op, arena, origin, gvn, peephole, cfgcache
+│   │   ├── op.coil          ; the OP-* constants: serialization tag and case key
+│   │   ├── arena.coil       ; dense node ids, the fidx registry, external functions, the iterate and inline worklists
+│   │   ├── origin.coil      ; the source range a node was built for
+│   │   ├── gvn.coil         ; hash, structural equality, the table, unlock-before-edit
+│   │   ├── peephole.coil    ; compute, constant replacement, idealize, GVN, DCE      Node.peephole
+│   │   ├── cfgcache.coil    ; CFG edit versioning; the idom, owner and depth caches it invalidates
+│   │   ├── boot.coil        ; one entry point that resets every compilation singleton
 │   │   ├── copy.coil        ; shallow shells and two-pass selected-subgraph copying
 │   │   ├── cfg.coil         ; CFGNode: idom, depth, blocks, loop depth, the loop tree
-│   │   ├── control.coil     ; Start, Stop, Region, Loop, If, Never, XCtrl, Proj, CProj, Multi
+│   │   ├── control.coil     ; Start, Stop, If, Never, XCtrl, Proj, CProj, Multi, Return; re-exports region, cfgof
+│   │   ├── region.coil      ; Region and Loop, their peepholes, dominators over them      RegionNode, LoopNode
+│   │   ├── cfgof.coil       ; the CFG view of any node, the owning function, and the extension points
 │   │   ├── phi.coil         ; Phi and the region/phi arity invariant
+│   │   ├── phicon.coil      ; Phi-of-constants folding
 │   │   ├── constant.coil    ; Constant, Extern, symbolic unit KeyRef/ShapeRef; ConFldOff, FRef
 │   │   ├── arith.coil       ; Add, Sub, Mul, Div, Minus, ToFloat, ToInt, RoundF32 + the int/float modes
 │   │   ├── bits.coil        ; And, Or, Xor, Shl, Shr, Sar, Not
 │   │   ├── compare.coil     ; EQ, NE, LT, LE, ULT
 │   │   ├── memory.coil      ; MemOp, Load, Store, New, MemMerge, MemPhi, ReadOnly
-│   │   ├── call.coil        ; Fun, Parm, Call, CallEnd, Return, Escape
+│   │   ├── call.coil        ; Call, CallEnd, linking and unlinking; the account of Simple's call rules; re-exports fun, inline
+│   │   ├── fun.coil         ; Fun, Parm, FunPtr      FunNode, ParmNode
+│   │   ├── inline.coil      ; size accounting, candidate selection, deferral, the trivial and cloning inliners' entries
 │   │   ├── scope.coil       ; ScopeNode + Var — the parser's SSA helper
 │   │   ├── dynamic.coil     ; ✦ Box, Unbox, TypeTest, Cast — the guard mechanism
-│   │   ├── property.coil    ; ✦ PropAccess node (load/has/store), its fold and late expansion
+│   │   ├── property.coil    ; ✦ PropAccess node (load/has/store) and its fold; re-exports propproof, propexpand
+│   │   ├── propproof.coil   ; ✦ what a shape, an image holder and the memory position prove about one property
+│   │   ├── propexpand.coil  ; ✦ late expansion into storage loads, stores, transitions and generic access
 │   │   ├── imagefacts.coil  ; ✦ the closed-world image analysis that fills aot.facts, once the world closes; `AOT_FACTS_TRACE=1` narrates escapes and stores
+│   │   ├── imagefacts/  { scan.coil   ; ✦ entry sets per node, escapes, prototype closure, image reads and writes
+│   │   │                  flow.coil   ; ✦ projections, call targets and results, paired writes, per-op effects
+│   │   │                  demand.coil } ; ✦ which intrinsic properties a program can observe
 │   │   ├── jsops.coil       ; ✦ string, symbol and number primitives the JSL layer bottoms out on
 │   │   ├── closure.coil     ; ✦ closure creation and captured-environment access
 │   │   ├── exception.coil   ; ✦ Throw and the exceptional control edge
 │   │   ├── gc.coil          ; ✦ Safepoint, Barrier, relocation projections
 │   │   └── cpus/
-│   │       ├── machnode.coil    ; MachNodeVT: regmap, outregmap, killmap, encoding, asm
 │   │       ├── arm64/  { arm64.coil, base.coil, arith.coil, bits.coil, dynamic.coil, mem.coil,
 │   │       │             phi.coil, branch.coil, call.coil, split.coil }
 │   │       └── x86_64/ { x86_64.coil, arith.coil, bits.coil, mem.coil,
@@ -236,13 +306,32 @@ aot-take-2/
 │   │   ├── opto.coil        ; optimistic interprocedural SCCP + call graph Opto
 │   │   ├── typecheck.coil   ; the last check for bad programs
 │   │   ├── looptree.coil    ; the loop tree; breaking infinite loops
-│   │   ├── gcm.coil         ; earliest/latest placement, use LCA, loop frequency
+│   │   ├── gcm.coil         ; CFG build, RPO, early schedule; the account of Simple's GCM; re-exports its parts
+│   │   ├── gcm/  { dom.coil      ; the dominator index: preorder intervals and block LCA
+│   │   │           globals.coil  ; breaking up Start-pinned globals, one clone per using function
+│   │   │           late.coil }   ; use LCA, constrained placement, memory waits, anti-dependencies
 │   │   ├── listsched.coil   ; block-local dependency DAG and scheduling
-│   │   ├── regalloc.coil    ; live ranges, interference, coalescing, splitting, colouring
-│   │   ├── regmask.coil     ; register masks and the stack-slot numbering
+│   │   ├── regalloc.coil    ; the driver, callee saves, frames, post-colour; the account of Simple's allocator      RegAlloc
+│   │   ├── regalloc/  { lrg.coil          ; state, LRG kinds, union-find with mask intersection      LRG
+│   │   │                build.coil        ; live ranges from machine defs, uses and phis      BuildLRG
+│   │   │                ifg.coil          ; backwards liveness per block, kills, adjacency      IFG
+│   │   │                colour.coil       ; simplify by risk, biased selection, propagation      Color
+│   │   │                coalesce.coil     ; coalescing split copies
+│   │   │                split.coil        ; copy and clone placement; the policy dispatcher
+│   │   │                split-self.coil   ; self-conflicting ranges
+│   │   │                split-loop.coil   ; loop boundaries and callee-save ranges
+│   │   │                split-empty.coil  ; ranges whose mask went empty
+│   │   │                trace.coil }      ; AOT_RA_TRACE
+│   │   ├── regmask.coil     ; RegMask: an impl over register sets, and the stack-slot numbering
 │   │   ├── machine.coil     ; MachineVT — the port interface               Machine
-│   │   ├── encoding.coil    ; encoding and relocations
-│   │   ├── image.coil       ; owned native images, Script entries and realm-object identities; checked installation, fresh realm-data instantiation and native program execution
+│   │   ├── encoding.coil    ; encoder state, bytes, fixups, definitions, emit and relocate; re-exports its parts
+│   │   ├── encoding/  { layout.coil   ; block order, fallthrough and inversion, offsets, branch relaxation
+│   │   │                veneer.coil   ; hubs and routes for transfers out of B26 range
+│   │   │                literal.coil } ; f64 literal islands
+│   │   ├── image.coil       ; owned native images, Script entries and realm-object identities; capture; re-exports its parts
+│   │   ├── image/  { abi.coil      ; versioned entry signature classes and export/import compatibility
+│   │   │             install.coil  ; executable memory, bindings, import resolution, relocation, unit sites
+│   │   │             run.coil }    ; fresh realm data, shared realm objects, the native entry
 │   │   ├── sourcecache.coil ; bounded Script/host image caches, exact source/JSL keys, leased handles and owned Script programs
 │   │   ├── serialize.coil   ; the ideal graph into the object file
 │   │   ├── compunit.coil    ; owned Script declarations, shape/key assembly, static-image remapping; dependency tree, cross-unit IR linking
@@ -252,23 +341,87 @@ aot-take-2/
 │   │
 │   ├── parse/               ; Simple's 2856-line Parser.java, split by concern
 │   │   ├── lexer.coil       ; JS/TS tokens, regex-vs-divide, ASI, template literals
-│   │   ├── parser.coil      ; recursive descent → SoN, straight through ScopeNode
-│   │   ├── regex.coil       ; RegExp pattern early errors: strict, web-compat and v-mode grammars
+│   │   ├── parser.coil      ; the driver: sources → syntax → analyses → lowering → closed world; re-exports everything below
+│   │   ├── syntax.coil      ; the thin syntax tree: node sums, records, arena accessors, walkers
+│   │   ├── state.coil       ; ParserState, function contexts, the token cursor, syntax errors
+│   │   ├── grammar/         ; tokens → syntax tree
+│   │   │   ├── literal.coil     ; numbers, strings, templates, regex literals, object and array literals
+│   │   │   ├── expression.coil  ; primaries, member chains, calls, the precedence ladder, assignment
+│   │   │   ├── pattern.coil     ; binding patterns and the cover grammar
+│   │   │   ├── statement.coil   ; statements and declarations
+│   │   │   ├── function.coil    ; parameters, declarations, expressions, arrows, methods, strictness
+│   │   │   └── class.coil       ; elements, keys, heritage, private names
+│   │   ├── early.coil       ; early errors over the finished tree: strict mode, declarations, jumps
+│   │   ├── analysis/        ; facts about the tree, computed before lowering
+│   │   │   ├── declarations.coil ; what each scope declares; Script declarations and globals
+│   │   │   ├── capture.coil      ; which bindings a nested function captures, and their owners
+│   │   │   ├── throws.coil       ; which functions can complete with the exception sentinel
+│   │   │   └── arguments.coil    ; how a function uses its arguments object
+│   │   ├── lower/           ; syntax tree → ideal graph, straight through ScopeNode
+│   │   │   ├── expression.coil  ; the expression dispatcher
+│   │   │   ├── statement.coil   ; blocks, declarations, if, loops, switch, labels
+│   │   │   ├── name.coil        ; scope slots, lexical and Script bindings, typeof operands
+│   │   │   ├── reference.coil   ; an assignment target prepared once, then read and written
+│   │   │   ├── operator.coil    ; unary, binary, short-circuit, conditional, assignment, delete, relational guards
+│   │   │   ├── literal.coil     ; object, array and template literals
+│   │   │   ├── member.coil      ; member reads and optional chains
+│   │   │   ├── call.coil        ; plain, member, keyed, spread and new
+│   │   │   ├── function.coil    ; headers, adapters, bodies, function objects, this, new.target, arguments
+│   │   │   ├── class.coil       ; constructors, members, fields, static blocks, super
+│   │   │   ├── environment.coil ; ✦ environment records for captured bindings
+│   │   │   ├── pattern.coil     ; destructuring
+│   │   │   ├── iteration.coil   ; for-in and for-of
+│   │   │   ├── jump.coil        ; return, break, continue as pruned scope merges
+│   │   │   ├── exception.coil   ; ✦ the sentinel completion through catch and finally
+│   │   │   └── jsl.coil         ; ✦ calls from lowered source into the JSL library
+│   │   ├── realm/           ; ✦ the global environment a program starts in
+│   │   │   ├── globals.coil     ; the var-like binding table, assignment marking, global loads and stores
+│   │   │   ├── intrinsics.coil  ; standard globals declared from JSL
+│   │   │   ├── image.coil       ; the global object, function objects, prototypes as static heap data
+│   │   │   ├── instantiate.coil ; GlobalDeclarationInstantiation for a Script
+│   │   │   └── demand.coil      ; intrinsics lowered only once something observes them
+│   │   ├── regex.coil       ; RegExp pattern early errors: strict, web-compat and v-mode grammars; re-exports its parts
+│   │   ├── regex/  { chars.coil  ; code-unit constants, grammar character classes, Unicode property tables
+│   │   │             class.coil } ; legacy classes and v-mode class sets
 │   │   ├── tstype.coil      ; TypeScript annotation syntax → our lattice
 │   │   └── decl.coil        ; hoisting, binding resolution, module records
 │   │
 │   ├── jsl/
 │   │   ├── reader.coil      ; the s-expression reader for .jsl
 │   │   ├── prims.coil       ; the primitive table
-│   │   ├── check.coil       ; the checker — refuses BY NAME what it cannot lower
-│   │   ├── lower.coil       ; JSL → ideal graph, and the transition check over it
+│   │   ├── check.coil       ; the checker — refuses BY NAME what it cannot lower; forms, definitions, units
+│   │   ├── check/  { types.coil      ; type codes, names, assignability, joins, tag predicates
+│   │   │             primitive.coil  ; result types of binary, unary and runtime primitives
+│   │   │             expr.coil }     ; admitted expression forms and the type each yields
+│   │   ├── lower.coil       ; JSL → ideal graph: graphs, link modes, units, the library index, the transition check
+│   │   ├── lower/  { expr.coil        ; the environment, macro values, types, the expression dispatcher
+│   │   │             primitive.coil   ; operators, property stores, runtime calls, pending throws, the argument vector
+│   │   │             object.coil      ; ordinary and shaped allocation, string literals
+│   │   │             call.coil        ; calls between definitions, calls of function values, closures
+│   │   │             specialize.coil } ; a definition's own idealization rules (docs/SPECIALIZE.md)
 │   │   └── decls.coil       ; (intrinsic …) read and flattened into the realm surface; (internal-slot …), (slot-list …) still stubs
 │   │
 │   ├── rt/                  ; the runtime, in Coil, built as its own object (Coil.toml `runtime`)
 │   │   ├── number.coil      ; Number conversions shared by compiler and runtime: exact radix integers, `strtod` decimals, StringToNumber, parseInt/parseFloat, the NaN-box word; the libm-backed Math table
 │   │   ├── abi.coil         ; RtHeap, realm lexical cells, unit data/key/shape bindings + folded offsets shared with encoders
 │   │   ├── shapes.coil      ; the runtime shape tree: static `__aot_shapes` blob + runtime transitions
-│   │   └── rt.coil          ; allocation, generational collector, static/lexical roots, realm lexical storage, strings, generic property access, throw entry points
+│   │   ├── rt.coil          ; the C ABI surface: the symbol table and the export-c list; re-exports everything below
+│   │   ├── layout.coil      ; object headers, NaN-box prefixes, payload offsets, card and barrier kinds
+│   │   ├── host.coil        ; libc declarations, output, time, rendering an uncaught value
+│   │   ├── code.coil        ; registered text ranges, their stack maps and unit identities, frame walking
+│   │   ├── stackmap.coil    ; stack map records, frame sizes, slot locations by return pc
+│   │   ├── heap.coil        ; spaces, statistics, boot and reset, allocation
+│   │   ├── gc.coil          ; the generational copying collector, root collection, the write barrier
+│   │   ├── verify.coil      ; heap and root verification (`AOT_RT_GC_VERIFY`)
+│   │   ├── statics.coil     ; adopting the linked heap image, unit identities and objects, static roots
+│   │   ├── lexical.coil     ; realm lexical cells: top-level let/const storage and its state
+│   │   ├── string.coil      ; code units, comparison, concatenation, substrings, UTF-8, key interning
+│   │   ├── numeric.coil     ; Number::toString, StringToNumber, parseInt, parseFloat, the Math table
+│   │   ├── symbol.coil      ; symbol creation, keys, descriptions
+│   │   ├── property.coil    ; generic own-property get, set, define, delete; integrity levels
+│   │   ├── array.coil       ; the elements store, growth, holes, length
+│   │   ├── keys.coil        ; own-key enumeration and the argument tail
+│   │   └── throw.coil       ; throw entry points, invariant traps, named refusals
 │   │
 │   ├── print/
 │   │   ├── ir.coil          ; the pretty printer                          IRPrinter
@@ -284,8 +437,11 @@ aot-take-2/
 │   ├── graph-gen.coil       ; shrinkable well-formed expression/control graph generators
 │   ├── graph-property-test.coil ; structural and optimizer properties over generated graphs
 │   ├── program-graph-test.coil ; complete Stop-rooted graph structure against Simple
-│   ├── type-test.coil  node-test.coil  peephole-test.coil  gvn-test.coil
-│   ├── scope-test.coil  loop-test.coil  mem-test.coil  shape-test.coil  rt-shapes-test.coil
+│   ├── support.coil                 ; shared test construction helpers
+│   ├── type-test.coil  node-test.coil  peephole-test.coil  phicon-test.coil
+│   ├── bits-test.coil  compare-test.coil  control-test.coil  call-test.coil  copy-test.coil
+│   ├── dynamic-test.coil  gc-test.coil  gcmeta-test.coil  select-test.coil  pipeline-test.coil
+│   ├── scope-test.coil  mem-test.coil  shape-test.coil  rt-shapes-test.coil
 │   ├── opto-test.coil  gcm-test.coil  sched-test.coil  regalloc-test.coil
 │   ├── encode-test.coil  compunit-test.coil  verify-test.coil  text-test.coil
 │   ├── lex-test.coil  parse-test.coil  regex-test.coil  tstype-test.coil  jsl-test.coil
@@ -295,7 +451,7 @@ aot-take-2/
 │   ├── image-test.coil              ; in-memory relocation, entry ABI, realm isolation and moving GC
 │   ├── library-support.coil         ; the runtime-library provider retained Script units import from, for tests
 │   ├── test262-test.coil            ; metadata, runner policy and accounting regressions
-│   ├── harness.coil                 ; source in → linked binary out → node's answer beside it
+│   ├── web-test.coil                ; browser graph snapshots over the production frontend and optimizer
 │   ├── bloat-test.coil              ; graph-size budgets: node-count ceilings after optimization
 │   ├── budget-test.coil             ; compile-time budgets as gates: rounds, shape, wall time (docs/COMPILE-TIME.md §7)
 │   ├── execution-test.coil          ; cases that must RUN, not merely compile
@@ -303,6 +459,15 @@ aot-take-2/
 ├── benchmarks/              ; JavaScript/TypeScript input fixtures for native comparisons
 ├── web/                     ; GitHub Pages graph playground; HTML/CSS/JS presentation over Coil/Wasm
 └── tools/
+    ├── lint/
+    │   ├── unused-imports.coil ; project lint rule (Coil.toml `[lint] rules`): an import nothing uses; `--fix` removes it
+    │   ├── layout.coil      ; project lint rule: every source file has a row in this document, and every row a file
+    │   └── size.coil        ; opt-in report: functions and files over a line budget
+    ├── refactor/            ; refactoring metaprograms, inert unless named with `coil lint --use` (docs/REFACTORING.md)
+    │   ├── source.coil      ; a module's top-level forms with the lines that travel with them; file reads and writes
+    │   ├── split.coil       ; move selected forms into other modules; the source re-exports them
+    │   ├── rename.coil      ; respell a definition everywhere, atomically, from the reader's symbol positions
+    │   └── methods.coil     ; gather a module's functions into an `impl` block
     ├── dot-dump.coil
     ├── memory-run.coil      ; source-to-memory compilation and execution without subprocesses
     ├── compile-study.coil   ; diagnostic retained-Script pass timings, graph counts and project DOT snapshots

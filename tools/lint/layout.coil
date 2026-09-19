@@ -1,0 +1,236 @@
+;; docs/LAYOUT.md is the file-by-file contract, and this rule is what holds it to that.
+
+;;
+;; "If a file exists with no row in that table, either add the row or delete the file" was a
+;; sentence in CLAUDE.md that nothing checked, and the table drifted: it named `type/scalar.coil`
+;; for a year of commits in which that file did not exist, and never named `node/phicon.coil`, which
+;; did. This rule reads the tree in §6 and reports, as ordinary lint warnings:
+;;
+;;   * a Coil source file the project owns that has no row, at that file's first form;
+;;   * a row that names a `.coil` file which does not exist.
+;;
+;; It is registered in Coil.toml, so plain `coil lint` runs it and the zero-warnings rule covers it.
+;;
+;; ── how the tree is read ─────────────────────────────────────────────────────────────────────
+;; Only the fenced block that starts with the project root line (`aot-take-2/`) is read. In it:
+;;
+;;   * an entry is whatever follows `├── ` or `└── `; its depth is its column / 4;
+;;   * an entry ending in `/` is a directory, and entries deeper than it live inside it;
+;;   * every other token ending in `.coil` on a line is a file in the directory the line is in, so
+;;     one row may list several (`type-test.coil  node-test.coil`);
+;;   * `dir/  { a.coil, b.coil }` lists files inside `dir`, across lines until the closing brace;
+;;     the brace must follow a space, which is what tells it from `compiler/{add,sub}.jsl`;
+;;   * everything from a `;` to the end of the line is commentary.
+;;
+;; Columns are counted in characters, not bytes: the box-drawing characters are three bytes each.
+(module aot.lint.layout)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use [subslice])
+(import "coil.str" :use [sb-new sb-push-str! sb-str str-find])
+(import "coil.fs" :use [read-file])
+
+(const LAYOUT-PATH "docs/LAYOUT.md")
+
+(defn layout-ends-with? [(s (slice u8)) (suffix (slice u8))] (-> bool)
+  (and (>= (len s) (len suffix))
+       (= (subslice s (- (len s) (len suffix)) (len s)) suffix)))
+
+(defn layout-byte [(s (slice u8)) (i i64)] (-> i64)
+  (primitive/cast i64 (get s i)))
+
+;;; Is the byte at `i` the first byte of a character (not a UTF-8 continuation byte)?
+(defn layout-char-start? [(s (slice u8)) (i i64)] (-> bool)
+  (!= (& (layout-byte s i) 0xC0) 0x80))
+
+;;; The line up to its first `;`.
+(defn layout-strip-comment [(line (slice u8))] (-> (slice u8))
+  (match (str-find line ";") (Some [at] (subslice line 0 at)) (None [] line)))
+
+;;; The byte offset of a tree marker (`├` E2 94 9C or `└` E2 94 94), or -1.
+(defn layout-marker-offset [(line (slice u8))] (-> i64)
+  (let [(mut at) -1
+        (mut i) 0]
+    (while (and (< (load at) 0) (< (+ (load i) 2) (len line)))
+      (when (and (= (layout-byte line (load i)) 0xE2)
+                 (= (layout-byte line (+ (load i) 1)) 0x94)
+                 (or (= (layout-byte line (+ (load i) 2)) 0x9C)
+                     (= (layout-byte line (+ (load i) 2)) 0x94)))
+        (set! at (load i))
+        0)
+      (set! i (+ (load i) 1)))
+    (load at)))
+
+;;; How many characters precede byte offset `at`.
+(defn layout-column [(line (slice u8)) (at i64)] (-> i64)
+  (let [(mut column) 0
+        (mut i) 0]
+    (while (< (load i) at)
+      (when (layout-char-start? line (load i))
+        (set! column (+ (load column) 1))
+        0)
+      (set! i (+ (load i) 1)))
+    (load column)))
+
+(defn layout-token-byte? [(b i64)] (-> bool)
+  (or (and (>= b 97) (<= b 122))
+      (and (>= b 65) (<= b 90))
+      (and (>= b 48) (<= b 57))
+      (= b 45)
+      (= b 95)
+      (= b 46)
+      (= b 47)))
+
+;;; `dirs[0..depth)` joined, then `name`.
+(defn layout-join [(dirs (ptr (ArrayList (slice u8))))
+                   (depth i64)
+                   (name (slice u8))] (-> (slice u8))
+  (let [(mut sb) (sb-new (malloc-allocator))
+        (mut i) 0]
+    (while (and (< (load i) depth) (< (load i) (len dirs)))
+      (sb-push-str! (mut sb) (get (load dirs) (load i)))
+      (set! i (+ (load i) 1)))
+    (sb-push-str! (mut sb) name)
+    (sb-str (load sb))))
+
+;;; Set `dirs[depth]` to `name` (which ends in `/`), dropping anything deeper.
+(defn layout-enter! [(dirs (ptr (ArrayList (slice u8))))
+                     (depth i64)
+                     (name (slice u8))] (-> i64)
+  (while (> (len dirs) depth) (match (pop! dirs) (Some [_] 0) (None [] 0)))
+  (while (< (len dirs) depth) (push! dirs ""))
+  (push! dirs name)
+  0)
+
+;;; Every file row of the tree, as a project-relative path.
+(defn layout-read-rows! [(rows (ptr (ArrayList (slice u8)))) (text (slice u8))] (-> i64)
+  (let [(mut dirs) (al-new [(slice u8)] (malloc-allocator))
+        (mut in-tree) false
+        (mut depth) 0  ; the directory depth file tokens on this line belong to
+        (mut group) false  ; inside `dir/ { … }`
+        (mut start) 0
+        (mut i) 0
+        n (len text)]
+    (while (<= (load i) n)
+      (when (or (= (load i) n) (= (layout-byte text (load i)) 10))
+        (let [raw (subslice text (load start) (load i))
+              line (layout-strip-comment raw)]
+          (cond (and (not (load in-tree)) (layout-ends-with? raw "aot-take-2/"))
+                  (do (set! in-tree true) 0)
+                (and (load in-tree)
+                     (>= (len raw) 3)
+                     (= (subslice raw 0 3) "```"))
+                  (do (set! in-tree false) 0)
+                (load in-tree)
+                  (let [marker (layout-marker-offset line)
+                        (mut k) (if (>= marker 0) (+ marker 3) 0)
+                        (mut first) (>= marker 0)]
+                    (when (and (>= marker 0) (not (load group)))
+                      (set! depth (/ (layout-column line marker) 4))
+                      0)
+                    (while (< (load k) (len line))
+                      (let [b (layout-byte line (load k))]
+                        (cond (and (= b 123)
+                                   (> (load k) 0)
+                                   (= (layout-byte line (- (load k) 1)) 32))
+                                (do (set! group true) (set! k (+ (load k) 1)) 0)
+                              (= b 125)
+                                (do
+                                  (set! group false)
+                                  (set! k (+ (load k) 1))
+                                  0)
+                              (and (layout-token-byte? b)
+                                   (layout-char-start? line (load k)))
+                                (let [from (load k)]
+                                  (while (and (< (load k) (len line))
+                                              (layout-token-byte? (layout-byte line
+                                                                               (load k))))
+                                    (set! k (+ (load k) 1)))
+                                  (let [token (subslice line from (load k))
+                                        inside
+                                          (if (load group)
+                                              (+ (load depth) 1)
+                                              (load depth))]
+                                    (cond (and (load first)
+                                               (layout-ends-with? token "/"))
+                                            (layout-enter! (mut dirs)
+                                                           (load depth)
+                                                           token)
+                                          (layout-ends-with? token ".coil")
+                                            (do
+                                              (push! rows
+                                                     (layout-join (mut dirs)
+                                                                  inside
+                                                                  token))
+                                              0)
+                                          :else 0)
+                                    (set! first false)
+                                    0))
+                              :else (do (set! k (+ (load k) 1)) 0))))
+                    0)
+                :else 0))
+        (set! start (+ (load i) 1))
+        0)
+      (set! i (+ (load i) 1)))
+    0))
+
+;;; The path of `file` below the project root: from its last `/src/`, `/tests/` or `/tools/`.
+(defn layout-relative [(file (slice u8))] (-> (slice u8))
+  (let [(mut best) -1]
+    (for root
+      (iter ["/src/" "/tests/" "/tools/"])
+      (let [(mut from) 0]
+        (loop (match (coil.str/str-find-from file root (load from))
+                (Some [at]
+                      (do
+                        (when (> at (load best)) (set! best at) 0)
+                        (set! from (+ at 1))
+                        (continue)))
+                (None [] (break 0))))))
+    (if (< (load best) 0) file (subslice file (+ (load best) 1) (len file)))))
+
+(defn layout-has? [(rows (ptr (ArrayList (slice u8)))) (path (slice u8))] (-> bool)
+  (let [(mut hit) false]
+    (for row (iter (load rows)) (when (= row path) (set! hit true) 0))
+    (load hit)))
+
+;;; The document's text, or "" when it cannot be read (a rule's own setup build runs elsewhere).
+(defn layout-text [] (-> (slice u8))
+  (try (let [text (try-or! (read-file (malloc-allocator) LAYOUT-PATH) "")] text)))
+
+(defn lint-layout [(modules Code)] (-> Code)
+  (let [(mut rows) (al-new [(slice u8)] (malloc-allocator))
+        (mut files) (al-new [(slice u8)] (malloc-allocator))
+        (mut anchor) `()
+        text (layout-text)]
+    (when (> (len text) 0)
+      (layout-read-rows! (mut rows) text)
+      (for m
+        (iter modules)
+        (when (and (> (len m) 1) (primitive/code-from-user? (get m 1)))
+          (let [first (get m 1)
+                path (layout-relative (primitive/code-file first))]
+            (when (= (len (load anchor)) 0) (set! anchor first) 0)
+            (push! (mut files) path)
+            (when (not (layout-has? (mut rows) path))
+              (primitive/warn first
+                              "this file has no row in docs/LAYOUT.md: add the row or delete the file")
+              0)
+            0)))
+      ;; A program that holds none of the project (a rule's own setup build) proves nothing
+      ;; about which rows are stale.
+      (when (> (len (load files)) 40)
+        (for row
+          (iter (load rows))
+          (when (not (layout-has? (mut files) row))
+            (println "docs/LAYOUT.md: row names a file that does not exist: {}"
+                     row)
+            (primitive/warn (load anchor)
+                            "docs/LAYOUT.md names a file that does not exist (see above)")
+            0))
+        0)
+      0)
+    `0))
+
+(checker lint-layout :phase before-expand)

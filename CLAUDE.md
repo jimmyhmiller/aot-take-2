@@ -212,7 +212,14 @@ When a `--fix` suggestion looks wrong, check it rather than accepting it. Report
 - `coil check FILE` typechecks a single file; `coil namespace coil.X` is how you learn a stdlib API.
   Never guess a stdlib signature — ask the compiler.
 - Read `docs/LAYOUT.md` before adding a file. If a file exists with no row in that table, either add
-  the row or delete the file.
+  the row or delete the file — `coil lint` now reports both directions (`aot.lint.layout`), so this
+  is part of the zero-warnings rule and not a thing to remember.
+- A module is one concern. When one outgrows that, split it into a directory named after it and
+  keep the original module as the facade that re-exports the parts (`docs/LAYOUT.md` §5). Move code
+  with the metaprograms in `tools/refactor/` — split, rename, methods — never by hand and never with
+  a script; `docs/REFACTORING.md` is the workflow. `coil lint --use aot.lint.size` lists the
+  functions and files that have grown too large.
+- An import states a dependency. `coil lint` reports an unused one and `--fix` removes it.
 - `docs/DESIGN.md` is the architecture. `docs/DECISIONS.md` is law — code contradicting it is a bug
   in the code or an amendment to the file, never a silent divergence.
 - Ask open questions with the AskUserQuestion tool, with real options. Not as prose, not as a

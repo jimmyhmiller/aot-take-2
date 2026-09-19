@@ -1,0 +1,466 @@
+;; Installing an image: executable memory, bindings, import resolution, relocation, map tokens and unit sites.
+
+(module aot.codegen.image.install)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.slice" :use [slice-data])
+(import "coil.mem" :as mem)
+(import "aot.util.panic" :use *)
+(import "aot.codegen.encoding" :use *)
+(import "aot.codegen.objfile" :use *)
+(import "aot.rt.abi" :use *)
+(import "aot.rt.shapes"
+        :use
+        [SHAPES-HEADER-BYTES
+         SHAPES-RECORD-BYTES
+         SHAPES-KEY-RECORD-BYTES
+         SHAPES-VERSION
+         shapes-blob-magic?])
+(import "aot.rt.rt"
+        :use
+        [rt-symbol-address
+         rt-symbol-lookup
+         rt-heap
+         rt-code-register-identities!
+         rt-code-unregister!
+         rt-code-find
+         rt-code-pin!
+         rt-code-unit-slot
+         rt-stackmap-find
+         rt-read-u32])
+(import "aot.codegen.image"
+        :use
+        [IMAGE-SYM-TEXT IMAGE-SYM-DATA IMAGE-SYM-IMPORT CodeImage])
+(import "aot.codegen.image.abi" :use *)
+
+(extern mmap :cc c [(ptr u8) u64 i32 i32 i32 i64] (-> (ptr u8)))
+
+(extern munmap :cc c [(ptr u8) u64] (-> i32))
+
+(extern pthread_jit_write_protect_np :cc c [i32] (-> void))
+
+(extern sys_icache_invalidate :cc c [(ptr u8) u64] (-> void))
+
+(const IMAGE-TEXT-LIMIT 67108864)
+
+(const IMAGE-PROT-RW 3)
+
+(const IMAGE-PROT-RWX 7)
+
+(const IMAGE-MAP-PRIVATE-ANON 0x1002)
+
+(const IMAGE-MAP-JIT 0x800)
+
+(defstruct InstalledImage
+  [(text (ptr u8))
+   (text-bytes u64)
+   (entry i64)
+   (code-id i64)
+   (owner (ptr CodeImage))
+   (imports (ArrayList i64))
+   (dependencies (ArrayList i64))])
+
+;; Bindings borrow their spelling only for installation. The installer copies resolved addresses
+;; and pins providers by registered code identity, never retaining caller-owned binding storage.
+(defstruct ImageBinding
+  [(name (slice u8)) (address i64) (provider i64) (abi (slice u8))])
+
+(defn image-export-binding [(im (ptr CodeImage))
+                            (loaded (ptr InstalledImage))
+                            (export-name (slice u8))
+                            (import-name (slice u8))] (-> ImageBinding)
+  (if (or (!= im (.owner loaded))
+          (= (.code-id loaded) 0)
+          (= (len import-name) 0))
+      (panic "image-export-binding: invalid installation or import name")
+      0)
+  (let [(mut found) -1
+        (mut i) 0]
+    (al-for [symbol (.symbols im)]
+            (let [s symbol]
+              (if (and (= (.segment s) IMAGE-SYM-TEXT)
+                       (= (.name s) export-name))
+                  (do
+                    (if (>= (load found) 0)
+                        (panic "image-export-binding: ambiguous export name")
+                        0)
+                    (set! (mut found) (load i))
+                    0)
+                  0)
+              (set! (mut i) (+ (load i) 1))))
+    (if (< (load found) 0) (panic "image-export-binding: missing export") 0)
+    (let [symbol (get (.symbols im) (load found))]
+      (ImageBinding
+        :name import-name
+        :address (image-address im loaded (load found))
+        :provider (.code-id loaded)
+        :abi (.abi symbol)))))
+
+(defn image-script-initializer-binding [(im (ptr CodeImage))
+                                        (loaded (ptr InstalledImage))
+                                        (script i64)
+                                        (import-name (slice u8))] (-> ImageBinding)
+  (if (or (< script 0) (>= script (len (.scripts im))))
+      (panic "image-script-initializer-binding: unknown Script")
+      0)
+  (let [record (get (.scripts im) script)
+        index (.initializer record)]
+    (if (or (< index 0) (>= index (len (.symbols im))))
+        (panic "image-script-initializer-binding: Script has no retained initializer")
+        0)
+    (let [symbol (get (.symbols im) index)]
+      (if (not (image-abi-script-entry? (.abi symbol)))
+          (panic "image-script-initializer-binding: invalid initializer ABI")
+          0)
+      (image-export-binding im loaded (.name symbol) import-name))))
+
+(defn image-address [(im (ptr CodeImage))
+                     (loaded (ptr InstalledImage))
+                     (symbol i64)] (-> i64)
+  (if (or (< symbol 0) (>= symbol (len (.symbols im))))
+      (panic "image-address: invalid symbol index")
+      0)
+  (let [s (get (.symbols im) symbol)]
+    (case (.segment s) IMAGE-SYM-TEXT
+          (+ (primitive/cast i64 (.text loaded)) (.offset s)) IMAGE-SYM-DATA
+          (panic "image-address: static data requires a realm unit binding")
+            IMAGE-SYM-IMPORT
+          (get (.imports loaded) symbol)
+            (panic "image-address: invalid symbol segment"))))
+
+(defn image-put4! [(base (ptr u8)) (offset i64) (bits i64)] (-> i64)
+  (set! (primitive/cast (ptr u32) (primitive/index base offset))
+        (primitive/cast u32 bits))
+  0)
+
+(defn image-map-token-word [(token i64) (reg i64) (word i64)] (-> i64)
+  (if (or (< token 0) (< reg 0) (> reg 30) (< word 0) (> word 3))
+      (panic "image-map-token-word: invalid token, register or word")
+      0)
+  (| (if (= word 0) 0xd2800000 0xf2800000)
+     (| (primitive/ishl word 21)
+        (| (primitive/ishl (& (primitive/ishr token (* word 16)) 0xffff) 5) reg))))
+
+(defn image-install-map-tokens! [(im (ptr CodeImage))
+                                 (loaded (ptr InstalledImage))] (-> i64)
+  (al-for [site (.map-sites im)]
+          (let [s site
+                token (rt-map-token (.code-id loaded) (.local-id s))
+                (mut word) 0]
+            (if (or (< (.offset s) 0)
+                    (> (.offset s) (- (len (.text im)) 16))
+                    (< (rt-stackmap-find (slice-data (.maps im))
+                                         (len (.maps im))
+                                         (.local-id s))
+                       0))
+                (panic "image-install-map-tokens!: map relocation has no code or metadata")
+                0)
+            (loop (if (>= (load word) 4)
+                      (break 0)
+                      (let [offset (+ (.offset s) (* (load word) 4))
+                            original
+                              (primitive/cast i64
+                                              (load (primitive/cast (ptr u32)
+                                                                    (primitive/index (.text loaded)
+                                                                                     offset))))]
+                        (if (!= original
+                                (image-map-token-word (.local-id s)
+                                                      (.reg s)
+                                                      (load word)))
+                            (panic "image-install-map-tokens!: unexpected instruction sequence")
+                            0)
+                        (image-put4! (.text loaded)
+                                     offset
+                                     (image-map-token-word token
+                                                           (.reg s)
+                                                           (load word)))
+                        (set! (mut word) (+ (load word) 1))
+                        (continue))))))
+  0)
+
+;; Pure instruction relocation, separately tested at positive/negative range boundaries.
+(defn image-relocate-word [(kind i64) (word i64) (pc i64) (target i64)] (-> i64)
+  (case kind ENC-FIXUP-A64-BL26
+        (let [delta (- target pc)]
+          (if (or (!= (% delta 4) 0) (< delta -134217728) (>= delta 134217728))
+              (panic "image-relocate-word: BL26 out of range")
+              0)
+          (| (& word 0xfc000000) (& (primitive/ishr delta 2) 0x03ffffff)))
+          ENC-FIXUP-A64-PAGE21
+        (let [pages (primitive/ishr (- (& target -4096) (& pc -4096)) 12)]
+          (if (or (< pages -1048576) (>= pages 1048576))
+              (panic "image-relocate-word: ADRP out of range")
+              0)
+          (| (& word 0x9f00001f)
+             (| (primitive/ishl (& pages 3) 29)
+                (primitive/ishl (& (primitive/ishr pages 2) 0x7ffff) 5))))
+          ENC-FIXUP-A64-PAGEOFF12
+        (| (& word 0xffc003ff) (primitive/ishl (& target 4095) 10))
+          (panic "image-relocate-word: unknown fixup")))
+
+(defstruct ImageImports
+  [(addresses (ArrayList i64)) (dependencies (ArrayList i64))])
+
+(defn image-resolve-imports [(im (ptr CodeImage))
+                             (bindings (ArrayList ImageBinding))] (-> ImageImports)
+  (let [(mut addresses) (al-new [i64] (alloc/malloc-allocator))
+        (mut dependencies) (al-new [i64] (alloc/malloc-allocator))
+        (mut index) 0]
+    ;; Validate explicit bindings before executable allocation or provider pinning.
+    (al-for [binding bindings]
+            (let [b binding
+                  (mut matches) 0
+                  (mut prior) 0]
+              (if (!= (rt-symbol-lookup (.name b)) 0)
+                  (panic "image-resolve-imports: runtime symbol cannot be rebound")
+                  0)
+              (match (rt-code-find (.provider b))
+                (Some [range]
+                      (let [r range]
+                        (if (or (< (.address b) (.text r))
+                                (>= (- (.address b) (.text r)) (.text-bytes r)))
+                            (panic "image-resolve-imports: binding is outside its provider")
+                            0)))
+                (None []
+                      (panic "image-resolve-imports: provider is no longer installed")))
+              (loop (if (>= (load prior) (load index))
+                        (break 0)
+                        (let [p (get bindings (load prior))]
+                          (if (= (.name p) (.name b))
+                              (panic "image-resolve-imports: duplicate binding")
+                              0)
+                          (set! (mut prior) (+ (load prior) 1))
+                          (continue))))
+              (al-for [symbol (.symbols im)]
+                      (let [s symbol]
+                        (if (and (= (.segment s) IMAGE-SYM-IMPORT)
+                                 (= (.name s) (.name b)))
+                            (do
+                              (if (not (image-abi-compatible? (.abi s) (.abi b)))
+                                  (panic "image-resolve-imports: incompatible callable ABI")
+                                  0)
+                              (set! (mut matches) (+ (load matches) 1)))
+                            0)))
+              (if (!= (load matches) 1)
+                  (panic "image-resolve-imports: binding must name one import")
+                  0)
+              (set! (mut index) (+ (load index) 1))))
+    (al-for [symbol (.symbols im)]
+            (let [s symbol
+                  (mut address) 0]
+              (if (= (.segment s) IMAGE-SYM-IMPORT)
+                  (do
+                    (al-for [binding bindings]
+                            (let [b binding]
+                              (if (= (.name b) (.name s))
+                                  (do
+                                    (set! (mut address) (.address b))
+                                    (push! [i64]
+                                           (mut dependencies)
+                                           (.provider b))
+                                    0)
+                                  0)))
+                    (if (= (load address) 0)
+                        (do
+                          (if (> (len (.abi s)) 0)
+                              (panic "image-resolve-imports: declared unit import requires a provider binding")
+                              0)
+                          (set! (mut address) (rt-symbol-address (.name s))))
+                        0))
+                  0)
+              (push! [i64] (mut addresses) (load address))))
+    (ImageImports :addresses (load addresses) :dependencies (load dependencies))))
+
+(defn image-unit-identity-count [(im (ptr CodeImage)) (kind i64)] (-> i64)
+  (if (not (or (= kind ENC-UNIT-KEY) (= kind ENC-UNIT-SHAPE)))
+      (panic "image-unit-identity-count: unknown identity kind")
+      0)
+  (let [blob (.shapes im)]
+    (if (= (len blob) 0)
+        (if (= kind ENC-UNIT-KEY) 1 2)
+        (let [p (slice-data blob)]
+          (if (or (< (len blob) SHAPES-HEADER-BYTES)
+                  (not (shapes-blob-magic? p)))
+              (panic "image-unit-identity-count: invalid unit namespace header")
+              0)
+          (let [shapes (rt-read-u32 p 12)
+                keys (rt-read-u32 p 16)
+                names (rt-read-u32 p 20)]
+            (if (or (!= (rt-read-u32 p 8) SHAPES-VERSION)
+                    (< shapes 2)
+                    (< keys 1)
+                    (!= (+ (+ (+ SHAPES-HEADER-BYTES
+                                 (* shapes SHAPES-RECORD-BYTES))
+                              (* keys SHAPES-KEY-RECORD-BYTES))
+                           names)
+                        (len blob)))
+                (panic "image-unit-identity-count: invalid unit namespace extent")
+                0)
+            (if (= kind ENC-UNIT-KEY) keys shapes))))))
+
+(defn image-install-unit-sites! [(im (ptr CodeImage))
+                                 (loaded (ptr InstalledImage))] (-> i64)
+  (let [slot (rt-code-unit-slot (.code-id loaded))]
+    (if (or (<= slot 0) (> slot RT-CODE-ID-LIMIT))
+        (panic "image-install-unit-sites!: installation slot outside the ABI")
+        0)
+    (al-for [site (.unit-sites im)]
+            (let [s site
+                  off (.offset s)
+                  reg (.reg s)]
+              (if (or (< reg 0) (> reg 30) (= reg 28))
+                  (panic "image-install-unit-sites!: invalid slot scratch register")
+                  0)
+              (if (= (.kind s) ENC-UNIT-DATA)
+                  (if (or (< (len (.data im)) 32)
+                          (< (.local-id s) 0)
+                          (>= (.local-id s)
+                              (rt-read-u32 (slice-data (.data im)) 12)))
+                      (panic "image-install-unit-sites!: static identity outside the unit image")
+                      0)
+                  (let [count (image-unit-identity-count im (.kind s))]
+                    (if (or (<= (.local-id s) 0) (>= (.local-id s) count))
+                        (panic "image-install-unit-sites!: identity outside the unit namespace")
+                        0)))
+              (if (or (< off 0) (> off (- (len (.text im)) 8)) (!= (% off 4) 0))
+                  (panic "image-install-unit-sites!: relocation outside text")
+                  0)
+              (if (or (!= (rt-read-u32 (slice-data (.text im)) off)
+                          (| 0xd2800000 reg))
+                      (!= (rt-read-u32 (slice-data (.text im)) (+ off 4))
+                          (| 0xf2a00000 reg)))
+                  (panic "image-install-unit-sites!: relocation is not the reserved slot sequence")
+                  0)
+              (image-put4! (.text loaded)
+                           off
+                           (| (| 0xd2800000 reg)
+                              (primitive/ishl (& slot 0xffff) 5)))
+              (image-put4! (.text loaded)
+                           (+ off 4)
+                           (| (| 0xf2a00000 reg)
+                              (primitive/ishl (primitive/ishr slot 16) 5)))))
+    0))
+
+(defn image-install-bound [(im (ptr CodeImage))
+                           (bindings (ArrayList ImageBinding))] (-> InstalledImage)
+  (if (.booted (rt-heap)) (panic "image-install-bound: a realm is active") 0)
+  (let [text-bytes
+          (obj-align-up (+ (obj-align-up (len (.text im)) 8)
+                           (* (len (.symbols im)) 16))
+                        16384)]
+    (if (> text-bytes IMAGE-TEXT-LIMIT)
+        (panic "image-install: text and veneers exceed the 64MiB image limit")
+        0)
+    (let [imports (image-resolve-imports im bindings)
+          text
+            (mmap (primitive/cast (ptr u8) 0)
+                  (primitive/cast u64 text-bytes)
+                  (primitive/cast i32 IMAGE-PROT-RWX)
+                  (primitive/cast i32 (| IMAGE-MAP-PRIVATE-ANON IMAGE-MAP-JIT))
+                  -1
+                  0)
+          loaded (primitive/alloc-stack InstalledImage)
+          veneer-start (obj-align-up (len (.text im)) 8)]
+      (set! loaded
+            (InstalledImage
+              :text text
+              :text-bytes (primitive/cast u64 text-bytes)
+              :entry
+                (if (< (.entry im) 0)
+                    0
+                    (+ (primitive/cast i64 text) (.entry im)))
+              :code-id 0
+              :owner im
+              :imports (.addresses imports)
+              :dependencies (.dependencies imports)))
+      (if (= (primitive/cast i64 text) -1)
+          (panic "image-install: executable mapping failed")
+          0)
+      (set! (.code-id loaded)
+            (rt-code-register-identities! (primitive/cast i64 text)
+                                          (len (.text im))
+                                          (slice-data (.maps im))
+                                          (len (.maps im))
+                                          (image-unit-identity-count im
+                                                                     ENC-UNIT-KEY)
+                                          (image-unit-identity-count im
+                                                                     ENC-UNIT-SHAPE)))
+      (al-for [provider (.dependencies loaded)] (rt-code-pin! provider true))
+      (set! (.installations im) (+ (.installations im) 1))
+      (pthread_jit_write_protect_np 0)
+      (mem/mem-copy [u8] text (slice-data (.text im)) (len (.text im)))
+      (image-install-map-tokens! im loaded)
+      (image-install-unit-sites! im loaded)
+      (let [(mut i) 0]
+        (al-for [s (.symbols im)]
+                (let [symbol s
+                      offset (+ veneer-start (* (load i) 16))]
+                  ;; ldr x16,pc+8; br x16; absolute target. BR preserves the original BL's LR.
+                  (if (= (.segment symbol) IMAGE-SYM-DATA)
+                      ;; Data symbols have no process address and cannot be branch targets.
+                      (image-put4! text offset 0xd4200000)
+                      (do
+                        (image-put4! text offset 0x58000050)
+                        (image-put4! text (+ offset 4) 0xd61f0200)
+                        (set! (primitive/cast (ptr i64)
+                                              (primitive/index text
+                                                               (+ offset 8)))
+                              (image-address im loaded (load i)))
+                        0))
+                  (set! (mut i) (+ (load i) 1)))))
+      (al-for [fixup (.fixups im)]
+              (let [f fixup
+                    pc (+ (primitive/cast i64 text) (.offset f))
+                    target (image-address im loaded (.symbol f))
+                    branch-target
+                      (if (and (= (.kind f) ENC-FIXUP-A64-BL26)
+                               (or (< (- target pc) -134217728)
+                                   (>= (- target pc) 134217728)))
+                          (+ (primitive/cast i64 text)
+                             (+ veneer-start (* (.symbol f) 16)))
+                          target)]
+                (if (or (< (.offset f) 0)
+                        (> (+ (.offset f) 4) (len (.text im))))
+                    (panic "image-install: code relocation outside text")
+                    0)
+                (image-put4! text
+                             (.offset f)
+                             (image-relocate-word (.kind f)
+                                                  (primitive/cast i64
+                                                                  (load (primitive/cast (ptr u32)
+                                                                                        (primitive/index text
+                                                                                                         (.offset f)))))
+                                                  pc
+                                                  branch-target))))
+      (sys_icache_invalidate text (primitive/cast u64 text-bytes))
+      (pthread_jit_write_protect_np 1)
+      (load loaded))))
+
+(defn image-install [(im (ptr CodeImage))] (-> InstalledImage)
+  (let [(mut bindings) (al-new [ImageBinding] (alloc/malloc-allocator))
+        loaded (image-install-bound im (load bindings))]
+    (al-free! (mut bindings))
+    loaded))
+
+(defn image-uninstall! [(loaded (ptr InstalledImage))] (-> i64)
+  (rt-code-unregister! (.code-id loaded))
+  (al-for [provider (.dependencies loaded)] (rt-code-pin! provider false))
+  (if (!= (munmap (.text loaded) (.text-bytes loaded)) (primitive/cast i32 0))
+      (panic "image-uninstall!: munmap failed")
+      0)
+  (set! (.installations (.owner loaded)) (- (.installations (.owner loaded)) 1))
+  (al-free! (mut (.imports loaded)))
+  (al-free! (mut (.dependencies loaded)))
+  (set! loaded (primitive/zeroed InstalledImage))
+  0)
+
+(defn image-require-installed! [(loaded (ptr InstalledImage))] (-> i64)
+  (match (rt-code-find (.code-id loaded))
+    (Some [range]
+          (let [r range]
+            (if (!= (.text r) (primitive/cast i64 (.text loaded)))
+                (panic "image-require-installed!: installation does not own its code range")
+                0)))
+    (None [] (panic "image-require-installed!: code is not installed"))))

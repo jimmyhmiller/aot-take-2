@@ -1,0 +1,143 @@
+;; The image entry ABI: versioned signature classes, their description, and compatibility between an export and an import.
+
+(module aot.codegen.image.abi)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.slice" :use [slice-new slice-data])
+(import "coil.mem" :as mem)
+(import "aot.util.panic" :use *)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "aot.codegen.objfile" :use *)
+(import "aot.node.node" :use [arena-external-named])
+(import "aot.type.type" :use *)
+(import "aot.rt.rt" :use [rt-read-u32])
+(import "aot.codegen.image" :use [image-copy])
+
+;; Simple serializes declared function types beside external names; our native-only artifact
+;; also needs an arena-independent machine contract before IR serialization exists. These bytes
+;; describe representation and calling convention, not nominal types or value-range proofs.
+;; Version 1 fixes Darwin/AArch64's register banks, 64-bit stack slots, heap register, NaN boxes,
+;; and the current GC/raw-pointer distinction. A change to those contracts bumps this version.
+(const IMAGE-ABI-VERSION 5)
+
+(const IMAGE-ABI-HEADER 20)
+
+(const IMAGE-ABI-INTERNAL 1)
+
+(const IMAGE-ABI-HOST-ENTRY 2)
+
+(const IMAGE-ABI-UNKNOWN 0)
+
+(const IMAGE-ABI-INTEGER 1)
+
+(const IMAGE-ABI-FLOAT 2)
+
+(const IMAGE-ABI-BOXED 3)
+
+(const IMAGE-ABI-MANAGED 4)
+
+(const IMAGE-ABI-HOST-POINTER 5)
+
+(const IMAGE-ABI-CODE-POINTER 6)
+
+(const IMAGE-ABI-BOXED-SCALAR 7)
+
+(defn image-abi-class [(t i64)] (-> i64)
+  (if (ty-int? t)
+      IMAGE-ABI-INTEGER
+      (if (ty-flt? t)
+          IMAGE-ABI-FLOAT
+          (if (ty-dyn? t)
+              (if (ty-dyn-may-reference? t)
+                  IMAGE-ABI-BOXED
+                  IMAGE-ABI-BOXED-SCALAR)
+              (if (ty-memptr? t)
+                  IMAGE-ABI-MANAGED
+                  (if (ty-funptr? t)
+                      IMAGE-ABI-CODE-POINTER
+                      (if (ty-ptr? t) IMAGE-ABI-HOST-POINTER IMAGE-ABI-UNKNOWN)))))))
+
+(defn image-abi-describe [(signature i64) (host-entry bool)] (-> (slice u8))
+  (if (or (not (ty-tuple? signature)) (= (ty-tuple-len signature) 0))
+      (panic "image-abi-describe: missing callable signature")
+      0)
+  (let [(mut bytes) (al-new [u8] (compiler-allocator))
+        (mut i) 0]
+    (obj-put-slice! (mut bytes) "AOTCABI\0")
+    (obj-put4! (mut bytes) IMAGE-ABI-VERSION)
+    (obj-put4! (mut bytes)
+               (if host-entry IMAGE-ABI-HOST-ENTRY IMAGE-ABI-INTERNAL))
+    (obj-put4! (mut bytes) (- (ty-tuple-len signature) 1))
+    (loop (if (>= (load i) (ty-tuple-len signature))
+              (break 0)
+              (do
+                (obj-put1! (mut bytes)
+                           (image-abi-class (ty-tuple-at signature (load i))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (let [owned (image-copy (al-slice (load bytes)))]
+      (al-free! (mut bytes))
+      owned)))
+
+(defn image-abi-compatible? [(expected (slice u8)) (actual (slice u8))] (-> bool)
+  (let [(mut valid)
+          (and (> (len expected) IMAGE-ABI-HEADER)
+               (= (len expected) (len actual))
+               (= (slice-new (slice-data expected) IMAGE-ABI-HEADER)
+                  (slice-new (slice-data actual) IMAGE-ABI-HEADER))
+               (= (slice-new (slice-data expected) 8) "AOTCABI\0")
+               (= (rt-read-u32 (slice-data expected) 8) IMAGE-ABI-VERSION)
+               (= (rt-read-u32 (slice-data expected) 12) IMAGE-ABI-INTERNAL)
+               (= (rt-read-u32 (slice-data expected) 16)
+                  (- (len expected) (+ IMAGE-ABI-HEADER 1))))
+        (mut i) IMAGE-ABI-HEADER]
+    (loop (if (or (not (load valid)) (>= (load i) (len expected)))
+              (break 0)
+              (let [want (primitive/cast i64 (get expected (load i)))
+                    have (primitive/cast i64 (get actual (load i)))]
+                ;; A provider may return a scalar box to a general boxed caller. Conversely,
+                ;; an argument known to be a scalar box may enter a general boxed parameter.
+                ;; The reverse directions could hide a managed reference from a stack map.
+                (if (or (= want IMAGE-ABI-UNKNOWN)
+                        (> want IMAGE-ABI-BOXED-SCALAR)
+                        (= have IMAGE-ABI-UNKNOWN)
+                        (> have IMAGE-ABI-BOXED-SCALAR)
+                        (not (or (= want have)
+                                 (if (= (load i) IMAGE-ABI-HEADER)
+                                     (and (= want IMAGE-ABI-BOXED)
+                                          (= have IMAGE-ABI-BOXED-SCALAR))
+                                     (and (= want IMAGE-ABI-BOXED-SCALAR)
+                                          (= have IMAGE-ABI-BOXED))))))
+                    (set! (mut valid) false)
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load valid)))
+
+(defn image-import-abi [(name (slice u8))] (-> (slice u8))
+  (match (arena-external-named name)
+    (Some [decl] (let [d decl] (image-abi-describe (.signature d) false)))
+    ;; Runtime imports are resolved exclusively by this executable's fixed runtime table.
+    (None [] (image-copy ""))))
+
+;; Validate the serialized generic entry contract without consulting compiler-generation types.
+;; Result is a completion box; arguments are callee/this/new.target boxes, count, managed
+;; overflow vector and three direct boxed arguments (callable ABI version 2).
+(defn image-abi-script-entry? [(abi (slice u8))] (-> bool)
+  (and (= (len abi) (+ IMAGE-ABI-HEADER 9))
+       (= (slice-new (slice-data abi) 8) "AOTCABI\0")
+       (= (rt-read-u32 (slice-data abi) 8) IMAGE-ABI-VERSION)
+       (= (rt-read-u32 (slice-data abi) 12) IMAGE-ABI-INTERNAL)
+       (= (rt-read-u32 (slice-data abi) 16) 8)
+       (or (= (primitive/cast i64 (get abi 20)) IMAGE-ABI-BOXED)
+           (= (primitive/cast i64 (get abi 20)) IMAGE-ABI-BOXED-SCALAR))
+       (= (primitive/cast i64 (get abi 21)) IMAGE-ABI-BOXED)
+       (= (primitive/cast i64 (get abi 22)) IMAGE-ABI-BOXED)
+       (= (primitive/cast i64 (get abi 23)) IMAGE-ABI-BOXED)
+       (= (primitive/cast i64 (get abi 24)) IMAGE-ABI-INTEGER)
+       (= (primitive/cast i64 (get abi 25)) IMAGE-ABI-MANAGED)
+       (= (primitive/cast i64 (get abi 26)) IMAGE-ABI-BOXED)
+       (= (primitive/cast i64 (get abi 27)) IMAGE-ABI-BOXED)
+       (= (primitive/cast i64 (get abi 28)) IMAGE-ABI-BOXED)))
