@@ -1,0 +1,497 @@
+;; Lowering of object, array and template literals.
+
+(module aot.parse.lower.literal)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.shape" :use *)
+(import "aot.heap" :use *)
+(import "aot.jsl.lower" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.realm.demand" :use *)
+(import "aot.parse.lower.jsl" :use *)
+(import "aot.parse.lower.function" :use *)
+(import "aot.parse.lower.exception" :use *)
+(import "aot.parse.lower.class" :use *)
+(import "aot.parse.lower.expression" :use *)
+
+;; Declare the shapes the source spells out — object literals and the realm's global object —
+;; before lowering, so a literal's layout is one canonical transition path however many places
+;; build it. Nothing else is declared: a named write to an owner the compiler cannot see is a
+;; runtime transition (`aot.rt.shapes`), never a compile-time one. The closure this pass once
+;; took over every written key multiplied the shape universe by every permutation of those keys
+;; (docs/DECISIONS.md, generic property access) and could not even close it.
+(defn syntax-declare-object-shapes! [] (-> i64)
+  (let [(mut i) 0
+        (mut declared) 0]
+    (loop (if (>= (load i) (len (.exprs (parser-state))))
+              (break 0)
+              (let [x (get (.exprs (parser-state)) (load i))]
+                (match (.node x)
+                  (SxObject [entries]
+                            (let [(mut shape) SHAPE-EMPTY]
+                              ;; The object-initializer `__proto__` setter mutates the stable
+                              ;; prototype slot; it does not define a data property or create a
+                              ;; hidden-class transition. Computed and spread entries refuse
+                              ;; lowering, so they declare no layout here.
+                              (al-for [entry entries]
+                                      (match entry
+                                        (PropValue [prop-key value]
+                                                   (match prop-key
+                                                     (KeyNamed [key]
+                                                               (if (= (shape-key-name key)
+                                                                      "__proto__")
+                                                                   0
+                                                                   (set! (mut shape)
+                                                                         (shape-transition (load shape)
+                                                                                           (shape-key-name key)))))
+                                                     (_ 0)))
+                                        (_ 0)))
+                              (set! (mut declared) (+ (load declared) 1))))
+                  (_ 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    ;; The realm's global object is built by adding every var-like global in table order; a
+    ;; lexically resolved global is a field access over that one hidden class.
+    (if (> (len (.globals (parser-state))) 0)
+        (let [(mut shape) SHAPE-EMPTY]
+          (al-for [g (.globals (parser-state))]
+                  (let [binding g]
+                    (set! (mut shape)
+                          (shape-transition (load shape) (.name binding)))))
+          (set! (mut declared) (+ (load declared) 1))
+          0)
+        0)
+    (load declared)))
+
+(defn lower-singleton [(name (slice u8))] (-> (dyn NodeOps))
+  (let [scope (parser-node (.current-scope (parser-state)))
+        args (al-new [(dyn NodeOps)] (compiler-allocator))
+        result
+          (jsl-lower-macro-values name
+                                  args
+                                  (scope-ctrl scope)
+                                  (scope-mem scope))]
+    (parser-set-current-ctrl! (.ctrl result))
+    (scope-set-mem! scope (.mem result))
+    (.value result)))
+
+;; OrdinaryObjectCreate(%Object.prototype%) for a literal or a function's `prototype` object: the
+;; raw object with %Object.prototype% as its [[Prototype]] when the realm materialized `Object`
+;; (docs/DECISIONS.md, function objects), else the raw object whose prototype stays null.
+(defn lower-fresh-ordinary-object [] (-> (dyn NodeOps))
+  (lower-fresh-ordinary-object-layout SHAPE-EMPTY))
+
+(defn lower-fresh-ordinary-object-layout [(layout i64)] (-> (dyn NodeOps))
+  (let [scope (parser-node (.current-scope (parser-state)))
+        raw
+          (if (= layout SHAPE-EMPTY)
+              (lower-jsl-nullary "JsNewObjectRaw")
+              (let [(mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+                (push! (mut args) (con-int layout))
+                (let [r
+                        (jsl-lower-macro-values "JsNewObjectLiteralRaw"
+                                                (load args)
+                                                (parser-node (.current-ctrl (parser-state)))
+                                                (scope-mem scope))]
+                  (al-free! (mut args))
+                  (parser-set-current-ctrl! (.ctrl r))
+                  (scope-set-mem! scope (.mem r))
+                  (.value r))))]
+    (if (>= (parser-intrinsic-prototype-entry "Object.prototype") 0)
+        (let [(mut sargs) (al-new [(dyn NodeOps)] (compiler-allocator))]
+          (n-keep! raw)
+          (push! [(dyn NodeOps)] (mut sargs) raw)
+          (push! [(dyn NodeOps)]
+                 (mut sargs)
+                 (box-make (staticref-make (heap-intrinsic-entry "Object.prototype")
+                                           REP-OBJECT)))
+          (let [linked
+                  (jsl-lower-macro-values "JsSetObjectLiteralPrototype"
+                                          (load sargs)
+                                          (parser-node (.current-ctrl (parser-state)))
+                                          (scope-mem scope))]
+            (al-free! [(dyn NodeOps)] (mut sargs))
+            (parser-set-current-ctrl! (.ctrl linked))
+            (scope-set-mem! scope (.mem linked))
+            (n-unkeep! raw)
+            (.value linked)))
+        raw)))
+
+;; Only fixed data keys participate in the private backing plan. Duplicates retain the first
+;; slot and are still evaluated/stored every time. __proto__ is not an own data property.
+;; Unsupported dynamic forms continue to refuse; this never approximates their semantics.
+;; An accessor has no data slot: the plan stops at the first one, so every later key is added after
+;; it, in source order, and insertion order stays what the definitions make it.
+(defn lower-object-literal-layout [(entries (ArrayList ObjectEntry))] (-> i64)
+  (let [(mut shape) SHAPE-EMPTY
+        (mut planning) true]
+    (al-for [entry entries]
+            (match entry
+              (PropValue [key value]
+                         (match key
+                           (KeyNamed [k]
+                                     (if (or (not (load planning))
+                                             (= (shape-key-name k) "__proto__"))
+                                         0
+                                         (do
+                                           (set! (mut shape)
+                                                 (shape-transition (load shape)
+                                                                   (shape-key-name k)))
+                                           0)))
+                           ;; A computed key is not known here, so the fixed layout stops at it and every later
+                           ;; definition is an ordinary one.
+                           (KeyComputed [e] (do (set! (mut planning) false) 0))))
+              (PropMethod [key fun]
+                          (match key
+                            (KeyNamed [k]
+                                      (match (.kind (syntax-fun-ptr fun))
+                                        (FunMethod []
+                                                   (if (load planning)
+                                                       (do
+                                                         (set! (mut shape)
+                                                               (shape-transition (load shape)
+                                                                                 (shape-key-name k)))
+                                                         0)
+                                                       0))
+                                        (_ (do (set! (mut planning) false) 0))))
+                            (KeyComputed [e] (do (set! (mut planning) false) 0))))
+              (PropSpread [expr] (do (set! (mut planning) false) 0))
+              (PropCoverInit [name init]
+                             (broken "lower-object-literal: CoverInitializedName survived validation"))))
+    (load shape)))
+
+(defn lower-object-literal [(entries (ArrayList ObjectEntry))] (-> (dyn NodeOps))
+  (let [scope (parser-node (.current-scope (parser-state)))
+        created
+          (lower-fresh-ordinary-object-layout (lower-object-literal-layout entries))
+        (mut object-nid) (n-nid created)
+        ;; Keys an accessor has defined so far: a later data definition of one replaces the accessor.
+        (mut accessor-keys) (al-new [i64] (compiler-allocator))]
+    (al-for [entry entries]
+            (match entry
+              (PropValue [prop-key value-id]
+                         (match prop-key
+                           ;; `[expr]: value` (§13.2.5.5): the key is evaluated and converted before
+                           ;; the value, and the property is an ordinary definition.
+                           (KeyComputed [e]
+                                        (let [key (lower-literal-computed-key e)]
+                                          (n-keep! key)
+                                          (let [value
+                                                  (lower-syntax-expr value-id)]
+                                            (set! (mut object-nid)
+                                                  (lower-literal-computed-data! (load object-nid)
+                                                                                key
+                                                                                value))
+                                            (n-unkeep! key)
+                                            0)))
+                           (_ (let [key (lower-literal-named-key prop-key)
+                                    value (lower-syntax-expr value-id)]
+                                (set! (mut object-nid)
+                                      (lower-literal-data! (load object-nid)
+                                                           key
+                                                           value
+                                                           (load accessor-keys)))
+                                0))))
+              (PropMethod [prop-key fun]
+                          (match prop-key
+                            (KeyComputed [e]
+                                         (let [key
+                                                 (lower-literal-computed-key e)]
+                                           (n-keep! key)
+                                           (let [function
+                                                   (lower-function-object fun)
+                                                 setter
+                                                   (match (.kind (syntax-fun-ptr fun))
+                                                     (FunSetter [] 1)
+                                                     (_ 0))
+                                                 accessor
+                                                   (match (.kind (syntax-fun-ptr fun))
+                                                     (FunGetter [] true)
+                                                     (FunSetter [] true)
+                                                     (_ false))]
+                                             (if accessor
+                                                 (lower-literal-computed-accessor! (load object-nid)
+                                                                                   key
+                                                                                   function
+                                                                                   setter)
+                                                 (set! (mut object-nid)
+                                                       (lower-literal-computed-data! (load object-nid)
+                                                                                     key
+                                                                                     function)))
+                                             (n-unkeep! key)
+                                             0)))
+                            (_ (let [key (lower-literal-named-key prop-key)
+                                     function (lower-function-object fun)]
+                                 (match (.kind (syntax-fun-ptr fun))
+                                   (FunMethod []
+                                              (do
+                                                (set! (mut object-nid)
+                                                      (lower-literal-data! (load object-nid)
+                                                                           key
+                                                                           function
+                                                                           (load accessor-keys)))
+                                                0))
+                                   (_ (let [setter
+                                              (match (.kind (syntax-fun-ptr fun))
+                                                (FunSetter [] 1)
+                                                (_ 0))
+                                            (mut args)
+                                              (al-new [(dyn NodeOps)]
+                                                      (compiler-allocator))]
+                                        (push! [(dyn NodeOps)]
+                                               (mut args)
+                                               (parser-node (load object-nid)))
+                                        (push! [(dyn NodeOps)]
+                                               (mut args)
+                                               (keyref-make key))
+                                        (push! [(dyn NodeOps)]
+                                               (mut args)
+                                               function)
+                                        (push! [(dyn NodeOps)]
+                                               (mut args)
+                                               (con-int setter))
+                                        (let [r
+                                                (lower-jsl-call-values "JsDefineLiteralAccessor"
+                                                                       (load args))]
+                                          (al-free! [(dyn NodeOps)] (mut args))
+                                          (parser-set-current-ctrl! (.ctrl r))
+                                          (scope-set-mem! scope (.mem r))
+                                          (lower-completion! (.value r))
+                                          (push! [i64] (mut accessor-keys) key)
+                                          0))))))))
+              (PropSpread [expr]
+                          (let [source (lower-syntax-expr expr)]
+                            (n-keep! source)
+                            (let [target
+                                    (match (arena-node (load object-nid))
+                                      (Some [n] n)
+                                      (None [] (unreachable-node)))]
+                              (lower-completion! (lower-jsl-values2 "JsCopyLiteralProperties"
+                                                                    target
+                                                                    source))
+                              (n-unkeep! source)
+                              0)))
+              (PropCoverInit [name init]
+                             (broken "lower-object-literal: CoverInitializedName survived validation"))))
+    (al-free! [i64] (mut accessor-keys))
+    (let [(mut finish-args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+      (push! [(dyn NodeOps)]
+             (mut finish-args)
+             (match (arena-node (load object-nid))
+               (Some [n] n)
+               (None [] (unreachable-node))))
+      (let [finished
+              (jsl-lower-macro-values "JsFinishObjectLiteral"
+                                      (load finish-args)
+                                      (parser-node (.current-ctrl (parser-state)))
+                                      (scope-mem scope))]
+        (.value finished)))))
+
+(defn lower-literal-named-key [(prop-key PropKey)] (-> i64)
+  (match prop-key
+    (KeyNamed [k] k)
+    (KeyComputed [e]
+                 (do
+                   (unimplemented "computed property keys"
+                                  "docs/GAPS.md — property keys")
+                   0))))
+
+;; A computed key of an object literal: its value as a primitive, converted where it is written
+;; (§13.2.5.5 step 1), so the interning at the definition cannot fail.
+(defn lower-literal-computed-key [(expr i64)] (-> (dyn NodeOps))
+  (lower-completion! (lower-jsl-values1 "JsComputedKeyPrimitive"
+                                        (lower-syntax-expr expr))))
+
+;; `[k]: value` and `[k]() {}`: an ordinary definition on the literal, whatever the key turns out to
+;; be — a computed `__proto__` is a data property, not the literal's prototype.
+(defn lower-literal-computed-data! [(object-nid i64)
+                                    (key (dyn NodeOps))
+                                    (value (dyn NodeOps))] (-> i64)
+  (let [scope (parser-node (.current-scope (parser-state)))
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (push! [(dyn NodeOps)] (mut args) (parser-node object-nid))
+    (push! [(dyn NodeOps)] (mut args) key)
+    (push! [(dyn NodeOps)] (mut args) value)
+    (let [r (lower-jsl-values "JsDefineLiteralDataComputed" (load args))]
+      (al-free! [(dyn NodeOps)] (mut args))
+      (lower-completion! r)
+      object-nid)))
+
+(defn lower-literal-computed-accessor! [(object-nid i64)
+                                        (key (dyn NodeOps))
+                                        (function (dyn NodeOps))
+                                        (setter i64)] (-> i64)
+  (let [scope (parser-node (.current-scope (parser-state)))
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (push! [(dyn NodeOps)] (mut args) (parser-node object-nid))
+    (push! [(dyn NodeOps)] (mut args) key)
+    (push! [(dyn NodeOps)] (mut args) function)
+    (push! [(dyn NodeOps)] (mut args) (con-int setter))
+    (let [r (lower-jsl-values "JsDefineLiteralAccessorComputed" (load args))]
+      (al-free! [(dyn NodeOps)] (mut args))
+      (lower-completion! r)
+      0)))
+
+;; `key: value` or `key() {}` on the literal under construction: CreateDataPropertyOrThrow, or
+;; `__proto__: value`'s [[Prototype]]. The raw object node the next definition continues from.
+(defn lower-literal-data! [(object-nid i64)
+                           (key i64)
+                           (value (dyn NodeOps))
+                           (accessor-keys (ArrayList i64))] (-> i64)
+  (let [scope (parser-node (.current-scope (parser-state)))
+        proto (= (shape-key-name key) "__proto__")
+        (mut replaces) false
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (al-for [k accessor-keys] (if (= k key) (set! (mut replaces) true) 0))
+    (push! [(dyn NodeOps)] (mut args) (parser-node object-nid))
+    (if proto 0 (push! [(dyn NodeOps)] (mut args) (keyref-make key)))
+    (push! [(dyn NodeOps)] (mut args) value)
+    (if (and (load replaces) (not proto))
+        ;; An accessor of this key was defined earlier in the literal.
+        (let [r (lower-jsl-call-values "JsDefineLiteralData" (load args))]
+          (al-free! [(dyn NodeOps)] (mut args))
+          (parser-set-current-ctrl! (.ctrl r))
+          (scope-set-mem! scope (.mem r))
+          (lower-completion! (.value r))
+          object-nid)
+        (let [defined
+                (jsl-lower-macro-values (if proto
+                                            "JsSetObjectLiteralPrototype"
+                                            "JsCreateDataPropertyNamed")
+                                        (load args)
+                                        (parser-node (.current-ctrl (parser-state)))
+                                        (scope-mem scope))]
+          (al-free! [(dyn NodeOps)] (mut args))
+          (parser-set-current-ctrl! (.ctrl defined))
+          (scope-set-mem! scope (.mem defined))
+          (n-nid (.value defined))))))
+
+;; ArrayLiteral (ECMA-262 §13.2.4.2): ArrayCreate(0), then each element is CreateDataProperty at the
+;; next index and each elision advances the length; the JSL (`jsl/compiler/array.jsl`) owns every
+;; step. Spread refuses by name until iteration exists.
+(defn lower-array-literal [(elements (ArrayList ArrayElement))] (-> (dyn NodeOps))
+  (let [(mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (push! [(dyn NodeOps)] (mut args) (con-int 0))
+    (let [scope (parser-node (.current-scope (parser-state)))
+          created
+            (jsl-lower-macro-values "JsNewArray"
+                                    (load args)
+                                    (parser-node (.current-ctrl (parser-state)))
+                                    (scope-mem scope))
+          (mut array-nid) (n-nid (.value created))
+          (mut index) 0
+          ;; Once a spread has run, the syntactic position no longer names the element's index.
+          (mut spread-seen) false]
+      (al-free! [(dyn NodeOps)] (mut args))
+      (parser-set-current-ctrl! (.ctrl created))
+      (scope-set-mem! scope (.mem created))
+      (al-for [element elements]
+              (do
+                (match element
+                  (ElemHole []
+                            (let [(mut hargs)
+                                    (al-new [(dyn NodeOps)]
+                                            (compiler-allocator))
+                                  scope2
+                                    (parser-node (.current-scope (parser-state)))]
+                              (push! [(dyn NodeOps)]
+                                     (mut hargs)
+                                     (parser-node (load array-nid)))
+                              (let [r
+                                      (jsl-lower-macro-values "JsArrayLiteralHole"
+                                                              (load hargs)
+                                                              (parser-node (.current-ctrl (parser-state)))
+                                                              (scope-mem scope2))]
+                                (al-free! [(dyn NodeOps)] (mut hargs))
+                                (parser-set-current-ctrl! (.ctrl r))
+                                (scope-set-mem! scope2 (.mem r))
+                                (set! (mut array-nid) (n-nid (.value r))))))
+                  (ElemExpr [expr]
+                            (if (load spread-seen)
+                                ;; After a spread the position is the array's own length.
+                                (let [array (parser-node (load array-nid))]
+                                  (n-keep! array)
+                                  (let [value (lower-syntax-expr expr)
+                                        appended
+                                          (lower-completion! (lower-jsl-values2 "JsArrayAppend"
+                                                                                array
+                                                                                value))]
+                                    (n-unkeep! array)
+                                    (set! (mut array-nid) (n-nid appended))
+                                    0))
+                                (let [array (parser-node (load array-nid))]
+                                  (n-keep! array)
+                                  (let [value (lower-syntax-expr expr)
+                                        (mut eargs)
+                                          (al-new [(dyn NodeOps)]
+                                                  (compiler-allocator))
+                                        scope2
+                                          (parser-node (.current-scope (parser-state)))]
+                                    (n-keep! value)
+                                    (push! [(dyn NodeOps)] (mut eargs) array)
+                                    (push! [(dyn NodeOps)]
+                                           (mut eargs)
+                                           (con-int (load index)))
+                                    (push! [(dyn NodeOps)] (mut eargs) value)
+                                    (let [r
+                                            (jsl-lower-macro-values "JsArrayLiteralElement"
+                                                                    (load eargs)
+                                                                    (parser-node (.current-ctrl (parser-state)))
+                                                                    (scope-mem scope2))]
+                                      (al-free! [(dyn NodeOps)] (mut eargs))
+                                      (parser-set-current-ctrl! (.ctrl r))
+                                      (scope-set-mem! scope2 (.mem r))
+                                      (n-unkeep! value)
+                                      (n-unkeep! array)
+                                      (set! (mut array-nid) (n-nid (.value r))))))))
+                  ;; `[...x]` (§13.2.4.2 step 5): the iterable is walked to exhaustion and each
+                  ;; value appended, so the next element lands where the spread left off. That is
+                  ;; also why a literal with a spread cannot use the fixed index above.
+                  (ElemSpread [expr]
+                              (let [array (parser-node (load array-nid))]
+                                (n-keep! array)
+                                (let [iterable (lower-syntax-expr expr)
+                                      spread
+                                        (lower-completion! (lower-jsl-values2 "JsArraySpreadInto"
+                                                                              array
+                                                                              iterable))]
+                                  (n-unkeep! array)
+                                  (set! (mut array-nid) (n-nid spread))
+                                  (set! (mut spread-seen) true)
+                                  0))))
+                (set! (mut index) (+ (load index) 1))
+                0))
+      (parser-node (load array-nid)))))
+
+;; A template with substitutions (§13.2.8.6): the first cooked string, then for each substitution its
+;; value, ToString'd at once (an object through ToPrimitive, which can throw; a Symbol is a TypeError),
+;; and the next cooked string (`JsTemplateAppend`).
+(defn lower-template [(quasis (ArrayList i64)) (substitutions (ArrayList i64))] (-> (dyn NodeOps))
+  (let [(mut acc) (lower-syntax-expr (get quasis 0))
+        (mut i) 0]
+    (loop (if (>= (load i) (len substitutions))
+              (break 0)
+              (do
+                (n-keep! (load acc))
+                (let [value (lower-syntax-expr (get substitutions (load i)))]
+                  (n-keep! value)
+                  (let [quasi (lower-syntax-expr (get quasis (+ (load i) 1)))]
+                    (n-unkeep! value)
+                    (n-unkeep! (load acc))
+                    (set! (mut acc)
+                          (lower-completion! (lower-jsl-values3 "JsTemplateAppend"
+                                                                (load acc)
+                                                                value
+                                                                quasi)))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load acc)))

@@ -1,0 +1,219 @@
+;; Global declaration instantiation: what a Script's declarations do to the realm when it starts.
+
+(module aot.parse.realm.instantiate)
+(import "aot.codegen.compunit"
+        :use
+        [CuScriptDecl
+         CU-SCRIPT-VAR
+         CU-SCRIPT-FUNCTION
+         CU-SCRIPT-LET
+         CU-SCRIPT-CONST
+         CU-SCRIPT-CLASS])
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use [hm-new hm-contains? hm-free!])
+(import "coil.str" :use [str-keyops-borrowed])
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.type.type" :use *)
+(import "aot.shape" :use *)
+(import "aot.jsl.lower" :use *)
+(import "aot.jsl.reader" :use [jsl-definition-form jsl-form-macro?])
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.analysis.declarations" :use *)
+(import "aot.parse.realm.globals" :use *)
+(import "aot.parse.lower.name" :use *)
+(import "aot.parse.lower.jsl" :use *)
+(import "aot.parse.lower.function" :use *)
+(import "aot.parse.lower.exception" :use *)
+
+;; Closed programs retain their static var/first-function setup. Reusable Script units perform
+;; object-record declaration checks and creation through their retained initialization entries.
+(defn lower-global-instantiation! [(root-index i64)] (-> i64)
+  (let [f (syntax-fun-at root-index)]
+    (if (.script-unit (parser-state))
+        (lower-script-object-instantiation! (.script f))
+        (do
+          ;; A Script's `let`, `const` and `class` are realm lexical bindings in both unit kinds: a
+          ;; function of the Script reads one by name at run time, which a Scope value living in the
+          ;; initializer could never give it.
+          (al-for [entry
+                   (get (.script-declarations (parser-state)) (.script f))]
+                  (let [e entry]
+                    (if (or (= (.kind e) CU-SCRIPT-LET)
+                            (= (.kind e) CU-SCRIPT-CONST)
+                            (= (.kind e) CU-SCRIPT-CLASS))
+                        (lower-script-create-lexical-slot! (.name e)
+                                                           (!= (.kind e)
+                                                               CU-SCRIPT-CONST))
+                        0)))
+          (if (= (.script f) 0)
+              0
+              (do
+                (al-for [entry
+                         (get (.script-declarations (parser-state)) (.script f))]
+                        (let [e entry]
+                          (if (= (.kind e) CU-SCRIPT-FUNCTION)
+                              (lower-global-store! (.name e)
+                                                   (lower-function-object (syntax-script-declared-function (.script f)
+                                                                                                           (.function-ordinal e))))
+                              0)))
+                0))))))
+
+;; Declaration effects use the same completion/control/memory protocol as source expressions.
+(defn lower-script-declaration-effect! [(operation (slice u8))
+                                        (name (slice u8))
+                                        (value (Option (dyn NodeOps)))] (-> i64)
+  (match value (Some [v] (n-keep! v)) (None [] 0))
+  (let [scope (parser-node (.current-scope (parser-state)))
+        slot
+          (if (= operation "JsInitializeGlobalLexicalBinding")
+              (lower-known-lexical-slot name)
+              (None [(dyn NodeOps)]))
+        selected
+          (match slot
+            (Some [_] "JsInitializeGlobalLexicalSlot")
+            (None [] operation))
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (push! [(dyn NodeOps)]
+           (mut args)
+           (match slot
+             (Some [s] s)
+             (None [] (keyref-make (shape-key-intern name)))))
+    (match value (Some [v] (push! [(dyn NodeOps)] (mut args) v)) (None [] 0))
+    (let [r
+            (match (jsl-definition-form selected)
+              (None []
+                    (do
+                      (panic "lower-script-declaration-effect!: missing JSL operation")
+                      (jsl-expr-result (unreachable-node)
+                                       (scope-ctrl scope)
+                                       (scope-mem scope))))
+              (Some [form]
+                    (if (jsl-form-macro? form)
+                        (jsl-lower-macro-values selected
+                                                (load args)
+                                                (scope-ctrl scope)
+                                                (scope-mem scope))
+                        (lower-jsl-call-values selected (load args)))))]
+      (al-free! (mut args))
+      (parser-set-current-ctrl! (.ctrl r))
+      (scope-set-mem! scope (.mem r))
+      (lower-completion! (.value r))
+      (match value (Some [v] (n-unkeep! v)) (None [] 0))
+      0)))
+
+(defn lower-script-create-lexical-slot! [(name (slice u8)) (writable bool)] (-> i64)
+  (let [scope (parser-node (.current-scope (parser-state)))
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (push! (mut args) (keyref-make (shape-key-intern name)))
+    (push! (mut args) (con-int (if writable 1 0)))
+    (let [r
+            (jsl-lower-macro-values "JsCreateGlobalLexicalSlot"
+                                    (load args)
+                                    (scope-ctrl scope)
+                                    (scope-mem scope))]
+      (parser-set-current-ctrl! (.ctrl r))
+      (scope-set-mem! scope (.mem r))
+      (scope-define! scope
+                     (lower-lexical-slot-name name)
+                     (ty-int-range 1 0x7fffffffffffffff)
+                     true
+                     (.value r))
+      (al-free! (mut args))
+      0)))
+
+;; Simple's parseDeclaration parses the initializer (or selects the declared type's default),
+;; derives finality/inferred type, converts the value, then Scope.define rejects a repeated name.
+;; JavaScript Script units execute the object-record portion of GlobalDeclarationInstantiation
+;; (ECMA-262 16.1.7):
+;; select last function declarations in reverse order, check those names, check vars, then define
+;; selected functions in source order and create vars. No store precedes the complete check pass.
+;; The name set borrows parser-owned bytes only for this lowering; emitted keys are symbolic.
+;; Retained root lexicals use realm cells rather than Scope SSA values. Check existing lexical
+;; names/restricted properties, then var conflicts before function/var admissibility; only after
+;; the complete check pass create uninitialized lexical cells, functions, and vars, in that order.
+(defn lower-script-object-instantiation! [(script i64)] (-> i64)
+  (let [entries (get (.script-declarations (parser-state)) script)
+        (mut names)
+          (hm-new [(slice u8) i64] (compiler-allocator) (str-keyops-borrowed))
+        (mut functions) (al-new [CuScriptDecl] (compiler-allocator))
+        (mut variables) (al-new [(slice u8)] (compiler-allocator))
+        (mut i) (len entries)]
+    (al-for [entry entries]
+            (let [e entry]
+              (if (or (= (.kind e) CU-SCRIPT-LET)
+                      (= (.kind e) CU-SCRIPT-CONST)
+                      (= (.kind e) CU-SCRIPT-CLASS))
+                  (lower-script-declaration-effect! "JsCheckGlobalLexicalDeclaration"
+                                                    (.name e)
+                                                    (None [(dyn NodeOps)]))
+                  0)))
+    (al-for [entry entries]
+            (let [e entry]
+              (if (or (= (.kind e) CU-SCRIPT-VAR)
+                      (= (.kind e) CU-SCRIPT-FUNCTION))
+                  (lower-script-declaration-effect! "JsCheckGlobalVarLexicalConflict"
+                                                    (.name e)
+                                                    (None [(dyn NodeOps)]))
+                  0)))
+    (loop (if (= (load i) 0)
+              (break 0)
+              (do
+                (set! (mut i) (- (load i) 1))
+                (let [e (get entries (load i))]
+                  (if (and (= (.kind e) CU-SCRIPT-FUNCTION)
+                           (not (hm-contains? (load names) (.name e))))
+                      (do
+                        (set! (mut names) (.name e) 1)
+                        (push! [CuScriptDecl] (mut functions) e)
+                        (lower-script-declaration-effect! "JsCheckGlobalFunctionDeclaration"
+                                                          (.name e)
+                                                          (None [(dyn NodeOps)])))
+                      0))
+                (continue))))
+    (al-for [entry entries]
+            (let [e entry]
+              (if (and (= (.kind e) CU-SCRIPT-VAR)
+                       (not (hm-contains? (load names) (.name e))))
+                  (do
+                    (set! (mut names) (.name e) 1)
+                    (push! [(slice u8)] (mut variables) (.name e))
+                    (lower-script-declaration-effect! "JsCheckGlobalVarDeclaration"
+                                                      (.name e)
+                                                      (None [(dyn NodeOps)])))
+                  0)))
+    (al-for [entry entries]
+            (let [e entry]
+              (if (or (= (.kind e) CU-SCRIPT-LET)
+                      (= (.kind e) CU-SCRIPT-CONST)
+                      (= (.kind e) CU-SCRIPT-CLASS))
+                  (lower-script-create-lexical-slot! (.name e)
+                                                     (!= (.kind e)
+                                                         CU-SCRIPT-CONST))
+                  0)))
+    (set! (mut i) (len (load functions)))
+    (loop (if (= (load i) 0)
+              (break 0)
+              (do
+                (set! (mut i) (- (load i) 1))
+                (let [e (get (load functions) (load i))]
+                  (lower-script-declaration-effect! "JsCreateGlobalFunctionBinding"
+                                                    (.name e)
+                                                    (Some (lower-function-object (syntax-script-declared-function script
+                                                                                                                  (.function-ordinal e))))))
+                (continue))))
+    (al-for [name (load variables)]
+            (lower-script-declaration-effect! "JsCreateGlobalVarBinding"
+                                              name
+                                              (None [(dyn NodeOps)])))
+    (hm-free! (mut names))
+    (al-free! (mut functions))
+    (al-free! (mut variables))
+    0))

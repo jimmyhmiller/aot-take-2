@@ -1,0 +1,516 @@
+;; Early errors: the static semantics checked over a finished syntax tree.
+
+(module aot.parse.early)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use [subslice])
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.node.property" :use *)
+(import "aot.node.compare" :use *)
+(import "aot.node.gc" :use *)
+(import "aot.node.jsops" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.parse.lexer" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.grammar.pattern" :use *)
+(import "aot.parse.grammar.statement" :use *)
+(import "aot.parse.analysis.declarations" :use *)
+
+;; The raw spelling of a string-literal expression statement, or None for any other statement.
+(defn syntax-directive-text [(stmt-id i64)] (-> (Option (slice u8)))
+  (match (syntax-stmt-node stmt-id)
+    (SsExpr [expr]
+            (match (syntax-node expr)
+              (SxString [raw units legacy] (Some raw))
+              (_ (None [(slice u8)]))))
+    (_ (None [(slice u8)]))))
+
+;; Simple has no strict-mode counterpart. ECMAScript directive prologues are local to Script or
+;; FunctionBody: grouped strings, blocks and strings after a non-directive do not opt in. Script
+;; strictness is inherited by its source functions, never from a sibling function's directive.
+(defn syntax-body-strict? [(body (ArrayList i64))] (-> bool)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len body))
+              (break false)
+              (match (syntax-directive-text (get body (load i)))
+                (Some [raw]
+                      (if (= raw "use strict")
+                          (break true)
+                          (do (set! (mut i) (+ (load i) 1)) (continue))))
+                (None [] (break false)))))))
+
+(defn syntax-check-directives! [(body (ArrayList i64))] (-> i64)
+  (if (syntax-body-strict? body)
+      (do (set! (.strict-pending (parser-state)) true) 0)
+      0))
+
+(defn syntax-strict-reserved? [(name (slice u8))] (-> bool)
+  (or (= name "implements")
+      (= name "interface")
+      (= name "let")
+      (= name "package")
+      (= name "private")
+      (= name "protected")
+      (= name "public")
+      (= name "static")
+      (= name "yield")))
+
+(defn syntax-strict-binding! [(name (slice u8))] (-> i64)
+  (if (or (= name "eval") (= name "arguments") (syntax-strict-reserved? name))
+      (syntax-error! "parser: invalid strict-mode binding name")
+      0))
+
+;; Strict AssignmentTargetType: `eval`/`arguments` cannot be assigned, and a CallExpression
+;; target is an early error rather than the sloppy runtime ReferenceError.
+(defn syntax-check-strict-target! [(target i64)] (-> i64)
+  (match (syntax-node target)
+    (SxName [name] (syntax-strict-binding! name))
+    (SxCall [callee args optional]
+            (syntax-error! "parser: call expression is not a valid assignment target in strict code"))
+    (_ 0)))
+
+;; Inspect syntax rather than lowered values: unreachable code still has early errors and
+;; property IdentifierNames are not IdentifierReferences.
+(defn syntax-check-strict-expr! [(id i64)] (-> i64)
+  (let [x (syntax-at id)
+        (mut children) (al-new [i64] (compiler-allocator))]
+    (match (.node x)
+      (SxAssign [target value] (syntax-check-strict-target! target))
+      (SxDestructuringAssign [pattern value]
+                             (syntax-strict-pattern-names! pattern))
+      (SxCompoundAssign [op target value] (syntax-check-strict-target! target))
+      (SxLogicalAssign [predicate rhs-on-true target value]
+                       (syntax-check-strict-target! target))
+      (SxUpdate [op prefix target] (syntax-check-strict-target! target))
+      (SxString [raw units legacy]
+                (if legacy
+                    (syntax-error! "parser: legacy string escape in strict code")
+                    0))
+      (SxName [name]
+              (if (syntax-strict-reserved? name)
+                  (syntax-error! "parser: reserved identifier in strict code")
+                  0))
+      (SxDelete [operand]
+                (if (syntax-name? (syntax-ungroup-id operand))
+                    (syntax-error! "parser: delete of an unqualified identifier in strict code")
+                    0))
+      (SxNumber [value value-float rep]
+                (let [text (subslice [u8] (lex-source) (.lo x) (.hi x))]
+                  (if (and (> (len text) 1)
+                           (= (get text 0) (cast u8 48))
+                           (lex-digit? (get text 1)))
+                      (syntax-error! "parser: legacy numeric literal in strict code")
+                      0)))
+      (_ 0))
+    (syntax-expr-children! id (mut children))
+    (al-for [child (load children)] (syntax-check-strict-expr! child))
+    (al-free! [i64] (mut children))
+    0))
+
+(defn syntax-strict-pattern-names! [(pattern i64)] (-> i64)
+  (do
+    (match (syntax-pattern-node pattern)
+      (PatName [name] (syntax-strict-binding! name))
+      (PatTarget [expr] (syntax-check-strict-target! (syntax-ungroup-id expr)))
+      (PatObject [props rest]
+                 (do
+                   (al-for [prop props]
+                           (let [pp prop]
+                             (syntax-strict-pattern-names! (.pattern pp))))
+                   (match rest
+                     (Some [r] (syntax-strict-pattern-names! r))
+                     (None [] 0))))
+      (PatArray [elements rest]
+                (do
+                  (al-for [element elements]
+                          (match element
+                            (PatItem [pat] (syntax-strict-pattern-names! pat))
+                            (PatHole [] 0)))
+                  (match rest
+                    (Some [r] (syntax-strict-pattern-names! r))
+                    (None [] 0)))))
+    0))
+
+(defn syntax-check-strict-statements! [(stmts (ArrayList i64))] (-> i64)
+  (do
+    (al-for [id stmts]
+            (let [(mut exprs) (al-new [i64] (compiler-allocator))
+                  (mut children) (al-new [i64] (compiler-allocator))]
+              (match (syntax-stmt-node id)
+                (SsLet [name init final annotation]
+                       (syntax-strict-binding! name))
+                (SsVar [name init annotation] (syntax-strict-binding! name))
+                (SsLetPattern [pattern init final]
+                              (syntax-strict-pattern-names! pattern))
+                (SsVarPattern [pattern init]
+                              (syntax-strict-pattern-names! pattern))
+                (SsWith [object body]
+                        (syntax-error! "parser: with statement is not allowed in strict code"))
+                (SsLabeled [label body]
+                           (do
+                             (if (syntax-strict-reserved? label)
+                                 (syntax-error! "parser: reserved identifier in strict code")
+                                 0)
+                             (if (syntax-labelled-function? id)
+                                 (syntax-error! "parser: labelled function declaration in strict code")
+                                 0)))
+                (SsBlock [body]
+                         (if (syntax-annexb-block? id)
+                             (syntax-error! "parser: function declaration in an if clause in strict code")
+                             0))
+                (SsTry [body catch-param catch-body finally-body]
+                       (match catch-param
+                         (Some [pat] (syntax-strict-pattern-names! pat))
+                         (None [] 0)))
+                (SsForIn [head of right body awaited]
+                         (match head
+                           (ForInitPattern [pat]
+                                           (syntax-strict-pattern-names! pat))
+                           (ForInitDecl [stmt]
+                                        (match (syntax-stmt-node stmt)
+                                          (SsVar [name init annotation]
+                                                 (match init
+                                                   (Some [e]
+                                                         (syntax-error! "parser: for-in var initializer in strict code"))
+                                                   (None [] 0)))
+                                          (_ 0)))
+                           (_ 0)))
+                (_ 0))
+              (syntax-stmt-exprs! id (mut exprs))
+              (al-for [e (load exprs)] (syntax-check-strict-expr! e))
+              (syntax-stmt-children! id (mut children))
+              (syntax-check-strict-statements! (load children))
+              (al-free! [i64] (mut exprs))
+              (al-free! [i64] (mut children))))
+    0))
+
+(defn syntax-check-strict-functions! [] (-> i64)
+  (let [p (parser-state)]
+    (al-for [entry (.funs p)]
+            (let [fun entry]
+              (if (.strict fun)
+                  (do
+                    ;; Only declarations and named expressions bind their name; a method, accessor,
+                    ;; field initializer or static block name is a property key.
+                    (match (.kind fun)
+                      (FunDeclaration [] (syntax-strict-binding! (.name fun)))
+                      (FunExpression [] (syntax-strict-binding! (.name fun)))
+                      (_ 0))
+                    (let [(mut bound) (syntax-fun-bound-names fun)]
+                      (al-for [name (load bound)] (syntax-strict-binding! name))
+                      (al-free! [(slice u8)] (mut bound)))
+                    (match (.expression-body fun)
+                      (Some [e] (syntax-check-strict-expr! e))
+                      (None [] 0))
+                    (al-for [d (.param-defaults fun)]
+                            (match d
+                              (Some [e] (syntax-check-strict-expr! e))
+                              (None [] 0)))
+                    (let [(mut bound) (syntax-fun-bound-names fun)
+                          (mut i) 0]
+                      (loop (if (>= (load i) (len (load bound)))
+                                (break 0)
+                                (let [name (get (load bound) (load i))
+                                      (mut j) (+ (load i) 1)]
+                                  (loop (if (>= (load j) (len (load bound)))
+                                            (break 0)
+                                            (do
+                                              (if (= name
+                                                     (get (load bound) (load j)))
+                                                  (syntax-error! "parser: duplicate strict-mode parameter")
+                                                  0)
+                                              (set! (mut j) (+ (load j) 1))
+                                              (continue))))
+                                  (set! (mut i) (+ (load i) 1))
+                                  (continue))))
+                      (al-free! [(slice u8)] (mut bound)))
+                    (syntax-check-strict-statements! (.body fun)))
+                  0)))
+    0))
+
+;; `{a = 1}` is only valid when the object literal is reinterpreted as an assignment pattern.
+;; Reinterpreted literals are marked consumed, so any surviving CoverInitializedName is a proven
+;; SyntaxError.
+(defn syntax-check-cover-initializers! [] (-> i64)
+  (do
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (len (.exprs (parser-state))))
+                (break 0)
+                (let [expr (get (.exprs (parser-state)) (load i))]
+                  (match (.node expr)
+                    (SxObject [entries]
+                              (if (syntax-cover-consumed? (+ (load i) 1))
+                                  0
+                                  (do
+                                    (al-for [entry entries]
+                                            (match entry
+                                              (PropCoverInit [name init]
+                                                             (syntax-error! "parser: invalid shorthand property initializer"))
+                                              (_ 0)))
+                                    0)))
+                    (_ 0))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    0))
+
+;; Early errors are checked before graph construction, including unreachable nested blocks.
+;; This is declaration-name validation, not a second semantic environment or SSA pass.
+;; `top` marks a function body's own statement list, where function declarations are var-like.
+;; Sloppy code tolerates duplicate FunctionDeclarations in a Block (Annex B.3.2.4); everything
+;; else duplicated is an error.
+(defn syntax-check-declarations! [(stmts (ArrayList i64))
+                                  (parameters (ArrayList (slice u8)))
+                                  (lexical-scope bool)
+                                  (top bool)
+                                  (strict bool)] (-> i64)
+  (do
+    (if lexical-scope
+        (let [(mut names) (al-new [(slice u8)] (compiler-allocator))
+              (mut vars) (al-new [(slice u8)] (compiler-allocator))
+              (mut functions) (al-new [(slice u8)] (compiler-allocator))
+              (mut i) 0]
+          (syntax-collect-declarations-at! stmts true top (mut names))
+          (syntax-collect-declarations-at! stmts false top (mut vars))
+          (if top 0 (syntax-function-decl-names! stmts (mut functions)))
+          (loop (if (>= (load i) (len (load names)))
+                    (break 0)
+                    (let [name (get (load names) (load i))
+                          (mut j) (+ (load i) 1)]
+                      (loop (if (>= (load j) (len (load names)))
+                                (break 0)
+                                (do
+                                  (if (and (= name (get (load names) (load j)))
+                                           (not (and (not strict)
+                                                     (syntax-labels-contain? (load functions)
+                                                                             name)
+                                                     (syntax-all-plain-functions? stmts
+                                                                                  name))))
+                                      (syntax-error! "parser: duplicate lexical declaration")
+                                      0)
+                                  (set! (mut j) (+ (load j) 1))
+                                  (continue))))
+                      (al-for [var-name (load vars)]
+                              (if (= name var-name)
+                                  (syntax-error! "parser: lexical declaration conflicts with var declaration")
+                                  0))
+                      (al-for [parameter parameters]
+                              (if (= name parameter)
+                                  (syntax-error! "parser: lexical declaration conflicts with parameter")
+                                  0))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue)))))
+        0)
+    (let [empty (al-new [(slice u8)] (compiler-allocator))]
+      (al-for [id stmts]
+              (let [(mut children) (al-new [i64] (compiler-allocator))
+                    ;; A for head is its own lexical scope containing the body, so a head `let`
+                    ;; conflicts with the body's VarDeclaredNames and with itself.
+                    scope
+                      (match (syntax-stmt-node id)
+                        (SsBlock [body] true)
+                        (SsSwitch [discriminant cases] true)
+                        (SsFor [init test update body] true)
+                        (SsForIn [head of right body awaited] true)
+                        (_ false))]
+                (match (syntax-stmt-node id)
+                  (SsTry [body catch-param catch-body finally-body]
+                         (syntax-check-catch-parameter! catch-param catch-body))
+                  (_ 0))
+                (syntax-stmt-children! id (mut children))
+                (syntax-check-declarations! (load children)
+                                            empty
+                                            scope
+                                            false
+                                            strict)
+                (al-free! [i64] (mut children)))))
+    0))
+
+;; Annex B.3.2.4 tolerates duplicate FunctionDeclarations in a sloppy Block only when every
+;; declaration of the name there is a plain (non-generator, non-async) function declaration.
+(defn syntax-all-plain-functions? [(stmts (ArrayList i64)) (name (slice u8))] (-> bool)
+  (let [(mut ok) true]
+    (al-for [id stmts]
+            (match (syntax-stmt-node id)
+              (SsFunctionDecl [fun]
+                              (let [f (syntax-fun-at fun)]
+                                (if (and (= (.name f) name)
+                                         (or (.generator f) (.async f)))
+                                    (set! (mut ok) false)
+                                    0)))
+              (SsClassDecl [cls]
+                           (let [c (get (.classes (parser-state)) cls)]
+                             (if (= (.name c) name) (set! (mut ok) false) 0)))
+              (SsLet [declared init final annotation]
+                     (if (= declared name) (set! (mut ok) false) 0))
+              (SsLetPattern [pattern init final] (set! (mut ok) false))
+              (SsDeclList [decls]
+                          (do
+                            (al-for [d decls]
+                                    (match (syntax-stmt-node d)
+                                      (SsLet [declared init final annotation]
+                                             (if (= declared name)
+                                                 (set! (mut ok) false)
+                                                 0))
+                                      (SsLetPattern [pattern init final]
+                                                    (set! (mut ok) false))
+                                      (_ 0)))
+                            0))
+              (_ 0)))
+    (load ok)))
+
+;; The CatchParameter shares a scope with the catch Block's lexical declarations; a `var` of the
+;; same name is permitted by Annex B.
+(defn syntax-check-catch-parameter! [(param (Option i64))
+                                     (catch-body (Option i64))] (-> i64)
+  (match param
+    (None [] 0)
+    (Some [pattern]
+          (let [(mut bound) (al-new [(slice u8)] (compiler-allocator))]
+            (syntax-pattern-names! pattern (mut bound))
+            ;; A destructuring catch parameter cannot repeat a name.
+            (let [(mut i) 0]
+              (loop (if (>= (load i) (len (load bound)))
+                        (break 0)
+                        (let [name (get (load bound) (load i))
+                              (mut j) (+ (load i) 1)]
+                          (loop (if (>= (load j) (len (load bound)))
+                                    (break 0)
+                                    (do
+                                      (if (= name (get (load bound) (load j)))
+                                          (syntax-error! "parser: duplicate catch parameter name")
+                                          0)
+                                      (set! (mut j) (+ (load j) 1))
+                                      (continue))))
+                          (set! (mut i) (+ (load i) 1))
+                          (continue)))))
+            (match catch-body
+              (None [] 0)
+              (Some [block]
+                    (match (syntax-stmt-node block)
+                      (SsBlock [body]
+                               (let [(mut names)
+                                       (al-new [(slice u8)]
+                                               (compiler-allocator))]
+                                 (syntax-collect-declarations! body
+                                                               true
+                                                               (mut names))
+                                 (al-for [declared (load names)]
+                                         (al-for [name (load bound)]
+                                                 (if (= declared name)
+                                                     (syntax-error! "parser: catch parameter conflicts with a lexical declaration")
+                                                     0)))
+                                 (al-free! [(slice u8)] (mut names))
+                                 0))
+                      (_ 0))))))))
+
+(defn syntax-iteration-stmt? [(id i64)] (-> bool)
+  (match (syntax-stmt-node id)
+    (SsWhile [condition body] true)
+    (SsDoWhile [body condition] true)
+    (SsFor [init test update body] true)
+    (SsForIn [head of right body awaited] true)
+    (_ false)))
+
+;; `a: b: while (…)` names the loop by both labels; only such labels are `continue` targets.
+(defn syntax-labeled-iteration? [(id i64)] (-> bool)
+  (match (syntax-stmt-node id)
+    (SsLabeled [label body] (syntax-labeled-iteration? body))
+    (_ (syntax-iteration-stmt? id))))
+
+(defn syntax-labels-contain? [(labels (ArrayList (slice u8))) (name (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (al-for [label labels] (if (= label name) (set! (mut found) true) 0))
+    (load found)))
+
+(defn syntax-check-jump-label! [(label (Option (slice u8)))
+                                (labels (ArrayList (slice u8)))
+                                (depth i64)
+                                (unlabelled (slice u8))
+                                (unknown (slice u8))] (-> i64)
+  (match label
+    (None [] (if (= depth 0) (syntax-error! unlabelled) 0))
+    (Some [name]
+          (if (syntax-labels-contain? labels name) 0 (syntax-error! unknown)))))
+
+;; Early errors for break/continue/labels. `labels` is the enclosing label set, `loop-labels`
+;; the subset naming an iteration statement; `breakable` and `loops` count enclosing targets for
+;; the unlabelled forms. Labels are function-local; each SyntaxFun body starts empty.
+(defn syntax-check-jumps! [(stmts (ArrayList i64))
+                           (labels (mut (ArrayList (slice u8))))
+                           (loop-labels (mut (ArrayList (slice u8))))
+                           (breakable i64)
+                           (loops i64)] (-> i64)
+  (do
+    (al-for [id stmts]
+            (let [(mut children) (al-new [i64] (compiler-allocator))
+                  handled
+                    (match (syntax-stmt-node id)
+                      (SsLabeled [label body]
+                                 (let [iteration
+                                         (syntax-labeled-iteration? body)]
+                                   (if (syntax-labels-contain? (load labels)
+                                                               label)
+                                       (syntax-error! "parser: duplicate label")
+                                       0)
+                                   (push! [(slice u8)] (mut labels) label)
+                                   (if iteration
+                                       (push! [(slice u8)]
+                                              (mut loop-labels)
+                                              label)
+                                       0)
+                                   (push! [i64] (mut children) body)
+                                   (syntax-check-jumps! (load children)
+                                                        (mut labels)
+                                                        (mut loop-labels)
+                                                        breakable
+                                                        loops)
+                                   (pop! (mut labels))
+                                   (if iteration
+                                       (do (pop! (mut loop-labels)) 0)
+                                       0)
+                                   true))
+                      (SsBreak [label]
+                               (do
+                                 (syntax-check-jump-label! label
+                                                           (load labels)
+                                                           breakable
+                                                           "parser: break has no enclosing breakable statement"
+                                                           "parser: break names an undefined label")
+                                 true))
+                      (SsContinue [label]
+                                  (do
+                                    (syntax-check-jump-label! label
+                                                              (load loop-labels)
+                                                              loops
+                                                              "parser: continue has no enclosing iteration statement"
+                                                              "parser: continue names a label that is not an enclosing iteration statement")
+                                    true))
+                      (_ false))
+                  loop (syntax-iteration-stmt? id)
+                  switch
+                    (match (syntax-stmt-node id)
+                      (SsSwitch [discriminant cases] true)
+                      (_ false))]
+              (if handled
+                  0
+                  (do
+                    (syntax-stmt-children! id (mut children))
+                    (syntax-check-jumps! (load children)
+                                         (mut labels)
+                                         (mut loop-labels)
+                                         (if (or loop switch)
+                                             (+ breakable 1)
+                                             breakable)
+                                         (if loop (+ loops 1) loops))))
+              (al-free! [i64] (mut children))))
+    0))

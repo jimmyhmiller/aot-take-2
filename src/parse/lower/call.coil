@@ -1,0 +1,466 @@
+;; Lowering of calls: plain, member, keyed, spread and new.
+
+(module aot.parse.lower.call)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "aot.codegen.callabi" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.str" :use [sb-new sb-push-str! sb-str])
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.node.property" :use *)
+(import "aot.node.compare" :use *)
+(import "aot.node.gc" :use *)
+(import "aot.node.jsops" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.type.type" :use *)
+(import "aot.shape" :use *)
+(import "aot.jsl.lower" :use *)
+(import "aot.parse.parser" :use [syntax-find-fun])
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.analysis.declarations" :use *)
+(import "aot.parse.analysis.capture" :use *)
+(import "aot.parse.analysis.throws" :use *)
+(import "aot.parse.realm.globals" :use *)
+(import "aot.parse.realm.intrinsics" :use *)
+(import "aot.parse.lower.name" :use *)
+(import "aot.parse.lower.jsl" :use *)
+(import "aot.parse.lower.literal" :use *)
+(import "aot.parse.lower.function" :use *)
+(import "aot.parse.lower.exception" :use *)
+(import "aot.parse.lower.expression" :use *)
+
+;; A call through a value with `this` = undefined: a plain `f(...)`.
+(defn lower-value-call [(callee (dyn NodeOps))
+                        (args (ArrayList i64))
+                        (label (slice u8))] (-> (dyn NodeOps))
+  (lower-value-call-with-receiver callee
+                                  (dyn-undefined-make)
+                                  (dyn-undefined-make)
+                                  args
+                                  (lower-callee-message label
+                                                        " is not a function")))
+
+;; The TypeError message for a call through a non-callable: the callee as the source spelled it
+;; (`f`, `o.m`, `this.x`, `a[…]`), as engines report it, so a failing program names its callee.
+(defn lower-callee-message [(label (slice u8)) (suffix (slice u8))] (-> (slice u8))
+  (let [(mut sb) (sb-new (compiler-allocator))]
+    (sb-push-str! (mut sb) label)
+    (sb-push-str! (mut sb) suffix)
+    (sb-str (mut sb))))
+
+;; A callee expression's spelling for that message. Only the shapes a message can name usefully
+;; are spelled; anything else is `value`.
+(defn syntax-callee-label [(id i64)] (-> (slice u8))
+  (match (syntax-node (syntax-ungroup-id id))
+    (SxName [name] name)
+    (SxThis [] "this")
+    (SxMember [owner name optional]
+              (lower-callee-message (lower-callee-message (syntax-callee-label owner)
+                                                          ".")
+                                    name))
+    (SxIndex [owner key optional]
+             (lower-callee-message (syntax-callee-label owner) "[...]"))
+    (SxCall [callee args optional]
+            (lower-callee-message (syntax-callee-label callee) "(...)"))
+    (_ "value")))
+
+;; A call through a value. `receiver` becomes the callee's `this` slot; sloppy functions map an
+;; undefined receiver to the global object at their entry (JsSloppyThis). `new-target` is the
+;; callee's `new.target` slot: undefined for a call, the constructor for `new` (lower-new).
+;; `message` is the TypeError's text when the callee is not callable.
+(defn lower-value-call-with-receiver [(callee (dyn NodeOps))
+                                      (receiver (dyn NodeOps))
+                                      (new-target (dyn NodeOps))
+                                      (args (ArrayList i64))
+                                      (message (slice u8))] (-> (dyn NodeOps))
+  (let [(mut actuals) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (n-keep! callee)
+    (n-keep! receiver)
+    (n-keep! new-target)
+    (al-for [a args]
+            (let [v (lower-syntax-expr a)]
+              (n-keep! v)
+              (push! [(dyn NodeOps)] (mut actuals) v)))
+    (let [result
+            (lower-value-call-with-receiver-values callee
+                                                   receiver
+                                                   new-target
+                                                   (load actuals)
+                                                   message)]
+      (al-for [v (load actuals)] (n-unkeep! v))
+      (n-unkeep! new-target)
+      (n-unkeep! receiver)
+      (n-unkeep! callee)
+      (al-free! (mut actuals))
+      result)))
+
+;; The call itself, over actuals the caller already evaluated in source order and keeps alive.
+(defn lower-value-call-with-receiver-values [(callee (dyn NodeOps))
+                                             (receiver (dyn NodeOps))
+                                             (new-target (dyn NodeOps))
+                                             (actuals (ArrayList (dyn NodeOps)))
+                                             (message (slice u8))] (-> (dyn NodeOps))
+  (let [(mut operands) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (let [scope (parser-node (.current-scope (parser-state)))
+          packed (callabi-pack! (scope-ctrl scope) (scope-mem scope) actuals)]
+      (scope-set-mem! scope (.memory packed))
+      (push! [(dyn NodeOps)] (mut operands) callee)
+      (push! [(dyn NodeOps)] (mut operands) receiver)
+      (push! [(dyn NodeOps)] (mut operands) new-target)
+      (push! [(dyn NodeOps)] (mut operands) (.count packed))
+      (push! [(dyn NodeOps)] (mut operands) (.vector packed))
+      (al-for [v (.direct packed)] (push! [(dyn NodeOps)] (mut operands) v))
+      (push! [(dyn NodeOps)] (mut operands) (lower-ascii-string message))
+      ;; The shared JSL body owns unknown callable dispatch and error construction. A proven
+      ;; function needs neither; expose its ordinary code-pointer call for optimization.
+      ;; The caller owns exactly one completion check, after all argument evaluation.
+      (let [t (n-ty callee)
+            r
+              (if (and (not (ty-high? t)) (ty-isa? t (ty-dyn TAG-FUNCTION)))
+                  (let [code
+                          (load-make (scope-ctrl scope)
+                                     (scope-mem scope)
+                                     (unbox-make callee REP-FUNCTION)
+                                     (con-int OFFSET-FUNCTION-CODE)
+                                     ALIAS-FUNCTION-CODE
+                                     (parser-value-funptr-ty))
+                        end
+                          (callabi-invoke! (scope-ctrl scope)
+                                           (scope-mem scope)
+                                           code
+                                           callee
+                                           receiver
+                                           new-target
+                                           packed)]
+                    (jsl-expr-result (proj-make end
+                                                RETURN-VALUE
+                                                "value-call.value")
+                                     (cproj-make end
+                                                 RETURN-CTRL
+                                                 "value-call.ctrl")
+                                     (proj-make end RETURN-MEM "value-call.mem")))
+                  (lower-jsl-call-values "JsInvokeCallable" (load operands)))]
+        (parser-set-current-ctrl! (.ctrl r))
+        (scope-set-mem! scope (.mem r))
+        (let [result (lower-completion! (.value r))]
+          (al-free! (mut operands))
+          result)))))
+
+(defn lower-keyed-call [(owner-id i64) (key-id i64) (args (ArrayList i64))] (-> (dyn NodeOps))
+  (let [owner (lower-syntax-expr owner-id)]
+    (n-keep! owner)
+    (let [k (lower-syntax-expr key-id)
+          scope (parser-node (.current-scope (parser-state)))
+          (mut margs) (al-new [(dyn NodeOps)] (compiler-allocator))]
+      (n-keep! k)
+      (push! [(dyn NodeOps)] (mut margs) owner)
+      (push! [(dyn NodeOps)] (mut margs) k)
+      (let [r (lower-jsl-call-values "JsGetKeyed" (load margs))]
+        (al-free! [(dyn NodeOps)] (mut margs))
+        (n-unkeep! k)
+        (parser-set-current-ctrl! (.ctrl r))
+        (scope-set-mem! scope (.mem r))
+        (let [checked (lower-completion! (.value r))
+              answer
+                (lower-value-call-with-receiver checked
+                                                owner
+                                                (dyn-undefined-make)
+                                                args
+                                                (lower-callee-message (lower-callee-message (syntax-callee-label owner-id)
+                                                                                            "[...]")
+                                                                      " is not a function"))]
+          (n-unkeep! owner)
+          answer)))))
+
+;; `new F(args)` (EvaluateNew, ECMA-262 §13.3.5.1.1): F, then every argument, in source order; then
+;; JsConstructReceiver refuses a value without [[Construct]] with the TypeError and gives the
+;; receiver (a fresh object from F's `prototype` for an ordinary base constructor, undefined for a
+;; built-in one); F runs with that receiver and itself as `new.target`, and JsConstructResult keeps
+;; an object it returned, else the receiver. The semantics are JSL; this only orders evaluation.
+(defn lower-new [(callee-id i64) (args (ArrayList i64))] (-> (dyn NodeOps))
+  (let [callee (lower-syntax-expr callee-id)
+        (mut actuals) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (n-keep! callee)
+    (al-for [a args]
+            (let [v (lower-syntax-expr a)]
+              (n-keep! v)
+              (push! [(dyn NodeOps)] (mut actuals) v)))
+    (let [scope (parser-node (.current-scope (parser-state)))
+          message
+            (lower-ascii-string (lower-callee-message (syntax-callee-label callee-id)
+                                                      " is not a constructor"))
+          (mut cargs) (al-new [(dyn NodeOps)] (compiler-allocator))]
+      (push! [(dyn NodeOps)] (mut cargs) callee)
+      (push! [(dyn NodeOps)] (mut cargs) message)
+      (let [prepared (lower-jsl-call-values "JsConstructReceiver" (load cargs))]
+        (al-free! [(dyn NodeOps)] (mut cargs))
+        (parser-set-current-ctrl! (.ctrl prepared))
+        (scope-set-mem! scope (.mem prepared))
+        (let [receiver (lower-completion! (.value prepared))]
+          (n-keep! receiver)
+          (let [returned
+                  (lower-value-call-with-receiver-values callee
+                                                         receiver
+                                                         callee
+                                                         (load actuals)
+                                                         (lower-callee-message (syntax-callee-label callee-id)
+                                                                               " is not a constructor"))
+                (mut rargs) (al-new [(dyn NodeOps)] (compiler-allocator))]
+            (n-keep! returned)
+            (push! [(dyn NodeOps)] (mut rargs) returned)
+            (push! [(dyn NodeOps)] (mut rargs) receiver)
+            (let [scope2 (parser-node (.current-scope (parser-state)))
+                  result
+                    (jsl-lower-macro-values "JsConstructResult"
+                                            (load rargs)
+                                            (parser-node (.current-ctrl (parser-state)))
+                                            (scope-mem scope2))]
+              (al-free! [(dyn NodeOps)] (mut rargs))
+              (parser-set-current-ctrl! (.ctrl result))
+              (scope-set-mem! scope2 (.mem result))
+              (n-unkeep! returned)
+              (n-unkeep! receiver)
+              (al-for [v (load actuals)] (n-unkeep! v))
+              (al-free! (mut actuals))
+              (n-unkeep! callee)
+              (.value result))))))))
+
+;; `o.m(args)`: the owner is evaluated once and is both the property base and the receiver.
+(defn lower-member-call [(owner-id i64)
+                         (name (slice u8))
+                         (args (ArrayList i64))] (-> (dyn NodeOps))
+  (let [owner (lower-syntax-expr owner-id)]
+    (n-keep! owner)
+    (let [scope (parser-node (.current-scope (parser-state)))
+          (mut margs) (al-new [(dyn NodeOps)] (compiler-allocator))]
+      (push! [(dyn NodeOps)] (mut margs) owner)
+      (push! [(dyn NodeOps)] (mut margs) (keyref-make (shape-key-intern name)))
+      (let [loaded (lower-jsl-call-values "JsGetNamed" (load margs))]
+        (al-free! [(dyn NodeOps)] (mut margs))
+        (parser-set-current-ctrl! (.ctrl loaded))
+        (scope-set-mem! scope (.mem loaded))
+        (let [checked (lower-completion! (.value loaded))
+              answer
+                (lower-value-call-with-receiver checked
+                                                owner
+                                                (dyn-undefined-make)
+                                                args
+                                                (lower-callee-message (lower-callee-message (lower-callee-message (syntax-callee-label owner-id)
+                                                                                                                  ".")
+                                                                                            name)
+                                                                      " is not a function"))]
+          (n-unkeep! owner)
+          answer)))))
+
+(defn lower-named-call [(name (slice u8)) (args (ArrayList i64))] (-> (dyn NodeOps))
+  (let [bound
+          (or (>= (scope-find (parser-node (.current-scope (parser-state)))
+                              name)
+                  0)
+              (syntax-script-binding? name)
+              (syntax-enclosing-binding? (.current-fun (parser-state)) name))
+        global (syntax-global-index name)
+        ;; A realm global is a direct call only when nothing ever assigns the name; a plain
+        ;; function-entry program keeps its hoisted declarations.
+        target-idx
+          (if bound
+              -1
+              (if (>= global 0)
+                  (syntax-global-direct-fun global)
+                  (syntax-find-fun name)))]
+    (if (or bound
+            (< target-idx 0)
+            (and (>= target-idx 0)
+                 (or (syntax-fun-forwarding? target-idx)
+                     ;; Its entry fills a hidden slot from the call itself: the callee it was called
+                     ;; with (its environment, its home object), an arguments object, a rest array.
+                     (.needs-callee (syntax-fun-ptr target-idx))
+                     (match (syntax-fun-hidden-builtin target-idx)
+                       (Some [b] true)
+                       (None [] false)))))
+        ;; A binding, not a hoisted declaration, a forwarding entry (it has no local body to call
+        ;; directly) or a function whose entry fills a hidden slot from the call itself (an
+        ;; arguments object, a rest parameter): call through whatever value it holds.
+        (lower-value-call (lower-name name) args name)
+        (let [target-syntax (syntax-fun-at target-idx)
+              target (parser-node (.fun-nid target-syntax))
+              scope (parser-node (.current-scope (parser-state)))
+              c
+                (call-make-with-mem (parser-node (.current-ctrl (parser-state)))
+                                    (scope-mem scope))
+              formal-count (parser-abi-slots)
+              (mut i) 0]
+          ;; An intrinsic's body sees exactly the arguments it declares; a longer argument list
+          ;; would be dropped silently, so it refuses by name instead.
+          (if (syntax-intrinsic-fun? target-idx)
+              (let [table (intrinsic-table)
+                    entry
+                      (get table (intrinsic-index table (.name target-syntax)))]
+                (if (> (len args) (.arity entry))
+                    (unimplemented "more arguments than the intrinsic admits (the slot ABI carries no argument count)"
+                                   "docs/GAPS.md — intrinsics")
+                    0))
+              0)
+          ;; JavaScript evaluates every actual left-to-right. The shared ABI carries `this`,
+          ;; `new.target` (undefined: this is a call) and the program-wide slot count: extra
+          ;; actuals still run for effects, while omitted slots receive the canonical boxed undefined.
+          (call-add-arg! c (dyn-undefined-make))
+          (call-add-arg! c (dyn-undefined-make))
+          (loop (if (>= (load i) (len args))
+                    (break 0)
+                    (do
+                      (let [actual (lower-syntax-expr (get args (load i)))]
+                        (if (< (load i) formal-count)
+                            (call-add-arg! c actual)
+                            0))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (loop (if (>= (load i) formal-count)
+                    (break 0)
+                    (do
+                      (call-add-arg! c (dyn-undefined-make))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (n-set-def! c
+                      CALL-CTRL
+                      (Some (parser-node (.current-ctrl (parser-state)))))
+          (n-set-def! c
+                      CALL-MEM
+                      (Some (scope-mem (parser-node (.current-scope (parser-state))))))
+          (call-set-fptr! c (funptr-make target (.fidx target-syntax)))
+          (let [end (callend-make c)]
+            (let [ctrl (cproj-make end RETURN-CTRL "call.ctrl")]
+              (parser-set-current-ctrl! ctrl))
+            (scope-set-mem! (parser-node (.current-scope (parser-state)))
+                            (proj-make end RETURN-MEM "call.mem"))
+            (let [value (proj-make end RETURN-VALUE "call.value")]
+              ;; The callee's completion: tested when the filter says the callee may throw; else
+              ;; the filter's proof narrows the result to a value (the Cast folds once SCCP
+              ;; sharpens the callee's return type).
+              (if (syntax-fun-may-throw? target-idx)
+                  (lower-exception-check! value)
+                  (cast-make (parser-node (.current-ctrl (parser-state)))
+                             value
+                             (ty-dyn TAG-ANY)))))))))
+
+;; A direct call of a record's own entry with a receiver and no arguments.
+(defn lower-receiver-entry-call [(fi i64) (receiver (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [target-syntax (syntax-fun-at fi)
+        target (parser-node (.fun-nid target-syntax))
+        scope (parser-node (.current-scope (parser-state)))
+        c
+          (call-make-with-mem (parser-node (.current-ctrl (parser-state)))
+                              (scope-mem scope))
+        formal-count (parser-abi-slots)
+        (mut i) 0]
+    (call-add-arg! c receiver)
+    (call-add-arg! c (dyn-undefined-make))
+    (loop (if (>= (load i) formal-count)
+              (break 0)
+              (do
+                (call-add-arg! c (dyn-undefined-make))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (n-set-def! c CALL-CTRL (Some (parser-node (.current-ctrl (parser-state)))))
+    (n-set-def! c
+                CALL-MEM
+                (Some (scope-mem (parser-node (.current-scope (parser-state))))))
+    (call-set-fptr! c (funptr-make target (.fidx target-syntax)))
+    (let [end (callend-make c)]
+      (parser-set-current-ctrl! (cproj-make end RETURN-CTRL "call.ctrl"))
+      (scope-set-mem! (parser-node (.current-scope (parser-state)))
+                      (proj-make end RETURN-MEM "call.mem"))
+      (let [value (proj-make end RETURN-VALUE "call.value")]
+        (if (syntax-fun-may-throw? fi)
+            (lower-exception-check! value)
+            (cast-make (parser-node (.current-ctrl (parser-state)))
+                       value
+                       (ty-dyn TAG-ANY)))))))
+
+;; The function object being called, from the hidden slot its entry filled.
+(defn lower-hidden-callee [(fi i64) (fun (dyn NodeOps))] (-> (dyn NodeOps))
+  (match (fun-parm fun (+ (syntax-fun-callee-slot fi) 2))
+    (Some [c] c)
+    (None []
+          (do
+            (broken "lower-hidden-callee: the callee slot has no Parm")
+            (unreachable-node)))))
+
+;; An argument list as an array, for the calls that take any number of them (`super`).
+(defn lower-arguments-array [(args (ArrayList i64))] (-> (dyn NodeOps))
+  (let [(mut elements) (al-new [ArrayElement] (compiler-allocator))]
+    ;; A spread argument contributes every value of its iterable, in place (§13.3.8.1).
+    (al-for [a args]
+            (match (syntax-node (syntax-ungroup-id a))
+              (SxSpread [expr]
+                        (push! [ArrayElement] (mut elements) (ElemSpread expr)))
+              (_ (push! [ArrayElement] (mut elements) (ElemExpr a)))))
+    (let [array (lower-array-literal (load elements))]
+      (al-free! [ArrayElement] (mut elements))
+      array)))
+
+;; The key of a named member call, as a value: the receiver is evaluated once and is both the
+;; property's base and the call's `this`.
+(defn lower-member-key [(name (slice u8))] (-> (dyn NodeOps))
+  (keyref-make (shape-key-intern name)))
+
+;; `o.m(...xs)`: the owner is evaluated once, the method read from it, and the call takes the
+;; argument array with the owner as its receiver.
+(defn lower-spread-member-call [(owner-id i64)
+                                (key (dyn NodeOps))
+                                (args (ArrayList i64))] (-> (dyn NodeOps))
+  (let [owner (lower-syntax-expr owner-id)]
+    (n-keep! owner)
+    (n-keep! key)
+    (let [method
+            (lower-completion! (lower-jsl-values2 (if (= (n-op key) OP-KEYREF)
+                                                      "JsGetNamed"
+                                                      "JsGetKeyed")
+                                                  owner
+                                                  key))]
+      (n-unkeep! key)
+      (let [answer (lower-spread-call method owner args)]
+        (n-unkeep! owner)
+        answer))))
+
+;; `f(...xs)` and `o.m(...xs)`: the arguments become one array and the call takes it, which is the
+;; same path a bound function's call already used.
+(defn lower-spread-call [(callee (dyn NodeOps))
+                         (receiver (dyn NodeOps))
+                         (args (ArrayList i64))] (-> (dyn NodeOps))
+  (n-keep! callee)
+  (n-keep! receiver)
+  (let [array (lower-arguments-array args)
+        answer
+          (lower-completion! (lower-jsl-values4 "JsCallWithArray"
+                                                callee
+                                                receiver
+                                                (dyn-undefined-make)
+                                                array))]
+    (n-unkeep! receiver)
+    (n-unkeep! callee)
+    answer))
+
+(defn lower-jsl-values4 [(name (slice u8))
+                         (a (dyn NodeOps))
+                         (b (dyn NodeOps))
+                         (c (dyn NodeOps))
+                         (d (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [(mut values) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (push! [(dyn NodeOps)] (mut values) a)
+    (push! [(dyn NodeOps)] (mut values) b)
+    (push! [(dyn NodeOps)] (mut values) c)
+    (push! [(dyn NodeOps)] (mut values) d)
+    (let [v (lower-jsl-values name (load values))]
+      (al-free! [(dyn NodeOps)] (mut values))
+      v)))

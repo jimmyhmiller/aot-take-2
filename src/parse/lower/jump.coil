@@ -1,0 +1,240 @@
+;; Returns, breaks and continues: pruned scope merges into labelled jump targets.
+
+(module aot.parse.lower.jump)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.node.property" :use *)
+(import "aot.node.compare" :use *)
+(import "aot.node.gc" :use *)
+(import "aot.node.jsops" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.type.type" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.early" :use *)
+(import "aot.parse.lower.exception" :use *)
+
+;; One breakable statement during lowering. `labels` are the labels naming it, `kind` decides
+;; which unlabelled jumps it accepts, and a loop also owns the Scope its `continue`s merge into.
+(const JUMP-LOOP 1)
+
+(const JUMP-SWITCH 2)
+
+(const JUMP-BLOCK 3)
+
+;; A try statement's catch clause: the target of every throw and unwinding call inside its body.
+(const JUMP-CATCH 4)
+
+;; A try statement's finally block: the target of every abrupt completion — a return, or a throw
+;; the statement does not catch — that must run the block before leaving (docs/DECISIONS.md,
+;; finally). The completion travels in two synthetic Scope variables: its kind and its value.
+(const JUMP-FINALLY 5)
+
+(defstruct JumpTarget
+  [(scope i64)
+   (count i64)
+   (continue-scope (Option i64))
+   (continue-count i64)
+   (kind i64)
+   (completions i64)  ; a finally target: the completion kinds recorded into it, as bits
+   (labels (ArrayList (slice u8)))])
+
+;; Final Simple's `Parser.addReturn` accumulates a pruned return Scope holding control, memory, and
+;; `$expr`, then kills the current control. Later exits merge into that accumulator and function
+;; fallthrough contributes its default value only while control remains live. These three nid lists
+;; are the same pruned accumulator: source locals are irrelevant after exit, while control, memory,
+;; and value are all kept until one final Return owns them.
+(defn parser-reset-returns! [] (-> i64)
+  (let [p (parser-state)]
+    (al-clear! [i64] (mut (.return-ctrls p)))
+    (al-clear! [i64] (mut (.return-mems p)))
+    (al-clear! [i64] (mut (.return-values p)))
+    0))
+
+(defn parser-record-return! [(value (dyn NodeOps))] (-> i64)
+  (let [p (parser-state)
+        scope (parser-node (.current-scope p))
+        ctrl (scope-ctrl scope)
+        ;; Force lazy loop memory before severing the current control, exactly as Simple does.
+        mem (scope-mem scope)
+        dead (xctrl-make)]
+    (n-keep! ctrl)
+    (n-keep! mem)
+    (n-keep! value)
+    (push! [i64] (mut (.return-ctrls p)) (n-nid ctrl))
+    (push! [i64] (mut (.return-mems p)) (n-nid mem))
+    (push! [i64] (mut (.return-values p)) (n-nid value))
+    (scope-set-ctrl! scope dead)
+    (set! (.current-ctrl p) (n-nid dead))
+    1))
+
+;; Final Simple jumpTo duplicates the current Scope, kills current control, pops lexical levels
+;; to the target depth and merges the pruned copy into the exit Scope. We retain that order and
+;; keep the target while nested loops replace the active Scope. Unlike a return, a break carries
+;; surviving variable bindings as well as control/memory. Simple's `_continueScope` starts null
+;; and the first continue's pruned copy BECOMES it; later continues merge into it, and the loop
+;; bottom merges last (`jumpTo(_continueScope)`) before the `for` update and the backedge. Labels
+;; name a target explicitly; unlabelled `break` takes the nearest loop or switch and unlabelled
+;; `continue` the nearest loop. `finally` unwinding remains UNIMPLEMENTED with exceptions.
+(defn parser-push-jump! [(exit (dyn NodeOps)) (kind i64)] (-> i64)
+  (let [p (parser-state)
+        (mut target) (primitive/zeroed JumpTarget)
+        (mut labels) (al-new [(slice u8)] (compiler-allocator))]
+    (al-for [label (.pending-labels p)] (push! [(slice u8)] (mut labels) label))
+    (al-clear! [(slice u8)] (mut (.pending-labels p)))
+    (set! (.scope (mut target)) (n-nid exit))
+    (set! (.kind (mut target)) kind)
+    (set! (.completions (mut target)) 0)
+    (set! (.continue-scope (mut target)) (None [i64]))
+    (set! (.labels (mut target)) (load labels))
+    (n-keep! exit)
+    (push! [JumpTarget] (mut (.jump-targets p)) (load target))))
+
+(defn parser-pop-jump! [] (-> JumpTarget)
+  (match (pop! (mut (.jump-targets (parser-state))))
+    (None []
+          (do
+            (broken "parser-pop-jump!: no target")
+            (primitive/zeroed JumpTarget)))
+    (Some [target]
+          (let [saved target
+                (mut labels) (.labels saved)]
+            (n-unkeep! (parser-node (.scope saved)))
+            (al-free! [(slice u8)] (mut labels))
+            saved))))
+
+(defn parser-find-jump [(label (Option (slice u8))) (continue? bool)] (-> i64)
+  (let [p (parser-state)
+        (mut i) (- (len (.jump-targets p)) 1)]
+    (loop (if (< (load i) 0)
+              (break (do
+                       (broken "parser-find-jump: no target after syntax validation")
+                       -1))
+              (let [target (get (.jump-targets p) (load i))
+                    matches
+                      (match label
+                        (Some [name]
+                              (syntax-labels-contain? (.labels target) name))
+                        (None []
+                              (if continue?
+                                  (= (.kind target) JUMP-LOOP)
+                                  (or (= (.kind target) JUMP-LOOP)
+                                      (= (.kind target) JUMP-SWITCH)))))]
+                (if matches
+                    (break (load i))
+                    (do (set! (mut i) (- (load i) 1)) (continue))))))))
+
+(defn parser-record-jump! [(label (Option (slice u8))) (continue? bool)] (-> i64)
+  (let [p (parser-state)
+        index (parser-find-jump label continue?)
+        finally-index (parser-find-finally)
+        target (get (.jump-targets p) index)
+        exit (parser-node (.scope target))
+        outgoing (scope-dup (parser-node (.current-scope p)) false)
+        depth (len (.levels (scope-node exit)))]
+    ;; A break or continue that would leave a try with a finally block must run the block first.
+    (if (> finally-index index)
+        (unimplemented "break or continue crossing a finally block"
+                       "docs/GAPS.md — exceptions")
+        0)
+    (parser-set-current-ctrl! (xctrl-make))
+    (loop (if (<= (len (.levels (scope-node outgoing))) depth)
+              (break 0)
+              (do (scope-pop! outgoing) (continue))))
+    (let [meta (al-elem [JumpTarget] (mut (.jump-targets p)) index)]
+      (if continue?
+          (do
+            (match (.continue-scope meta)
+              (None []
+                    (do
+                      (n-keep! outgoing)
+                      (set! (.continue-scope meta) (Some (n-nid outgoing)))
+                      0))
+              (Some [cs] (do (scope-merge! (parser-node cs) outgoing) 0)))
+            (set! (.continue-count meta) (+ (.continue-count meta) 1)))
+          (do
+            (scope-merge! exit outgoing)
+            (set! (.count meta) (+ (.count meta) 1)))))
+    1))
+
+;; The loop bottom: merge the live fallthrough into the continue Scope, which then becomes the
+;; current Scope. Returns whether any path reaches the loop's update/condition/backedge.
+(defn parser-close-continues! [(terminated i64)] (-> bool)
+  (let [p (parser-state)
+        index (- (len (.jump-targets p)) 1)
+        target (get (.jump-targets p) index)]
+    (match (.continue-scope target)
+      (None [] (= terminated 0))
+      (Some [cs]
+            (let [cont (parser-node cs)]
+              (scope-merge! cont (parser-node (.current-scope p)))
+              (n-unkeep! cont)
+              (parser-use-scope! cont)
+              true)))))
+
+(defn parser-release-return-keeps! [] (-> i64)
+  (let [p (parser-state)
+        (mut i) 0]
+    (loop (if (>= (load i) (len (.return-values p)))
+              (break 0)
+              (do
+                (n-unkeep! (parser-node (get (.return-ctrls p) (load i))))
+                (n-unkeep! (parser-node (get (.return-mems p) (load i))))
+                (n-unkeep! (parser-node (get (.return-values p) (load i))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn parser-build-return! [(fun (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [p (parser-state)
+        count (len (.return-values p))]
+    (if (= count 0)
+        (do
+          (panic "parser-build-return!: function has no exit")
+          (unreachable-node))
+        (let [ret
+                (if (= count 1)
+                    (return-make (parser-node (get (.return-ctrls p) 0))
+                                 (Some (parser-node (get (.return-mems p) 0)))
+                                 (parser-node (get (.return-values p) 0))
+                                 (None [(dyn NodeOps)])
+                                 (Some fun))
+                    (let [region (region-make)
+                          memphi
+                            (memphi-make region ALIAS-BULK TY-BOT "$return.mem")
+                          ;; A function returns a completion: a value, or the exception sentinel.
+                          valuephi
+                            (phi-make region
+                                      (ty-dyn TAG-COMPLETION)
+                                      "$return.value")
+                          (mut i) 0]
+                      (loop (if (>= (load i) count)
+                                (break 0)
+                                (do
+                                  (region-add-path! region
+                                                    (parser-node (get (.return-ctrls p)
+                                                                      (load i))))
+                                  (memphi-add-state! memphi
+                                                     (parser-node (get (.return-mems p)
+                                                                       (load i))))
+                                  (phi-add-value! valuephi
+                                                  (parser-node (get (.return-values p)
+                                                                    (load i))))
+                                  (set! (mut i) (+ (load i) 1))
+                                  (continue))))
+                      (return-make region
+                                   (Some memphi)
+                                   valuephi
+                                   (None [(dyn NodeOps)])
+                                   (Some fun))))]
+          (parser-release-return-keeps!)
+          ret))))

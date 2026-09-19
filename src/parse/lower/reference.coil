@@ -1,0 +1,318 @@
+;; References: an assignment target prepared once, then read and written.
+
+(module aot.parse.lower.reference)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.shape" :use *)
+(import "aot.jsl.lower" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.analysis.declarations" :use *)
+(import "aot.parse.analysis.capture" :use *)
+(import "aot.parse.realm.globals" :use *)
+(import "aot.parse.lower.name" :use *)
+(import "aot.parse.lower.jsl" :use *)
+(import "aot.parse.lower.function" :use *)
+(import "aot.parse.lower.exception" :use *)
+(import "aot.parse.lower.class" :use *)
+(import "aot.parse.lower.environment" :use *)
+(import "aot.parse.lower.expression" :use *)
+
+;; Final Simple parseAsgn finds the Var before recursively parsing the RHS, then converts and
+;; updates that same Scope binding. Its field path emits a memory-threaded Store. Here local `bound` is
+;; likewise stable, while an object record's property set can change during the RHS. Retain its
+;; environment, key and pre-RHS resolution as nodes until PutValue: strict unresolvable
+;; assignment must still throw if the RHS creates the property (docs/DECISIONS.md).
+;; A positive resolution is a stable realm lexical slot, -1 an object binding, zero unresolved.
+;; Local/block bindings retain Simple's Scope inputs; retained Script root lexicals live in cells.
+(defstruct SyntaxRef
+  [(member bool)
+   (name (slice u8))
+   (owner-nid i64)
+   (key-nid i64)
+   (bound bool)
+   (object-binding bool)
+   (resolved-nid i64)
+   (keyed bool)  ; `owner[key]`: key-nid is the evaluated key value, not an interned key
+   (super bool)  ; `super.x`: owner-nid is the base above the home object, not the receiver
+   (receiver-nid i64)  ; a super reference's `this`, the receiver of its [[Get]] and [[Set]]
+   (captured-owner i64)])  ; a captured binding of an enclosing activation: the record owning it, or -1
+
+(defn lower-ref-global-prepare! [(ref (ptr SyntaxRef))] (-> i64)
+  (if (or (and (not (.script-unit (parser-state)))
+               (syntax-script-binding? (.name ref)))
+          (syntax-enclosing-binding? (.current-fun (parser-state)) (.name ref)))
+      (unimplemented "nonlocal lexical assignment reference"
+                     "docs/GAPS.md — lexical environments and closures")
+      0)
+  (let [owner (lower-global-object)
+        key (keyref-make (shape-key-intern (.name ref)))
+        scope (parser-node (.current-scope (parser-state)))
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (n-keep! owner)
+    (n-keep! key)
+    (push! [(dyn NodeOps)] (mut args) owner)
+    (push! [(dyn NodeOps)] (mut args) key)
+    (let [r
+            (match (lower-known-lexical-slot (.name ref))
+              (Some [slot]
+                    (jsl-expr-result slot (scope-ctrl scope) (scope-mem scope)))
+              (None []
+                    (jsl-lower-macro-values "JsGlobalResolveReference"
+                                            (load args)
+                                            (scope-ctrl scope)
+                                            (scope-mem scope))))]
+      (al-free! (mut args))
+      (parser-set-current-ctrl! (.ctrl r))
+      (scope-set-mem! scope (.mem r))
+      (n-keep! (.value r))
+      (set! (.object-binding ref) true)
+      (set! (.owner-nid ref) (n-nid owner))
+      (set! (.key-nid ref) (n-nid key))
+      (set! (.resolved-nid ref) (n-nid (.value r)))
+      0)))
+
+;; Consume a retained environment Reference in the current post-expression Scope. Its nodes
+;; stay kept until lower-ref-release!, including across a compound read and logical branches.
+(defn lower-ref-global-apply! [(ref SyntaxRef)
+                               (operation (slice u8))
+                               (value (Option (dyn NodeOps)))] (-> (dyn NodeOps))
+  (let [scope (parser-node (.current-scope (parser-state)))
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (push! [(dyn NodeOps)] (mut args) (parser-node (.owner-nid ref)))
+    (push! [(dyn NodeOps)] (mut args) (parser-node (.key-nid ref)))
+    (push! [(dyn NodeOps)] (mut args) (parser-node (.resolved-nid ref)))
+    (match value (Some [v] (push! [(dyn NodeOps)] (mut args) v)) (None [] 0))
+    (push! [(dyn NodeOps)]
+           (mut args)
+           (con-int (if (syntax-fun-strict (.current-fun (parser-state))) 1 0)))
+    (let [r
+            (jsl-lower-macro-values operation
+                                    (load args)
+                                    (scope-ctrl scope)
+                                    (scope-mem scope))]
+      (al-free! (mut args))
+      (parser-set-current-ctrl! (.ctrl r))
+      (scope-set-mem! scope (.mem r))
+      (lower-completion! (.value r)))))
+
+(defn lower-ref-name-prepare! [(ref (ptr SyntaxRef)) (name (slice u8))] (-> i64)
+  (set! (.name ref) name)
+  (set! (.captured-owner ref) -1)
+  (set! (.bound ref)
+        (>= (scope-find (parser-node (.current-scope (parser-state))) name) 0))
+  ;; A binding of an enclosing activation is read and written through its environment record.
+  (if (.bound ref)
+      0
+      (let [owner (syntax-capture-owner (.current-fun (parser-state)) name)]
+        (if (and (>= (.fun owner) 0) (.activation owner))
+            (do (set! (.captured-owner ref) (.fun owner)) 0)
+            (lower-require-uncaptured! name))))
+  (if (and (.external-mutation (parser-state))
+           (not (.bound ref))
+           (not (syntax-restricted-global? name)))
+      (lower-ref-global-prepare! ref)
+      0))
+
+(defn lower-ref-prepare! [(target i64)] (-> SyntaxRef)
+  (let [(mut ref) (primitive/zeroed SyntaxRef)]
+    (set! (.captured-owner (mut ref)) -1)
+    (match (syntax-node target)
+      (SxIndex [owner key optional]
+               (if (syntax-is-super? owner)
+                   (lower-ref-super-prepare! (mut ref) key "")
+                   (let [base (lower-syntax-expr owner)]
+                     (n-keep! base)
+                     (let [k (lower-syntax-expr key)]
+                       (n-keep! k)
+                       (set! (.member (mut ref)) true)
+                       (set! (.keyed (mut ref)) true)
+                       (set! (.owner-nid (mut ref)) (n-nid base))
+                       (set! (.key-nid (mut ref)) (n-nid k))))))
+      (SxPrivateMember [owner name optional]
+                       (unimplemented "private class members"
+                                      "docs/GAPS.md — classes"))
+      (SxMember [owner name optional]
+                (if (syntax-is-super? owner)
+                    (lower-ref-super-prepare! (mut ref) -1 name)
+                    (let [base (lower-syntax-expr owner)
+                          key (keyref-make (shape-key-intern name))]
+                      (n-keep! base)
+                      (n-keep! key)
+                      (set! (.member (mut ref)) true)
+                      (set! (.owner-nid (mut ref)) (n-nid base))
+                      (set! (.key-nid (mut ref)) (n-nid key)))))
+      (SxName [name] (lower-ref-name-prepare! (mut ref) name))
+      (SxCall [callee args optional]
+              (unimplemented "call expression assignment target (sloppy runtime ReferenceError)"
+                             "docs/GAPS.md — exceptions"))
+      (_ (broken "lower-ref-prepare!: target survived syntax validation")))
+    (load ref)))
+
+;; A `super` reference (§13.3.7.3 MakeSuperPropertyReference), in the specification's order: the
+;; method's `this`, which a derived constructor must have initialized, then the key of a computed
+;; access, then the base — the object above the home object its function object carries.
+(defn lower-ref-super-prepare! [(ref (ptr SyntaxRef))
+                                (key-id i64)
+                                (name (slice u8))] (-> i64)
+  (let [receiver (lower-this)]
+    (n-keep! receiver)
+    (let [key
+            (if (>= key-id 0)
+                (lower-syntax-expr key-id)
+                (keyref-make (shape-key-intern name)))]
+      (n-keep! key)
+      (let [base (lower-super-base)]
+        (n-keep! base)
+        (set! (.member ref) true)
+        (set! (.super ref) true)
+        (set! (.keyed ref) (>= key-id 0))
+        (set! (.receiver-nid ref) (n-nid receiver))
+        (set! (.key-nid ref) (n-nid key))
+        (set! (.owner-nid ref) (n-nid base))
+        0))))
+
+(defn lower-ref-get! [(ref SyntaxRef)] (-> (dyn NodeOps))
+  (if (.object-binding ref)
+      (lower-ref-global-apply! ref
+                               "JsGlobalReferenceRead"
+                               (None [(dyn NodeOps)]))
+      (lower-ref-nonglobal-get! ref)))
+
+(defn lower-ref-nonglobal-get! [(ref SyntaxRef)] (-> (dyn NodeOps))
+  (if (.super ref)
+      (lower-completion! (lower-jsl-values3 (if (.keyed ref)
+                                                "JsSuperGetKeyed"
+                                                "JsSuperGet")
+                                            (parser-node (.owner-nid ref))
+                                            (parser-node (.key-nid ref))
+                                            (parser-node (.receiver-nid ref))))
+      (if (.member ref)
+          (let [scope (parser-node (.current-scope (parser-state)))
+                (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+            (push! [(dyn NodeOps)] (mut args) (parser-node (.owner-nid ref)))
+            (push! [(dyn NodeOps)] (mut args) (parser-node (.key-nid ref)))
+            (let [loaded
+                    (if (.keyed ref)
+                        (lower-jsl-call-values "JsGetKeyed" (load args))
+                        (lower-jsl-call-values "JsGetNamed" (load args)))]
+              (al-free! [(dyn NodeOps)] (mut args))
+              (parser-set-current-ctrl! (.ctrl loaded))
+              (scope-set-mem! scope (.mem loaded))
+              (lower-completion! (.value loaded))))
+          (if (>= (.captured-owner ref) 0)
+              (lower-environment-outer (.captured-owner ref) (.name ref))
+              (lower-name (.name ref))))))
+
+;; PutValue against the live post-RHS Scope. Non-strict PutValue to the three non-writable
+;; globals has no effect; lexical shadows take Scope's ordinary update and const/TDZ checks. JSL
+;; owns property semantics; descriptors, accessors and nullish-base exceptions remain its gaps.
+(defn lower-ref-put! [(ref SyntaxRef) (value (dyn NodeOps))] (-> i64)
+  (if (.object-binding ref)
+      (do (lower-ref-global-apply! ref "JsGlobalReferenceWrite" (Some value)) 0)
+      (lower-ref-nonglobal-put! ref value)))
+
+(defn lower-ref-nonglobal-put! [(ref SyntaxRef) (value (dyn NodeOps))] (-> i64)
+  (let [scope (parser-node (.current-scope (parser-state)))]
+    (if (.super ref)
+        (let [(mut sargs) (al-new [(dyn NodeOps)] (compiler-allocator))]
+          (push! [(dyn NodeOps)] (mut sargs) (parser-node (.owner-nid ref)))
+          (push! [(dyn NodeOps)] (mut sargs) (parser-node (.key-nid ref)))
+          (push! [(dyn NodeOps)] (mut sargs) value)
+          (push! [(dyn NodeOps)] (mut sargs) (parser-node (.receiver-nid ref)))
+          (push! [(dyn NodeOps)]
+                 (mut sargs)
+                 (con-int (if (.strict (syntax-fun-ptr (.current-fun (parser-state))))
+                              1
+                              0)))
+          (let [stored
+                  (lower-jsl-values (if (.keyed ref)
+                                        "JsSuperSetKeyed"
+                                        "JsSuperSet")
+                                    (load sargs))]
+            (al-free! [(dyn NodeOps)] (mut sargs))
+            (lower-completion! stored)
+            0))
+        (if (.member ref)
+            (let [(mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+              (push! [(dyn NodeOps)] (mut args) (parser-node (.owner-nid ref)))
+              (push! [(dyn NodeOps)] (mut args) (parser-node (.key-nid ref)))
+              (push! [(dyn NodeOps)] (mut args) value)
+              ;; The site's strictness: a failed [[Set]] (a read-only or accessor-only property, a
+              ;; non-extensible object, a primitive base) throws a TypeError only in strict code.
+              (push! [(dyn NodeOps)]
+                     (mut args)
+                     (con-int (if (.strict (syntax-fun-ptr (.current-fun (parser-state))))
+                                  1
+                                  0)))
+              (let [stored
+                      (if (.keyed ref)
+                          (lower-jsl-call-values "JsSetKeyed" (load args))
+                          (lower-jsl-call-values "JsDefineOwnNamed" (load args)))]
+                (al-free! [(dyn NodeOps)] (mut args))
+                (parser-set-current-ctrl! (.ctrl stored))
+                (scope-set-mem! scope (.mem stored))
+                (lower-completion! (.value stored))
+                0))
+            (if (>= (.captured-owner ref) 0)
+                (lower-environment-outer-store! (.captured-owner ref)
+                                                (.name ref)
+                                                value)
+                (if (.bound ref)
+                    (let [binding
+                            (scope-var scope (scope-find scope (.name ref)))]
+                      (if (.realm-constant binding)
+                          (lower-throw-type-error! "Assignment to constant variable")
+                          ;; A binding a nested function captures lives in this activation's environment.
+                          (let [slot (scope-env-slot scope (.name ref))]
+                            (if (>= slot 0)
+                                (lower-environment-store! slot value)
+                                (scope-update! scope (.name ref) value)))))
+                    ;; A Script's lexical binding is the realm's: its slot where the initializer knows it,
+                    ;; and by key from a function of the Script.
+                    (if (syntax-script-binding? (.name ref))
+                        (lower-script-binding-write! (.name ref) value)
+                        (if (syntax-restricted-global? (.name ref))
+                            ;; `undefined = 1`: silently ignored in sloppy code; a TypeError in strict code
+                            ;; (the runtime's TypeError trap until exception objects exist).
+                            (if (syntax-fun-strict (.current-fun (parser-state)))
+                                (lower-throw-type-error! "Cannot assign to read only property")
+                                0)
+                            ;; Var-like globals are properties of the realm's global object; an undeclared
+                            ;; name would create one at run time and refuses until that is implemented.
+                            (if (>= (syntax-global-index (.name ref)) 0)
+                                (lower-global-store! (.name ref) value)
+                                (let [scope
+                                        (parser-node (.current-scope (parser-state)))
+                                      (mut wargs)
+                                        (al-new [(dyn NodeOps)]
+                                                (compiler-allocator))]
+                                  (push! [(dyn NodeOps)]
+                                         (mut wargs)
+                                         (keyref-make (shape-key-intern (.name ref))))
+                                  (push! [(dyn NodeOps)] (mut wargs) value)
+                                  (let [w
+                                          (jsl-lower-macro-values "JsUnresolvedGlobalWrite"
+                                                                  (load wargs)
+                                                                  (parser-node (.current-ctrl (parser-state)))
+                                                                  (scope-mem scope))]
+                                    (al-free! [(dyn NodeOps)] (mut wargs))
+                                    (parser-set-current-ctrl! (.ctrl w))
+                                    (scope-set-mem! scope (.mem w))
+                                    0)))))))))))
+
+(defn lower-ref-release! [(ref SyntaxRef)] (-> i64)
+  (if (.object-binding ref) (n-unkeep! (parser-node (.resolved-nid ref))) 0)
+  (if (.super ref) (n-unkeep! (parser-node (.receiver-nid ref))) 0)
+  (if (or (.member ref) (.object-binding ref))
+      (do
+        (n-unkeep! (parser-node (.key-nid ref)))
+        (n-unkeep! (parser-node (.owner-nid ref))))
+      0))

@@ -1,0 +1,328 @@
+;; The realm materialized by demand: intrinsics lowered only once something observes them.
+
+(module aot.parse.realm.demand)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use [hm-new hm-contains? hm-free! i64-keyops])
+(import "aot.node.imagefacts" :use [imagefacts-surface-demands! ImageDemand])
+(import "coil.slice" :use [subslice slice-new])
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.shape" :use *)
+(import "aot.heap" :use *)
+(import "aot.jsl.lower" :use *)
+(import "aot.jsl.decls" :use *)
+(import "aot.parse.parser"
+        :use
+        [syntax-find-intrinsic-fun parser-entry-fun parser-adapter-open?])
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.analysis.throws" :use *)
+(import "aot.parse.realm.intrinsics" :use *)
+(import "aot.parse.realm.image" :use *)
+(import "aot.parse.lower.function" :use *)
+
+;; Materialize one declared intrinsic once the program's headers exist and before the image facts do:
+;; its record, header, adapter, image objects and properties, in the phase order
+;; `realm-image-build!` uses, with the realm's prototype links refreshed. Its owner (a method's) or
+;; parent (a constructor's) is materialized first. The body waits in `pending-bodies`, because a
+;; demand can arrive in the middle of lowering another body (`parser-lower-pending-bodies!`).
+;; Answers whether anything was added.
+(defn parser-materialize-intrinsic! [(entry Intrinsic)] (-> bool)
+  (let [p (parser-state)
+        table (intrinsic-table)
+        start (parser-node (.lower-start p))
+        stop (parser-node (.lower-stop p))]
+    (if (or (= (.lower-start p) 0) (= (.lower-stop p) 0))
+        (panic "parser-materialize-intrinsic!: the program's passes have not begun")
+        0)
+    (if (or (and (intrinsic-namespace? entry)
+                 (>= (syntax-namespace-index (.name entry)) 0))
+            (and (= (.target entry) INTRINSIC-TARGET-ENTRY)
+                 (>= (syntax-find-entry-fun (.name entry)) 0))
+            (and (not (intrinsic-namespace? entry))
+                 (!= (.target entry) INTRINSIC-TARGET-ENTRY)
+                 (>= (syntax-find-intrinsic-fun (.name entry)) 0)))
+        false
+        (if (= (.target entry) INTRINSIC-TARGET-ENTRY)
+            ;; An entry is only its forwarding Fun: no image object, no body.
+            (do
+              (syntax-declare-intrinsic! entry)
+              (parser-check-late-reservation!)
+              (let [fi (- (len (.funs p)) 1)]
+                (parser-fun-header! fi start)
+                (parser-fun-adapter! fi start stop)
+                true))
+            (do
+              (if (!= (.parent entry) "")
+                  (parser-materialize-intrinsic! (get table
+                                                      (intrinsic-index table
+                                                                       (.parent entry))))
+                  false)
+              (if (intrinsic-method? entry)
+                  (parser-materialize-intrinsic! (get table
+                                                      (intrinsic-index table
+                                                                       (.owner entry))))
+                  false)
+              (syntax-declare-intrinsic! entry)
+              (parser-check-late-reservation!)
+              (if (intrinsic-namespace? entry)
+                  (do
+                    (realm-image-namespace! (.name entry))
+                    (realm-image-link-object-prototypes!)
+                    (parser-materialize-chain-roots!)
+                    true)
+                  (let [fi (- (len (.funs p)) 1)]
+                    (syntax-intrinsic-may-throw! fi)
+                    (parser-fun-header! fi start)
+                    (parser-fun-adapter! fi start stop)
+                    (realm-image-function-object! fi)
+                    (realm-image-root-binding! fi)
+                    (realm-image-method-placement! fi)
+                    (realm-image-register-prototype! fi)
+                    (realm-image-link-function-prototypes!)
+                    (realm-image-link-object-prototypes!)
+                    (realm-image-constructor-record-setup! fi)
+                    (push! [i64] (mut (.pending-bodies p)) fi)
+                    (parser-materialize-chain-roots!)
+                    true)))))))
+
+;; Late materialization appends records, syntax nodes and global bindings while lowering holds
+;; pointers into those lists (`syntax-fun-ptr` across a lowering that demands an intrinsic). Reserve
+;; room for everything the declared surface can add, so no append reallocates under such a pointer;
+;; `parser-materialize-intrinsic!` refuses to exceed the reservation.
+(defn parser-reserve-late-materialization! [] (-> i64)
+  (let [p (parser-state)
+        table (intrinsic-table)
+        rows (len table)
+        (mut widest) 0]
+    (al-for [r table]
+            (let [row r]
+              (if (> (.arity row) (load widest))
+                  (set! (mut widest) (.arity row))
+                  0)))
+    (al-reserve! [SyntaxFun] (mut (.funs p)) (+ (len (.funs p)) rows))
+    ;; An intrinsic record adds `this`, `new.target`, its own name, one name per slot and its body.
+    (al-reserve! [SyntaxExpr]
+                 (mut (.exprs p))
+                 (+ (len (.exprs p)) (* rows (+ (load widest) 4))))
+    (al-reserve! [GlobalBinding] (mut (.globals p)) (+ (len (.globals p)) rows))
+    (al-reserve! [(slice u8)]
+                 (mut (.namespaces p))
+                 (+ (len (.namespaces p)) rows))
+    (set! (.late-exprs-cap p) (al-cap [SyntaxExpr] (.exprs p)))
+    (set! (.late-funs-cap p) (al-cap [SyntaxFun] (.funs p)))
+    0))
+
+(defn parser-check-late-reservation! [] (-> i64)
+  (let [p (parser-state)]
+    (if (or (!= (al-cap [SyntaxFun] (.funs p)) (.late-funs-cap p))
+            (!= (al-cap [SyntaxExpr] (.exprs p)) (.late-exprs-cap p)))
+        (panic "parser-materialize-intrinsic!: late materialization outgrew its reservation (a list reallocated under lowering pointers)")
+        0)))
+
+;; Every declared [[Prototype]] chain ends at %Object.prototype%, and every function object's is
+;; %Function.prototype%: a realm that materialized any intrinsic has both.
+(defn parser-materialize-chain-roots! [] (-> i64)
+  (let [table (intrinsic-table)]
+    (parser-materialize-intrinsic! (get table (intrinsic-index table "Object")))
+    (parser-materialize-intrinsic! (get table
+                                        (intrinsic-index table "Function")))
+    0))
+
+;; Lower the bodies of records materialized since the last boundary; a body can materialize more.
+(defn parser-lower-pending-bodies! [] (-> i64)
+  (let [p (parser-state)
+        stop (parser-node (.lower-stop p))
+        (mut i) 0]
+    (loop (if (>= (load i) (len (.pending-bodies p)))
+              (break 0)
+              (do
+                (parser-fun-body! (get (.pending-bodies p) (load i)) stop)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (al-clear! [i64] (mut (.pending-bodies p)))
+    (load i)))
+
+;; A well-known intrinsic prototype a lowering names (`Object.prototype` for a literal,
+;; `Function.prototype` for a function object, `%IntrinsicPrototype` in JSL): the reference is a
+;; demand, so the realm materializes its declared constructor first. Its image entry, or -1 where
+;; the program has no realm (function-entry mode) or does not declare the constructor.
+(defn parser-intrinsic-prototype-entry [(name (slice u8))] (-> i64)
+  (do
+    (parser-demand-intrinsic-prototype! name)
+    (heap-intrinsic-entry name)))
+
+(defn parser-demand-intrinsic-prototype! [(name (slice u8))] (-> i64)
+  (let [p (parser-state)
+        suffix ".prototype"]
+    (if (not (.script-mode p))
+        0
+        (if (or (<= (len name) (len suffix))
+                (!= (subslice [u8] name (- (len name) (len suffix)) (len name))
+                    suffix))
+            (panic "parser-demand-intrinsic-prototype!: not a well-known prototype name")
+            (let [table (intrinsic-table)
+                  i
+                    (intrinsic-index table
+                                     (subslice [u8]
+                                               name
+                                               0
+                                               (- (len name) (len suffix))))]
+              (if (< i 0)
+                  0
+                  (do
+                    (if (= (.lower-start p) 0)
+                        (panic "parser-demand-intrinsic-prototype!: a prototype was named before the program's passes")
+                        0)
+                    (parser-materialize-intrinsic! (get table i))
+                    0)))))))
+
+;; The JSL lowering's hook (`jsl-set-intrinsic-demand!`).
+(defn parser-jsl-demand-intrinsic [(bytes (ptr u8)) (n i64)] (-> i64)
+  (parser-demand-intrinsic-prototype! (slice-new [u8] bytes n)))
+
+;; ---------------------------------------------------------------------------
+;; The realm is materialized by demand (docs/DECISIONS.md)
+;;
+;; A closed program's realm holds the declared intrinsics the program can observe. Identifier
+;; references to a declared root are bindings resolved during syntax collection; implicit references
+;; (a literal's or a function's prototype, `%IntrinsicPrototype` in JSL) materialize at the reference;
+;; everything else — `o.m`, `o[k]`, `this.Array`, reflection — is observed on the graphs by
+;; `imagefacts-surface-demands!` and materialized here, scan after scan, until a scan observes nothing
+;; new. Only then are the value-call code-word types final.
+
+;; The declared row an observation (owner, key) selects: a root on the global object, or a method
+;; on a materialized carrier (a constructor's function object or `prototype`, or a namespace).
+(defn parser-row-observed? [(row Intrinsic) (d ImageDemand)] (-> bool)
+  (let [key-matches
+          (or (< (.key d) 0)
+              (if (and (intrinsic-method? row) (.symbol-key row))
+                  ;; A symbol-keyed row is observed by the well-known Symbol's key id: its `prop` is
+                  ;; the Symbol's name, which no property name reaches.
+                  (= (.key d) (realm-image-well-known-key (.prop row)))
+                  (shape-key-name-eq? (.key d)
+                                      (if (intrinsic-method? row)
+                                          (.prop row)
+                                          (.name row)))))]
+    (if (not key-matches)
+        false
+        (if (not (intrinsic-method? row))
+            (= (.owner d) (heap-global-entry))
+            (if (= (.target row) INTRINSIC-TARGET-NAMESPACE)
+                (let [ns (syntax-namespace-index (.owner row))]
+                  (and (>= ns 0)
+                       (< ns (len (.namespace-entries (parser-state))))
+                       (= (.owner d)
+                          (get (.namespace-entries (parser-state)) ns))))
+                (let [fi (syntax-find-intrinsic-fun (.owner row))]
+                  (if (< fi 0)
+                      false
+                      (let [f (syntax-fun-at fi)]
+                        (if (< (.static-entry f) 0)
+                            false
+                            (if (= (.target row) INTRINSIC-TARGET-PROTOTYPE)
+                                (and (syntax-intrinsic-constructor? fi)
+                                     (= (.owner d)
+                                        (realm-image-prototype-of (.static-entry f))))
+                                (= (.owner d) (.static-entry f))))))))))))
+
+;; The Funs `parser-close-world!` will leave with unknown callers: the process entry and every
+;; adapter `parser-adapter-open?` keeps open.
+(defn parser-open-funs [] (-> (ArrayList i64))
+  (let [(mut open) (al-new [i64] (compiler-allocator))
+        (mut fi) 0]
+    (push! [i64] (mut open) (n-nid (parser-entry-fun)))
+    (loop (if (>= (load fi) (len (.funs (parser-state))))
+              (break 0)
+              (let [f (syntax-fun-at (load fi))]
+                (if (and (syntax-fun-lowered? (load fi))
+                         (!= (.adapter-nid f) 0)
+                         (parser-adapter-open? (load fi)))
+                    (push! [i64] (mut open) (.adapter-nid f))
+                    0)
+                (set! (mut fi) (+ (load fi) 1))
+                (continue))))
+    (load open)))
+
+;; One scan: materialize every declared row some observation selects. Answers whether any was added.
+(defn parser-apply-surface-demands! [] (-> bool)
+  (let [demands
+          (imagefacts-surface-demands! (.external-mutation (parser-state))
+                                       (parser-open-funs))
+        table (intrinsic-table)
+        (mut seen) (hm-new [i64 bool] (compiler-allocator) (i64-keyops))
+        (mut added) false]
+    (al-for [item demands]
+            (let [d item
+                  ;; Owner and key fit in one word: entries and key ids are far below 2^31.
+                  id (+ (* (+ (.owner d) 1) 2147483648) (+ (.key d) 1))]
+              (if (hm-contains? (load seen) id)
+                  0
+                  (do
+                    (set! (mut seen) id true)
+                    (al-for [r table]
+                            (let [row r]
+                              (if (and (parser-row-observed? row d)
+                                       (parser-materialize-intrinsic! row))
+                                  (do
+                                    ;; `AOT_REALM_TRACE=1` narrates each row the scan materialized and why.
+                                    (if (!= (primitive/cast i64
+                                                            (os/getenv c"AOT_REALM_TRACE"))
+                                            0)
+                                        (do
+                                          (println "realm: {s} observed as (entry {}, key {})"
+                                                   (.name row)
+                                                   (.owner d)
+                                                   (.key d))
+                                          0)
+                                        0)
+                                    (set! (mut added) true))
+                                  0)))))))
+    (hm-free! (mut seen))
+    (load added)))
+
+;; Lower pending parser bodies and JSL definitions until neither has work: each can demand the other.
+(defn parser-drain-lowering! [] (-> i64)
+  (loop (do
+          (jsl-define-pending!)
+          (if (> (parser-lower-pending-bodies!) 0) (continue) (break 0)))))
+
+;; The fixpoint, then the final value-call type: every function a code word can hold now exists.
+(defn parser-settle-realm! [] (-> i64)
+  (let [p (parser-state)]
+    (parser-drain-lowering!)
+    (if (and (.script-mode p) (parser-realm-by-demand?))
+        (loop (if (parser-apply-surface-demands!)
+                  (do (parser-drain-lowering!) (continue))
+                  (break 0)))
+        0)
+    (let [final (parser-value-funptr-ty)
+          count (arena-node-count)
+          (mut i) 1]
+      (jsl-set-value-call-abi! final)
+      (loop (if (> (load i) count)
+                (break 0)
+                (do
+                  (match (arena-node (load i))
+                    (Some [n]
+                          (if (and (not (n-dead? n))
+                                   (or (= (n-op n) OP-LOAD)
+                                       (= (n-op n) OP-STORE))
+                                   (= (mem-alias-of-node n) ALIAS-FUNCTION-CODE))
+                              (mem-redeclare-code-word! n final)
+                              0))
+                    (None [] 0))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      0)))
+
+;; A closed program decides its realm by demand. A shared-realm provider carries the declared
+;; surface, its clients carry none of its methods, and any other external Script unit carries the
+;; declared surface too, since another unit it cannot see may observe any of it.
+(defn parser-realm-by-demand? [] (-> bool)
+  (not (.external-mutation (parser-state))))

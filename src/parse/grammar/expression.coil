@@ -1,0 +1,1051 @@
+;; Grammar of expressions: primaries, member chains, calls, the operator precedence ladder, assignment.
+
+(module aot.parse.grammar.expression)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.parse.lexer" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.grammar.literal" :use *)
+(import "aot.parse.grammar.pattern" :use *)
+(import "aot.parse.grammar.statement" :use *)
+(import "aot.parse.grammar.function" :use *)
+(import "aot.parse.grammar.class" :use *)
+
+;; A token that can never begin an ECMAScript expression proves a SyntaxError. Tokens that begin
+;; grammar this parser has not admitted yet (regex, template, array literal, function, class,
+;; `this`, `new`, `super`, `import`, escaped or non-ASCII identifiers) must fail closed instead.
+(defn token-cannot-start-expression? [(t Token)] (-> bool)
+  (if (= (.kind t) TOK-EOF)
+      true
+      (if (= (.kind t) TOK-PUNCT)
+          (let [x (token-text t)]
+            (not (or (= x "(")
+                     (= x "{")
+                     (= x "#")
+                     (= x "\\")
+                     (= x "@")
+                     (>= (get x 0) (cast u8 128)))))
+          (if (= (.kind t) TOK-KEYWORD)
+              (let [x (token-text t)]
+                (not (or (= x "function")
+                         (= x "class")
+                         (= x "super")
+                         (= x "let"))))
+              false))))
+
+(defn parse-primary-fallback [(t Token)] (-> i64)
+  (if (token-cannot-start-expression? t)
+      (syntax-error! "parser: expected an expression")
+      (do
+        (parse-fail "parser: primary is outside the admitted subset at byte" t)
+        0)))
+
+;; Arguments: AssignmentExpressions and `...spread`, with an optional trailing comma.
+(defn parse-syntax-arguments [] (-> (ArrayList i64))
+  (let [(mut args) (al-new [i64] (compiler-allocator))]
+    (set! (.spread-trailing-comma (parser-state)) false)
+    (if (not (take-is ")"))
+        (loop (let [spread (token-is (peek-token) "...")]
+                (if spread
+                    (let [dots (take-token)
+                          value (parse-syntax-assignment)]
+                      (push! [i64]
+                             (mut args)
+                             (syntax-add-node! (SxSpread value)
+                                               (.start dots)
+                                               (syntax-hi value))))
+                    (push! [i64] (mut args) (parse-syntax-assignment)))
+                (let [comma (token-is (peek-token) ",")]
+                  (if (parse-list-separator! ")"
+                                             "parser: expected `,` or `)` in argument list")
+                      (do
+                        (if (and spread comma)
+                            (set! (.spread-trailing-comma (parser-state)) true)
+                            0)
+                        (break 0))
+                      (continue)))))
+        0)
+    (load args)))
+
+;; `import(specifier)` / `import(specifier, options)` and the module-only `import.meta`, which is a
+;; proven error in a Script. Phase imports (`import.source`, `import.defer`) are proposals this
+;; parser fails closed on; any other `import.x` matches no production.
+(defn parse-syntax-import-expression [(keyword Token)] (-> i64)
+  (if (take-is ".")
+      (let [name (take-token)]
+        (if (token-is name "meta")
+            (syntax-error! "parser: import.meta is only valid in a module")
+            (if (or (token-is name "source") (token-is name "defer"))
+                (parse-fail "parser: phase imports are outside the admitted subset at byte"
+                            name)
+                (syntax-error! "parser: unexpected token after import"))))
+      (if (take-is "(")
+          (do
+            (if (token-is (peek-token) ")")
+                (syntax-error! "parser: import() requires a specifier")
+                0)
+            (if (token-is (peek-token) "...")
+                (syntax-error! "parser: import() does not accept spread arguments")
+                0)
+            (let [specifier (parse-syntax-assignment)
+                  options
+                    (if (and (take-is ",") (not (token-is (peek-token) ")")))
+                        (do
+                          (if (token-is (peek-token) "...")
+                              (syntax-error! "parser: import() does not accept spread arguments")
+                              0)
+                          (let [o (parse-syntax-assignment)]
+                            (take-is ",")
+                            (Some o)))
+                        (None [i64]))]
+              (require-closing! ")"
+                                "parser: import() accepts at most two arguments")
+              (syntax-add-node! (SxImportCall specifier options)
+                                (.start keyword)
+                                (lex-consumed-end))))
+          (syntax-error! "parser: import declarations are only valid in a module"))))
+
+;; IdentifierReference, or the start of an arrow function / async function that shares its first
+;; token with one. `yield`/`await` reaching this point inside their reserving contexts are errors:
+;; the expression forms are parsed at the assignment and unary levels.
+(defn parse-syntax-identifier-primary [(t Token)] (-> i64)
+  (let [next (peek-token)
+        same-line (not (.nl-before next))]
+    ;; These are StringValue rules: an escaped spelling of the name is still the name.
+    (if (token-escaped-reserved? t)
+        (syntax-error! "parser: escaped reserved word cannot be an identifier")
+        (if (and (= (token-text t) "yield") (parser-ctx-generator?))
+            (syntax-error! "parser: yield expression is not allowed here")
+            (if (and (= (token-text t) "await")
+                     (or (parser-ctx-async?) (parser-ctx-static-block?)))
+                (syntax-error! "parser: await expression is not allowed here")
+                (if (and (= (token-text t) "arguments")
+                         (parser-ctx-forbids-arguments?))
+                    (syntax-error! "parser: arguments is not allowed in a class field initializer or static block")
+                    (if (and (token-is t "async")
+                             same-line
+                             (not (.new-callee (parser-state)))
+                             (or (token-is next "function")
+                                 (= (.kind next) TOK-IDENT)
+                                 (token-is next "(")))
+                        (parse-syntax-async-head t)
+                        (if (and same-line (token-is next "=>"))
+                            (let [(mut params)
+                                    (al-new [(slice u8)] (compiler-allocator))
+                                  (mut defaults)
+                                    (al-new [(Option i64)] (compiler-allocator))
+                                  (mut patterns)
+                                    (al-new [(Option i64)] (compiler-allocator))]
+                              (syntax-check-binding-name! (token-text t))
+                              (push! [(slice u8)] (mut params) (token-text t))
+                              (push! [(Option i64)] (mut defaults) (None [i64]))
+                              (push! [(Option i64)] (mut patterns) (None [i64]))
+                              (parse-syntax-arrow-body! (.start t)
+                                                        (load params)
+                                                        (load defaults)
+                                                        (load patterns)
+                                                        (None [(slice u8)])
+                                                        (None [i64])
+                                                        true
+                                                        false))
+                            (syntax-add-node! (SxName (token-text t))
+                                              (.start t)
+                                              (.end t))))))))))
+
+;; `async function …`, `async x => …`, `async (…) => …`, or an ordinary call `async(…)`
+;; (CoverCallExpressionAndAsyncArrowHead).
+(defn parse-syntax-async-head [(t Token)] (-> i64)
+  (let [next (peek-token)]
+    (if (token-is next "function")
+        (parse-syntax-function-expression (take-token) true (.start t))
+        (if (= (.kind next) TOK-IDENT)
+            (let [param (take-token)
+                  (mut params) (al-new [(slice u8)] (compiler-allocator))
+                  (mut defaults) (al-new [(Option i64)] (compiler-allocator))
+                  (mut patterns) (al-new [(Option i64)] (compiler-allocator))]
+              (if (= (token-text param) "await")
+                  (syntax-error! "parser: await is not a valid async arrow parameter")
+                  0)
+              (syntax-check-binding-name! (token-text param))
+              (push! [(slice u8)] (mut params) (token-text param))
+              (push! [(Option i64)] (mut defaults) (None [i64]))
+              (push! [(Option i64)] (mut patterns) (None [i64]))
+              (if (not (token-is (peek-token) "=>"))
+                  (syntax-error! "parser: expected => after async arrow parameter")
+                  0)
+              (parse-syntax-arrow-body! (.start t)
+                                        (load params)
+                                        (load defaults)
+                                        (load patterns)
+                                        (None [(slice u8)])
+                                        (None [i64])
+                                        true
+                                        true))
+            (do
+              (take-token)
+              (let [args (parse-syntax-arguments)
+                    trailing (.spread-trailing-comma (parser-state))
+                    after (peek-token)]
+                (if (and (token-is after "=>") (not (.nl-before after)))
+                    (do
+                      (if trailing
+                          (syntax-error! "parser: rest parameter must be last")
+                          0)
+                      (parse-syntax-arrow-from-cover! (.start t) args true))
+                    (let [callee
+                            (syntax-add-node! (SxName "async")
+                                              (.start t)
+                                              (.end t))]
+                      (syntax-add-node! (SxCall
+                                          :callee callee
+                                          :args args
+                                          :optional false)
+                                        (.start t)
+                                        (lex-consumed-end))))))))))
+
+;; `super.x`, `super[x]` inside a method (through arrows); `super(...)` only inside a derived
+;; class constructor. Anything else is a proven error. A super property reference makes the home
+;; object part of the method's function object, and its entry pass that object in the callee slot.
+(defn parse-syntax-super [(t Token)] (-> i64)
+  (let [next (peek-token)]
+    (if (or (token-is next ".") (token-is next "["))
+        (if (parser-ctx-home-method?)
+            (do
+              (parser-ctx-needs-home!)
+              (syntax-add-node! (SxSuper) (.start t) (.end t)))
+            (syntax-error! "parser: super property access is only allowed in a method"))
+        (if (token-is next "(")
+            (if (parser-ctx-allows-super-call?)
+                (syntax-add-node! (SxSuper) (.start t) (.end t))
+                (syntax-error! "parser: super call is only allowed in a derived class constructor"))
+            (syntax-error! "parser: unexpected super")))))
+
+;; CoverParenthesizedExpressionAndArrowParameterList. Parentheses restore the `[+In]` grammar.
+;; The list is parsed as expressions; a following `=>` reinterprets it as ArrowFormalParameters,
+;; otherwise an empty list, a rest element or a trailing comma is a proven error and the items
+;; fold into a comma expression inside a group.
+(defn parse-syntax-parenthesized [(open Token)] (-> i64)
+  (let [saved-no-in (.no-in (parser-state))
+        (mut items) (al-new [i64] (compiler-allocator))
+        (mut arrow-only) false]
+    (set! (.no-in (parser-state)) false)
+    (if (take-is ")")
+        (set! (mut arrow-only) true)
+        (loop (if (token-is (peek-token) "...")
+                  (let [dots (take-token)
+                        target
+                          (if (or (token-is (peek-token) "[")
+                                  (token-is (peek-token) "{"))
+                              (parse-syntax-primary)
+                              (let [name (require-binding-identifier)]
+                                (syntax-add-node! (SxName (token-text name))
+                                                  (.start name)
+                                                  (.end name))))]
+                    (set! (mut arrow-only) true)
+                    (if (token-is (peek-token) "=")
+                        (syntax-error! "parser: rest parameter may not have a default")
+                        0)
+                    (push! [i64]
+                           (mut items)
+                           (syntax-add-node! (SxSpread target)
+                                             (.start dots)
+                                             (syntax-hi target)))
+                    (if (take-is ")")
+                        0
+                        (syntax-error! "parser: rest parameter must be last"))
+                    (break 0))
+                  (do
+                    (push! [i64] (mut items) (parse-syntax-assignment))
+                    (if (take-is ",")
+                        (if (take-is ")")
+                            (break (do (set! (mut arrow-only) true) 0))
+                            (continue))
+                        (break (do
+                                 (require-closing! ")"
+                                                   "parser: expected `)` after expression")
+                                 0)))))))
+    (set! (.no-in (parser-state)) saved-no-in)
+    (let [after (peek-token)]
+      (if (and (token-is after "=>") (not (.nl-before after)))
+          (parse-syntax-arrow-from-cover! (.start open) (load items) false)
+          (if (load arrow-only)
+              (syntax-error! "parser: expected an expression")
+              (let [(mut expr) (get (load items) 0)
+                    (mut i) 1]
+                (loop (if (>= (load i) (len (load items)))
+                          (break 0)
+                          (let [rhs (get (load items) (load i))]
+                            (set! (mut expr)
+                                  (syntax-binary! (SxComma (load expr) rhs)
+                                                  (load expr)
+                                                  rhs))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (syntax-add-node! (SxGroup (load expr))
+                                  (.start open)
+                                  (lex-consumed-end))))))))
+
+(defn parse-syntax-primary [] (-> i64)
+  (let [t (take-token)]
+    (if (= (.kind t) TOK-BIGINT)
+        (unimplemented "BigInt literal value lowering"
+                       "jsl/compiler — BigInt runtime")
+        0)
+    (if (or (= (.kind t) TOK-NUMBER) (= (.kind t) TOK-LEGACY-NUMBER))
+        (syntax-add! (syntax-number t))
+        (if (or (token-is t "true") (token-is t "false") (token-is t "null"))
+            (syntax-add-node! (SxSingleton (if (token-is t "true")
+                                               "JsTrue"
+                                               (if (token-is t "false")
+                                                   "JsFalse"
+                                                   "JsNull")))
+                              (.start t)
+                              (.end t))
+            (if (or (= (.kind t) TOK-IDENT) (token-is t "let"))
+                (parse-syntax-identifier-primary t)
+                (if (= (.kind t) TOK-STRING)
+                    (syntax-add! (syntax-string t))
+                    (if (token-is t "(")
+                        (parse-syntax-parenthesized t)
+                        (if (token-is t "{")
+                            (parse-syntax-object-literal t)
+                            (if (token-is t "[")
+                                (parse-syntax-array-literal t)
+                                (if (token-is t "this")
+                                    (syntax-add-node! (SxThis)
+                                                      (.start t)
+                                                      (.end t))
+                                    (if (token-is t "super")
+                                        (parse-syntax-super t)
+                                        (if (token-is t "function")
+                                            (parse-syntax-function-expression t
+                                                                              false
+                                                                              (.start t))
+                                            (if (token-is t "class")
+                                                (let [cls
+                                                        (parse-syntax-class t
+                                                                            false)]
+                                                  (syntax-add-node! (SxClass cls)
+                                                                    (.start t)
+                                                                    (syntax-class-hi cls)))
+                                                (if (token-is t "#")
+                                                    (parse-syntax-private-in t)
+                                                    (if (token-is t "import")
+                                                        (parse-syntax-import-expression t)
+                                                        (if (token-is t "`")
+                                                            (parse-syntax-template t
+                                                                                   false)
+                                                            (if (and (= (.kind t)
+                                                                        TOK-PUNCT)
+                                                                     (or (token-is t
+                                                                                   "/")
+                                                                         (token-is t
+                                                                                   "/=")))
+                                                                (parse-syntax-regex t)
+                                                                (parse-primary-fallback t))))))))))))))))))
+
+;; The member/call suffix loop shared by MemberExpression (`allow-call` false, for a `new` callee),
+;; CallExpression and OptionalExpression. A tagged template cannot follow an optional chain.
+(defn parse-syntax-member-tail [(start i64) (allow-call bool)] (-> i64)
+  (let [(mut base) start]
+    (loop (let [t (peek-token)]
+            (if (and (syntax-arrow? (load base))
+                     (or (token-is t ".")
+                         (token-is t "?.")
+                         (token-is t "[")
+                         (token-is t "`")
+                         (and allow-call (token-is t "("))))
+                (syntax-error! "parser: an arrow function cannot be accessed or called without parentheses")
+                0)
+            (if (token-is t ".")
+                (do
+                  (take-token)
+                  (if (token-is (peek-token) "#")
+                      (let [is-super
+                              (match (syntax-node (load base))
+                                (SxSuper [] true)
+                                (_ false))
+                            name (parse-syntax-private-name! (take-token))]
+                        (if is-super
+                            (syntax-error! "parser: super cannot access a private name")
+                            0)
+                        (set! (mut base)
+                              (syntax-add-node! (SxPrivateMember
+                                                  :owner (load base)
+                                                  :name (token-text name)
+                                                  :optional false)
+                                                (syntax-lo (load base))
+                                                (.end name))))
+                      (let [member (require-property-name)]
+                        (set! (mut base)
+                              (syntax-add-node! (SxMember
+                                                  :owner (load base)
+                                                  :name (token-text member)
+                                                  :optional false)
+                                                (syntax-lo (load base))
+                                                (.end member)))))
+                  (continue))
+                (if (token-is t "?.")
+                    (do
+                      (take-token)
+                      (let [next (peek-token)]
+                        (if (token-is next "(")
+                            (do
+                              (take-token)
+                              (let [args (parse-syntax-arguments)]
+                                (set! (mut base)
+                                      (syntax-add-node! (SxCall
+                                                          :callee (load base)
+                                                          :args args
+                                                          :optional true)
+                                                        (syntax-lo (load base))
+                                                        (lex-consumed-end)))))
+                            (if (token-is next "[")
+                                (let [saved-no-in (.no-in (parser-state))]
+                                  (take-token)
+                                  (set! (.no-in (parser-state)) false)
+                                  (let [key (parse-syntax-expression)]
+                                    (set! (.no-in (parser-state)) saved-no-in)
+                                    (require-closing! "]"
+                                                      "parser: expected `]` after computed member")
+                                    (set! (mut base)
+                                          (syntax-add-node! (SxIndex
+                                                              :owner (load base)
+                                                              :key key
+                                                              :optional true)
+                                                            (syntax-lo (load base))
+                                                            (lex-consumed-end)))))
+                                (if (token-is next "`")
+                                    (syntax-error! "parser: tagged template is not allowed in an optional chain")
+                                    (if (token-is next "#")
+                                        (let [name
+                                                (parse-syntax-private-name! (take-token))]
+                                          (set! (mut base)
+                                                (syntax-add-node! (SxPrivateMember
+                                                                    :owner
+                                                                      (load base)
+                                                                    :name
+                                                                      (token-text name)
+                                                                    :optional
+                                                                      true)
+                                                                  (syntax-lo (load base))
+                                                                  (.end name))))
+                                        (if (or (= (.kind next) TOK-IDENT)
+                                                (= (.kind next) TOK-KEYWORD))
+                                            (let [member (take-token)]
+                                              (set! (mut base)
+                                                    (syntax-add-node! (SxMember
+                                                                        :owner
+                                                                          (load base)
+                                                                        :name
+                                                                          (token-text member)
+                                                                        :optional
+                                                                          true)
+                                                                      (syntax-lo (load base))
+                                                                      (.end member))))
+                                            (syntax-error! "parser: expected a property, index or call after ?.")))))))
+                      (continue))
+                    (if (token-is t "[")
+                        (let [saved-no-in (.no-in (parser-state))]
+                          (take-token)
+                          (set! (.no-in (parser-state)) false)
+                          (let [key (parse-syntax-expression)]
+                            (set! (.no-in (parser-state)) saved-no-in)
+                            (require-closing! "]"
+                                              "parser: expected `]` after computed member")
+                            (set! (mut base)
+                                  (syntax-add-node! (SxIndex
+                                                      :owner (load base)
+                                                      :key key
+                                                      :optional false)
+                                                    (syntax-lo (load base))
+                                                    (lex-consumed-end)))
+                            (continue)))
+                        (if (and allow-call (token-is t "("))
+                            (do
+                              (take-token)
+                              (let [args (parse-syntax-arguments)]
+                                (set! (mut base)
+                                      (syntax-add-node! (SxCall
+                                                          :callee (load base)
+                                                          :args args
+                                                          :optional false)
+                                                        (syntax-lo (load base))
+                                                        (lex-consumed-end)))
+                                (continue)))
+                            (if (token-is t "`")
+                                (do
+                                  (if (syntax-optional-chain? (load base))
+                                      (syntax-error! "parser: tagged template is not allowed in an optional chain")
+                                      0)
+                                  (take-token)
+                                  (let [template (parse-syntax-template t true)]
+                                    (set! (mut base)
+                                          (syntax-add-node! (SxTaggedTemplate (load base)
+                                                                              template)
+                                                            (syntax-lo (load base))
+                                                            (lex-consumed-end)))
+                                    (continue)))
+                                (break 0))))))))
+    (load base)))
+
+;; `new MemberExpression Arguments?`, `new new X()()`, and the meta property `new.target`, which
+;; is a proven error outside a function body. An `import()` or optional chain cannot be a `new`
+;; callee.
+(defn parse-syntax-new [(keyword Token)] (-> i64)
+  (if (take-is ".")
+      (let [name (take-token)]
+        (if (not (token-is name "target"))
+            (syntax-error! "parser: expected new.target")
+            (if (not (parser-ctx-allows-new-target?))
+                (syntax-error! "parser: new.target is not allowed outside a function")
+                (syntax-add-node! (SxNewTarget) (.start keyword) (.end name)))))
+      (let [callee
+              (if (token-is (peek-token) "new")
+                  (parse-syntax-new (take-token))
+                  (parse-syntax-member-tail (parse-syntax-primary) false))]
+        (match (syntax-node (syntax-spine-root callee))
+          (SxImportCall [specifier options]
+                        (syntax-error! "parser: import() cannot be used with new"))
+          (_ 0))
+        (if (syntax-optional-chain? callee)
+            (syntax-error! "parser: optional chain cannot be used with new")
+            0)
+        (syntax-reject-arrow-operand! callee)
+        (let [args
+                (if (take-is "(")
+                    (parse-syntax-arguments)
+                    (al-new [i64] (compiler-allocator)))]
+          (syntax-add-node! (SxNew callee args)
+                            (.start keyword)
+                            (lex-consumed-end))))))
+
+;; LeftHandSideExpression: NewExpression or CallExpression, with the shared suffix loop.
+(defn parse-syntax-lhs [] (-> i64)
+  (let [first (peek-token)
+        base
+          (if (token-is first "new")
+              (parse-syntax-new (take-token))
+              (parse-syntax-primary))]
+    (parse-syntax-member-tail base true)))
+
+;; AssignmentTargetType. A name or property Reference is simple. A CallExpression is invalid, but
+;; only strict code proves it early: sloppy web-compatible code defers to a runtime ReferenceError,
+;; so the strict pass reports it and lowering refuses it by name. Every other admitted expression
+;; kind is proven invalid here. Parentheses are transparent for Reference targets, while a
+;; parenthesized object literal can no longer be reinterpreted as a destructuring pattern.
+(defn syntax-check-simple-target! [(id i64)
+                                   (pattern-allowed bool)
+                                   (web-compat bool)] (-> i64)
+  (let [target-id (syntax-ungroup-id id)
+        pattern (and pattern-allowed (= target-id id))]
+    (if (syntax-optional-chain? target-id)
+        (syntax-error! "parser: optional chain is not a valid assignment target")
+        (match (syntax-node target-id)
+          (SxName [name] 0)
+          (SxMember [owner name optional] 0)
+          (SxPrivateMember [owner name optional] 0)
+          (SxIndex [owner key optional] 0)
+          ;; Sloppy `f() = 1`, `f() += 1` and `f()++` defer to a runtime ReferenceError; logical
+          ;; assignment and for-in/of heads never do.
+          (SxCall [callee args optional]
+                  (if web-compat
+                      0
+                      (syntax-error! "parser: call expression is not a valid assignment target")))
+          (SxObject [entries]
+                    (syntax-error! "parser: invalid assignment target"))
+          (SxArray [elements]
+                   (syntax-error! "parser: invalid assignment target"))
+          (_ (syntax-error! "parser: invalid assignment target"))))))
+
+(defn token-update-op-name [(t Token)] (-> (slice u8))
+  (if (token-is t "++") "JsIncrement" "JsDecrement"))
+
+;; UpdateExpression: postfix `++`/`--` must follow on the same line. A line terminator ends the
+;; LeftHandSideExpression and the operator then begins a prefix update of the next statement.
+(defn parse-syntax-update [] (-> i64)
+  (let [lhs (parse-syntax-lhs)
+        t (peek-token)]
+    (if (and (or (token-is t "++") (token-is t "--")) (not (.nl-before t)))
+        (do
+          (take-token)
+          (syntax-check-simple-target! lhs false true)
+          (syntax-add-node! (SxUpdate
+                              :op (token-update-op-name t)
+                              :prefix false
+                              :target (syntax-ungroup-id lhs))
+                            (syntax-lo lhs)
+                            (.end t)))
+        lhs)))
+
+(defn token-unary-operator? [(t Token)] (-> bool)
+  (or (token-is t "!")
+      (token-is t "void")
+      (token-is t "-")
+      (token-is t "+")
+      (token-is t "typeof")
+      (token-is t "~")
+      (token-is t "delete")))
+
+(defn token-unary-op-name [(t Token)] (-> (slice u8))
+  (if (token-is t "!")
+      "JsLogicalNot"
+      (if (token-is t "void")
+          "JsVoid"
+          (if (token-is t "-")
+              "JsNegate"
+              (if (token-is t "typeof")
+                  "JsTypeof"
+                  (if (token-is t "~") "JsBitNot" "JsPositive"))))))
+
+(defn parse-syntax-unary [] (-> i64)
+  ;; Final Simple recursively parses unary minus before its multiplication loop. JavaScript
+  ;; numeric conversion belongs to JSL; the parser never subtracts from zero (which loses -0).
+  (let [t (peek-token)]
+    (if (and (token-is t "await") (parser-ctx-async?))
+        (do
+          (take-token)
+          (if (parser-ctx-in-params?)
+              (syntax-error! "parser: await expression is not allowed in formal parameters")
+              0)
+          (let [operand (parse-syntax-unary)]
+            (syntax-reject-arrow-operand! operand)
+            (syntax-add-node! (SxAwait operand) (.start t) (syntax-hi operand))))
+        (if (token-unary-operator? t)
+            (do
+              (take-token)
+              (let [operand (parse-syntax-unary)
+                    hi (syntax-hi operand)]
+                (syntax-reject-arrow-operand! operand)
+                (if (token-is t "delete")
+                    (do
+                      ;; Private names cannot be deleted, parenthesized or not.
+                      (match (syntax-node (syntax-ungroup-id operand))
+                        (SxPrivateMember [owner name optional]
+                                         (syntax-error! "parser: private names cannot be deleted"))
+                        (_ 0))
+                      (syntax-add-node! (SxDelete operand) (.start t) hi))
+                    (syntax-add-node! (SxUnary (token-unary-op-name t) operand)
+                                      (.start t)
+                                      hi))))
+            (if (or (token-is t "++") (token-is t "--"))
+                (do
+                  (take-token)
+                  (let [operand (parse-syntax-unary)]
+                    (syntax-reject-arrow-operand! operand)
+                    (syntax-check-simple-target! operand false true)
+                    (syntax-add-node! (SxUpdate
+                                        :op (token-update-op-name t)
+                                        :prefix true
+                                        :target (syntax-ungroup-id operand))
+                                      (.start t)
+                                      (syntax-hi operand))))
+                (parse-syntax-update))))))
+
+(defn syntax-reject-arrow-operand! [(id i64)] (-> i64)
+  (if (syntax-arrow? id)
+      (syntax-error! "parser: an arrow function cannot be an operand without parentheses")
+      0))
+
+(defn syntax-binary! [(node SyntaxNode) (lhs i64) (rhs i64)] (-> i64)
+  (do
+    ;; Assignment right-hand sides, comma operands and conditional arms are AssignmentExpressions.
+    (match node
+      (SxComma [l r] 0)
+      (SxAssign [target value] 0)
+      (SxCompoundAssign [op target value] 0)
+      (SxLogicalAssign [predicate rhs-on-true target value] 0)
+      (SxConditional [condition when-true when-false]
+                     (syntax-reject-arrow-operand! condition))
+      (_ (do
+           (syntax-reject-arrow-operand! lhs)
+           (syntax-reject-arrow-operand! rhs))))
+    (syntax-add-node! node (syntax-lo lhs) (syntax-hi rhs))))
+
+;; ExponentiationExpression is right-associative and its base is an UpdateExpression: a unary
+;; operator directly before `**` is a proven SyntaxError, while a parenthesized unary is fine.
+(defn parse-syntax-exponent [] (-> i64)
+  (let [first (peek-token)
+        base (parse-syntax-unary)]
+    (if (token-is (peek-token) "**")
+        (do
+          (if (token-unary-operator? first)
+              (syntax-error! "parser: unary operator before ** requires parentheses")
+              0)
+          (take-token)
+          (let [rhs (parse-syntax-exponent)]
+            (syntax-binary! (SxBinary
+                              :op "JsExp"
+                              :left base
+                              :right rhs)
+                            base
+                            rhs)))
+        base)))
+
+(defn parse-syntax-mul [] (-> i64)
+  (let [(mut lhs) (parse-syntax-exponent)]
+    (loop (let [t (peek-token)]
+            (if (not (or (token-is t "*") (token-is t "/") (token-is t "%")))
+                (break 0)
+                (do
+                  (take-token)
+                  (let [rhs (parse-syntax-exponent)
+                        op
+                          (if (token-is t "*")
+                              "JsMul"
+                              (if (token-is t "/") "JsDiv" "JsMod"))]
+                    (set! (mut lhs)
+                          (syntax-binary! (SxBinary
+                                            :op op
+                                            :left (load lhs)
+                                            :right rhs)
+                                          (load lhs)
+                                          rhs))
+                    (continue))))))
+    (load lhs)))
+
+(defn parse-syntax-add [] (-> i64)
+  (let [(mut lhs) (parse-syntax-mul)]
+    (loop (let [t (peek-token)]
+            (if (not (or (token-is t "+") (token-is t "-")))
+                (break 0)
+                (do
+                  (take-token)
+                  (let [rhs (parse-syntax-mul)
+                        op (if (token-is t "+") "JsAdd" "JsSub")]
+                    (set! (mut lhs)
+                          (syntax-binary! (SxBinary
+                                            :op op
+                                            :left (load lhs)
+                                            :right rhs)
+                                          (load lhs)
+                                          rhs))
+                    (continue))))))
+    (load lhs)))
+
+(defn parse-syntax-shift [] (-> i64)
+  (let [(mut lhs) (parse-syntax-add)]
+    (loop (let [t (peek-token)]
+            (if (not (or (token-is t "<<") (token-is t ">>") (token-is t ">>>")))
+                (break 0)
+                (do
+                  (take-token)
+                  (let [rhs (parse-syntax-add)
+                        op
+                          (if (token-is t "<<")
+                              "JsShl"
+                              (if (token-is t ">>") "JsShr" "JsUshr"))]
+                    (set! (mut lhs)
+                          (syntax-binary! (SxBinary
+                                            :op op
+                                            :left (load lhs)
+                                            :right rhs)
+                                          (load lhs)
+                                          rhs))
+                    (continue))))))
+    (load lhs)))
+
+;; RelationalExpression. `in` is a keyword operator here; the `[~In]` grammar parameter used by
+;; for-statement heads is not needed until that statement is admitted.
+(defn parse-syntax-relational [] (-> i64)
+  (let [(mut lhs) (parse-syntax-shift)]
+    (loop (let [t (peek-token)]
+            (if (not (or (token-is t "<")
+                         (token-is t ">")
+                         (token-is t "<=")
+                         (token-is t ">=")
+                         (token-is t "instanceof")
+                         (and (token-is t "in") (not (.no-in (parser-state))))))
+                (break 0)
+                (do
+                  (take-token)
+                  (let [rhs (parse-syntax-shift)
+                        op
+                          (if (token-is t "<")
+                              "JsLt"
+                              (if (token-is t ">")
+                                  "JsGt"
+                                  (if (token-is t "<=")
+                                      "JsLe"
+                                      (if (token-is t ">=")
+                                          "JsGe"
+                                          (if (token-is t "instanceof")
+                                              "JsInstanceof"
+                                              "JsIn")))))]
+                    (match (syntax-node rhs)
+                      (SxPrivateName [name]
+                                     (syntax-error! "parser: a private name can only be the left operand of in"))
+                      (_ 0))
+                    (set! (mut lhs)
+                          (syntax-binary! (SxBinary
+                                            :op op
+                                            :left (load lhs)
+                                            :right rhs)
+                                          (load lhs)
+                                          rhs))
+                    (continue))))))
+    (load lhs)))
+
+(defn parse-syntax-equality [] (-> i64)
+  ;; Final Simple Parser.parseEquality loops over comparison operands, left-associatively.
+  ;; JavaScript preserves that precedence but ===/!== mean JSL strict equality, not raw EQ.
+  (let [(mut lhs) (parse-syntax-relational)]
+    (loop (let [t (peek-token)]
+            (if (not (or (token-is t "===")
+                         (token-is t "!==")
+                         (token-is t "==")
+                         (token-is t "!=")))
+                (break 0)
+                (do
+                  (take-token)
+                  (let [rhs (parse-syntax-relational)
+                        op
+                          (if (token-is t "===")
+                              "JsStrictEqual"
+                              (if (token-is t "!==")
+                                  "JsStrictNotEqual"
+                                  (if (token-is t "==")
+                                      "JsLooseEqual"
+                                      "JsLooseNotEqual")))]
+                    (set! (mut lhs)
+                          (syntax-binary! (SxBinary
+                                            :op op
+                                            :left (load lhs)
+                                            :right rhs)
+                                          (load lhs)
+                                          rhs))
+                    (continue))))))
+    (load lhs)))
+
+(defn parse-syntax-bitand [] (-> i64)
+  (let [(mut lhs) (parse-syntax-equality)]
+    (loop (if (not (take-is "&"))
+              (break 0)
+              (let [rhs (parse-syntax-equality)]
+                (set! (mut lhs)
+                      (syntax-binary! (SxBinary
+                                        :op "JsBitAnd"
+                                        :left (load lhs)
+                                        :right rhs)
+                                      (load lhs)
+                                      rhs))
+                (continue))))
+    (load lhs)))
+
+(defn parse-syntax-bitxor [] (-> i64)
+  (let [(mut lhs) (parse-syntax-bitand)]
+    (loop (if (not (take-is "^"))
+              (break 0)
+              (let [rhs (parse-syntax-bitand)]
+                (set! (mut lhs)
+                      (syntax-binary! (SxBinary
+                                        :op "JsBitXor"
+                                        :left (load lhs)
+                                        :right rhs)
+                                      (load lhs)
+                                      rhs))
+                (continue))))
+    (load lhs)))
+
+(defn parse-syntax-bitor [] (-> i64)
+  (let [(mut lhs) (parse-syntax-bitxor)]
+    (loop (if (not (take-is "|"))
+              (break 0)
+              (let [rhs (parse-syntax-bitxor)]
+                (set! (mut lhs)
+                      (syntax-binary! (SxBinary
+                                        :op "JsBitOr"
+                                        :left (load lhs)
+                                        :right rhs)
+                                      (load lhs)
+                                      rhs))
+                (continue))))
+    (load lhs)))
+
+(defn parse-syntax-and [] (-> i64)
+  (let [(mut lhs) (parse-syntax-bitor)]
+    (loop (if (not (take-is "&&"))
+              (break 0)
+              (let [rhs (parse-syntax-bitor)]
+                (set! (mut lhs)
+                      (syntax-binary! (SxAnd (load lhs) rhs) (load lhs) rhs))
+                (continue))))
+    (load lhs)))
+
+(defn syntax-logical-and-or? [(id i64)] (-> bool)
+  (match (syntax-node id) (SxAnd [l r] true) (SxOr [l r] true) (_ false)))
+
+(defn syntax-coalesce? [(id i64)] (-> bool)
+  (match (syntax-node id) (SxCoalesce [l r] true) (_ false)))
+
+(defn parse-syntax-short-circuit [] (-> i64)
+  (let [(mut lhs) (parse-syntax-and)]
+    (loop (let [t (peek-token)]
+            (if (not (or (token-is t "||") (token-is t "??")))
+                (break 0)
+                (do
+                  (take-token)
+                  (let [rhs (parse-syntax-and)
+                        coalesce (token-is t "??")]
+                    ;; CoalesceExpression may not contain an unparenthesized LogicalOR/AND.
+                    ;; Group nodes preserve this grammar distinction without semantic AST facts.
+                    (if (if coalesce
+                            (or (syntax-logical-and-or? (load lhs))
+                                (match (syntax-node rhs)
+                                  (SxAnd [l r] true)
+                                  (_ false)))
+                            (syntax-coalesce? (load lhs)))
+                        (syntax-error! "parser: nullish and logical operators require parentheses")
+                        0)
+                    (set! (mut lhs)
+                          (syntax-binary! (if coalesce
+                                              (SxCoalesce (load lhs) rhs)
+                                              (SxOr (load lhs) rhs))
+                                          (load lhs)
+                                          rhs))
+                    (continue))))))
+    (load lhs)))
+
+(defn parse-syntax-conditional [] (-> i64)
+  (let [condition (parse-syntax-short-circuit)]
+    (if (not (take-is "?"))
+        condition
+        (let [when-true (parse-syntax-assignment)]
+          (require-token ":")
+          (let [when-false (parse-syntax-assignment)]
+            (syntax-binary! (SxConditional
+                              :condition condition
+                              :when-true when-true
+                              :when-false when-false)
+                            condition
+                            when-false))))))
+
+(defn token-compound-operator-name [(op Token)] (-> (slice u8))
+  (if (token-is op "+=")
+      "JsAdd"
+      (if (token-is op "-=")
+          "JsSub"
+          (if (token-is op "*=")
+              "JsMul"
+              (if (token-is op "/=")
+                  "JsDiv"
+                  (if (token-is op "%=")
+                      "JsMod"
+                      (if (token-is op "**=")
+                          "JsExp"
+                          (if (token-is op "<<=")
+                              "JsShl"
+                              (if (token-is op ">>=")
+                                  "JsShr"
+                                  (if (token-is op ">>>=")
+                                      "JsUshr"
+                                      (if (token-is op "&=")
+                                          "JsBitAnd"
+                                          (if (token-is op "|=")
+                                              "JsBitOr"
+                                              (if (token-is op "^=")
+                                                  "JsBitXor"
+                                                  "")))))))))))))
+
+(defn token-logical-assignment? [(op Token)] (-> bool)
+  (or (token-is op "&&=") (token-is op "||=") (token-is op "??=")))
+
+;; Assignment is right-associative and below the conditional expression. Parentheses preserve a
+;; Reference, but arithmetic/calls cannot be turned into one by discarding their expression.
+;; Logical assignment short-circuits: the RHS and the PutValue both live on one edge, and `||=`
+;; evaluates its RHS on the FALSE edge of the truthiness predicate.
+;; YieldExpression: `yield`, `yield expr`, `yield* expr`. Its argument is optional and ends at a
+;; line terminator or any token that cannot begin an expression.
+(defn parse-syntax-yield [] (-> i64)
+  (let [t (take-token)]
+    (if (parser-ctx-in-params?)
+        (syntax-error! "parser: yield expression is not allowed in formal parameters")
+        0)
+    (let [next (peek-token)]
+      (if (.nl-before next)
+          (syntax-add-node! (SxYield (None [i64]) false) (.start t) (.end t))
+          (if (token-is next "*")
+              (do
+                (take-token)
+                (let [argument (parse-syntax-assignment)]
+                  (syntax-add-node! (SxYield (Some argument) true)
+                                    (.start t)
+                                    (syntax-hi argument))))
+              (if (or (token-cannot-start-expression? next)
+                      (token-is next "in")
+                      (token-is next "of"))
+                  (syntax-add-node! (SxYield (None [i64]) false)
+                                    (.start t)
+                                    (.end t))
+                  (let [argument (parse-syntax-assignment)]
+                    (syntax-add-node! (SxYield (Some argument) false)
+                                      (.start t)
+                                      (syntax-hi argument)))))))))
+
+(defn parse-syntax-assignment [] (-> i64)
+  (if (and (token-is (peek-token) "yield") (parser-ctx-generator?))
+      (parse-syntax-yield)
+      (parse-syntax-assignment-proper)))
+
+;; An unparenthesized object or array literal on the left of `=` is a destructuring pattern.
+(defn syntax-pattern-literal? [(id i64)] (-> bool)
+  (match (syntax-node id)
+    (SxObject [entries] true)
+    (SxArray [elements] true)
+    (_ false)))
+
+(defn parse-syntax-assignment-proper [] (-> i64)
+  (let [lhs (parse-syntax-conditional)
+        op (peek-token)
+        compound (token-compound-operator-name op)
+        logical (token-logical-assignment? op)]
+    (if (not (or (token-is op "=") (!= compound "") logical))
+        lhs
+        (do
+          (take-token)
+          (if (and (token-is op "=") (syntax-pattern-literal? lhs))
+              ;; Destructuring assignment: the literal becomes an assignment pattern.
+              (let [pattern (syntax-cover-to-pattern! lhs false)
+                    rhs (parse-syntax-assignment)]
+                (syntax-add-node! (SxDestructuringAssign pattern rhs)
+                                  (syntax-lo lhs)
+                                  (syntax-hi rhs)))
+              (do
+                (syntax-check-simple-target! lhs
+                                             (token-is op "=")
+                                             (not logical))
+                (let [target (syntax-ungroup-id lhs)
+                      rhs (parse-syntax-assignment)]
+                  (syntax-binary! (if logical
+                                      (SxLogicalAssign
+                                        :predicate
+                                          (if (token-is op "??=")
+                                              "JsNullish"
+                                              "JsTruthy")
+                                        :rhs-on-true (not (token-is op "||="))
+                                        :target target
+                                        :value rhs)
+                                      (if (token-is op "=")
+                                          (SxAssign target rhs)
+                                          (SxCompoundAssign
+                                            :op compound
+                                            :target target
+                                            :value rhs)))
+                                  lhs
+                                  rhs))))))))
+
+;; Expression: comma-separated AssignmentExpressions, left to right, valued by the last.
+(defn parse-syntax-expression [] (-> i64)
+  (let [(mut lhs) (parse-syntax-assignment)]
+    (loop (if (not (take-is ","))
+              (break 0)
+              (let [rhs (parse-syntax-assignment)]
+                (set! (mut lhs)
+                      (syntax-binary! (SxComma (load lhs) rhs) (load lhs) rhs))
+                (continue))))
+    (load lhs)))

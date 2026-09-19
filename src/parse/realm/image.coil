@@ -1,0 +1,499 @@
+;; The realm image: the global object, function objects, prototypes and namespaces as static heap data.
+
+(module aot.parse.realm.image)
+(import "aot.codegen.compunit" :use [CU-SCRIPT-FUNCTION])
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.str" :use [sb-new sb-push-str! sb-str])
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.rt.number" :use [number-word NUMBER-INFINITY-BITS NUMBER-NAN-BITS])
+(import "aot.shape" :use *)
+(import "aot.heap" :use *)
+(import "aot.jsl.decls" :use *)
+(import "aot.parse.parser" :use [syntax-find-intrinsic-fun])
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.analysis.declarations" :use *)
+(import "aot.parse.realm.globals" :use *)
+(import "aot.parse.realm.intrinsics" :use *)
+(import "aot.parse.lower.function" :use *)
+
+;; Realm creation as data: the static heap image (aot.heap, docs/DECISIONS.md, the realm image).
+;;
+;; Everything a realm holds before its first statement runs is laid out here, once, after the
+;; header pass has given every hoisted function its Fun and index: the global object with an
+;; `undefined` property per var-like global in table order (so its hidden class is the table's),
+;; one function object with its `prototype` object per hoisted declaration of every Script and per
+;; materialized intrinsic, the properties CreateIntrinsics gives an Error prototype, and the
+;; global object's initial words — the intrinsics, then the first Script's own function
+;; declarations in order, later declarations winning, exactly the stores GlobalDeclarationInstantiation
+;; would have made before that Script's first statement. A later Script's function step stays a
+;; store at its start (`lower-global-instantiation!`): the first Script runs before it and must
+;; still see `undefined`.
+;; Reusable Script units omit source bindings from this template. Their initializers check and
+;; create those bindings in the executing global; only intrinsic properties exist on adoption.
+;; globalThis (§19.1.1): the global object itself, writable and configurable but not enumerable.
+;; It is a property whose value is its own carrier, so it is defined here rather than declared.
+(defn realm-image-global-this! [(global i64)] (-> i64)
+  (heap-define-own-attrs! global
+                          "globalThis"
+                          (heap-ref-word DYNAMIC-PREFIX-OBJECT global)
+                          HEAP-WORD-REF
+                          (+ SHAPE-ATTR-WRITABLE SHAPE-ATTR-CONFIGURABLE)))
+
+(defn realm-image-build! [] (-> i64)
+  (let [p (parser-state)
+        global (heap-add-object! DYNAMIC-NULL-WORD)]
+    (if (.script-unit p)
+        (do
+          ;; SetDefaultGlobalBindings: these singleton properties participate in runtime
+          ;; declaration checks even when source identifier reads can use a constant.
+          (heap-define-own-attrs! global
+                                  "undefined"
+                                  DYNAMIC-UNDEFINED-WORD
+                                  HEAP-WORD-CONST
+                                  0)
+          (heap-define-own-attrs! global
+                                  "Infinity"
+                                  NUMBER-INFINITY-BITS
+                                  HEAP-WORD-CONST
+                                  0)
+          (heap-define-own-attrs! global
+                                  "NaN"
+                                  NUMBER-NAN-BITS
+                                  HEAP-WORD-CONST
+                                  0)
+          (realm-image-global-this! global)
+          0)
+        (do
+          (al-for [g (.globals p)]
+                  (let [binding g]
+                    ;; CreateGlobalVarBinding / CreateGlobalFunctionBinding (§9.1.1.4.17–18): writable,
+                    ;; enumerable, not configurable.
+                    (heap-define-own-attrs! global
+                                            (.name binding)
+                                            DYNAMIC-UNDEFINED-WORD
+                                            HEAP-WORD-CONST
+                                            (+ SHAPE-ATTR-WRITABLE
+                                               SHAPE-ATTR-ENUMERABLE))))
+          0))
+    (heap-set-global! global)
+    ;; The phases below run over every record in declaration order, so the image's entry and
+    ;; property order is the realm's declaration order. `realm-image-add-intrinsic!` runs the same
+    ;; phases for one record materialized later, before the image facts exist.
+    (realm-image-each-hoisted! (primitive/fnptr-of realm-image-function-object!))
+    (realm-image-each-intrinsic! (primitive/fnptr-of realm-image-root-binding!))
+    (al-clear! [i64] (mut (.namespace-entries p)))
+    (al-for [name (.namespaces p)] (realm-image-namespace! name))
+    (realm-image-each-intrinsic! (primitive/fnptr-of realm-image-method-placement!))
+    (realm-image-each-intrinsic! (primitive/fnptr-of realm-image-register-prototype!))
+    (realm-image-link-function-prototypes!)
+    (realm-image-link-object-prototypes!)
+    (realm-image-each-intrinsic! (primitive/fnptr-of realm-image-constructor-record-setup!))
+    ;; Closed programs preinstall the first Script's functions. Reusable Script units execute
+    ;; this step through the retained initializer so adoption alone does not evaluate a Script.
+    (if (and (> (len (.scripts p)) 0) (not (.script-unit p)))
+        (do
+          (al-for [entry (get (.script-declarations p) 0)]
+                  (let [e entry]
+                    (if (= (.kind e) CU-SCRIPT-FUNCTION)
+                        (let [declared
+                                (syntax-fun-at (syntax-script-declared-function 0
+                                                                                (.function-ordinal e)))]
+                          (heap-define-own-attrs! global
+                                                  (.name e)
+                                                  (heap-ref-word DYNAMIC-PREFIX-FUNCTION
+                                                                 (.static-entry declared))
+                                                  HEAP-WORD-REF
+                                                  (+ SHAPE-ATTR-WRITABLE
+                                                     SHAPE-ATTR-ENUMERABLE)))
+                        0)))
+          0)
+        0)
+    0))
+
+(defn realm-image-each-hoisted! [(step (fnptr c [i64] i64))] (-> i64)
+  (let [(mut fi) 0]
+    (loop (if (>= (load fi) (len (.funs (parser-state))))
+              (break 0)
+              (let [f (syntax-fun-at (load fi))]
+                (if (and (.hoisted f) (not (syntax-script-root? (load fi))))
+                    (primitive/call-ptr step (load fi))
+                    0)
+                (set! (mut fi) (+ (load fi) 1))
+                (continue))))))
+
+(defn realm-image-each-intrinsic! [(step (fnptr c [i64] i64))] (-> i64)
+  (let [(mut fi) 0]
+    (loop (if (>= (load fi) (len (.funs (parser-state))))
+              (break 0)
+              (do
+                (if (syntax-intrinsic-fun? (load fi))
+                    (primitive/call-ptr step (load fi))
+                    0)
+                (set! (mut fi) (+ (load fi) 1))
+                (continue))))))
+
+(defn realm-image-intrinsic-entry [(fi i64)] (-> Intrinsic)
+  (let [table (intrinsic-table)
+        f (syntax-fun-at fi)]
+    (get table (intrinsic-index table (.name f)))))
+
+;; A hoisted declaration's or intrinsic's function object, MakeConstructor included.
+(defn realm-image-function-object! [(fi i64)] (-> i64)
+  (let [f (syntax-fun-at fi)]
+    (if (not (syntax-fun-lowered? fi))
+        (unimplemented-function-value fi)
+        0)
+    (let [flags (syntax-fun-construct-flags fi)
+          constructor (!= (& flags FUNCTION-FLAG-CONSTRUCTOR) 0)
+          fobj
+            (heap-add-function! (.adapter-fidx f)
+                                DYNAMIC-NULL-WORD
+                                flags)
+          proto (if constructor (heap-add-object! DYNAMIC-NULL-WORD) -1)
+          fp (syntax-fun-ptr fi)]
+      ;; MakeConstructor (§10.2.5): `prototype` writable only, `constructor` writable and
+      ;; configurable. A function without [[Construct]] has neither.
+      (if constructor
+          (heap-define-own-attrs! proto
+                                  "constructor"
+                                  (heap-ref-word DYNAMIC-PREFIX-FUNCTION fobj)
+                                  HEAP-WORD-REF
+                                  (+ SHAPE-ATTR-WRITABLE
+                                     SHAPE-ATTR-CONFIGURABLE))
+          0)
+      ;; A built-in function (CreateBuiltinFunction, §10.3.4) defines `length` then `name`, both
+      ;; configurable only; a built-in constructor's `prototype` is neither writable, enumerable
+      ;; nor configurable (§20-§23).
+      (if (syntax-intrinsic-fun? fi)
+          (let [entry (realm-image-intrinsic-entry fi)]
+            (heap-define-own-attrs! fobj
+                                    "length"
+                                    (number-word (primitive/cast f64
+                                                                 (.length entry)))
+                                    HEAP-WORD-CONST
+                                    SHAPE-ATTR-CONFIGURABLE)
+            (heap-define-own-attrs! fobj
+                                    "name"
+                                    (realm-image-ascii-string-word (if (intrinsic-method? entry)
+                                                                       (.prop entry)
+                                                                       (.name entry)))
+                                    HEAP-WORD-REF
+                                    SHAPE-ATTR-CONFIGURABLE))
+          0)
+      (if constructor
+          (heap-define-own-attrs! fobj
+                                  "prototype"
+                                  (heap-ref-word DYNAMIC-PREFIX-OBJECT proto)
+                                  HEAP-WORD-REF
+                                  (if (syntax-intrinsic-fun? fi)
+                                      0
+                                      SHAPE-ATTR-WRITABLE))
+          0)
+      (set! (.static-entry fp) fobj)
+      ;; The pointer escapes into a value: the Fun is never inlined away from under its address. At
+      ;; an external boundary this object may be observed without a local call site, so caller
+      ;; closure must keep its generic hook.
+      (set! (.value-taken fp) true)
+      (fun-set-escapes! (parser-node (.adapter-nid f)))
+      ;; The code word is typed as the finite set of every value-taken function; the linker
+      ;; (`opto-link-cg!`) resolves each index through the registry a FunPtr would have filled.
+      (arena-register-function! (.adapter-fidx f)
+                                (parser-node (.adapter-nid f)))
+      0)))
+
+;; A global intrinsic function's binding, with its declared attributes.
+(defn realm-image-root-binding! [(fi i64)] (-> i64)
+  (let [f (syntax-fun-at fi)
+        entry (realm-image-intrinsic-entry fi)
+        g (syntax-global-index (.name f))
+        ;; A closed program's Script function declaration owns the binding (preinstalled below).
+        shadowed
+          (and (not (.script-unit (parser-state)))
+               (>= g 0)
+               (let [b (get (.globals (parser-state)) g)]
+                 (and (>= (.fun b) 0) (not (syntax-intrinsic-fun? (.fun b))))))]
+    (if (or (intrinsic-method? entry) shadowed)
+        0
+        (heap-define-own-attrs! (heap-global-entry)
+                                (.name f)
+                                (heap-ref-word DYNAMIC-PREFIX-FUNCTION
+                                               (.static-entry f))
+                                HEAP-WORD-REF
+                                (.attrs entry)))))
+
+;; A namespace object (`Math`): an ordinary object, the global binding's word, the well-known
+;; name, and its declared data properties.
+(defn realm-image-namespace! [(name (slice u8))] (-> i64)
+  (let [p (parser-state)
+        table (intrinsic-table)
+        obj (heap-add-object! DYNAMIC-NULL-WORD)
+        entry (get table (intrinsic-index table name))]
+    (push! [i64] (mut (.namespace-entries p)) obj)
+    (if (.anonymous entry)
+        ;; An object the specification names and a program cannot: no global binding, and the
+        ;; registry name is the one JSL asks for (docs/DECISIONS.md, iteration).
+        (let [(mut b) (sb-new (compiler-allocator))]
+          (sb-push-str! (mut b) name)
+          (sb-push-str! (mut b) ".prototype")
+          (heap-set-intrinsic! (sb-str (mut b)) obj)
+          0)
+        (do
+          (heap-define-own-attrs! (heap-global-entry)
+                                  name
+                                  (heap-ref-word DYNAMIC-PREFIX-OBJECT obj)
+                                  HEAP-WORD-REF
+                                  (.attrs entry))
+          (heap-set-intrinsic! name obj)
+          0))
+    (realm-image-intrinsic-data! entry obj -1)))
+
+;; A built-in method on its owner's object, with its declared attributes.
+(defn realm-image-method-placement! [(fi i64)] (-> i64)
+  (let [f (syntax-fun-at fi)
+        entry (realm-image-intrinsic-entry fi)]
+    (if (intrinsic-method? entry)
+        (let [carrier
+                (if (= (.target entry) INTRINSIC-TARGET-NAMESPACE)
+                    (syntax-namespace-entry (.owner entry))
+                    (let [owner
+                            (syntax-fun-at (syntax-find-intrinsic-fun (.owner entry)))]
+                      (if (= (.target entry) INTRINSIC-TARGET-PROTOTYPE)
+                          (realm-image-prototype-of (.static-entry owner))
+                          (.static-entry owner))))]
+          (let [;; An accessor row's value is the pair object a descriptor holds — `get` and `set`,
+                ;; in that order — and its property carries the accessor attribute, exactly as a
+                ;; getter defined at run time does (docs/DECISIONS.md, image accessors).
+                word
+                  (if (.accessor entry)
+                      (heap-ref-word DYNAMIC-PREFIX-OBJECT
+                                     (realm-image-accessor-pair (.static-entry f)))
+                      (heap-ref-word DYNAMIC-PREFIX-FUNCTION (.static-entry f)))
+                ;; An accessor property has no writable bit: `get` and `set` replace the value,
+                ;; and only enumerable and configurable remain of what the row declared.
+                attrs
+                  (if (.accessor entry)
+                      (+ (& (.attrs entry)
+                            (+ SHAPE-ATTR-ENUMERABLE SHAPE-ATTR-CONFIGURABLE))
+                         SHAPE-ATTR-ACCESSOR)
+                      (.attrs entry))]
+            (if (.symbol-key entry)
+                ;; `Array.prototype[@@iterator]`: the key is the well-known Symbol the row names,
+                ;; whose id the compiler minted with the Symbol itself (docs/DECISIONS.md,
+                ;; iteration).
+                (heap-define-own-key-attrs! carrier
+                                            (realm-image-well-known-key (.prop entry))
+                                            word
+                                            HEAP-WORD-REF
+                                            attrs)
+                (heap-define-own-attrs! carrier
+                                        (.prop entry)
+                                        word
+                                        HEAP-WORD-REF
+                                        attrs))))
+        0)))
+
+;; The pair object an accessor property holds: `get` is the row's getter and `set` is undefined.
+;; A descriptor reads these two names, so they are ordinary data properties of an ordinary object.
+(defn realm-image-accessor-pair [(getter-entry i64)] (-> i64)
+  (let [pair (heap-add-object! DYNAMIC-NULL-WORD)]
+    (heap-define-own-attrs! pair
+                            "get"
+                            (heap-ref-word DYNAMIC-PREFIX-FUNCTION getter-entry)
+                            HEAP-WORD-REF
+                            (+ (+ SHAPE-ATTR-WRITABLE SHAPE-ATTR-ENUMERABLE)
+                               SHAPE-ATTR-CONFIGURABLE))
+    (heap-define-own-attrs! pair
+                            "set"
+                            DYNAMIC-UNDEFINED-WORD
+                            HEAP-WORD-CONST
+                            (+ (+ SHAPE-ATTR-WRITABLE SHAPE-ATTR-ENUMERABLE)
+                               SHAPE-ATTR-CONFIGURABLE))
+    pair))
+
+;; The key of the well-known Symbol a row names: `Symbol.iterator` for "iterator".
+(defn realm-image-well-known-key [(name (slice u8))] (-> i64)
+  (let [(mut b) (sb-new (compiler-allocator))]
+    (sb-push-str! (mut b) "Symbol.")
+    (sb-push-str! (mut b) name)
+    (shape-key-intern-symbol! (sb-str (mut b)))))
+
+;; A materialized constructor's prototype is a well-known intrinsic the lowering may name
+;; (`%IntrinsicPrototype "Array.prototype"`).
+(defn realm-image-register-prototype! [(fi i64)] (-> i64)
+  (if (not (syntax-intrinsic-constructor? fi))
+      0
+      (let [f (syntax-fun-at fi)
+            (mut sb) (sb-new (compiler-allocator))]
+        (sb-push-str! (mut sb) (.name f))
+        (sb-push-str! (mut sb) ".prototype")
+        (heap-set-intrinsic! (sb-str (mut sb))
+                             (realm-image-prototype-of (.static-entry f))))))
+
+;; With `Function` materialized, every function object in the image has %Function.prototype% as
+;; its [[Prototype]] (§10.2.3 MakeConstructor / OrdinaryFunctionCreate), including the intrinsics.
+(defn realm-image-link-function-prototypes! [] (-> i64)
+  (let [function-fun (syntax-find-intrinsic-fun "Function")]
+    (if (< function-fun 0)
+        0
+        (let [function-syntax (syntax-fun-at function-fun)
+              function-proto
+                (realm-image-prototype-of (.static-entry function-syntax))
+              (mut fi) 0]
+          (loop (if (>= (load fi) (len (.funs (parser-state))))
+                    (break 0)
+                    (let [f (syntax-fun-at (load fi))]
+                      (if (>= (.static-entry f) 0)
+                          (heap-set-prototype! (.static-entry f)
+                                               (heap-ref-word DYNAMIC-PREFIX-OBJECT
+                                                              function-proto)
+                                               HEAP-WORD-REF)
+                          0)
+                      (set! (mut fi) (+ (load fi) 1))
+                      (continue))))))))
+
+;; With `Object` materialized, every intrinsic prototype that heads its own chain, every namespace
+;; object and every hoisted source function's `prototype` object continues to %Object.prototype%
+;; (ECMA-262 §20.5.3.1, §21.3, §23.1.3.1, MakeConstructor).
+(defn realm-image-link-object-prototypes! [] (-> i64)
+  (let [p (parser-state)
+        object-fun (syntax-find-intrinsic-fun "Object")]
+    (if (< object-fun 0)
+        0
+        (let [object-syntax (syntax-fun-at object-fun)
+              object-proto
+                (realm-image-prototype-of (.static-entry object-syntax))
+              word (heap-ref-word DYNAMIC-PREFIX-OBJECT object-proto)
+              (mut fi) 0]
+          (al-for [ns (.namespace-entries p)]
+                  (heap-set-prototype! ns word HEAP-WORD-REF))
+          (loop (if (>= (load fi) (len (.funs p)))
+                    (break 0)
+                    (do
+                      (if (and (syntax-intrinsic-fun? (load fi))
+                               (!= (load fi) object-fun))
+                          (let [f (syntax-fun-at (load fi))
+                                entry (realm-image-intrinsic-entry (load fi))]
+                            (if (and (syntax-intrinsic-constructor? (load fi))
+                                     (= (.parent entry) ""))
+                                (heap-set-prototype! (realm-image-prototype-of (.static-entry f))
+                                                     word
+                                                     HEAP-WORD-REF)
+                                0))
+                          (let [f (syntax-fun-at (load fi))]
+                            (if (and (.hoisted f)
+                                     (not (syntax-intrinsic-fun? (load fi)))
+                                     (not (syntax-script-root? (load fi)))
+                                     (>= (.static-entry f) 0)
+                                     (!= (& (syntax-fun-construct-flags (load fi))
+                                            FUNCTION-FLAG-CONSTRUCTOR)
+                                         0))
+                                (heap-set-prototype! (realm-image-prototype-of (.static-entry f))
+                                                     word
+                                                     HEAP-WORD-REF)
+                                0)))
+                      (set! (mut fi) (+ (load fi) 1))
+                      (continue))))))))
+
+(defn realm-image-constructor-record-setup! [(fi i64)] (-> i64)
+  (if (not (syntax-intrinsic-constructor? fi))
+      0
+      (let [f (syntax-fun-at fi)]
+        (realm-image-constructor-setup! (realm-image-intrinsic-entry fi)
+                                        (.static-entry f)))))
+
+;; The `prototype` object of an image function object.
+(defn realm-image-prototype-of [(fobj i64)] (-> i64)
+  (heap-ref-entry (heap-own-word fobj "prototype")))
+
+;; The image word of an ASCII string (declared names and values; JSL sources are ASCII here).
+(defn realm-image-ascii-string-word [(text (slice u8))] (-> i64)
+  (let [(mut units) (al-new [i64] (compiler-allocator))]
+    (al-for [b text]
+            (if (>= (primitive/cast i64 b) 128)
+                (unimplemented "non-ASCII intrinsic string values (UTF-8 to UTF-16)"
+                               "src/parse/parser.coil — realm-image-ascii-string-word")
+                (push! [i64] (mut units) (primitive/cast i64 b))))
+    (let [word
+            (heap-ref-word DYNAMIC-PREFIX-STRING
+                           (heap-add-string! (load units)))]
+      (al-free! [i64] (mut units))
+      word)))
+
+;; A well-known Symbol's image entry: its description string and the unminted key word every Symbol
+;; carries. One entry per declaration, so `Symbol.iterator` is one value for the program's life.
+(defn realm-image-well-known-symbol-word [(description (slice u8))] (-> i64)
+  (let [existing (heap-well-known-symbol-entry description)]
+    (if (>= existing 0)
+        (heap-ref-word DYNAMIC-PREFIX-SYMBOL existing)
+        (let [entry
+                (heap-add-symbol! (realm-image-ascii-string-word description)
+                                  HEAP-WORD-REF
+                                  (shape-key-intern-symbol! description))]
+          ;; Registered by description so an assembler can bind this unit's Symbol to the one an
+          ;; earlier unit allocated (codegen/image.coil, image-shared-bindings).
+          (heap-set-well-known-symbol! description entry)
+          (heap-ref-word DYNAMIC-PREFIX-SYMBOL entry)))))
+
+;; An intrinsic's declared data properties, in declaration order: rows targeting `prototype` go on
+;; `proto`, the others on `root` (a namespace passes -1 for `proto`; the reader admits prototype
+;; rows only on a constructor).
+(defn realm-image-intrinsic-data! [(entry Intrinsic) (root i64) (proto i64)] (-> i64)
+  (do
+    (al-for [row (.data entry)]
+            (let [prop row
+                  carrier
+                    (if (= (.target prop) JSL-INTRINSIC-TARGET-PROTOTYPE)
+                        proto
+                        root)]
+              (if (< carrier 0)
+                  (panic "realm-image-intrinsic-data!: a prototype row on an object without a prototype")
+                  0)
+              (if (= (.value-kind prop) JSL-INTRINSIC-VALUE-NUMBER)
+                  (heap-define-own-attrs! carrier
+                                          (.key prop)
+                                          (.bits prop)
+                                          HEAP-WORD-CONST
+                                          (.attrs prop))
+                  (if (= (.value-kind prop) JSL-INTRINSIC-VALUE-SYMBOL)
+                      ;; A well-known Symbol: one image allocation, whose identity is the value.
+                      (heap-define-own-attrs! carrier
+                                              (.key prop)
+                                              (realm-image-well-known-symbol-word (.text prop))
+                                              HEAP-WORD-REF
+                                              (.attrs prop))
+                      (heap-define-own-attrs! carrier
+                                              (.key prop)
+                                              (realm-image-ascii-string-word (.text prop))
+                                              HEAP-WORD-REF
+                                              (.attrs prop))))))
+    0))
+
+;; A constructor's declared prototype setup: its data rows, then for a `:parent` the [[Prototype]]
+;; link from its prototype object to the parent's (ECMA-262 §20.5.6.3: a NativeError prototype's
+;; [[Prototype]] is %Error.prototype%). A constructor without a parent was linked to
+;; %Object.prototype% with the other ordinary prototypes.
+(defn realm-image-constructor-setup! [(entry Intrinsic) (fobj i64)] (-> i64)
+  (let [proto (realm-image-prototype-of fobj)]
+    (realm-image-intrinsic-data! entry fobj proto)
+    (if (= (.parent entry) "")
+        0
+        (let [pi (syntax-find-intrinsic-fun (.parent entry))]
+          (if (< pi 0)
+              (panic "realm-image-constructor-setup!: the parent intrinsic was not declared")
+              0)
+          (let [pf (syntax-fun-at pi)]
+            (if (< (.static-entry pf) 0)
+                (panic "realm-image-constructor-setup!: the parent has no image object")
+                0)
+            (heap-set-prototype! proto
+                                 (heap-ref-word DYNAMIC-PREFIX-OBJECT
+                                                (realm-image-prototype-of (.static-entry pf)))
+                                 HEAP-WORD-REF))))))

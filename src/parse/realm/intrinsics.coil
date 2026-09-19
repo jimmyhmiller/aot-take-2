@@ -1,0 +1,394 @@
+;; Standard globals: the builtin library declared into the realm from JSL.
+
+(module aot.parse.realm.intrinsics)
+(import "aot.jsl.reader" :use [JSL-COMPILER-INDEX])
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.str" :use [sb-new sb-push-str! sb-push-i64! sb-str])
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.type.type" :use *)
+(import "aot.shape" :use *)
+(import "aot.jsl.lower" :use *)
+(import "aot.jsl.reader" :use [jsl-load-library!])
+(import "aot.jsl.decls" :use *)
+(import "aot.parse.parser" :use [syntax-find-intrinsic-fun])
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.grammar.function" :use *)
+(import "aot.parse.realm.globals" :use *)
+(import "aot.parse.lower.jsl" :use *)
+(import "aot.parse.lower.expression" :use *)
+
+;; ---------------------------------------------------------------------------
+;; Standard globals — the builtin library (docs/DECISIONS.md, intrinsics)
+;;
+;; A standard global is a hoisted function whose body is one JSL builtin: `Error(m)` is the
+;; function record `Error(a0)` with the expression body `(SxIntrinsic "JsIntrinsicError" [this,
+;; Error, a0])`. Everything else — its Fun, its function object with a `prototype` object, direct
+;; and value calls, inlining, `new`, `instanceof` — is what every source function already gets.
+;; Only the intrinsics a program names (and the ones those depend on, an Error subclass's parent)
+;; are materialized: the realm is closed, so the rest simply do not exist in it.
+;;
+;; WHICH intrinsics exist, their bodies, prototype chains, property values and attributes are
+;; JSL `(intrinsic ...)` declarations (`jsl/compiler/intrinsics.jsl`, read by aot.jsl.decls).
+;; This section only flattens them into one row per function or namespace object.
+(defn intrinsic-namespace? [(entry Intrinsic)] (-> bool)
+  (and (= (.owner entry) "") (= (.target entry) INTRINSIC-TARGET-NAMESPACE)))
+
+(defn syntax-namespace-index [(name (slice u8))] (-> i64)
+  (let [p (parser-state)
+        (mut i) 0
+        (mut found) -1]
+    (loop (if (or (>= (load found) 0) (>= (load i) (len (.namespaces p))))
+              (break 0)
+              (do
+                (if (= (get (.namespaces p) (load i)) name)
+                    (set! (mut found) (load i))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
+;; The image entry of a materialized namespace object; panics for one the realm did not lay out.
+(defn syntax-namespace-entry [(name (slice u8))] (-> i64)
+  (let [p (parser-state)
+        i (syntax-namespace-index name)]
+    (if (or (< i 0) (>= i (len (.namespace-entries p))))
+        (do
+          (panic "syntax-namespace-entry: the realm did not lay out this namespace")
+          0)
+        (get (.namespace-entries p) i))))
+
+(defn intrinsic-method? [(entry Intrinsic)] (-> bool)
+  (!= (.owner entry) ""))
+
+;; The flattened declarations (`jsl-intrinsic-table`). Reading them loads the JSL library, which
+;; `parse-program-sources-config` then lowers without loading it again.
+(defn intrinsic-table [] (-> (ArrayList Intrinsic))
+  (do
+    (parser-load-jsl!)
+    (jsl-intrinsic-table)))
+
+;; Load the production JSL library once per compilation; lowering then uses it without reloading.
+(defn parser-load-jsl! [] (-> i64)
+  (let [p (parser-state)]
+    (if (.jsl-loaded p)
+        0
+        (do
+          (jsl-load-library! JSL-COMPILER-INDEX)
+          (set! (.jsl-loaded p) true)
+          0))))
+
+(defn intrinsic-index [(table (ArrayList Intrinsic)) (name (slice u8))] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (loop (if (or (>= (load i) (len table)) (>= (load found) 0))
+              (break 0)
+              (do
+                (let [entry (get table (load i))]
+                  (if (= (.name entry) name) (set! (mut found) (load i)) 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
+;; Does any expression in the realm name `name` as an identifier?
+(defn syntax-names-identifier? [(name (slice u8))] (-> bool)
+  (let [(mut i) 0
+        (mut found) false]
+    (loop (if (or (>= (load i) (len (.exprs (parser-state)))) (load found))
+              (break 0)
+              (do
+                (let [x (get (.exprs (parser-state)) (load i))]
+                  (match (.node x)
+                    (SxName [n] (if (= n name) (set! (mut found) true) 0))
+                    (_ 0)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
+(defn syntax-intrinsic-fun? [(i i64)] (-> bool)
+  (let [f (syntax-fun-at i)] (and (.hoisted f) (< (.script f) 0))))
+
+;; FUNCTION-FLAG-* of a function record's object. MakeConstructor (§10.2.5) gives an ordinary
+;; function declaration or expression that is not a generator or async a base [[Construct]];
+;; arrows, methods and accessors have none (§15.3.4, §15.4). A built-in has [[Construct]] exactly
+;; when its JSL declaration says `:constructor`, and creates its own result from NewTarget.
+(defn syntax-fun-construct-flags [(i i64)] (-> i64)
+  (if (syntax-intrinsic-fun? i)
+      (if (syntax-intrinsic-constructor? i) FUNCTION-FLAG-CONSTRUCTOR 0)
+      (let [f (syntax-fun-at i)]
+        (if (or (.generator f) (.async f))
+            0
+            (if (.class-ctor f)
+                ;; A class constructor constructs; calling it without `new` is a TypeError its body
+                ;; raises (§15.7.14). A base class creates its own `this`; a derived one's comes from
+                ;; `super()`, so it has no base [[Construct]].
+                (if (.derived-ctor f)
+                    FUNCTION-FLAG-CONSTRUCTOR
+                    (+ FUNCTION-FLAG-CONSTRUCTOR FUNCTION-FLAG-BASE-CONSTRUCTOR))
+                (match (.kind f)
+                  (FunDeclaration []
+                                  (+ FUNCTION-FLAG-CONSTRUCTOR
+                                     FUNCTION-FLAG-BASE-CONSTRUCTOR))
+                  (FunExpression []
+                                 (+ FUNCTION-FLAG-CONSTRUCTOR
+                                    FUNCTION-FLAG-BASE-CONSTRUCTOR))
+                  (_ 0)))))))
+
+;; An intrinsic declared `:constructor` (not a global function, method or namespace).
+(defn syntax-intrinsic-constructor? [(i i64)] (-> bool)
+  (if (syntax-intrinsic-fun? i)
+      (let [table (intrinsic-table)
+            f (syntax-fun-at i)
+            entry (get table (intrinsic-index table (.name f)))]
+        (and (not (intrinsic-method? entry))
+             (= (.kind entry) JSL-INTRINSIC-CONSTRUCTOR)))
+      false))
+
+;; Reserve the function record and the global binding of one intrinsic (once). A namespace has no
+;; function: it is recorded for the realm layout and bound as a plain global.
+(defn syntax-declare-intrinsic! [(entry Intrinsic)] (-> i64)
+  (if (intrinsic-namespace? entry)
+      (if (>= (syntax-namespace-index (.name entry)) 0)
+          0
+          (do
+            (push! [(slice u8)]
+                   (mut (.namespaces (parser-state)))
+                   (.name entry))
+            (syntax-global-declare! (.name entry) -1 -1)
+            0))
+      (if (= (.target entry) INTRINSIC-TARGET-ENTRY)
+          (syntax-declare-intrinsic-entry! entry)
+          (if (>= (syntax-find-intrinsic-fun (.name entry)) 0)
+              0
+              (let [index
+                      (syntax-fun-reserve! (.name entry)
+                                           (FunDeclaration)
+                                           false
+                                           false
+                                           0)
+                    fp (syntax-fun-ptr index)
+                    (mut args) (al-new [i64] (compiler-allocator))
+                    (mut i) 0]
+                (set! (.hoisted fp) true)
+                (set! (.script fp) -1)
+                (set! (.parent fp) -1)
+                ;; A built-in function receives `this` as the caller passed it (ECMA-262 §10.3: built-ins
+                ;; are not sloppy functions); no receiver mapping at its entry.
+                (set! (.strict fp) true)
+                (if (.abi entry)
+                    ;; The builtin is the entry itself: no formals, no body.
+                    (do
+                      (set! (.abi-builtin fp) (.builtin entry))
+                      (set! (.may-throw fp) true)
+                      0)
+                    (do
+                      ;; A constructor's body is (this new.target callee a0 a1 ...): the receiver, `new.target`
+                      ;; (undefined when called, the constructor when constructed: how the body tells the two
+                      ;; apart), the constructor's own function object (its `prototype` is what a plain call
+                      ;; still needs), then the arguments. A method's is (this a0 a1 ...): it has no global
+                      ;; binding to name itself by and no use for its own object.
+                      (push! [i64] (mut args) (syntax-add-node! (SxThis) 0 0))
+                      (if (intrinsic-method? entry)
+                          0
+                          (do
+                            (push! [i64]
+                                   (mut args)
+                                   (syntax-add-node! (SxNewTarget) 0 0))
+                            (push! [i64]
+                                   (mut args)
+                                   (syntax-add-node! (SxName :name (.name entry))
+                                                     0
+                                                     0))))
+                      (loop (if (>= (load i) (.arity entry))
+                                (break 0)
+                                (let [(mut sb) (sb-new (compiler-allocator))]
+                                  (sb-push-str! (mut sb) "$aot$arg")
+                                  (sb-push-i64! (mut sb) (load i))
+                                  (let [pname (sb-str (mut sb))]
+                                    (push! [(slice u8)]
+                                           (mut (.params fp))
+                                           pname)
+                                    (push! [i64]
+                                           (mut (.param-annotations fp))
+                                           (ty-dyn TAG-ANY))
+                                    (push! [(Option i64)]
+                                           (mut (.param-defaults fp))
+                                           (None [i64]))
+                                    (push! [(Option i64)]
+                                           (mut (.param-patterns fp))
+                                           (None [i64]))
+                                    (push! [i64]
+                                           (mut args)
+                                           (syntax-add-node! (SxName :name pname)
+                                                             0
+                                                             0)))
+                                  (set! (mut i) (+ (load i) 1))
+                                  (continue))))
+                      (set! (.expression-body fp)
+                            (Some (syntax-add-node! (SxIntrinsic :builtin
+                                                                   (.builtin entry)
+                                                      :args (load args))
+                                                    0
+                                                    0)))
+                      0))
+                (if (intrinsic-method? entry)
+                    0
+                    ;; A binding a Script function declaration already owns stays that function's.
+                    (let [g (syntax-global-index (.name entry))]
+                      (if (and (>= g 0) (>= (.fun (syntax-global-ptr g)) 0))
+                          0
+                          (syntax-global-declare! (.name entry) -1 index))))
+                0)))))
+
+;; An entry (`(intrinsic %Name% :entry Builtin)`): a record with only a forwarding entry, no global
+;; binding, no function object of its own and no image presence. It is not hoisted, so no source
+;; name resolves to it; `%MakeClosure` names it.
+(defn syntax-declare-intrinsic-entry! [(entry Intrinsic)] (-> i64)
+  (if (>= (syntax-find-entry-fun (.name entry)) 0)
+      0
+      (let [index
+              (syntax-fun-reserve! (.name entry) (FunDeclaration) false false 0)
+            fp (syntax-fun-ptr index)]
+        (set! (.hoisted fp) false)
+        (set! (.script fp) -1)
+        (set! (.parent fp) -1)
+        (set! (.strict fp) true)
+        (set! (.abi-builtin fp) (.builtin entry))
+        (set! (.may-throw fp) true)
+        0)))
+
+;; The record of a declared entry, or -1.
+(defn syntax-find-entry-fun [(name (slice u8))] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (loop (if (or (>= (load found) 0)
+                  (>= (load i) (len (.funs (parser-state)))))
+              (break 0)
+              (let [f (syntax-fun-ptr (load i))]
+                (if (and (= (.name f) name)
+                         (not (.hoisted f))
+                         (> (len (.abi-builtin f)) 0))
+                    (set! (mut found) (load i))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
+;; The intrinsics declared during syntax collection, before the Scripts' own declarations so a
+;; Script redefining `Object` shadows it as JavaScript says it does.
+;;
+;; A shared-realm provider, and any other external Script unit that is not a provider's client,
+;; carries the entire declared surface: another unit it cannot see may observe any of it. A closed
+;; program declares the roots its identifiers bind (with their parents) and the ones its image objects
+;; need for their declared [[Prototype]] chains; every other intrinsic materializes by demand while
+;; the program lowers (`parser-settle-realm!`). A provider's client carries the foundational chain
+;; objects and the roots its identifiers bind, never a method (docs/DECISIONS.md, the provider
+;; carries the declared surface).
+(defn syntax-declare-intrinsics! [] (-> i64)
+  (let [p (parser-state)
+        table (intrinsic-table)
+        mode (.link-mode (jsl-graphs))
+        full
+          (or (= mode JSL-LINK-PROVIDER)
+              (and (.external-mutation p) (= mode JSL-LINK-LOCAL)))
+        (mut any-root) false
+        (mut i) 0]
+    (loop (if (>= (load i) (len table))
+              (break 0)
+              (let [entry (get table (load i))]
+                (if (and (not (intrinsic-method? entry))
+                         ;; An entry has no name a source identifier binds; only a full surface carries it up front.
+                         (or full
+                             (and (!= (.target entry) INTRINSIC-TARGET-ENTRY)
+                                  (syntax-names-identifier? (.name entry)))))
+                    (do
+                      (if (!= (.parent entry) "")
+                          (let [pi (intrinsic-index table (.parent entry))]
+                            (if (< pi 0)
+                                (panic "syntax-declare-intrinsics!: an intrinsic names an unknown parent")
+                                (syntax-declare-intrinsic! (get table pi))))
+                          0)
+                      (syntax-declare-intrinsic! entry)
+                      (set! (mut any-root) true)
+                      0)
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    ;; Declared chains end at %Object.prototype%, and every function object's [[Prototype]] is
+    ;; %Function.prototype%: a realm with an intrinsic root, a hoisted function in its image, or an
+    ;; external boundary (whose callers observe those chains) has both.
+    (if (or (load any-root)
+            (.external-mutation p)
+            (syntax-has-hoisted-function?))
+        (do
+          (syntax-declare-intrinsic! (get table
+                                          (intrinsic-index table "Object")))
+          (syntax-declare-intrinsic! (get table
+                                          (intrinsic-index table "Function")))
+          0)
+        0)
+    (if (and (.external-mutation p) (= mode JSL-LINK-IMPORT))
+        (do
+          ;; A client's language-raised errors must name the canonical prototypes; a later unit
+          ;; cannot repair a null [[Prototype]] by canonicalizing identities.
+          (syntax-declare-intrinsic! (get table (intrinsic-index table "Error")))
+          (syntax-declare-intrinsic! (get table
+                                          (intrinsic-index table "TypeError")))
+          (syntax-declare-intrinsic! (get table
+                                          (intrinsic-index table
+                                                           "ReferenceError")))
+          (syntax-declare-intrinsic! (get table
+                                          (intrinsic-index table "SyntaxError")))
+          0)
+        0)
+    (if full
+        (do
+          (set! (mut i) 0)
+          (loop (if (>= (load i) (len table))
+                    (break 0)
+                    (let [entry (get table (load i))]
+                      (if (intrinsic-method? entry)
+                          (syntax-declare-intrinsic! entry)
+                          0)
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          0)
+        0)
+    0))
+
+;; Does the realm hold a hoisted source function other than a Script root (an image object)?
+(defn syntax-has-hoisted-function? [] (-> bool)
+  (let [(mut i) 0
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) (len (.funs (parser-state)))))
+              (break 0)
+              (let [f (syntax-fun-at (load i))]
+                (if (and (.hoisted f)
+                         (not (syntax-script-root? (load i)))
+                         (not (syntax-intrinsic-fun? (load i))))
+                    (set! (mut found) true)
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
+;; The body of an intrinsic: its JSL builtin over the lowered operands.
+(defn lower-intrinsic-call [(builtin (slice u8)) (args (ArrayList i64))] (-> (dyn NodeOps))
+  (let [(mut values) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (al-for [a args]
+            (let [v (lower-syntax-expr a)]
+              (n-keep! v)
+              (push! [(dyn NodeOps)] (mut values) v)))
+    (let [scope (parser-node (.current-scope (parser-state)))
+          r (lower-jsl-call-values builtin (load values))]
+      (al-for [v (load values)] (n-unkeep! v))
+      (al-free! [(dyn NodeOps)] (mut values))
+      (parser-set-current-ctrl! (.ctrl r))
+      (scope-set-mem! scope (.mem r))
+      (.value r))))

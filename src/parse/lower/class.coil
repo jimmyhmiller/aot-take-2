@@ -1,0 +1,522 @@
+;; Lowering of classes: constructors, members, fields, static blocks and super.
+
+(module aot.parse.lower.class)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.node.property" :use *)
+(import "aot.node.compare" :use *)
+(import "aot.node.gc" :use *)
+(import "aot.node.jsops" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.type.type" :use *)
+(import "aot.shape" :use *)
+(import "aot.jsl.lower" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.grammar.function" :use *)
+(import "aot.parse.analysis.declarations" :use *)
+(import "aot.parse.realm.globals" :use *)
+(import "aot.parse.realm.instantiate" :use *)
+(import "aot.parse.lower.jsl" :use *)
+(import "aot.parse.lower.reference" :use *)
+(import "aot.parse.lower.function" :use *)
+(import "aot.parse.lower.exception" :use *)
+(import "aot.parse.lower.call" :use *)
+(import "aot.parse.lower.environment" :use *)
+(import "aot.parse.lower.expression" :use *)
+
+;; The record a class's `constructor` element names, or a fresh empty one standing for the default
+;; constructor. Class code is strict.
+(defn syntax-class-constructor-record! [(elements (ArrayList ClassElement))
+                                        (name (slice u8))
+                                        (lo i64)
+                                        (derived bool)
+                                        (class-index i64)] (-> i64)
+  (let [(mut found) -1]
+    (al-for [element elements]
+            (match element
+              (CeMethod [key is-static fun]
+                        (if is-static
+                            0
+                            (match key
+                              (CkNamed [k]
+                                       (if (= k "constructor")
+                                           (set! (mut found) fun)
+                                           0))
+                              (_ 0))))
+              (_ 0)))
+    (if (>= (load found) 0)
+        (let [fp (syntax-fun-ptr (load found))]
+          (set! (.class-ctor fp) true)
+          (set! (.derived-ctor fp) derived)
+          (set! (.class-index fp) class-index)
+          ;; A derived constructor's `super()` needs the function object being called.
+          (if derived (set! (.needs-callee fp) true) 0)
+          (load found))
+        (let [index (syntax-fun-reserve! name (FunMethod) false false lo)
+              fp (syntax-fun-ptr index)]
+          (set! (.strict fp) true)
+          (set! (.in-class fp) true)
+          (set! (.class-ctor fp) true)
+          (set! (.derived-ctor fp) derived)
+          (set! (.class-index fp) class-index)
+          ;; The default derived constructor forwards the call's arguments to `super`.
+          (set! (.default-derived fp) derived)
+          (set! (.needs-callee fp) derived)
+          index))))
+
+;; ---------------------------------------------------------------------------
+;; Classes (docs/DECISIONS.md, classes)
+;;
+;; ClassDefinitionEvaluation (§15.7.14) for a base class: the constructor is the `constructor`
+;; element's record, or the empty one the parse synthesized; its function object gets the class's
+;; prototype object with the specified attributes, and every method and accessor is defined —
+;; non-enumerable — on that prototype, or on the constructor when it is static. Heritage, fields,
+;; static blocks, computed keys and private names refuse by name.
+(defn lower-class [(cls i64)] (-> (dyn NodeOps))
+  (let [c (get (.classes (parser-state)) cls)
+        derived (match (.heritage c) (Some [h] true) (None [] false))
+        (mut parent-nid) 0]
+    (match (.heritage c)
+      (Some [h]
+            (let [v (lower-syntax-expr h)]
+              (n-keep! v)
+              (set! (mut parent-nid) (n-nid v))
+              0))
+      (None [] 0))
+    ;; The prototype object precedes the constructor, which takes it as its home object.
+    (let [proto
+            (if derived
+                (let [parent (parser-node (load parent-nid))
+                      parent-proto
+                        (lower-jsl-values1 "JsClassHeritagePrototype" parent)]
+                  (lower-jsl-values1 "JsNewClassPrototype" parent-proto))
+                (lower-jsl-values0 "JsNewBaseClassPrototype"))]
+      (n-keep! proto)
+      (let [ctor (lower-method-object (.ctor c) proto)]
+        (n-keep! ctor)
+        (let [linked
+                (if derived
+                    (lower-completion! (lower-jsl-values3 "JsLinkDerivedClass"
+                                                          ctor
+                                                          (parser-node (load parent-nid))
+                                                          proto))
+                    (lower-completion! (lower-jsl-values2 "JsLinkClassPrototype"
+                                                          ctor
+                                                          proto)))]
+          (if derived (n-unkeep! (parser-node (load parent-nid))) 0)
+          ;; Every element's property name is evaluated where it is written, in element order
+          ;; (§15.7.14 step 25), and a method is defined at once; a static field's initializer and a
+          ;; static block wait for step 29, so the keys are kept until then.
+          (let [(mut keys) (al-new [(dyn NodeOps)] (compiler-allocator))
+                (mut i) 0]
+            (al-for [element (.elements c)]
+                    ;; A static block has no property name; every other element's is evaluated here.
+                    (let [key
+                            (match element
+                              (CeMethod [key is-static fun]
+                                        (lower-class-key key))
+                              (CeField [key is-static init-fun]
+                                       (lower-class-key key))
+                              (CeStaticBlock [fun] (dyn-undefined-make)))]
+                      (n-keep! key)
+                      (push! [(dyn NodeOps)] (mut keys) key)
+                      (match element
+                        (CeMethod [k is-static fun]
+                                  (if (= fun (.ctor c))
+                                      0
+                                      (lower-class-member! (if is-static
+                                                               ctor
+                                                               proto)
+                                                           k
+                                                           key
+                                                           fun)))
+                        (_ 0))
+                      0))
+            (al-for [element (.elements c)]
+                    (do
+                      (match element
+                        (CeField [key is-static init-fun]
+                                 ;; A static field is defined on the constructor, with the
+                                 ;; constructor as its `this`, in declaration order; an instance
+                                 ;; field waits for a construction.
+                                 (if is-static
+                                     (lower-define-field! ctor
+                                                          key
+                                                          (get (load keys)
+                                                               (load i))
+                                                          init-fun)
+                                     0))
+                        ;; A static block is a body run with the constructor as its `this`, in the
+                        ;; same order as the static fields it sits among (§15.7.14 step 29).
+                        (CeStaticBlock [fun]
+                                       (do (lower-static-block! fun ctor) 0))
+                        (_ 0))
+                      (set! (mut i) (+ (load i) 1))
+                      0))
+            (al-for [key (load keys)] (n-unkeep! key))
+            (al-free! [(dyn NodeOps)] (mut keys)))
+          (n-unkeep! proto)
+          (n-unkeep! ctor)
+          ctor)))))
+
+;; One class element's property name (§15.7.14 ClassElementName): an interned key, or the value of a
+;; computed one, converted to a primitive where it is written so the interning cannot fail later.
+(defn lower-class-key [(key ClassKey)] (-> (dyn NodeOps))
+  (match key
+    (CkNamed [k] (keyref-make (shape-key-intern k)))
+    (CkComputed [e]
+                (lower-completion! (lower-jsl-values1 "JsComputedKeyPrimitive"
+                                                      (lower-syntax-expr e))))
+    (CkPrivate [k]
+               (do
+                 (unimplemented "private class elements"
+                                "docs/GAPS.md — classes")
+                 (unreachable-node)))))
+
+(defn class-key-computed? [(key ClassKey)] (-> bool)
+  (match key (CkComputed [e] true) (_ false)))
+
+;; One method or accessor of a class, on the prototype object or on the constructor.
+(defn lower-class-member! [(target (dyn NodeOps))
+                           (key ClassKey)
+                           (key-value (dyn NodeOps))
+                           (fun i64)] (-> i64)
+  (let [computed (class-key-computed? key)
+        ;; MakeMethod (§15.7.14 step 25): the home object is the object the member is defined on.
+        function (lower-method-object fun target)
+        setter (match (.kind (syntax-fun-ptr fun)) (FunSetter [] 1) (_ 0))
+        accessor
+          (match (.kind (syntax-fun-ptr fun))
+            (FunGetter [] true)
+            (FunSetter [] true)
+            (_ false))
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (push! [(dyn NodeOps)] (mut args) target)
+    (push! [(dyn NodeOps)] (mut args) key-value)
+    (push! [(dyn NodeOps)] (mut args) function)
+    (if accessor (push! [(dyn NodeOps)] (mut args) (con-int setter)) 0)
+    (let [defined
+            (lower-jsl-values (if accessor
+                                  (if computed
+                                      "JsDefineClassAccessorComputed"
+                                      "JsDefineClassAccessor")
+                                  (if computed
+                                      "JsDefineClassMethodComputed"
+                                      "JsDefineClassMethod"))
+                              (load args))]
+      (al-free! [(dyn NodeOps)] (mut args))
+      (lower-completion! defined)
+      0)))
+
+(defn lower-jsl-values1 [(name (slice u8)) (a (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [(mut values) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (push! [(dyn NodeOps)] (mut values) a)
+    (let [v (lower-completion! (lower-jsl-values name (load values)))]
+      (al-free! [(dyn NodeOps)] (mut values))
+      v)))
+
+;; `class C { … }` as a statement: the class value initializes C's lexical binding.
+(defn lower-class-declaration! [(cls i64)] (-> i64)
+  (let [p (parser-state)
+        name (syntax-class-name cls)
+        value (lower-class cls)]
+    (if (>= (scope-find (parser-node (.current-scope p)) name) 0)
+        (lower-binding-initialize! name value)
+        (if (and (syntax-script-root? (.current-fun p))
+                 (syntax-script-binding? name))
+            (lower-script-declaration-effect! "JsInitializeGlobalLexicalBinding"
+                                              name
+                                              (Some value))
+            (panic "lower-class-declaration!: the class binding was not instantiated")))
+    0))
+
+;; A class constructor's entry (§15.7.14, the [[Call]] of a class constructor): calling it without
+;; `new` — so with an undefined `new.target` — is a TypeError before anything else runs.
+(defn lower-class-constructor-entry! [(fi i64) (fun (dyn NodeOps))] (-> i64)
+  (if (not (.class-ctor (syntax-fun-ptr fi)))
+      0
+      (let [new-target
+              (match (fun-parm fun 1)
+                (Some [p] p)
+                (None []
+                      (do
+                        (broken "lower-class-constructor-entry!: no new.target Parm")
+                        (unreachable-node))))
+            iff
+              (if-make (parser-node (.current-ctrl (parser-state)))
+                       (n-peephole! (typetest-make new-target TAG-UNDEFINED)))
+            arms (if-arms! iff)
+            scope (parser-node (.current-scope (parser-state)))
+            constructed (scope-dup scope false)]
+        ;; The called path throws and never joins the constructed one.
+        (scope-set-ctrl! scope (arms-true arms))
+        (set! (.current-ctrl (parser-state)) (n-nid (arms-true arms)))
+        (lower-throw-type-error! "Class constructor cannot be invoked without 'new'")
+        (scope-set-ctrl! constructed (arms-false arms))
+        (set! (.current-scope (parser-state)) (n-nid constructed))
+        (set! (.current-ctrl (parser-state)) (n-nid (arms-false arms)))
+        ;; A base constructor's instance fields are defined on its `this` before its body runs
+        ;; (§10.2.2 step 8); a derived one's wait for `super()`.
+        (if (.derived-ctor (syntax-fun-ptr fi))
+            0
+            (lower-instance-fields! fi (lower-receiver-parm fi)))
+        0)))
+
+;; The ABI builtins that fill a record's hidden slots, in slot order.
+(defn parser-hidden-builders [(fi i64)] (-> (ArrayList (dyn NodeOps)))
+  (let [(mut builders) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (match (syntax-fun-hidden-builtin fi)
+      (Some [builder]
+            (push! [(dyn NodeOps)] (mut builders) (jsl-call-target builder)))
+      (None [] 0))
+    (if (.needs-callee (syntax-fun-ptr fi))
+        (push! [(dyn NodeOps)] (mut builders) (jsl-call-target "JsCallCallee"))
+        0)
+    (load builders)))
+
+;; The compiler-only Scope name holding a derived constructor's `this`, which `super()` initializes.
+(const DERIVED-THIS-SLOT "$aot$.this")
+
+;; A derived constructor's `this` starts uninitialized; `super()` binds it (§9.1.1.3).
+(defn lower-derived-this-entry! [(fi i64) (scope (dyn NodeOps))] (-> i64)
+  (if (.derived-ctor (syntax-fun-ptr fi))
+      (do
+        (scope-define! scope
+                       DERIVED-THIS-SLOT
+                       (ty-dyn TAG-ANY)
+                       false
+                       (dyn-undefined-make))
+        0)
+      0))
+
+;; `super(...)` (§13.3.7.1): the parent constructor is the running constructor's [[Prototype]], which
+;; the entry passed in the hidden callee slot; its result becomes `this`, and a second `super()` in
+;; one constructor is a ReferenceError.
+(defn lower-super-call [(args (ArrayList i64))] (-> (dyn NodeOps))
+  (let [p (parser-state)
+        fi (.current-fun p)]
+    (if (not (.derived-ctor (syntax-fun-ptr fi)))
+        (do
+          (unimplemented "`super()` outside a derived constructor"
+                         "docs/GAPS.md — classes")
+          (unreachable-node))
+        (let [array (lower-arguments-array args)]
+          (n-keep! array)
+          (let [fun (parser-node (.fun-nid (syntax-fun-ptr fi)))
+                callee (lower-hidden-callee fi fun)
+                new-target
+                  (match (fun-parm fun 1)
+                    (Some [t] t)
+                    (None [] (unreachable-node)))
+                constructed
+                  (lower-completion! (lower-jsl-values3 "JsSuperConstruct"
+                                                        callee
+                                                        new-target
+                                                        array))]
+            (n-unkeep! array)
+            (n-keep! constructed)
+            (let [scope (parser-node (.current-scope p))
+                  bound
+                    (lower-completion! (lower-jsl-values2 "JsRequireThisUninitialized"
+                                                          (lower-derived-this-value fi)
+                                                          constructed))]
+              (n-unkeep! constructed)
+              (scope-update! (parser-node (.current-scope p))
+                             DERIVED-THIS-SLOT
+                             bound)
+              (lower-instance-fields! fi bound)
+              (dyn-undefined-make)))))))
+
+;; The current derived constructor's `this` binding, before any initialization check.
+(defn lower-derived-this-value [(fi i64)] (-> (dyn NodeOps))
+  (match (scope-lookup (parser-node (.current-scope (parser-state)))
+                       DERIVED-THIS-SLOT)
+    (Some [v] v)
+    (None []
+          (do
+            (broken "lower-derived-this-value: the derived `this` binding is missing")
+            (unreachable-node)))))
+
+;; InitializeInstanceElements (§10.2.11): each instance field of the class, in declaration order,
+;; defined on the object being constructed — for a base constructor before its body runs, for a
+;; derived one the moment `super()` binds `this` (§13.3.7.1 step 8).
+(defn lower-instance-fields! [(fi i64) (receiver (dyn NodeOps))] (-> i64)
+  (let [cls (.class-index (syntax-fun-ptr fi))]
+    (if (< cls 0)
+        0
+        (let [c (get (.classes (parser-state)) cls)]
+          (n-keep! receiver)
+          (al-for [element (.elements c)]
+                  (match element
+                    (CeField [key is-static init-fun]
+                             (if is-static
+                                 0
+                                 (if (class-key-computed? key)
+                                     ;; Its key was evaluated once, where the class was: a
+                                     ;; construction would have to read it back from the class.
+                                     (unimplemented "a computed key on an instance field"
+                                                    "docs/GAPS.md — classes")
+                                     (lower-define-field! receiver
+                                                          key
+                                                          (lower-class-key key)
+                                                          init-fun))))
+                    (_ 0)))
+          (n-unkeep! receiver)
+          0))))
+
+;; DefineField (§10.2.11): CreateDataPropertyOrThrow of the initializer's value — undefined when the
+;; field has none — on the object the field belongs to. The initializer is a function of `this`
+;; alone: the constructor's parameters and body bindings are not in its scope, so it is called, not
+;; inlined.
+(defn lower-define-field! [(target (dyn NodeOps))
+                           (key ClassKey)
+                           (key-value (dyn NodeOps))
+                           (init (Option i64))] (-> i64)
+  (let [computed (class-key-computed? key)
+        value
+          (match init
+            (Some [f] (lower-field-initializer f target))
+            (None [] (dyn-undefined-make)))]
+    (n-keep! value)
+    (let [(mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+      (push! [(dyn NodeOps)] (mut args) target)
+      (push! [(dyn NodeOps)] (mut args) key-value)
+      (push! [(dyn NodeOps)] (mut args) value)
+      (let [defined
+              (lower-jsl-values (if computed
+                                    "JsDefineFieldComputed"
+                                    "JsDefineField")
+                                (load args))]
+        (al-free! [(dyn NodeOps)] (mut args))
+        (lower-completion! defined)
+        (n-unkeep! value)
+        0))))
+
+;; A static block: its record's entry called with the constructor as the receiver, its value dropped.
+(defn lower-static-block! [(fi i64) (ctor (dyn NodeOps))] (-> i64)
+  (if (.needs-home (syntax-fun-ptr fi))
+      (do
+        (unimplemented "`super` in a class static block"
+                       "docs/GAPS.md — classes")
+        0)
+      (if (not (syntax-fun-lowered? fi))
+          (do
+            (unimplemented "a class static block that is not an admitted function value"
+                           "docs/GAPS.md — classes")
+            0)
+          (do (lower-receiver-entry-call fi ctor) 0))))
+
+;; A field initializer's value: its record's entry called with the field's object as the receiver.
+(defn lower-field-initializer [(fi i64) (receiver (dyn NodeOps))] (-> (dyn NodeOps))
+  (if (.needs-home (syntax-fun-ptr fi))
+      (do
+        (unimplemented "`super` in a class field initializer"
+                       "docs/GAPS.md — classes")
+        (unreachable-node))
+      (if (not (syntax-fun-lowered? fi))
+          (do
+            (unimplemented "a class field initializer that is not an admitted function value"
+                           "docs/GAPS.md — classes")
+            (unreachable-node))
+          (lower-receiver-entry-call fi receiver))))
+
+;; MakeSuperPropertyReference (§13.3.7.3): the base of a `super` reference is the object above the
+;; running method's home object, which its function object carries. Its receiver is the method's
+;; own `this`, so an inherited accessor runs on the current object.
+(defn lower-super-base [] (-> (dyn NodeOps))
+  (let [p (parser-state)
+        fi (.current-fun p)]
+    (if (not (.needs-home (syntax-fun-ptr fi)))
+        ;; An arrow inherits `super` from the method around it, which is a capture.
+        (do
+          (unimplemented "`super` through an arrow function"
+                         "docs/GAPS.md — lexical environments and closures")
+          (unreachable-node))
+        (let [fun (parser-node (.fun-nid (syntax-fun-ptr fi)))
+              callee (lower-hidden-callee fi fun)]
+          (lower-completion! (lower-jsl-values1 "JsSuperBase" callee))))))
+
+;; `super.x` and `super[k]` as a value: the reference, read and released.
+(defn lower-super-read [(target i64)] (-> (dyn NodeOps))
+  (let [ref (lower-ref-prepare! target)
+        value (lower-ref-get! ref)]
+    (lower-ref-release! ref)
+    value))
+
+;; `super.m(args)` and `super[k](args)`: the method is found on the base object and called with the
+;; running method's `this` — the receiver of a super call is never the base (§13.3.7.1).
+(defn lower-super-member-call [(target i64)
+                               (args (ArrayList i64))
+                               (label (slice u8))] (-> (dyn NodeOps))
+  (let [ref (lower-ref-prepare! target)
+        function (lower-ref-get! ref)]
+    (n-keep! function)
+    (let [answer
+            (lower-value-call-with-receiver function
+                                            (parser-node (.receiver-nid ref))
+                                            (dyn-undefined-make)
+                                            args
+                                            (lower-callee-message label
+                                                                  " is not a function"))]
+      (n-unkeep! function)
+      (lower-ref-release! ref)
+      answer)))
+
+;; A constructor's returned value (§10.2.2 step 13): an object wins; a base constructor otherwise
+;; answers its `this`, and a derived one requires `super()` to have run and refuses a primitive.
+(defn lower-constructor-return [(value (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [p (parser-state)
+        fi (.current-fun p)]
+    (if (not (.class-ctor (syntax-fun-ptr fi)))
+        value
+        (if (.derived-ctor (syntax-fun-ptr fi))
+            (lower-completion! (lower-jsl-values2 "JsConstructorResult"
+                                                  value
+                                                  (lower-derived-this-value fi)))
+            (lower-jsl-values2 "JsBaseConstructorResult"
+                               value
+                               (lower-receiver-parm fi))))))
+
+(defn lower-receiver-parm [(fi i64)] (-> (dyn NodeOps))
+  (match (fun-parm (parser-node (.fun-nid (syntax-fun-ptr fi))) 0)
+    (Some [r] r)
+    (None []
+          (do
+            (broken "lower-receiver-parm: no receiver Parm")
+            (unreachable-node)))))
+
+;; The default derived constructor's body: `super(...args)` over the call's own actuals, which its
+;; entry passed in the hidden slot.
+(defn lower-default-derived-body! [(fi i64) (fun (dyn NodeOps))] (-> i64)
+  (let [array (lower-hidden-slot-parm fi fun)
+        callee (lower-hidden-callee fi fun)
+        new-target
+          (match (fun-parm fun 1) (Some [t] t) (None [] (unreachable-node)))
+        constructed
+          (lower-completion! (lower-jsl-values3 "JsSuperConstruct"
+                                                callee
+                                                new-target
+                                                array))]
+    (n-keep! constructed)
+    (let [bound
+            (lower-completion! (lower-jsl-values2 "JsRequireThisUninitialized"
+                                                  (lower-derived-this-value fi)
+                                                  constructed))]
+      (n-unkeep! constructed)
+      (scope-update! (parser-node (.current-scope (parser-state)))
+                     DERIVED-THIS-SLOT
+                     bound)
+      (lower-instance-fields! fi bound)
+      0)))

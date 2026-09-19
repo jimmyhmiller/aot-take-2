@@ -1,0 +1,445 @@
+;; Exceptions: a sentinel completion and ordinary control flow through catch and finally.
+
+(module aot.parse.lower.exception)
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.node.compare" :use *)
+(import "aot.rt.abi" :use *)
+(import "aot.node.gc" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.type.type" :use *)
+(import "aot.shape" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.lower.jump" :use *)
+(import "aot.parse.lower.statement" :use *)
+(import "aot.parse.lower.pattern" :use *)
+(import "aot.parse.lower.class" :use *)
+(import "aot.parse.lower.expression" :use *)
+
+;; The synthetic Scope variable that carries a thrown value to its catch clause.
+(const EXCEPTION-VAR "$aot$.exception")
+
+(const FINALLY-KIND-VAR "$aot$.finally.kind")
+
+(const FINALLY-VALUE-VAR "$aot$.finally.value")
+
+(const COMPLETION-NORMAL 0)
+
+(const COMPLETION-RETURN 1)
+
+(const COMPLETION-THROW 2)
+
+;; Call through a value. The callee and every actual are evaluated first, as the specification
+;; orders them; then a FUNCTION guard either loads the code word and calls through the shared
+;; ABI or hands the value to the runtime's abrupt-completion entry (a TypeError once exceptions
+;; exist). Both arms merge as an ordinary Scope diamond.
+;; ---------------------------------------------------------------------------
+;; Exceptions: a sentinel completion and ordinary control flow (docs/DECISIONS.md, exceptions are
+;; a sentinel completion)
+
+;; The innermost catch target, or -1 when a throw leaves the function.
+(defn parser-find-catch [] (-> i64)
+  (let [p (parser-state)
+        (mut i) (- (len (.jump-targets p)) 1)
+        (mut found) -1]
+    (loop (if (or (< (load i) 0) (>= (load found) 0))
+              (break 0)
+              (let [target (get (.jump-targets p) (load i))]
+                (if (= (.kind target) JUMP-CATCH)
+                    (set! (mut found) (load i))
+                    (set! (mut i) (- (load i) 1)))
+                (continue))))
+    (load found)))
+
+;; Carry `value` to the catch target `index`: bind the synthetic exception variable, then take the
+;; same Scope-merging jump a `break` takes to a labeled block.
+(defn lower-jump-to-catch! [(index i64) (value (dyn NodeOps))] (-> i64)
+  (lower-jump-to-target! index (Some value)))
+
+;; The nearest enclosing finally target, or -1.
+(defn parser-find-finally [] (-> i64)
+  (let [p (parser-state)
+        (mut i) (- (len (.jump-targets p)) 1)
+        (mut found) -1]
+    (loop (if (or (< (load i) 0) (>= (load found) 0))
+              (break 0)
+              (let [target (get (.jump-targets p) (load i))]
+                (if (= (.kind target) JUMP-FINALLY)
+                    (set! (mut found) (load i))
+                    (set! (mut i) (- (load i) 1)))
+                (continue))))
+    (load found)))
+
+;; `return v`, or the propagation of an uncaught exception: inside a try with a finally block the
+;; completion is recorded in the finally's variables and control jumps to the block; otherwise it
+;; is the function's Return.
+(defn lower-return-completion! [(value (dyn NodeOps))] (-> i64)
+  (let [index (parser-find-finally)]
+    (if (>= index 0)
+        (let [scope (parser-node (.current-scope (parser-state)))]
+          (n-keep! value)
+          (parser-note-completion! index COMPLETION-RETURN)
+          (scope-update! scope FINALLY-KIND-VAR (con-int COMPLETION-RETURN))
+          (scope-update! scope FINALLY-VALUE-VAR value)
+          (lower-jump-to-target! index (None [(dyn NodeOps)]))
+          (n-unkeep! value)
+          0)
+        (parser-record-return! (lower-constructor-return value)))))
+
+;; A thrown value leaving the current point (docs/DECISIONS.md, exceptions are a sentinel
+;; completion): to the nearest try as a Scope jump (its catch, or its finally as a throw
+;; completion); with no try around it, into the pending word, and the function completes with the
+;; exception sentinel, which every caller tests.
+(defn lower-throw-value! [(value (dyn NodeOps))] (-> i64)
+  (let [catch-index (parser-find-catch)
+        finally-index (parser-find-finally)]
+    (n-keep! value)
+    (if (>= catch-index 0)
+        (lower-jump-to-catch! catch-index value)
+        (if (>= finally-index 0)
+            (let [scope (parser-node (.current-scope (parser-state)))]
+              (parser-note-completion! finally-index COMPLETION-THROW)
+              (scope-update! scope FINALLY-KIND-VAR (con-int COMPLETION-THROW))
+              (scope-update! scope FINALLY-VALUE-VAR value)
+              (lower-jump-to-target! finally-index (None [(dyn NodeOps)])))
+            (do
+              (lower-pending-store! value)
+              (parser-note-propagation!)
+              (parser-record-return! (dyn-exception-make)))))
+    (n-unkeep! value)
+    0))
+
+;; The function being lowered can complete with the sentinel. The syntactic filter must have said
+;; so, or a direct caller was built without its test (`syntax-fun-may-throw?`).
+(defn parser-note-propagation! [] (-> i64)
+  (do (set! (.propagates (parser-state)) true) 0))
+
+;; Take the Scope-merging jump a `break` takes to target `index`, binding the synthetic exception
+;; variable first when a value is carried.
+(defn lower-jump-to-target! [(index i64) (value (Option (dyn NodeOps)))] (-> i64)
+  (let [p (parser-state)
+        scope (parser-node (.current-scope p))
+        target (get (.jump-targets p) index)
+        exit (parser-node (.scope target))
+        outgoing (scope-dup scope false)
+        depth (len (.levels (scope-node exit)))]
+    (parser-set-current-ctrl! (xctrl-make))
+    (loop (if (<= (len (.levels (scope-node outgoing))) depth)
+              (break 0)
+              (do (scope-pop! outgoing) (continue))))
+    ;; Bind the carried value AFTER unwinding to the target's depth: a nested try's own level holds
+    ;; another binding of the same synthetic name, and updating before the pops filled that one.
+    (match value
+      (Some [v] (scope-update! outgoing EXCEPTION-VAR v))
+      (None [] 0))
+    (scope-merge! exit outgoing)
+    (let [meta (al-elem [JumpTarget] (mut (.jump-targets p)) index)]
+      (set! (.count meta) (+ (.count meta) 1)))
+    0))
+
+;; The pending word of the runtime heap record: the thrown value while a throw unwinds.
+(defn lower-pending-store! [(value (dyn NodeOps))] (-> i64)
+  (let [p (parser-state)
+        scope (parser-node (.current-scope p))
+        mem (scope-mem scope)
+        stored
+          (store-make (parser-node (.current-ctrl p))
+                      mem
+                      (heapstate-make)
+                      (con-int RT-HEAP-OFFSET-EXCEPTION-VALUE)
+                      value
+                      ALIAS-EXCEPTION-VALUE
+                      (ty-dyn TAG-ANY))
+        merged (memmerge-make)]
+    (memmerge-set-alias! merged ALIAS-BULK (mem-effective mem ALIAS-BULK))
+    (if (= (n-op mem) OP-MEMMERGE)
+        (let [(mut a) 2]
+          (loop (if (>= (load a) (n-nins mem))
+                    (break 0)
+                    (do
+                      (match (n-in mem (load a))
+                        (Some [slice]
+                              (if (= (load a) ALIAS-EXCEPTION-VALUE)
+                                  0
+                                  (memmerge-set-alias! merged (load a) slice)))
+                        (None [] 0))
+                      (set! (mut a) (+ (load a) 1))
+                      (continue)))))
+        0)
+    (memmerge-set-alias! merged ALIAS-EXCEPTION-VALUE stored)
+    (scope-set-mem! scope merged)
+    0))
+
+(defn lower-pending-load [] (-> (dyn NodeOps))
+  (let [p (parser-state)
+        scope (parser-node (.current-scope p))]
+    (load-make (parser-node (.current-ctrl p))
+               (scope-mem scope)
+               (heapstate-make)
+               (con-int RT-HEAP-OFFSET-EXCEPTION-VALUE)
+               ALIAS-EXCEPTION-VALUE
+               (ty-dyn TAG-ANY))))
+
+;; `throw v`: inside a try, a jump to its catch; otherwise set the pending word and leave the
+;; function with undefined.
+(defn lower-throw [(value-id i64)] (-> i64)
+  (do
+    (lower-throw-value! (lower-syntax-expr value-id))
+    1))
+
+;; After a call or operation whose result may be the exception sentinel: one TypeTest on the
+;; result. On the exceptional arm the thrown value leaves the pending word (cleared) for the
+;; enclosing try, or the function completes with the sentinel itself; the normal arm continues
+;; with the result narrowed to a JavaScript value. The arm ends dead, so the merge keeps only the
+;; normal continuation. Where the result's type already excludes the sentinel there is nothing to
+;; test, and every call and throwing operation is asked: SCCP is the may-throw analysis. (A
+;; syntactic may-throw fixpoint used to decide which calls were asked; it missed operators that
+;; throw, and a missed site let the sentinel escape as a value. Nothing decides but the type.)
+(defn lower-exception-check! [(value (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [p (parser-state)
+        t (n-ty value)
+        tags
+          (match (ty-kind t)
+            (TDyn [bits high int identity] (if high TAG-COMPLETION bits))
+            (_ TAG-COMPLETION))]
+    (if (= (primitive/iand tags TAG-EXCEPTION) 0)
+        value
+        (let [iff
+                (if-make (parser-node (.current-ctrl p))
+                         (typetest-make value TAG-EXCEPTION))
+              arms (if-arms! iff)
+              normal (parser-node (.current-scope p))
+              unwinding (scope-dup normal false)]
+          (n-keep! value)
+          (set! (.current-scope p) (n-nid unwinding))
+          (scope-set-ctrl! unwinding (arms-true arms))
+          (set! (.current-ctrl p) (n-nid (arms-true arms)))
+          (if (or (>= (parser-find-catch) 0) (>= (parser-find-finally) 0))
+              (let [thrown (lower-pending-load)]
+                (n-keep! thrown)
+                (lower-pending-store! (con-int 0))
+                (lower-throw-value! thrown)
+                (n-unkeep! thrown))
+              (do
+                (parser-note-propagation!)
+                (parser-record-return! (dyn-exception-make))))
+          (let [taken (parser-node (.current-scope p))
+                narrowed
+                  (cast-make (arms-false arms)
+                             value
+                             (ty-dyn (primitive/iand tags
+                                                     (primitive/ixor TAG-COMPLETION
+                                                                     TAG-EXCEPTION))))]
+            (n-keep! narrowed)
+            (scope-set-ctrl! normal (arms-false arms))
+            (let [merged (scope-merge! normal taken)]
+              (set! (.current-scope p) (n-nid merged))
+              (set! (.current-ctrl p) (n-nid (scope-ctrl merged)))
+              (n-unkeep! narrowed)
+              (n-unkeep! value)
+              narrowed))))))
+
+;; `try { body } catch (e) { handler } finally { tail }`. The catch target is a Scope with the
+;; synthetic exception variable; every throw and unwinding call in the body merges into it. The
+;; handler binds `e` from that variable in its own level. `finally` runs after the normal merge;
+;; an abrupt completion crossing it refuses by name.
+(defn lower-try [(body i64)
+                 (catch-param (Option i64))
+                 (catch-body (Option i64))
+                 (finally-body (Option i64))] (-> i64)
+  (let [p (parser-state)
+        scope (parser-node (.current-scope p))
+        has-finally (match finally-body (Some [_] true) (None [] false))]
+    (scope-push! scope)
+    (scope-define! scope
+                   EXCEPTION-VAR
+                   (ty-dyn TAG-ANY)
+                   false
+                   (dyn-undefined-make))
+    ;; With a finally block, every abrupt completion of the body or handler records its kind and
+    ;; value here and jumps to the block; the normal path arrives with kind 0.
+    (if has-finally
+        (do
+          (scope-define! scope
+                         FINALLY-KIND-VAR
+                         (ty-int-bot)
+                         false
+                         (con-int COMPLETION-NORMAL))
+          (scope-define! scope
+                         FINALLY-VALUE-VAR
+                         (ty-dyn TAG-ANY)
+                         false
+                         (dyn-undefined-make))
+          (let [fin-exit (scope-dup scope false)]
+            (scope-set-ctrl! fin-exit (xctrl-make))
+            (parser-push-jump! fin-exit JUMP-FINALLY)))
+        0)
+    (let [exit (scope-dup (parser-node (.current-scope p)) false)]
+      (scope-set-ctrl! exit (xctrl-make))
+      (parser-push-jump! exit JUMP-CATCH)
+      (let [terminated (lower-syntax-statement body)
+            target (parser-pop-jump!)
+            after-body (parser-node (.current-scope p))]
+        (match catch-body
+          (None []
+                ;; No catch: a throw out of the body runs the finally block with a throw completion.
+                (if (> (.count target) 0)
+                    (if has-finally
+                        (do
+                          (lower-throw-completion-into-finally! exit)
+                          (parser-use-scope! after-body))
+                        (unimplemented "try/finally without catch (rethrow through finally)"
+                                       "docs/GAPS.md — exceptions"))
+                    0))
+          (Some [handler]
+                (do
+                  ;; The handler runs in the merged throw Scope with `e` bound in a fresh level. With a
+                  ;; finally block its own throws land in a second catch target that feeds the block.
+                  (parser-use-scope! exit)
+                  (scope-push! exit)
+                  (match catch-param
+                    (Some [pattern]
+                          (match (syntax-pattern-node pattern)
+                            (PatName [name]
+                                     (scope-define! (parser-node (.current-scope p))
+                                                    name
+                                                    (ty-dyn TAG-ANY)
+                                                    false
+                                                    (match (scope-lookup (parser-node (.current-scope p))
+                                                                         EXCEPTION-VAR)
+                                                      (Some [thrown] thrown)
+                                                      (None []
+                                                            (unreachable-node)))))
+                            ;; `catch ({message})`: the thrown value is what the pattern binds from.
+                            (_ (lower-pattern-bind! pattern
+                                                    (match (scope-lookup (parser-node (.current-scope p))
+                                                                         EXCEPTION-VAR)
+                                                      (Some [thrown] thrown)
+                                                      (None []
+                                                            (unreachable-node)))
+                                                    PATTERN-PARAM))))
+                    (None [] 0))
+                  (let [rethrow
+                          (scope-dup (parser-node (.current-scope p)) false)]
+                    (scope-set-ctrl! rethrow (xctrl-make))
+                    (if has-finally (parser-push-jump! rethrow JUMP-CATCH) 0)
+                    (lower-syntax-statement handler)
+                    (if has-finally
+                        (let [rethrow-target (parser-pop-jump!)
+                              handler-scope (parser-node (.current-scope p))]
+                          (if (> (.count rethrow-target) 0)
+                              (do
+                                (scope-pop! rethrow)
+                                (lower-throw-completion-into-finally! rethrow))
+                              0)
+                          (parser-use-scope! handler-scope))
+                        0))
+                  (scope-pop! (parser-node (.current-scope p)))
+                  (let [merged
+                          (scope-merge! after-body
+                                        (parser-node (.current-scope p)))]
+                    (parser-use-scope! merged)))))
+        (match finally-body
+          (Some [tail]
+                (let [fin-target (parser-pop-jump!)
+                      normal (parser-node (.current-scope p))]
+                  (if (!= (.kind fin-target) JUMP-FINALLY)
+                      (broken "lower-try: the finally target is not on top of the jump stack")
+                      0)
+                  ;; Every completion meets here: the normal path (kind 0), returns (kind 1) and
+                  ;; throws (kind 2). The block runs once over the merge, then the completion resumes.
+                  (parser-use-scope! (scope-merge! normal
+                                                   (parser-node (.scope fin-target))))
+                  (lower-syntax-statement tail)
+                  (lower-finally-dispatch! fin-target)
+                  0))
+          (None [] 0))
+        (scope-pop! (parser-node (.current-scope p)))
+        (if (and (!= terminated 0) (= (.count target) 0) (not has-finally)) 1 0)))))
+
+;; Arrivals at a catch-like target that has no handler of its own (a try/finally without catch,
+;; or a throw inside the handler) continue as a throw completion into the finally block.
+(defn lower-throw-completion-into-finally! [(arrivals (dyn NodeOps))] (-> i64)
+  (let [p (parser-state)
+        index (parser-find-finally)]
+    (parser-use-scope! arrivals)
+    (let [thrown
+            (match (scope-lookup arrivals EXCEPTION-VAR)
+              (Some [v] v)
+              (None [] (unreachable-node)))]
+      (n-keep! thrown)
+      (parser-note-completion! index COMPLETION-THROW)
+      (scope-update! arrivals FINALLY-KIND-VAR (con-int COMPLETION-THROW))
+      (scope-update! arrivals FINALLY-VALUE-VAR thrown)
+      (lower-jump-to-target! index (None [(dyn NodeOps)]))
+      (n-unkeep! thrown)
+      0)))
+
+;; After the finally block: resume the recorded completion. Each arm is a Scope diamond whose taken
+;; side ends dead (a return or a throw severs control), so the merge keeps only the normal path.
+;; Only the kinds some path recorded into this target get an arm: a block nothing throws into has
+;; no throw arm, so it emits no propagation path (and the may-throw filter's guard stays honest).
+(defn lower-finally-dispatch! [(target JumpTarget)] (-> i64)
+  (do
+    (if (!= (primitive/iand (.completions target)
+                            (primitive/ishl 1 COMPLETION-RETURN))
+            0)
+        (lower-completion-arm! COMPLETION-RETURN)
+        0)
+    (if (!= (primitive/iand (.completions target)
+                            (primitive/ishl 1 COMPLETION-THROW))
+            0)
+        (lower-completion-arm! COMPLETION-THROW)
+        0)
+    0))
+
+;; A completion of `kind` is recorded into the finally target `index`.
+(defn parser-note-completion! [(index i64) (kind i64)] (-> i64)
+  (let [meta (al-elem [JumpTarget] (mut (.jump-targets (parser-state))) index)]
+    (set! (.completions meta)
+          (primitive/ior (.completions meta) (primitive/ishl 1 kind)))
+    0))
+
+(defn lower-completion-arm! [(kind i64)] (-> i64)
+  (let [p (parser-state)
+        normal (parser-node (.current-scope p))
+        kind-value
+          (match (scope-lookup normal FINALLY-KIND-VAR)
+            (Some [v] v)
+            (None [] (unreachable-node)))
+        iff
+          (if-make (parser-node (.current-ctrl p))
+                   (eq-make kind-value (con-int kind)))
+        arms (if-arms! iff)
+        taken (scope-dup normal false)]
+    (set! (.current-scope p) (n-nid taken))
+    (scope-set-ctrl! taken (arms-true arms))
+    (set! (.current-ctrl p) (n-nid (arms-true arms)))
+    (let [value
+            (match (scope-lookup taken FINALLY-VALUE-VAR)
+              (Some [v] v)
+              (None [] (unreachable-node)))]
+      (if (= kind COMPLETION-RETURN)
+          (lower-return-completion! value)
+          (lower-throw-value! value)))
+    (let [ended (parser-node (.current-scope p))]
+      (scope-set-ctrl! normal (arms-false arms))
+      (let [merged (scope-merge! normal ended)]
+        (set! (.current-scope p) (n-nid merged))
+        (set! (.current-ctrl p) (n-nid (scope-ctrl merged)))
+        0))))
+
+;; The completion of a JSL operation that may throw (a property access on undefined or null is a
+;; TypeError raised inside JsGetNamed): tested for the sentinel, which is nothing when the operand
+;; types already folded the throwing arm away.
+(defn lower-completion! [(result (dyn NodeOps))] (-> (dyn NodeOps))
+  (lower-exception-check! result))

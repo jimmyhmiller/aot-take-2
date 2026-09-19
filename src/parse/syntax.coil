@@ -1,0 +1,838 @@
+;; The thin syntax tree: its node sums and records, and the arena accessors and walkers over them.
+
+(module aot.parse.syntax)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.node.property" :use *)
+(import "aot.node.compare" :use *)
+(import "aot.node.gc" :use *)
+(import "aot.node.jsops" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.grammar.function" :use *)
+
+;; The thin syntax tree is a pair of sum types. Every walk over it — strict early errors,
+;; declaration collection, break validation, the hidden-class prepass and graph lowering — is an
+;; exhaustive `match`, so adding a grammar production is a compile error at every site that has
+;; not yet decided what to do with it. Records carry source spans and grammar shape only. Child
+;; references are 1-based ids into the parser-owned side arrays; an absent optional child is
+;; `None`, never a sentinel id. Operator variants name their JSL entry point directly.
+;; One PropertyDefinition. Shorthand `{a}` is desugared to a named property valued by an
+;; IdentifierReference at parse time; CoverInitializedName survives only to be reinterpreted as a
+;; destructuring pattern and is otherwise a SyntaxError. Methods, accessors and generators are
+;; not admitted yet and fail closed.
+(defsum PropKey
+  (KeyNamed [(key i64)])  ; interned shape key
+  (KeyComputed [(expr i64)]))
+
+(defsum ObjectEntry
+  (PropValue [(key PropKey) (value i64)])
+  (PropMethod [(key PropKey) (fun i64)])  ; method, getter or setter: see the SyntaxFun kind
+  (PropSpread [(expr i64)])
+  (PropCoverInit [(name (slice u8)) (init i64)]))
+
+;; ClassElementName. Private names keep their spelling without `#`; class keys are not shape keys
+;; until classes lower.
+(defsum ClassKey
+  (CkNamed [(name (slice u8))])
+  (CkComputed [(expr i64)])
+  (CkPrivate [(name (slice u8))]))
+
+;; A field initializer and a static block each get a method-like SyntaxFun (they evaluate with a
+;; home object and their own `arguments`/`await` rules); the field's initializer is that
+;; function's expression body.
+(defsum ClassElement
+  (CeMethod [(key ClassKey) (static bool) (fun i64)])
+  (CeField [(key ClassKey) (static bool) (init-fun (Option i64))])
+  (CeStaticBlock [(fun i64)]))
+
+(defstruct SyntaxClass
+  [(name (slice u8))
+   (heritage (Option i64))
+   (elements (ArrayList ClassElement))
+   (ctor i64)  ; the constructor record: the `constructor` element, or one synthesized empty
+   (lo i64)
+   (hi i64)])
+
+;; A `.#name` or `#name in` reference awaiting the class that declares the name, and a declared
+;; private name (a getter/setter pair may share one name).
+(defstruct PrivateRef [(name (slice u8)) (depth i64)])
+
+(defstruct PrivateDecl
+  [(name (slice u8)) (static bool) (getter bool) (setter bool)])
+
+;; Destructuring patterns. A binding pattern's leaves are names; an assignment pattern's leaves
+;; may also be Reference expressions. Every element may carry a default initializer.
+(defsum PatElem
+  (PatHole)
+  (PatItem [(pattern i64)]))
+
+(defstruct PatProp [(key PropKey) (pattern i64)])
+
+(defsum PatternNode
+  (PatName [(name (slice u8))])
+  (PatTarget [(expr i64)])  ; assignment pattern leaf: member, index or private member
+  (PatObject [(props (ArrayList PatProp)) (rest (Option i64))])
+  (PatArray [(elements (ArrayList PatElem)) (rest (Option i64))]))
+
+(defstruct SyntaxPattern
+  [(node PatternNode) (default (Option i64)) (lo i64) (hi i64)])
+
+;; What a SyntaxFun is syntactically. Declarations hoist and name a Fun; the others are values.
+(defsum FunKind
+  (FunDeclaration)
+  (FunExpression)
+  (FunArrow)
+  (FunMethod)
+  (FunGetter)
+  (FunSetter))
+
+(defsum ArrayElement
+  (ElemHole)
+  (ElemExpr [(expr i64)])
+  (ElemSpread [(expr i64)]))
+
+(defsum SyntaxNode
+  (SxNumber [(value i64) (value-float f64) (rep i64)])
+  (SxString [(raw (slice u8)) (units (ArrayList i64)) (legacy-escape bool)])
+  (SxName [(name (slice u8))])
+  (SxSingleton [(name (slice u8))])  ; JsTrue, JsFalse, JsNull
+  (SxGroup [(inner i64)])
+  (SxObject [(entries (ArrayList ObjectEntry))])
+  (SxArray [(elements (ArrayList ArrayElement))])
+  (SxMember [(owner i64) (name (slice u8)) (optional bool)])  ; optional: this link is `?.`
+  (SxIndex [(owner i64) (key i64) (optional bool)])
+  (SxCall [(callee i64) (args (ArrayList i64)) (optional bool)])
+  ;; The body of a standard global: a call to a JSL builtin (docs/DECISIONS.md, intrinsics).
+  (SxIntrinsic [(builtin (slice u8)) (args (ArrayList i64))])
+  (SxNew [(callee i64) (args (ArrayList i64))])
+  (SxNewTarget)
+  (SxThis)
+  (SxSpread [(expr i64)])  ; only as an argument or array element
+  (SxImportCall [(specifier i64) (options (Option i64))])
+  (SxTemplate [(quasis (ArrayList i64)) (substitutions (ArrayList i64))])  ; quasis: SxString ids
+  (SxTaggedTemplate [(tag i64) (template i64)])
+  (SxRegex [(body (slice u8)) (flags (slice u8))])
+  (SxFunction [(fun i64)])  ; function expression or arrow: index into the SyntaxFun table
+  (SxYield [(argument (Option i64)) (delegate bool)])
+  (SxAwait [(operand i64)])
+  (SxSuper)  ; only as the owner of a member/index or the callee of a call
+  (SxClass [(cls i64)])  ; class expression: index into the SyntaxClass table
+  (SxDestructuringAssign [(pattern i64) (value i64)])
+  (SxPrivateMember [(owner i64) (name (slice u8)) (optional bool)])
+  (SxPrivateName [(name (slice u8))])  ; only as the left operand of `in`
+  (SxUnary [(op (slice u8)) (operand i64)])
+  (SxDelete [(operand i64)])
+  (SxUpdate [(op (slice u8)) (prefix bool) (target i64)])
+  (SxBinary [(op (slice u8)) (left i64) (right i64)])
+  (SxAnd [(left i64) (right i64)])
+  (SxOr [(left i64) (right i64)])
+  (SxCoalesce [(left i64) (right i64)])
+  (SxConditional [(condition i64) (when-true i64) (when-false i64)])
+  (SxAssign [(target i64) (value i64)])
+  (SxCompoundAssign [(op (slice u8)) (target i64) (value i64)])
+  (SxLogicalAssign [(predicate (slice u8))
+                    (rhs-on-true bool)
+                    (target i64)
+                    (value i64)])
+  (SxComma [(left i64) (right i64)]))
+
+(defstruct SyntaxExpr [(lo i64) (hi i64) (node SyntaxNode)])
+
+;; The head of a `for` statement: nothing, a declaration statement (var/let/const, possibly a
+;; list) or an expression. For-in/of heads reuse it with exactly one binding or one Reference.
+(defsum ForInit
+  (ForNoInit)
+  (ForInitDecl [(stmt i64)])
+  (ForInitExpr [(expr i64)])
+  (ForInitPattern [(pattern i64)]))  ; an assignment pattern as a for-in/of head
+
+(defsum SyntaxStmtNode
+  (SsLet [(name (slice u8)) (init (Option i64)) (final bool) (annotation i64)])
+  (SsVar [(name (slice u8)) (init (Option i64)) (annotation i64)])
+  (SsLetPattern [(pattern i64) (init (Option i64)) (final bool)])
+  (SsVarPattern [(pattern i64) (init (Option i64))])
+  (SsDeclList [(decls (ArrayList i64))])
+  (SsReturn [(value (Option i64))])
+  (SsExpr [(expr i64)])
+  (SsBlock [(body (ArrayList i64))])
+  (SsIf [(condition i64) (then-stmt i64) (else-stmt (Option i64))])
+  (SsWhile [(condition i64) (body i64)])
+  (SsEmpty)
+  (SsBreak [(label (Option (slice u8)))])
+  (SsContinue [(label (Option (slice u8)))])
+  (SsSwitch [(discriminant i64) (cases (ArrayList i64))])
+  (SsCase [(selector (Option i64)) (body (ArrayList i64))])  ; None selects `default`
+  (SsDoWhile [(body i64) (condition i64)])
+  (SsFor [(init ForInit) (test (Option i64)) (update (Option i64)) (body i64)])
+  (SsForIn [(head ForInit) (of bool) (right i64) (body i64) (awaited bool)])  ; awaited: `for await`
+  (SsLabeled [(label (slice u8)) (body i64)])
+  (SsThrow [(value i64)])
+  (SsTry [(body i64)
+          (catch-param (Option i64))
+          (catch-body (Option i64))
+          (finally-body (Option i64))])  ; catch-param: a pattern
+  (SsWith [(object i64) (body i64)])
+  (SsDebugger)
+  (SsFunctionDecl [(fun i64)])
+  (SsClassDecl [(cls i64)]))
+
+(defstruct SyntaxStmt [(lo i64) (hi i64) (node SyntaxStmtNode)])
+
+;; A function header. The record is reserved when its keyword is seen so nested functions can
+;; name their parent by index (parents therefore precede children), and filled when the body
+;; closes. `strict` is settled after parsing from the directive and the enclosing function.
+(defstruct SyntaxFun
+  [(name (slice u8))
+   (kind FunKind)
+   (generator bool)
+   (async bool)
+   (params (ArrayList (slice u8)))
+   (param-annotations (ArrayList i64))
+   (param-defaults (ArrayList (Option i64)))
+   (param-patterns (ArrayList (Option i64)))  ; a destructured parameter; its `params` name is ""
+   (rest-param (Option (slice u8)))
+   (rest-pattern (Option i64))
+   (simple-params bool)
+   (return-annotation i64)
+   (body (ArrayList i64))
+   (expression-body (Option i64))  ; an arrow's concise body
+   (parent i64)  ; enclosing SyntaxFun index, or -1 at the top level
+   (strict bool)
+   (in-class bool)  ; class bodies are strict code
+   (hoisted bool)  ; a top-level declaration (or the Script root): lowered as a closed-world Fun
+   (value-taken bool)  ; materialized as a function object: its pointer escapes into values
+   (lo i64)
+   (hi i64)
+   (fidx i64)
+   (fun-nid i64)
+   (adapter-fidx i64)
+   (adapter-nid i64)
+   (script i64)  ; the realm Script this function belongs to (its position in `scripts`)
+   (may-throw bool)  ; can a call to this function complete with the exception sentinel? (syntactic fixpoint)
+   (static-entry i64)  ; a hoisted declaration's function object in the static heap image, or -1
+   (abi-builtin (slice u8))  ; an intrinsic whose JSL builtin takes the callable ABI: no local body, a forwarding entry
+   (arguments-object bool)  ; its code names `arguments`: its entry passes the object in the slot after the formals
+   (arguments-unmappable bool)  ; a sloppy mapped object's aliasing would be observable (refused)
+   (class-ctor bool)  ; a class's constructor: [[Call]] without `new` is a TypeError
+   (derived-ctor bool)  ; a derived class's constructor: `this` waits for `super()`
+   (default-derived bool)  ; the synthesized `constructor(...args) { super(...args); }`
+   (needs-callee bool)  ; its body needs the function object being called (`super`)
+   (needs-home bool)  ; its body reads `super.x`: its function object carries its home object
+   (class-index i64)  ; a class constructor: the class whose instance fields it initializes, or -1
+   (owns-env bool)  ; a nested function captures one of its bindings: it allocates an environment
+   (uses-env bool)  ; it mentions a captured binding of an enclosing activation, or encloses one
+   (env-names (ArrayList (slice u8)))  ; its captured bindings, in environment slot order
+   (env-lexical (ArrayList i64))  ; 1 where that binding is a lexical, whose slot starts empty
+   (reads-captured-lexical bool)])  ; it reads one, so its read can be the dead zone's ReferenceError
+
+(defn syntax-fun-strict [(i i64)] (-> bool)
+  (let [f (syntax-fun-at i)] (.strict f)))
+
+(defn syntax-expr-new [(node SyntaxNode) (lo i64) (hi i64)] (-> SyntaxExpr)
+  (let [(mut x) (primitive/zeroed SyntaxExpr)]
+    (set! (.lo (mut x)) lo)
+    (set! (.hi (mut x)) hi)
+    (set! (.node (mut x)) node)
+    (load x)))
+
+(defn syntax-add! [(x SyntaxExpr)] (-> i64)
+  (do
+    (push! [SyntaxExpr] (mut (.exprs (parser-state))) x)
+    (len (.exprs (parser-state)))))
+
+(defn syntax-add-node! [(node SyntaxNode) (lo i64) (hi i64)] (-> i64)
+  (syntax-add! (syntax-expr-new node lo hi)))
+
+(defn syntax-at [(id i64)] (-> SyntaxExpr)
+  (get (.exprs (parser-state)) (- id 1)))
+
+(defn syntax-node [(id i64)] (-> SyntaxNode)
+  (let [x (syntax-at id)] (.node x)))
+
+(defn syntax-lo [(id i64)] (-> i64)
+  (let [x (syntax-at id)] (.lo x)))
+
+(defn syntax-hi [(id i64)] (-> i64)
+  (let [x (syntax-at id)] (.hi x)))
+
+(defn syntax-ungroup-id [(id i64)] (-> i64)
+  (match (syntax-node id)
+    (SxGroup [inner] (syntax-ungroup-id inner))
+    (_ id)))
+
+(defn syntax-name? [(id i64)] (-> bool)
+  (match (syntax-node id) (SxName [name] true) (_ false)))
+
+(defn syntax-member? [(id i64)] (-> bool)
+  (match (syntax-node id) (SxMember [owner name optional] true) (_ false)))
+
+;; Whether an OptionalExpression owns this member/call spine. Parentheses end the chain, so
+;; `(a?.b).c` is an ordinary Reference while `a?.b.c` is not.
+;; The innermost expression a member/call spine hangs from: `a.b(c)[d]` roots at `a`.
+(defn syntax-spine-root [(id i64)] (-> i64)
+  (match (syntax-node id)
+    (SxMember [owner name optional] (syntax-spine-root owner))
+    (SxPrivateMember [owner name optional] (syntax-spine-root owner))
+    (SxIndex [owner key optional] (syntax-spine-root owner))
+    (SxCall [callee args optional] (syntax-spine-root callee))
+    (SxTaggedTemplate [tag template] (syntax-spine-root tag))
+    (_ id)))
+
+(defn syntax-optional-chain? [(id i64)] (-> bool)
+  (match (syntax-node id)
+    (SxMember [owner name optional]
+              (or optional (syntax-optional-chain? owner)))
+    (SxPrivateMember [owner name optional]
+                     (or optional (syntax-optional-chain? owner)))
+    (SxIndex [owner key optional] (or optional (syntax-optional-chain? owner)))
+    (SxCall [callee args optional]
+            (or optional (syntax-optional-chain? callee)))
+    (SxTaggedTemplate [tag template] (syntax-optional-chain? tag))
+    (_ false)))
+
+;; ---------------------------------------------------------------------------
+;; Destructuring patterns
+(defn syntax-pattern-add! [(node PatternNode)
+                           (default (Option i64))
+                           (lo i64)
+                           (hi i64)] (-> i64)
+  (let [(mut x) (primitive/zeroed SyntaxPattern)]
+    (set! (.node (mut x)) node)
+    (set! (.default (mut x)) default)
+    (set! (.lo (mut x)) lo)
+    (set! (.hi (mut x)) hi)
+    (push! [SyntaxPattern] (mut (.patterns (parser-state))) (load x))
+    (len (.patterns (parser-state)))))
+
+(defn syntax-pattern-at [(id i64)] (-> SyntaxPattern)
+  (get (.patterns (parser-state)) (- id 1)))
+
+(defn syntax-pattern-node [(id i64)] (-> PatternNode)
+  (let [x (syntax-pattern-at id)] (.node x)))
+
+(defn syntax-pattern-default [(id i64)] (-> (Option i64))
+  (let [x (syntax-pattern-at id)] (.default x)))
+
+;; The names a pattern binds, in source order.
+(defn syntax-pattern-names! [(id i64) (out (mut (ArrayList (slice u8))))] (-> i64)
+  (do
+    (match (syntax-pattern-node id)
+      (PatName [name] (push! [(slice u8)] (mut out) name))
+      (PatTarget [expr] 0)
+      (PatObject [props rest]
+                 (do
+                   (al-for [prop props]
+                           (let [pp prop]
+                             (syntax-pattern-names! (.pattern pp) (mut out))))
+                   (match rest
+                     (Some [r] (syntax-pattern-names! r (mut out)))
+                     (None [] 0))))
+      (PatArray [elements rest]
+                (do
+                  (al-for [element elements]
+                          (match element
+                            (PatItem [pat]
+                                     (syntax-pattern-names! pat (mut out)))
+                            (PatHole [] 0)))
+                  (match rest
+                    (Some [r] (syntax-pattern-names! r (mut out)))
+                    (None [] 0)))))
+    0))
+
+;; The expressions a pattern owns: defaults, computed keys and Reference leaves.
+(defn syntax-pattern-exprs! [(id i64) (out (mut (ArrayList i64)))] (-> i64)
+  (do
+    (match (syntax-pattern-default id)
+      (Some [d] (push! [i64] (mut out) d))
+      (None [] 0))
+    (match (syntax-pattern-node id)
+      (PatName [name] 0)
+      (PatTarget [expr] (push! [i64] (mut out) expr))
+      (PatObject [props rest]
+                 (do
+                   (al-for [prop props]
+                           (let [pp prop]
+                             (match (.key pp)
+                               (KeyComputed [e] (push! [i64] (mut out) e))
+                               (_ 0))
+                             (syntax-pattern-exprs! (.pattern pp) (mut out))))
+                   (match rest
+                     (Some [r] (syntax-pattern-exprs! r (mut out)))
+                     (None [] 0))))
+      (PatArray [elements rest]
+                (do
+                  (al-for [element elements]
+                          (match element
+                            (PatItem [pat]
+                                     (syntax-pattern-exprs! pat (mut out)))
+                            (PatHole [] 0)))
+                  (match rest
+                    (Some [r] (syntax-pattern-exprs! r (mut out)))
+                    (None [] 0)))))
+    0))
+
+;; Every name a function binds through its parameters: plain names, destructured names and the
+;; rest element.
+(defn syntax-fun-bound-names [(f SyntaxFun)] (-> (ArrayList (slice u8)))
+  (let [(mut names) (al-new [(slice u8)] (compiler-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) (len (.params f)))
+              (break 0)
+              (do
+                (match (get (.param-patterns f) (load i))
+                  (Some [pat] (syntax-pattern-names! pat (mut names)))
+                  (None []
+                        (push! [(slice u8)]
+                               (mut names)
+                               (get (.params f) (load i)))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (match (.rest-param f)
+      (Some [r] (push! [(slice u8)] (mut names) r))
+      (None [] 0))
+    (match (.rest-pattern f)
+      (Some [r] (syntax-pattern-names! r (mut names)))
+      (None [] 0))
+    (load names)))
+
+;; An assignment pattern reused as a binding pattern: every leaf must be a binding name.
+(defn syntax-pattern-require-binding! [(id i64)] (-> i64)
+  (do
+    (match (syntax-pattern-node id)
+      (PatName [name] (syntax-check-binding-name! name))
+      (PatTarget [expr] (syntax-error! "parser: invalid binding pattern"))
+      (PatObject [props rest]
+                 (do
+                   (al-for [prop props]
+                           (let [pp prop]
+                             (syntax-pattern-require-binding! (.pattern pp))))
+                   (match rest
+                     (Some [r] (syntax-pattern-require-binding! r))
+                     (None [] 0))))
+      (PatArray [elements rest]
+                (do
+                  (al-for [element elements]
+                          (match element
+                            (PatItem [pat]
+                                     (syntax-pattern-require-binding! pat))
+                            (PatHole [] 0)))
+                  (match rest
+                    (Some [r] (syntax-pattern-require-binding! r))
+                    (None [] 0)))))
+    0))
+
+;; Whether any parameter of `f` is a destructuring pattern.
+(defn syntax-fun-has-patterns? [(f SyntaxFun)] (-> bool)
+  (let [(mut found) (match (.rest-pattern f) (Some [r] true) (None [] false))]
+    (al-for [p (.param-patterns f)]
+            (match p (Some [pat] (set! (mut found) true)) (None [] 0)))
+    (load found)))
+
+;; The one place that knows every variant's children. Generic walks (strict checks, and later any
+;; syntax query that does not care about shape) iterate this list instead of repeating the match.
+(defn syntax-expr-children! [(id i64) (out (mut (ArrayList i64)))] (-> i64)
+  (do
+    (match (syntax-node id)
+      (SxNumber [value value-float rep] 0)
+      (SxString [raw units legacy] 0)
+      (SxName [name] 0)
+      (SxSingleton [name] 0)
+      (SxGroup [inner] (push! [i64] (mut out) inner))
+      (SxObject [entries]
+                (do
+                  (al-for [entry entries]
+                          (match entry
+                            (PropValue [key value]
+                                       (do
+                                         (match key
+                                           (KeyComputed [e]
+                                                        (push! [i64]
+                                                               (mut out)
+                                                               e))
+                                           (_ 0))
+                                         (push! [i64] (mut out) value)))
+                            (PropMethod [key fun]
+                                        (match key
+                                          (KeyComputed [e]
+                                                       (push! [i64] (mut out) e))
+                                          (_ 0)))
+                            (PropSpread [expr] (push! [i64] (mut out) expr))
+                            (PropCoverInit [name init]
+                                           (push! [i64] (mut out) init))))
+                  0))
+      (SxArray [elements]
+               (do
+                 (al-for [element elements]
+                         (match element
+                           (ElemHole [] 0)
+                           (ElemExpr [expr] (push! [i64] (mut out) expr))
+                           (ElemSpread [expr] (push! [i64] (mut out) expr))))
+                 0))
+      (SxMember [owner name optional] (push! [i64] (mut out) owner))
+      (SxIndex [owner key optional]
+               (do (push! [i64] (mut out) owner) (push! [i64] (mut out) key)))
+      (SxCall [callee args optional]
+              (do
+                (push! [i64] (mut out) callee)
+                (al-for [arg args] (push! [i64] (mut out) arg))
+                0))
+      (SxNew [callee args]
+             (do
+               (push! [i64] (mut out) callee)
+               (al-for [arg args] (push! [i64] (mut out) arg))
+               0))
+      (SxNewTarget [] 0)
+      (SxThis [] 0)
+      (SxIntrinsic [builtin args] (al-for [a args] (push! [i64] (mut out) a)))
+      (SxSpread [expr] (push! [i64] (mut out) expr))
+      (SxImportCall [specifier options]
+                    (do
+                      (push! [i64] (mut out) specifier)
+                      (match options
+                        (Some [o] (push! [i64] (mut out) o))
+                        (None [] 0))))
+      (SxTemplate [quasis substitutions]
+                  (do
+                    (al-for [q quasis] (push! [i64] (mut out) q))
+                    (al-for [e substitutions] (push! [i64] (mut out) e))
+                    0))
+      (SxTaggedTemplate [tag template]
+                        (do
+                          (push! [i64] (mut out) tag)
+                          (push! [i64] (mut out) template)))
+      (SxRegex [body flags] 0)
+      (SxFunction [fun] 0)
+      (SxYield [argument delegate]
+               (match argument (Some [a] (push! [i64] (mut out) a)) (None [] 0)))
+      (SxAwait [operand] (push! [i64] (mut out) operand))
+      (SxSuper [] 0)
+      (SxClass [cls] (syntax-class-exprs! cls (mut out)))
+      (SxDestructuringAssign [pattern value]
+                             (do
+                               (syntax-pattern-exprs! pattern (mut out))
+                               (push! [i64] (mut out) value)))
+      (SxPrivateMember [owner name optional] (push! [i64] (mut out) owner))
+      (SxPrivateName [name] 0)
+      (SxUnary [op operand] (push! [i64] (mut out) operand))
+      (SxDelete [operand] (push! [i64] (mut out) operand))
+      (SxUpdate [op prefix target] (push! [i64] (mut out) target))
+      (SxBinary [op left right]
+                (do (push! [i64] (mut out) left) (push! [i64] (mut out) right)))
+      (SxAnd [left right]
+             (do (push! [i64] (mut out) left) (push! [i64] (mut out) right)))
+      (SxOr [left right]
+            (do (push! [i64] (mut out) left) (push! [i64] (mut out) right)))
+      (SxCoalesce [left right]
+                  (do
+                    (push! [i64] (mut out) left)
+                    (push! [i64] (mut out) right)))
+      (SxConditional [condition when-true when-false]
+                     (do
+                       (push! [i64] (mut out) condition)
+                       (push! [i64] (mut out) when-true)
+                       (push! [i64] (mut out) when-false)))
+      (SxAssign [target value]
+                (do
+                  (push! [i64] (mut out) target)
+                  (push! [i64] (mut out) value)))
+      (SxCompoundAssign [op target value]
+                        (do
+                          (push! [i64] (mut out) target)
+                          (push! [i64] (mut out) value)))
+      (SxLogicalAssign [predicate rhs-on-true target value]
+                       (do
+                         (push! [i64] (mut out) target)
+                         (push! [i64] (mut out) value)))
+      (SxComma [left right]
+               (do (push! [i64] (mut out) left) (push! [i64] (mut out) right))))
+    0))
+
+(defn syntax-stmt-new [(node SyntaxStmtNode) (lo i64) (hi i64)] (-> SyntaxStmt)
+  (let [(mut s) (primitive/zeroed SyntaxStmt)]
+    (set! (.lo (mut s)) lo)
+    (set! (.hi (mut s)) hi)
+    (set! (.node (mut s)) node)
+    (load s)))
+
+(defn syntax-stmt-add! [(s SyntaxStmt)] (-> i64)
+  (do
+    (push! [SyntaxStmt] (mut (.stmts (parser-state))) s)
+    (len (.stmts (parser-state)))))
+
+(defn syntax-stmt-add-node! [(node SyntaxStmtNode) (lo i64) (hi i64)] (-> i64)
+  (syntax-stmt-add! (syntax-stmt-new node lo hi)))
+
+(defn syntax-stmt-at [(id i64)] (-> SyntaxStmt)
+  (get (.stmts (parser-state)) (- id 1)))
+
+(defn syntax-stmt-node [(id i64)] (-> SyntaxStmtNode)
+  (let [s (syntax-stmt-at id)] (.node s)))
+
+(defn syntax-stmt-lo [(id i64)] (-> i64)
+  (let [x (get (.stmts (parser-state)) (- id 1))] (.lo x)))
+
+(defn syntax-stmt-hi [(id i64)] (-> i64)
+  (let [s (syntax-stmt-at id)] (.hi s)))
+
+;; Nested statement ids of one statement, exhaustively. Declaration lists and case clauses are
+;; grouping only; blocks, branches and loops introduce nesting the walks below care about.
+(defn syntax-stmt-children! [(id i64) (out (mut (ArrayList i64)))] (-> i64)
+  (do
+    (match (syntax-stmt-node id)
+      (SsLet [name init final annotation] 0)
+      (SsVar [name init annotation] 0)
+      (SsLetPattern [pattern init final] 0)
+      (SsVarPattern [pattern init] 0)
+      (SsDeclList [decls] (do (al-for [d decls] (push! [i64] (mut out) d)) 0))
+      (SsReturn [value] 0)
+      (SsExpr [expr] 0)
+      (SsBlock [body] (do (al-for [s body] (push! [i64] (mut out) s)) 0))
+      (SsIf [condition then-stmt else-stmt]
+            (do
+              (push! [i64] (mut out) then-stmt)
+              (match else-stmt (Some [e] (push! [i64] (mut out) e)) (None [] 0))))
+      (SsWhile [condition body] (push! [i64] (mut out) body))
+      (SsEmpty [] 0)
+      (SsBreak [label] 0)
+      (SsContinue [label] 0)
+      (SsSwitch [discriminant cases]
+                (do (al-for [c cases] (push! [i64] (mut out) c)) 0))
+      (SsCase [selector body]
+              (do (al-for [s body] (push! [i64] (mut out) s)) 0))
+      (SsDoWhile [body condition] (push! [i64] (mut out) body))
+      (SsFor [init test update body]
+             (do
+               (match init
+                 (ForInitDecl [stmt] (push! [i64] (mut out) stmt))
+                 (_ 0))
+               (push! [i64] (mut out) body)))
+      (SsForIn [head of right body awaited]
+               (do
+                 (match head
+                   (ForInitDecl [stmt] (push! [i64] (mut out) stmt))
+                   (_ 0))
+                 (push! [i64] (mut out) body)))
+      (SsLabeled [label body] (push! [i64] (mut out) body))
+      (SsThrow [value] 0)
+      (SsTry [body catch-param catch-body finally-body]
+             (do
+               (push! [i64] (mut out) body)
+               (match catch-body
+                 (Some [c] (push! [i64] (mut out) c))
+                 (None [] 0))
+               (match finally-body
+                 (Some [f] (push! [i64] (mut out) f))
+                 (None [] 0))))
+      (SsWith [object body] (push! [i64] (mut out) body))
+      (SsDebugger [] 0)
+      (SsFunctionDecl [fun] 0)
+      (SsClassDecl [cls] 0))
+    0))
+
+;; The expressions one statement owns, exhaustively — the counterpart of `syntax-stmt-children!`,
+;; which gives its nested statements. A generic walk over a body reaches every expression of it by
+;; iterating both; neither descends into a nested function record.
+(defn syntax-stmt-exprs! [(id i64) (out (mut (ArrayList i64)))] (-> i64)
+  (do
+    (match (syntax-stmt-node id)
+      (SsLet [name init final annotation]
+             (match init (Some [e] (push! [i64] (mut out) e)) (None [] 0)))
+      (SsVar [name init annotation]
+             (match init (Some [e] (push! [i64] (mut out) e)) (None [] 0)))
+      (SsLetPattern [pattern init final]
+                    (match init
+                      (Some [e] (push! [i64] (mut out) e))
+                      (None [] 0)))
+      (SsVarPattern [pattern init]
+                    (match init
+                      (Some [e] (push! [i64] (mut out) e))
+                      (None [] 0)))
+      (SsDeclList [decls] 0)
+      (SsReturn [value]
+                (match value (Some [e] (push! [i64] (mut out) e)) (None [] 0)))
+      (SsExpr [expr] (push! [i64] (mut out) expr))
+      (SsBlock [body] 0)
+      (SsIf [condition then-stmt else-stmt] (push! [i64] (mut out) condition))
+      (SsWhile [condition body] (push! [i64] (mut out) condition))
+      (SsEmpty [] 0)
+      (SsBreak [label] 0)
+      (SsContinue [label] 0)
+      (SsSwitch [discriminant cases] (push! [i64] (mut out) discriminant))
+      (SsCase [selector body]
+              (match selector (Some [e] (push! [i64] (mut out) e)) (None [] 0)))
+      (SsDoWhile [body condition] (push! [i64] (mut out) condition))
+      (SsFor [init test update body]
+             (do
+               (match init
+                 (ForInitExpr [e] (push! [i64] (mut out) e))
+                 (_ 0))
+               (match test (Some [e] (push! [i64] (mut out) e)) (None [] 0))
+               (match update (Some [e] (push! [i64] (mut out) e)) (None [] 0))))
+      (SsForIn [head of right body awaited]
+               (do
+                 (match head
+                   (ForInitExpr [e] (push! [i64] (mut out) e))
+                   (_ 0))
+                 (push! [i64] (mut out) right)))
+      (SsLabeled [label body] 0)
+      (SsThrow [value] (push! [i64] (mut out) value))
+      (SsTry [body catch-param catch-body finally-body] 0)
+      (SsWith [object body] (push! [i64] (mut out) object))
+      (SsDebugger [] 0)
+      (SsFunctionDecl [fun] 0)
+      (SsClassDecl [cls] 0))
+    0))
+
+;; The expressions a class body owns outside its methods: the heritage and computed keys.
+;; Method bodies and field initializers are SyntaxFun records walked by the function passes.
+(defn syntax-class-exprs! [(cls i64) (out (mut (ArrayList i64)))] (-> i64)
+  (let [c (get (.classes (parser-state)) cls)]
+    (match (.heritage c) (Some [h] (push! [i64] (mut out) h)) (None [] 0))
+    (al-for [element (.elements c)]
+            (let [key
+                    (match element
+                      (CeMethod [key is-static fun] key)
+                      (CeField [key is-static init-fun] key)
+                      (CeStaticBlock [fun] (CkNamed "")))]
+              (match key (CkComputed [e] (push! [i64] (mut out) e)) (_ 0))))
+    0))
+
+;; Expression ids directly owned by one statement, exhaustively.
+(defn syntax-stmt-exprs! [(id i64) (out (mut (ArrayList i64)))] (-> i64)
+  (do
+    (match (syntax-stmt-node id)
+      (SsLet [name init final annotation]
+             (match init (Some [e] (push! [i64] (mut out) e)) (None [] 0)))
+      (SsVar [name init annotation]
+             (match init (Some [e] (push! [i64] (mut out) e)) (None [] 0)))
+      (SsLetPattern [pattern init final]
+                    (do
+                      (syntax-pattern-exprs! pattern (mut out))
+                      (match init
+                        (Some [e] (push! [i64] (mut out) e))
+                        (None [] 0))))
+      (SsVarPattern [pattern init]
+                    (do
+                      (syntax-pattern-exprs! pattern (mut out))
+                      (match init
+                        (Some [e] (push! [i64] (mut out) e))
+                        (None [] 0))))
+      (SsDeclList [decls] 0)
+      (SsReturn [value]
+                (match value (Some [e] (push! [i64] (mut out) e)) (None [] 0)))
+      (SsExpr [expr] (push! [i64] (mut out) expr))
+      (SsBlock [body] 0)
+      (SsIf [condition then-stmt else-stmt] (push! [i64] (mut out) condition))
+      (SsWhile [condition body] (push! [i64] (mut out) condition))
+      (SsEmpty [] 0)
+      (SsBreak [label] 0)
+      (SsContinue [label] 0)
+      (SsSwitch [discriminant cases] (push! [i64] (mut out) discriminant))
+      (SsCase [selector body]
+              (match selector (Some [e] (push! [i64] (mut out) e)) (None [] 0)))
+      (SsDoWhile [body condition] (push! [i64] (mut out) condition))
+      (SsFor [init test update body]
+             (do
+               (match init
+                 (ForInitExpr [e] (push! [i64] (mut out) e))
+                 (ForInitPattern [pat] (syntax-pattern-exprs! pat (mut out)))
+                 (_ 0))
+               (match test (Some [e] (push! [i64] (mut out) e)) (None [] 0))
+               (match update (Some [e] (push! [i64] (mut out) e)) (None [] 0))))
+      (SsForIn [head of right body awaited]
+               (do
+                 (match head
+                   (ForInitExpr [e] (push! [i64] (mut out) e))
+                   (ForInitPattern [pat] (syntax-pattern-exprs! pat (mut out)))
+                   (_ 0))
+                 (push! [i64] (mut out) right)))
+      (SsLabeled [label body] 0)
+      (SsThrow [value] (push! [i64] (mut out) value))
+      (SsTry [body catch-param catch-body finally-body]
+             (match catch-param
+               (Some [pat] (syntax-pattern-exprs! pat (mut out)))
+               (None [] 0)))
+      (SsWith [object body] (push! [i64] (mut out) object))
+      (SsDebugger [] 0)
+      (SsFunctionDecl [fun] 0)
+      (SsClassDecl [cls] (syntax-class-exprs! cls (mut out))))
+    0))
+
+(defn syntax-expr-contains? [(id i64) (yield? bool) (await? bool)] (-> bool)
+  (let [(mut children) (al-new [i64] (compiler-allocator))
+        (mut found)
+          (match (syntax-node id)
+            (SxYield [argument delegate] yield?)
+            (SxAwait [operand] await?)
+            (SxName [name] (and await? (= name "await")))
+            (SxFunction [fun] (syntax-fun-params-mention? fun yield? await?))
+            (_ false))]
+    (syntax-expr-children! id (mut children))
+    (al-for [child (load children)]
+            (if (syntax-expr-contains? child yield? await?)
+                (set! (mut found) true)
+                0))
+    (al-free! [i64] (mut children))
+    (load found)))
+
+;; An ArrowFunction is a whole AssignmentExpression: it cannot be an operand, an object of a
+;; member access, a callee, or a `new` target without parentheses.
+(defn syntax-arrow? [(id i64)] (-> bool)
+  (match (syntax-node id)
+    (SxFunction [fun]
+                (let [f (syntax-fun-at fun)]
+                  (match (.kind f) (FunArrow [] true) (_ false))))
+    (_ false)))
+
+(defn syntax-fun-ptr [(i i64)] (-> (ptr SyntaxFun))
+  (al-elem [SyntaxFun] (mut (.funs (parser-state))) i))
+
+(defn syntax-class-hi [(cls i64)] (-> i64)
+  (let [c (get (.classes (parser-state)) cls)] (.hi c)))
+
+(defn syntax-fun-at [(i i64)] (-> SyntaxFun)
+  (get (.funs (parser-state)) i))
+
+(defn syntax-names-contain? [(names (ArrayList (slice u8))) (name (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (al-for [n names] (if (= n name) (set! (mut found) true) 0))
+    (load found)))
+
+(defn syntax-fun-arrow? [(fi i64)] (-> bool)
+  (let [f (syntax-fun-at fi)] (match (.kind f) (FunArrow [] true) (_ false))))
+
+(defn syntax-is-super? [(id i64)] (-> bool)
+  (match (syntax-node (syntax-ungroup-id id)) (SxSuper [] true) (_ false)))
+
+;; Walk one function's statements once, recording direct throws and named call edges.
+;; `protected` is true inside a try body that has a catch clause.
+;; Whether an array literal spreads an iterable into itself, which walks it.
+(defn syntax-elements-have-spread? [(elements (ArrayList ArrayElement))] (-> bool)
+  (let [(mut found) false]
+    (al-for [e elements]
+            (match e (ElemSpread [expr] (set! (mut found) true)) (_ 0)))
+    (load found)))
+
+(defn syntax-class-name [(cls i64)] (-> (slice u8))
+  (let [c (get (.classes (parser-state)) cls)] (.name c)))
+
+;; Whether an argument list contains a spread, which makes its length a runtime question and the
+;; call one over an argument array (`JsCallWithArray`) rather than the fixed slots.
+(defn syntax-args-have-spread? [(args (ArrayList i64))] (-> bool)
+  (let [(mut found) false]
+    (al-for [a args]
+            (match (syntax-node (syntax-ungroup-id a))
+              (SxSpread [expr] (set! (mut found) true))
+              (_ 0)))
+    (load found)))

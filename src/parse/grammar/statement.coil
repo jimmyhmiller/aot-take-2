@@ -1,0 +1,740 @@
+;; Grammar of statements and declarations.
+
+(module aot.parse.grammar.statement)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.node.property" :use *)
+(import "aot.node.compare" :use *)
+(import "aot.node.gc" :use *)
+(import "aot.node.jsops" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.type.type" :use *)
+(import "aot.parse.lexer" :use *)
+(import "aot.parse.tstype" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.grammar.expression" :use *)
+(import "aot.parse.grammar.pattern" :use *)
+(import "aot.parse.grammar.function" :use *)
+(import "aot.parse.grammar.class" :use *)
+
+(defn parse-optional-annotation [] (-> i64)
+  (if (not (take-is ":"))
+      (ty-dyn TAG-ANY)
+      (if (.script-mode (parser-state))
+          (do
+            (panic "parser: TypeScript annotations are not valid in JavaScript Script code")
+            TY-INVALID)
+          (tstype-parse))))
+
+;; JavaScript's ASI is a parser decision. An omitted semicolon is legal only at a line terminator,
+;; before `}`, or at EOF; accepting one between two same-line statements changes invalid source
+;; into a different valid program.
+(defn parse-statement-end! [] (-> i64)
+  (if (take-is ";")
+      0
+      (let [next (peek-token)]
+        (if (or (.nl-before next) (token-is next "}") (= (.kind next) TOK-EOF))
+            0
+            (syntax-error! "parser: expected semicolon or line terminator")))))
+
+;; Statement keywords whose grammar is not admitted yet must fail before the expression path can
+;; mistake them for a proven "expected an expression" error.
+;; `break`/`continue` take an optional same-line LabelIdentifier; a line terminator ends them.
+(defn parse-jump-label [] (-> (Option (slice u8)))
+  (let [next (peek-token)]
+    (if (and (not (.nl-before next)) (= (.kind next) TOK-IDENT))
+        (do (take-token) (Some (token-text next)))
+        (None [(slice u8)]))))
+
+(defn parse-syntax-statement [] (-> i64)
+  (let [t (peek-token)]
+    (if (token-is t "switch")
+        (parse-syntax-switch)
+        (if (or (token-is t "break") (token-is t "continue"))
+            (do
+              (take-token)
+              (let [label (parse-jump-label)]
+                (parse-statement-end!)
+                (syntax-stmt-add-node! (if (token-is t "break")
+                                           (SsBreak label)
+                                           (SsContinue label))
+                                       (.start t)
+                                       (lex-consumed-end))))
+            (if (take-is ";")
+                (syntax-stmt-add-node! (SsEmpty) (.start t) (.end t))
+                (do
+                  (if (and (token-is t "return")
+                           (not (parser-return-allowed?)))
+                      (syntax-error! "parser: return is not allowed here")
+                      0)
+                  (parse-syntax-statement-inner)))))))
+
+(defn parse-syntax-switch [] (-> i64)
+  (let [keyword (require-token "switch")
+        (mut cases) (al-new [i64] (compiler-allocator))
+        (mut has-default) false]
+    (require-token "(")
+    (let [value (parse-syntax-expression)]
+      (require-token ")")
+      (require-token "{")
+      (loop (if (token-is (peek-token) "}")
+                (break 0)
+                (let [label (take-token)
+                      selector
+                        (if (token-is label "case")
+                            (Some (parse-syntax-expression))
+                            (if (token-is label "default")
+                                (do
+                                  (if (load has-default)
+                                      (syntax-error! "parser: duplicate switch default")
+                                      0)
+                                  (set! (mut has-default) true)
+                                  (None [i64]))
+                                (do
+                                  (parse-fail "parser: expected switch case/default at byte"
+                                              label)
+                                  (None [i64]))))
+                      (mut body) (al-new [i64] (compiler-allocator))]
+                  (require-token ":")
+                  (loop (let [next (peek-token)]
+                          (if (or (token-is next "case")
+                                  (token-is next "default")
+                                  (token-is next "}"))
+                              (break 0)
+                              (do
+                                (push! [i64]
+                                       (mut body)
+                                       (parse-syntax-statement))
+                                (continue)))))
+                  (push! [i64]
+                         (mut cases)
+                         (syntax-stmt-add-node! (SsCase selector (load body))
+                                                (.start label)
+                                                (lex-consumed-end)))
+                  (continue))))
+      (let [close (require-token "}")]
+        (syntax-stmt-add-node! (SsSwitch value (load cases))
+                               (.start keyword)
+                               (.end close))))))
+
+;; A Statement position (the body of if/while/do/for/with/label) admits no declaration. `class`,
+;; `const`, `let [`, a same-line `let x` and `async function` are proven SyntaxErrors there, as is a
+;; FunctionDeclaration in a loop or `with` body; Annex B.3.3 admits `if (x) function f() {}` in
+;; sloppy code as a Block holding the declaration (the strict pass rejects it in strict code). A
+;; labelled function declaration is never a Statement body. A bare `let` is a sloppy identifier.
+(defn let-starts-declaration? [] (-> bool)
+  (or (lex-second-kind? TOK-IDENT)
+      (lex-second-is? "let")
+      (lex-second-is? "[")
+      (lex-second-is? "{")))
+
+(defn syntax-labelled-function? [(id i64)] (-> bool)
+  (match (syntax-stmt-node id)
+    (SsLabeled [label body]
+               (match (syntax-stmt-node body)
+                 (SsFunctionDecl [fun] true)
+                 (_ (syntax-labelled-function? body))))
+    (_ false)))
+
+(defn syntax-annexb-block? [(id i64)] (-> bool)
+  (let [(mut found) false]
+    (al-for [b (.annexb-blocks (parser-state))]
+            (if (= b id) (set! (mut found) true) 0))
+    (load found)))
+
+(defn parse-syntax-controlled-statement [(loop-body bool) (annexb-if bool)] (-> i64)
+  (let [stmt (parse-syntax-controlled-statement-inner loop-body annexb-if)]
+    (if (syntax-labelled-function? stmt)
+        (syntax-error! "parser: labelled function declaration is not allowed in a statement position")
+        0)
+    stmt))
+
+(defn parse-syntax-controlled-statement-inner [(loop-body bool)
+                                               (annexb-if bool)] (-> i64)
+  (let [t (peek-token)]
+    (if (or (token-is t "class") (token-is t "const"))
+        (syntax-error! "parser: declaration is not allowed in a statement position")
+        (if (token-is t "let")
+            ;; `let [` can never start a Statement; a same-line `let x` / `let {` is a lexical
+            ;; declaration in a statement position. Otherwise `let` is a sloppy identifier and the
+            ;; statement is an expression statement.
+            (if (or (lex-second-is? "[")
+                    (and (let [second (lex-peek-second false)]
+                           (not (.nl-before second)))
+                         (or (lex-second-kind? TOK-IDENT)
+                             (lex-second-is? "let")
+                             (lex-second-is? "{"))))
+                (syntax-error! "parser: lexical declaration is not allowed in a statement position")
+                (parse-syntax-expression-statement))
+            (if (token-is t "function")
+                (if loop-body
+                    (syntax-error! "parser: function declaration is not allowed in a loop body")
+                    (if (and annexb-if (not (lex-second-is? "*")))
+                        (let [decl (parse-syntax-statement)
+                              (mut body) (al-new [i64] (compiler-allocator))]
+                          (push! [i64] (mut body) decl)
+                          (let [id
+                                  (syntax-stmt-add-node! (SsBlock (load body))
+                                                         (syntax-stmt-lo decl)
+                                                         (syntax-stmt-hi decl))]
+                            (push! [i64]
+                                   (mut (.annexb-blocks (parser-state)))
+                                   id)
+                            id))
+                        (syntax-error! "parser: function declaration is not allowed in a statement position")))
+                (if (and (token-is t "async") (lex-second-is? "function"))
+                    (syntax-error! "parser: async function declaration is not allowed in a statement position")
+                    (parse-syntax-statement)))))))
+
+;; A declared name; `let` may not be lexically bound.
+(defn parse-syntax-declared-name! [(is-var bool)] (-> Token)
+  (let [t (require-binding-identifier)]
+    (if (and (not is-var) (token-is t "let"))
+        (syntax-error! "parser: let is not a valid lexical binding name")
+        0)
+    t))
+
+(defn parse-syntax-lexical-pattern! [(is-var bool)] (-> i64)
+  (let [pattern (parse-syntax-binding-pattern!)]
+    (if is-var
+        0
+        (let [(mut names) (al-new [(slice u8)] (compiler-allocator))]
+          (syntax-pattern-names! pattern (mut names))
+          (al-for [name (load names)]
+                  (if (= name "let")
+                      (syntax-error! "parser: let is not a valid lexical binding name")
+                      0))
+          (al-free! [(slice u8)] (mut names))
+          0))
+    pattern))
+
+;; ExpressionStatement, or a LabelledStatement that shares its first token with one. A labelled
+;; item may be a plain FunctionDeclaration in sloppy code (the strict pass rejects it in strict
+;; code); generator and async declarations are never labelled items.
+(defn parse-syntax-expression-statement [] (-> i64)
+  (let [expr (parse-syntax-expression)
+        parsed (syntax-at expr)]
+    (if (and (token-is (peek-token) ":") (syntax-name? expr))
+        (let [label (match (syntax-node expr) (SxName [name] name) (_ ""))]
+          (syntax-check-binding-name! label)
+          (take-token)
+          (let [body
+                  (if (token-is (peek-token) "function")
+                      (if (lex-second-is? "*")
+                          (syntax-error! "parser: generator declaration is not allowed as a labelled item")
+                          (parse-syntax-statement))
+                      ;; Nested labels are checked by whichever Statement body holds the chain.
+                      (parse-syntax-controlled-statement-inner false false))]
+            (syntax-stmt-add-node! (SsLabeled label body)
+                                   (.lo parsed)
+                                   (syntax-stmt-hi body))))
+        (do
+          (parse-statement-end!)
+          (syntax-stmt-add-node! (SsExpr expr) (.lo parsed) (.hi parsed))))))
+
+;; VariableDeclarationList / LexicalDeclaration without the terminating semicolon. In a for-head
+;; the missing `const` initializer is deferred: `for (const x of y)` is legal.
+(defn parse-syntax-declaration-list [(for-head bool)] (-> i64)
+  (let [keyword (take-token)
+        is-var (token-is keyword "var")
+        (mut declarations) (al-new [i64] (compiler-allocator))
+        (mut hi) (.end keyword)]
+    (loop (let [name-token (peek-token)]
+            ;; BoundNames of a LexicalDeclaration may not contain `let`.
+            (if (and (not is-var) (token-is name-token "let"))
+                (syntax-error! "parser: `let` is not a valid lexically bound name")
+                0)
+            (if (or (token-is name-token "[") (token-is name-token "{"))
+                (let [pattern (parse-syntax-lexical-pattern! is-var)
+                      init
+                        (if (take-is "=")
+                            (Some (parse-syntax-assignment))
+                            (do
+                              (if (not for-head)
+                                  (syntax-error! "parser: a destructuring declaration requires an initializer")
+                                  0)
+                              (None [i64])))
+                      end (lex-consumed-end)
+                      start
+                        (if (= (len (load declarations)) 0)
+                            (.start keyword)
+                            (.start name-token))
+                      node
+                        (if is-var
+                            (SsVarPattern pattern init)
+                            (SsLetPattern
+                              :pattern pattern
+                              :init init
+                              :final (token-is keyword "const")))]
+                  (push! [i64]
+                         (mut declarations)
+                         (syntax-stmt-add-node! node start end))
+                  (set! (mut hi) end)
+                  (if (take-is ",") (continue) (break 0)))
+                (let [name (parse-syntax-declared-name! is-var)
+                      annotation (parse-optional-annotation)
+                      init
+                        (if (take-is "=")
+                            (Some (parse-syntax-assignment))
+                            (do
+                              (if (and (token-is keyword "const")
+                                       (not for-head))
+                                  (syntax-error! "parser: const declaration requires an initializer")
+                                  0)
+                              (None [i64])))
+                      end (lex-consumed-end)
+                      start
+                        (if (= (len (load declarations)) 0)
+                            (.start keyword)
+                            (.start name))
+                      node
+                        (if is-var
+                            (SsVar
+                              :name (token-text name)
+                              :init init
+                              :annotation annotation)
+                            (SsLet
+                              :name (token-text name)
+                              :init init
+                              :final (token-is keyword "const")
+                              :annotation annotation))]
+                  (push! [i64]
+                         (mut declarations)
+                         (syntax-stmt-add-node! node start end))
+                  (set! (mut hi) end)
+                  (if (take-is ",") (continue) (break 0))))))
+    (if (= (len (load declarations)) 1)
+        (get (load declarations) 0)
+        (syntax-stmt-add-node! (SsDeclList (load declarations))
+                               (.start keyword)
+                               (load hi)))))
+
+;; After a complete for-head expression only the separator can follow; anything else is a
+;; proven error.
+(defn require-closing! [(text (slice u8)) (message (slice u8))] (-> i64)
+  (let [t (peek-token)]
+    (if (token-is t text)
+        (do (take-token) 0)
+        (syntax-error! message))))
+
+(defn parse-syntax-declarations [] (-> i64)
+  (let [stmt (parse-syntax-declaration-list false)]
+    (parse-statement-end!)
+    stmt))
+
+(defn syntax-stmt-lexical? [(id i64)] (-> bool)
+  (match (syntax-stmt-node id)
+    (SsLet [name init final annotation] true)
+    (SsLetPattern [pattern init final] true)
+    (SsDeclList [decls]
+                (if (= (len decls) 0)
+                    false
+                    (syntax-stmt-lexical? (get decls 0))))
+    (_ false)))
+
+;; A for-in/of head declaration binds exactly one name without an initializer. Annex B admits
+;; `for (var x = 1 in o)` in sloppy code; that is unsupported and fails closed.
+;; `of` heads never take an initializer; Annex B.3.5 admits `for (var x = 1 in o)` for a plain
+;; var binding in sloppy code (the strict pass rejects it in strict code).
+(defn syntax-check-for-in-head! [(stmt i64) (of bool)] (-> i64)
+  (match (syntax-stmt-node stmt)
+    (SsVar [name init annotation]
+           (match init
+             (Some [e]
+                   (if of
+                       (syntax-error! "parser: for-of var binding cannot have an initializer")
+                       0))
+             (None [] 0)))
+    (SsLet [name init final annotation]
+           (match init
+             (Some [e]
+                   (syntax-error! "parser: for-in/of lexical binding cannot have an initializer"))
+             (None [] 0)))
+    (SsLetPattern [pattern init final]
+                  (match init
+                    (Some [e]
+                          (syntax-error! "parser: for-in/of binding pattern cannot have an initializer"))
+                    (None [] 0)))
+    (SsVarPattern [pattern init]
+                  (match init
+                    (Some [e]
+                          (syntax-error! "parser: for-in/of binding pattern cannot have an initializer"))
+                    (None [] 0)))
+    (SsDeclList [decls]
+                (syntax-error! "parser: for-in/of head declares exactly one binding"))
+    (_ (broken "syntax-check-for-in-head!: head is not a declaration"))))
+
+(defn syntax-check-const-initializers! [(stmt i64)] (-> i64)
+  (match (syntax-stmt-node stmt)
+    (SsLet [name init final annotation]
+           (if (and final (match init (Some [e] false) (None [] true)))
+               (syntax-error! "parser: const declaration requires an initializer")
+               0))
+    (SsLetPattern [pattern init final]
+                  (match init
+                    (Some [e] 0)
+                    (None []
+                          (syntax-error! "parser: a destructuring declaration requires an initializer"))))
+    (SsVarPattern [pattern init]
+                  (match init
+                    (Some [e] 0)
+                    (None []
+                          (syntax-error! "parser: a destructuring declaration requires an initializer"))))
+    (SsDeclList [decls]
+                (do (al-for [d decls] (syntax-check-const-initializers! d)) 0))
+    (_ 0)))
+
+;; for ( init ; test ; update ) body, for ( head in object ) body, for ( head of iterable ) body.
+;; The head is parsed under the `[~In]` grammar so `in` can only mean for-in there.
+(defn parse-syntax-for [] (-> i64)
+  (let [keyword (require-token "for")
+        awaited (token-is (peek-token) "await")]
+    ;; `for await` exists only inside async functions; elsewhere `await` is an identifier that
+    ;; cannot follow `for`.
+    (if awaited
+        (do
+          (if (not (parser-ctx-async?))
+              (syntax-error! "parser: for await is only allowed in an async function")
+              0)
+          (take-token)
+          0)
+        0)
+    (require-token "(")
+    (let [first (peek-token)
+          saved-no-in (.no-in (parser-state))
+          head
+            (if (token-is first ";")
+                (ForNoInit)
+                (do
+                  (set! (.no-in (parser-state)) true)
+                  (if (or (token-is first "var")
+                          (token-is first "const")
+                          (and (token-is first "let") (let-starts-declaration?)))
+                      (ForInitDecl (parse-syntax-declaration-list true))
+                      ;; `for await (async of …)`: `async of` is not an arrow head here.
+                      (if (and awaited
+                               (token-is first "async")
+                               (lex-second-is? "of"))
+                          (let [t (take-token)]
+                            (ForInitExpr (syntax-add-node! (SxName "async")
+                                                           (.start t)
+                                                           (.end t))))
+                          (ForInitExpr (parse-syntax-expression))))))]
+      (set! (.no-in (parser-state)) saved-no-in)
+      (let [after (peek-token)
+            of (and (= (.kind after) TOK-IDENT) (token-is after "of"))]
+        (if (and awaited (not of))
+            (syntax-error! "parser: for await requires an of clause")
+            0)
+        ;; `for (let of …)` and `for (async of …)` are excluded by lookahead; `for await` admits
+        ;; `async`.
+        (if (and of
+                 (token-is first "let")
+                 (match head (ForInitExpr [e] true) (_ false)))
+            (syntax-error! "parser: for-of head cannot begin with let")
+            0)
+        (if (and of
+                 (not awaited)
+                 (token-is first "async")
+                 (match head
+                   (ForInitExpr [e]
+                                (match (syntax-node e)
+                                  (SxName [name] (= name "async"))
+                                  (_ false)))
+                   (_ false)))
+            (syntax-error! "parser: for-of head cannot be the identifier async")
+            0)
+        (if (and (or (token-is after "in") of)
+                 (match head (ForNoInit [] false) (_ true)))
+            (do
+              (take-token)
+              (let [head-pattern
+                      (match head
+                        (ForInitExpr [expr]
+                                     (match (syntax-node expr)
+                                       (SxObject [entries]
+                                                 (Some (syntax-cover-to-pattern! expr
+                                                                                 false)))
+                                       (SxArray [elements]
+                                                (Some (syntax-cover-to-pattern! expr
+                                                                                false)))
+                                       (_ (do
+                                            (syntax-check-simple-target! expr
+                                                                         true
+                                                                         false)
+                                            (None [i64])))))
+                        (ForInitDecl [stmt]
+                                     (do
+                                       (syntax-check-for-in-head! stmt of)
+                                       (None [i64])))
+                        (_ (None [i64])))
+                    head
+                      (match head-pattern
+                        (Some [pat] (ForInitPattern pat))
+                        (None [] head))
+                    right
+                      (if of
+                          (parse-syntax-assignment)
+                          (parse-syntax-expression))]
+                (require-closing! ")"
+                                  "parser: expected `)` after for-in/of head")
+                (let [body (parse-syntax-controlled-statement true false)]
+                  (syntax-stmt-add-node! (SsForIn
+                                           :head head
+                                           :of of
+                                           :right right
+                                           :body body
+                                           :awaited awaited)
+                                         (.start keyword)
+                                         (syntax-stmt-hi body)))))
+            (do
+              ;; A const without initializer was deferred for the for-in/of case above.
+              (match head
+                (ForInitDecl [stmt] (syntax-check-const-initializers! stmt))
+                (_ 0))
+              (require-closing! ";"
+                                "parser: expected `;` in for statement head")
+              (let [test
+                      (if (token-is (peek-token) ";")
+                          (None [i64])
+                          (Some (parse-syntax-expression)))]
+                (require-closing! ";"
+                                  "parser: expected `;` in for statement head")
+                (let [update
+                        (if (token-is (peek-token) ")")
+                            (None [i64])
+                            (Some (parse-syntax-expression)))]
+                  (require-closing! ")"
+                                    "parser: expected `)` after for statement head")
+                  (let [body (parse-syntax-controlled-statement true false)]
+                    (syntax-stmt-add-node! (SsFor
+                                             :init head
+                                             :test test
+                                             :update update
+                                             :body body)
+                                           (.start keyword)
+                                           (syntax-stmt-hi body)))))))))))
+
+;; try Block Catch? Finally?; at least one of Catch/Finally. CatchParameter is a BindingIdentifier
+;; or a BindingPattern, recorded as a pattern either way.
+(defn parse-syntax-block-required [(what (slice u8))] (-> i64)
+  (if (token-is (peek-token) "{")
+      (parse-syntax-statement)
+      (syntax-error! what)))
+
+(defn parse-syntax-try [] (-> i64)
+  (let [keyword (require-token "try")
+        body (parse-syntax-block-required "parser: expected a block after try")
+        (mut catch-param) (None [i64])
+        (mut catch-body) (None [i64])
+        (mut finally-body) (None [i64])]
+    (if (take-is "catch")
+        (do
+          (if (take-is "(")
+              (let [param (peek-token)]
+                (set! (mut catch-param)
+                      (Some (if (or (token-is param "[") (token-is param "{"))
+                                (parse-syntax-binding-pattern!)
+                                (let [name (require-binding-identifier)]
+                                  (syntax-pattern-add! (PatName (token-text name))
+                                                       (None [i64])
+                                                       (.start name)
+                                                       (.end name))))))
+                (require-token ")")
+                0)
+              0)
+          (set! (mut catch-body)
+                (Some (parse-syntax-block-required "parser: expected a block after catch"))))
+        0)
+    (if (take-is "finally")
+        (set! (mut finally-body)
+              (Some (parse-syntax-block-required "parser: expected a block after finally")))
+        0)
+    (if (and (match (load catch-body) (None [] true) (_ false))
+             (match (load finally-body) (None [] true) (_ false)))
+        (syntax-error! "parser: try requires a catch or finally clause")
+        0)
+    (syntax-stmt-add-node! (SsTry
+                             :body body
+                             :catch-param (load catch-param)
+                             :catch-body (load catch-body)
+                             :finally-body (load finally-body))
+                           (.start keyword)
+                           (lex-consumed-end))))
+
+(defn parse-syntax-statement-inner [] (-> i64)
+  (let [first (peek-token)]
+    ;; Import and export declarations exist only in the Module goal. `import(` and `import.` begin
+    ;; expressions and take the ordinary expression-statement path below.
+    (if (token-is first "export")
+        (syntax-error! "parser: export declarations are only valid in a module")
+        0)
+    (if (and (token-is first "import")
+             (not (or (lex-second-is? "(") (lex-second-is? "."))))
+        (syntax-error! "parser: import declarations are only valid in a module")
+        0)
+    (if (token-is first "class")
+        (let [cls (parse-syntax-class (take-token) true)]
+          (syntax-stmt-add-node! (SsClassDecl cls)
+                                 (.start first)
+                                 (syntax-class-hi cls)))
+        (if (or (token-is first "function")
+                (and (token-is first "async")
+                     (lex-second-is? "function")
+                     (let [second (lex-peek-second false)]
+                       (not (.nl-before second)))))
+            (parse-syntax-function-declaration!)
+            (if (token-is first "for")
+                (parse-syntax-for)
+                (if (token-is first "try")
+                    (parse-syntax-try)
+                    (if (token-is first "do")
+                        (let [keyword (take-token)
+                              body
+                                (parse-syntax-controlled-statement true false)]
+                          (require-token "while")
+                          (require-token "(")
+                          (let [condition (parse-syntax-expression)
+                                close (require-token ")")]
+                            ;; ASI: the `;` after a do-while's `)` may be omitted even without a line terminator.
+                            (take-is ";")
+                            (syntax-stmt-add-node! (SsDoWhile body condition)
+                                                   (.start keyword)
+                                                   (.end close))))
+                        (if (token-is first "throw")
+                            (let [keyword (take-token)
+                                  next (peek-token)]
+                              (if (.nl-before next)
+                                  (syntax-error! "parser: line terminator is not allowed after throw")
+                                  0)
+                              (let [value (parse-syntax-expression)]
+                                (parse-statement-end!)
+                                (syntax-stmt-add-node! (SsThrow value)
+                                                       (.start keyword)
+                                                       (syntax-hi value))))
+                            (if (token-is first "with")
+                                (let [keyword (take-token)]
+                                  (require-token "(")
+                                  (let [object (parse-syntax-expression)]
+                                    (require-token ")")
+                                    (let [body
+                                            (parse-syntax-controlled-statement false
+                                                                               false)]
+                                      (syntax-stmt-add-node! (SsWith object
+                                                                     body)
+                                                             (.start keyword)
+                                                             (syntax-stmt-hi body)))))
+                                (if (token-is first "debugger")
+                                    (let [keyword (take-token)]
+                                      (parse-statement-end!)
+                                      (syntax-stmt-add-node! (SsDebugger)
+                                                             (.start keyword)
+                                                             (.end keyword)))
+                                    (if (token-is first "while")
+                                        (let [keyword (take-token)]
+                                          (require-token "(")
+                                          (let [condition
+                                                  (parse-syntax-expression)]
+                                            (require-token ")")
+                                            (let [body
+                                                    (parse-syntax-controlled-statement true
+                                                                                       false)]
+                                              (syntax-stmt-add-node! (SsWhile condition
+                                                                              body)
+                                                                     (.start keyword)
+                                                                     (syntax-stmt-hi body)))))
+                                        (if (token-is first "if")
+                                            (let [keyword (take-token)]
+                                              (require-token "(")
+                                              (let [condition
+                                                      (parse-syntax-expression)]
+                                                (require-token ")")
+                                                (let [yes
+                                                        (parse-syntax-controlled-statement false
+                                                                                           true)
+                                                      no
+                                                        (if (take-is "else")
+                                                            (Some (parse-syntax-controlled-statement false
+                                                                                                     true))
+                                                            (None [i64]))
+                                                      last
+                                                        (match no
+                                                          (Some [n] n)
+                                                          (None [] yes))]
+                                                  (syntax-stmt-add-node! (SsIf
+                                                                           :condition
+                                                                             condition
+                                                                           :then-stmt
+                                                                             yes
+                                                                           :else-stmt
+                                                                             no)
+                                                                         (.start keyword)
+                                                                         (syntax-stmt-hi last)))))
+                                            (if (or (and (token-is first "let")
+                                                         (let-starts-declaration?))
+                                                    (token-is first "const")
+                                                    (token-is first "var"))
+                                                (parse-syntax-declarations)
+                                                (if (token-is first "return")
+                                                    (let [keyword (take-token)
+                                                          next (peek-token)]
+                                                      ;; Return is a restricted production: a line terminator ends it before the
+                                                      ;; following expression. A missing expression is the JavaScript value
+                                                      ;; `undefined`; the next line remains a separate, unreachable statement.
+                                                      (if (or (.nl-before next)
+                                                              (token-is next
+                                                                        ";")
+                                                              (token-is next
+                                                                        "}")
+                                                              (= (.kind next)
+                                                                 TOK-EOF))
+                                                          (do
+                                                            (parse-statement-end!)
+                                                            (syntax-stmt-add-node! (SsReturn (None [i64]))
+                                                                                   (.start keyword)
+                                                                                   (.end keyword)))
+                                                          (let [expr
+                                                                  (parse-syntax-expression)]
+                                                            (parse-statement-end!)
+                                                            (syntax-stmt-add-node! (SsReturn (Some expr))
+                                                                                   (.start keyword)
+                                                                                   (syntax-hi expr)))))
+                                                    (if (token-is first "{")
+                                                        (do
+                                                          (take-token)
+                                                          (let [(mut body)
+                                                                  (al-new [i64]
+                                                                          (compiler-allocator))]
+                                                            (loop (if (token-is (peek-token)
+                                                                                "}")
+                                                                      (break 0)
+                                                                      (do
+                                                                        (push! [i64]
+                                                                               (mut body)
+                                                                               (parse-syntax-statement))
+                                                                        (continue))))
+                                                            (let [close
+                                                                    (require-token "}")]
+                                                              (syntax-stmt-add-node! (SsBlock (load body))
+                                                                                     (.start first)
+                                                                                     (.end close)))))
+                                                        (parse-syntax-expression-statement))))))))))))))))
+
+(defn parse-syntax-statement-list [] (-> (ArrayList i64))
+  (let [(mut body) (al-new [i64] (compiler-allocator))]
+    (loop (if (token-is (peek-token) "}")
+              (break 0)
+              (do (push! [i64] (mut body) (parse-syntax-statement)) (continue))))
+    (load body)))

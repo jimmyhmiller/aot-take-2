@@ -1,0 +1,228 @@
+;; The expression dispatcher: one arm per syntax node.
+
+(module aot.parse.lower.expression)
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.jsl.lower" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.realm.intrinsics" :use *)
+(import "aot.parse.lower.name" :use *)
+(import "aot.parse.lower.jsl" :use *)
+(import "aot.parse.lower.operator" :use *)
+(import "aot.parse.lower.literal" :use *)
+(import "aot.parse.lower.function" :use *)
+(import "aot.parse.lower.call" :use *)
+(import "aot.parse.lower.member" :use *)
+(import "aot.parse.lower.pattern" :use *)
+(import "aot.parse.lower.class" :use *)
+
+;; Source provenance is a scoped construction context. Nested expressions temporarily narrow it;
+;; after they return, the enclosing operator regains its complete expression range. Node inputs and
+;; later graph rewrites merge these ranges, so optimization does not erase attribution.
+(defn lower-syntax-expr [(id i64)] (-> (dyn NodeOps))
+  (let [x (syntax-at id)
+        origin
+          (n-origin-enter! (match (.node x)
+                             (SxCall [callee args optional] "call")
+                             (SxNew [callee args] "construct")
+                             (SxMember [owner name optional] "named-read")
+                             (SxIndex [owner key optional] "keyed-read")
+                             (SxName [name] "binding-read")
+                             (SxObject [properties] "object-literal")
+                             (SxArray [elements] "array-literal")
+                             (_ "expression"))
+                           "frontend"
+                           (.lo x)
+                           (.hi x))
+        old-lo (n-source-context-lo)
+        old-hi (n-source-context-hi)]
+    (n-source-context-set! (.lo x) (.hi x))
+    (let [answer
+            (match (.node x)
+              ;; A source literal is a JavaScript value. The raw integer exists only inside its
+              ;; Box and may reappear after a proven JSL Unbox cancels that Box during
+              ;; specialization.
+              (SxNumber [value value-float rep]
+                        (box-make-at (Some (parser-node (.current-ctrl (parser-state))))
+                                     (if (= rep REP-INT)
+                                         (con-int value)
+                                         (con-flt value-float))))
+              (SxString [raw units legacy]
+                        (let [scope
+                                (parser-node (.current-scope (parser-state)))
+                              lowered
+                                (jsl-lower-string-units units
+                                                        (parser-node (.current-ctrl (parser-state)))
+                                                        (scope-mem scope))]
+                          (parser-set-current-ctrl! (.ctrl lowered))
+                          (scope-set-mem! scope (.mem lowered))
+                          (box-make-at (Some (.ctrl lowered)) (.value lowered))))
+              (SxName [name] (lower-name name))
+              (SxSingleton [name] (lower-singleton name))
+              (SxGroup [inner] (lower-syntax-expr inner))
+              (SxObject [entries] (lower-object-literal entries))
+              (SxArray [elements] (lower-array-literal elements))
+              (SxMember [owner name optional]
+                        (if (syntax-optional-chain? id)
+                            (lower-optional-chain id)
+                            (if (syntax-is-super? owner)
+                                (lower-super-read id)
+                                (lower-member-read owner name))))
+              (SxIndex [owner key optional]
+                       (if (syntax-optional-chain? id)
+                           (lower-optional-chain id)
+                           (if (syntax-is-super? owner)
+                               (lower-super-read id)
+                               (lower-keyed-read owner key))))
+              (SxCall [callee args optional]
+                      (if (syntax-optional-chain? id)
+                          (lower-optional-chain id)
+                          (if (syntax-args-have-spread? args)
+                              ;; A spread makes the argument count a runtime question: the call
+                              ;; takes an argument array (§13.3.8.1).
+                              (match (syntax-node (syntax-ungroup-id callee))
+                                (SxMember [owner member optional]
+                                          (lower-spread-member-call owner
+                                                                    (lower-member-key member)
+                                                                    args))
+                                (SxIndex [owner key optional]
+                                         (lower-spread-member-call owner
+                                                                   (lower-syntax-expr key)
+                                                                   args))
+                                (_ (lower-spread-call (lower-syntax-expr callee)
+                                                      (dyn-undefined-make)
+                                                      args)))
+                              (match (syntax-node (syntax-ungroup-id callee))
+                                (SxSuper [] (lower-super-call args))
+                                (SxName [name] (lower-named-call name args))
+                                (SxMember [owner member optional]
+                                          (if (syntax-is-super? owner)
+                                              (lower-super-member-call (syntax-ungroup-id callee)
+                                                                       args
+                                                                       (lower-callee-message "super."
+                                                                                             member))
+                                              (lower-member-call owner
+                                                                 member
+                                                                 args)))
+                                (SxPrivateMember [owner member optional]
+                                                 (do
+                                                   (unimplemented "private method calls"
+                                                                  "docs/GAPS.md — classes")
+                                                   (unreachable-node)))
+                                (SxIndex [owner key optional]
+                                         (if (syntax-is-super? owner)
+                                             (lower-super-member-call (syntax-ungroup-id callee)
+                                                                      args
+                                                                      "super[...]")
+                                             (lower-keyed-call owner
+                                                               key
+                                                               args)))
+                                (_ (lower-value-call (lower-syntax-expr callee)
+                                                     args
+                                                     (syntax-callee-label callee)))))))
+              (SxNew [callee args] (lower-new callee args))
+              (SxNewTarget [] (lower-new-target))
+              (SxThis [] (lower-this))
+              (SxIntrinsic [builtin args] (lower-intrinsic-call builtin args))
+              (SxSpread [expr]
+                        (do
+                          (unimplemented "spread arguments"
+                                         "docs/GAPS.md — iteration protocol")
+                          (unreachable-node)))
+              (SxImportCall [specifier options]
+                            (do
+                              (unimplemented "dynamic import()"
+                                             "docs/GAPS.md — modules")
+                              (unreachable-node)))
+              ;; A substitution-free template is exactly its cooked string.
+              (SxTemplate [quasis substitutions]
+                          (if (= (len substitutions) 0)
+                              (lower-syntax-expr (get quasis 0))
+                              (lower-template quasis substitutions)))
+              (SxTaggedTemplate [tag template]
+                                (do
+                                  (unimplemented "tagged templates"
+                                                 "docs/GAPS.md — function values")
+                                  (unreachable-node)))
+              (SxRegex [body flags]
+                       (do
+                         (unimplemented "regular expression objects"
+                                        "docs/GAPS.md — RegExp")
+                         (unreachable-node)))
+              (SxFunction [fun] (lower-function-object fun))
+              (SxYield [argument delegate]
+                       (do
+                         (unimplemented "generator yield"
+                                        "docs/GAPS.md — generators")
+                         (unreachable-node)))
+              (SxAwait [operand]
+                       (do
+                         (unimplemented "await"
+                                        "docs/GAPS.md — promises and async functions")
+                         (unreachable-node)))
+              ;; `super` is never a value of its own: it is the owner of a member or index (handled
+              ;; there) or the callee of a call.
+              (SxSuper []
+                       (do
+                         (broken "lower-syntax-expr: a bare `super` survived syntax validation")
+                         (unreachable-node)))
+              (SxClass [cls] (lower-class cls))
+              ;; `({a} = o)` and `[x, y] = xs` (§13.15.5): the value is the assignment's own result,
+              ;; and every leaf is a Reference rather than a fresh binding.
+              (SxDestructuringAssign [pattern value]
+                                     (let [assigned (lower-syntax-expr value)]
+                                       (n-keep! assigned)
+                                       (lower-pattern-bind! pattern
+                                                            assigned
+                                                            PATTERN-ASSIGN)
+                                       (n-unkeep! assigned)
+                                       assigned))
+              (SxPrivateMember [owner name optional]
+                               (do
+                                 (unimplemented "private class members"
+                                                "docs/GAPS.md — classes")
+                                 (unreachable-node)))
+              (SxPrivateName [name]
+                             (do
+                               (unimplemented "private brand checks"
+                                              "docs/GAPS.md — classes")
+                               (unreachable-node)))
+              (SxUnary [op operand]
+                       (do
+                         (lower-require-jsl! op)
+                         (lower-js-unary (if (= op "JsTypeof")
+                                             (lower-typeof-operand operand)
+                                             (lower-syntax-expr operand))
+                                         op)))
+              (SxDelete [operand] (lower-delete operand))
+              (SxUpdate [op prefix target] (lower-update op prefix target))
+              (SxBinary [op left right] (lower-syntax-binary left right op))
+              (SxAnd [left right]
+                     (lower-short-circuit left right "JsTruthy" true))
+              (SxOr [left right]
+                    (lower-short-circuit left right "JsTruthy" false))
+              (SxCoalesce [left right]
+                          (lower-short-circuit left right "JsNullish" true))
+              (SxConditional [condition when-true when-false]
+                             (lower-conditional condition when-true when-false))
+              (SxAssign [target value] (lower-assignment "" target value))
+              (SxCompoundAssign [op target value]
+                                (lower-assignment op target value))
+              (SxLogicalAssign [predicate rhs-on-true target value]
+                               (lower-logical-assignment predicate
+                                                         rhs-on-true
+                                                         target
+                                                         value))
+              (SxComma [left right]
+                       (do (lower-syntax-expr left) (lower-syntax-expr right))))]
+      (n-source-context-set! old-lo old-hi)
+      (n-origin-leave! origin)
+      answer)))

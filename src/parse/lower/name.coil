@@ -1,0 +1,198 @@
+;; Lowering of names: scope slots, lexical bindings, Script bindings and typeof operands.
+
+(module aot.parse.lower.name)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.str" :use [sb-new sb-push-str! sb-str])
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.shape" :use *)
+(import "aot.jsl.lower" :use *)
+(import "aot.parse.parser" :use [syntax-find-fun])
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.analysis.declarations" :use *)
+(import "aot.parse.analysis.capture" :use *)
+(import "aot.parse.realm.globals" :use *)
+(import "aot.parse.lower.jsl" :use *)
+(import "aot.parse.lower.literal" :use *)
+(import "aot.parse.lower.function" :use *)
+(import "aot.parse.lower.exception" :use *)
+(import "aot.parse.lower.environment" :use *)
+(import "aot.parse.lower.expression" :use *)
+
+;; What is left of the capture refusal: an enclosing function's binding that its activation does not
+;; own — a block's `let`, `const` or `class`, and a loop's per-iteration one above all, which has a
+;; lifetime one environment slot cannot model.
+(defn lower-require-uncaptured! [(name (slice u8))] (-> i64)
+  (if (syntax-enclosing-binding? (.current-fun (parser-state)) name)
+      (unimplemented "a captured binding of an enclosing block or loop iteration"
+                     "docs/GAPS.md — function values and closures")
+      0))
+
+;; The program loop marks the declarations it parsed at the top level as hoisted Funs.
+(defn syntax-mark-hoisted! [(stmt i64)] (-> i64)
+  (match (syntax-stmt-node stmt)
+    (SsFunctionDecl [fun]
+                    (let [fp (syntax-fun-ptr fun)] (set! (.hoisted fp) true) 0))
+    (_ 0)))
+
+(defn lower-typeof-operand [(id i64)] (-> (dyn NodeOps))
+  ;; Parentheses preserve a Reference. typeof skips GetValue only for an unresolvable name;
+  ;; a declared TDZ binding must still take the normal read path. Our global environment is
+  ;; incomplete in closed mode, so lack of a Scope slot does NOT prove that e.g. JSON is absent.
+  ;; Retained units resolve the executing realm's declarative record before its object record.
+  (let [unresolved
+          (match (syntax-node (syntax-ungroup-id id))
+            (SxName [name]
+                    (and (< (scope-find (parser-node (.current-scope (parser-state)))
+                                        name)
+                            0)
+                         ;; A function's `arguments` is its own binding (or an arrow's refused capture).
+                         (not (and (= name "arguments")
+                                   (not (syntax-script-root? (.current-fun (parser-state))))))
+                         (not (syntax-restricted-global? name))
+                         (or (.external-mutation (parser-state))
+                             (not (syntax-standard-global? name)))
+                         (not (syntax-script-binding? name))
+                         (or (.external-mutation (parser-state))
+                             (< (syntax-global-index name) 0))
+                         (or (and (.external-mutation (parser-state))
+                                  (>= (syntax-global-index name) 0))
+                             (< (syntax-find-fun name) 0))
+                         (not (syntax-enclosing-binding? (.current-fun (parser-state))
+                                                         name))))
+            (_ false))]
+    ;; A reusable unit cannot prove that another Script has not supplied this object binding.
+    ;; Preserve the runtime read, including getter completions. Closed programs retain their
+    ;; existing absent-name fold; retained lexical imports preserve TDZ through the JSL read.
+    (if unresolved
+        (if (.external-mutation (parser-state))
+            (match (syntax-node (syntax-ungroup-id id))
+              (SxName [name]
+                      (lower-completion! (lower-jsl-unary-value "JsGlobalTypeofOperand"
+                                                                (keyref-make (shape-key-intern name)))))
+              (_ (do
+                   (panic "lower-typeof-operand: unresolved operand is not a name")
+                   (unreachable-node))))
+            (dyn-undefined-make))
+        (lower-syntax-expr id))))
+
+;; As in Simple, compiler-only names contain a dot, which cannot occur in an IdentifierName.
+;; These SSA values are positive realm slot identities, never cell contents. They are created
+;; only in the owning Script initializer; a separate function starts with its own Scope and
+;; therefore cannot accidentally capture an initializer-local node. Unknown/imported names keep
+;; ordinary resolution, so later Scripts can still introduce lexicals shadowing object bindings.
+(defn lower-lexical-slot-name [(name (slice u8))] (-> (slice u8))
+  (let [(mut b) (sb-new (compiler-allocator))]
+    (sb-push-str! (mut b) "$aot$.lexical-slot.")
+    (sb-push-str! (mut b) name)
+    (sb-str (mut b))))
+
+(defn lower-known-lexical-slot [(name (slice u8))] (-> (Option (dyn NodeOps)))
+  (scope-lookup (parser-node (.current-scope (parser-state)))
+                (lower-lexical-slot-name name)))
+
+(defn lower-script-binding-read [(name (slice u8))] (-> (dyn NodeOps))
+  (lower-completion! (match (lower-known-lexical-slot name)
+                       (Some [slot]
+                             (lower-jsl-unary-value "JsReadGlobalLexicalSlot"
+                                                    slot))
+                       (None []
+                             (lower-jsl-unary-value "JsGlobalBindingRead"
+                                                    (keyref-make (shape-key-intern name)))))))
+
+;; A name in an expression: its environment slot when this activation's binding is captured, the
+;; slot of an enclosing activation's when that is where it is bound, and otherwise the ordinary
+;; resolution — a Scope binding, a realm lexical, a global.
+;; PutValue for a Script's lexical binding.
+(defn lower-script-binding-write! [(name (slice u8)) (value (dyn NodeOps))] (-> i64)
+  (match (lower-known-lexical-slot name)
+    (Some [slot]
+          (do
+            (n-keep! value)
+            (let [(mut args) (al-new [(dyn NodeOps)] (compiler-allocator))
+                  scope (parser-node (.current-scope (parser-state)))]
+              (push! [(dyn NodeOps)] (mut args) slot)
+              (push! [(dyn NodeOps)] (mut args) value)
+              (let [w
+                      (jsl-lower-macro-values "JsGlobalLexicalWrite"
+                                              (load args)
+                                              (parser-node (.current-ctrl (parser-state)))
+                                              (scope-mem scope))]
+                (al-free! [(dyn NodeOps)] (mut args))
+                (parser-set-current-ctrl! (.ctrl w))
+                (scope-set-mem! scope (.mem w))
+                (lower-completion! (.value w))
+                (n-unkeep! value)
+                0))))
+    (None []
+          (do
+            (lower-completion! (lower-jsl-values2 "JsGlobalBindingWrite"
+                                                  (keyref-make (shape-key-intern name))
+                                                  value))
+            0))))
+
+(defn lower-name [(name (slice u8))] (-> (dyn NodeOps))
+  (let [scope (parser-node (.current-scope (parser-state)))
+        slot (scope-env-slot scope name)]
+    (if (>= slot 0)
+        (if (scope-env-tdz? scope name)
+            (lower-environment-load-checked slot)
+            (lower-environment-load slot))
+        (if (>= (scope-find scope name) 0)
+            (lower-name-uncaptured name)
+            (let [owner
+                    (syntax-capture-owner (.current-fun (parser-state)) name)]
+              (if (and (>= (.fun owner) 0) (.activation owner))
+                  (lower-environment-outer (.fun owner) name)
+                  (lower-name-uncaptured name)))))))
+
+(defn lower-name-uncaptured [(name (slice u8))] (-> (dyn NodeOps))
+  (match (match (scope-lookup (parser-node (.current-scope (parser-state)))
+                              name)
+           (Some [value] (Some value))
+           (None []
+                 (if (= name "arguments")
+                     (lower-arguments-object)
+                     (None [(dyn NodeOps)]))))
+    (Some [value] value)
+    (None []
+          (do
+            (lower-require-uncaptured! name)
+            ;; A Script's lexical binding is the realm's, read by name from wherever it is named:
+            ;; its slot when the Script's own initializer knows it, and a runtime lookup — with the
+            ;; dead-zone ReferenceError — from a function of the Script.
+            (if (syntax-script-binding? name)
+                (lower-script-binding-read name)
+                ;; Resolve the non-writable global numeric/singleton values after lexical
+                ;; bindings first because JavaScript permits a parameter or local to shadow that global;
+                ;; only an unresolved identifier receives the canonical singleton.
+                (if (= name "undefined")
+                    (dyn-undefined-make)
+                    (if (or (= name "Infinity") (= name "NaN"))
+                        (lower-singleton (if (= name "Infinity")
+                                             "JsInfinity"
+                                             "JsNaN"))
+                        ;; globalThis (§19.1.1) is the realm's global object, which `this` already names
+                        ;; at a Script's top level.
+                        (if (= name "globalThis")
+                            (lower-global-object)
+                            (if (>= (syntax-global-index name) 0)
+                                (lower-global-load name)
+                                (if (>= (syntax-find-fun name) 0)
+                                    (lower-function-object (syntax-find-fun name))
+                                    ;; Nothing in the Script or any enclosing function declares the
+                                    ;; name: it is a Reference into the global object, resolved at
+                                    ;; runtime as a property read or a ReferenceError.
+                                    (if (.external-mutation (parser-state))
+                                        (lower-completion! (lower-jsl-unary-value "JsGlobalBindingRead"
+                                                                                  (keyref-make (shape-key-intern name))))
+                                        (lower-jsl-unary-value "JsUnresolvedGlobalRead"
+                                                               (keyref-make (shape-key-intern name))))))))))))))

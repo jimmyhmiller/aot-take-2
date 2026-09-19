@@ -1,0 +1,527 @@
+;; Lowering of statements: blocks, declarations, if, loops, switch and labels.
+
+(module aot.parse.lower.statement)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.memory" :use *)
+(import "aot.node.property" :use *)
+(import "aot.node.compare" :use *)
+(import "aot.node.gc" :use *)
+(import "aot.node.jsops" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.type.type" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.early" :use *)
+(import "aot.parse.analysis.declarations" :use *)
+(import "aot.parse.realm.globals" :use *)
+(import "aot.parse.realm.instantiate" :use *)
+(import "aot.parse.lower.operator" :use *)
+(import "aot.parse.lower.reference" :use *)
+(import "aot.parse.lower.literal" :use *)
+(import "aot.parse.lower.function" :use *)
+(import "aot.parse.lower.exception" :use *)
+(import "aot.parse.lower.jump" :use *)
+(import "aot.parse.lower.iteration" :use *)
+(import "aot.parse.lower.pattern" :use *)
+(import "aot.parse.lower.class" :use *)
+(import "aot.parse.lower.environment" :use *)
+(import "aot.parse.lower.expression" :use *)
+
+;; Instantiate direct lexical bindings, including comma-separated declarations without a new scope.
+(defn lower-instantiate-lexicals! [(stmts (ArrayList i64))] (-> i64)
+  (do
+    (al-for [id stmts]
+            (match (syntax-stmt-node id)
+              (SsLet [name init final annotation]
+                     ;; A captured lexical was already bound to its environment slot at entry, empty
+                     ;; until its initialization (docs/DECISIONS.md, closures).
+                     (if (>= (scope-env-slot (parser-node (.current-scope (parser-state)))
+                                             name)
+                             0)
+                         0
+                         (scope-declare! (parser-node (.current-scope (parser-state)))
+                                         name
+                                         (ty-dyn TAG-ANY)
+                                         final)))
+              ;; A pattern declares every name it names, each in its own dead zone until the
+              ;; declaration runs (§14.3.1.2).
+              (SsLetPattern [pattern init final]
+                            (let [(mut names)
+                                    (al-new [(slice u8)] (compiler-allocator))]
+                              (syntax-pattern-names! pattern (mut names))
+                              (al-for [name (load names)]
+                                      (if (>= (scope-env-slot (parser-node (.current-scope (parser-state)))
+                                                              name)
+                                              0)
+                                          0
+                                          (scope-declare! (parser-node (.current-scope (parser-state)))
+                                                          name
+                                                          (ty-dyn TAG-ANY)
+                                                          final)))
+                              (al-free! [(slice u8)] (mut names))
+                              0))
+              ;; A class declaration is a lexical binding of its name, in its temporal dead zone
+              ;; until the class is evaluated.
+              (SsClassDecl [cls]
+                           (if (>= (scope-env-slot (parser-node (.current-scope (parser-state)))
+                                                   (syntax-class-name cls))
+                                   0)
+                               0
+                               (scope-declare! (parser-node (.current-scope (parser-state)))
+                                               (syntax-class-name cls)
+                                               (ty-dyn TAG-ANY)
+                                               true)))
+              (SsDeclList [decls] (lower-instantiate-lexicals! decls))
+              (SsCase [selector body] (lower-instantiate-lexicals! body))
+              ;; A block-level FunctionDeclaration is a lexical binding initialized on block entry.
+              ;; The function body's own list is instantiated var-like by `lower-bind-body-functions!`
+              ;; instead, which finds the var already defined.
+              (SsFunctionDecl [fun]
+                              (let [f (syntax-fun-at fun)
+                                    scope
+                                      (parser-node (.current-scope (parser-state)))]
+                                (if (or (.hoisted f)
+                                        (>= (scope-find scope (.name f)) 0))
+                                    0
+                                    (scope-define! scope
+                                                   (.name f)
+                                                   (ty-dyn TAG-ANY)
+                                                   false
+                                                   (lower-function-object fun)))))
+              (_ 0)))
+    0))
+
+;; Final Simple installs parameters in its function Scope before parsing the body. JavaScript's
+;; FunctionDeclarationInstantiation additionally hoists var names out of nested statements.
+;; Preserve existing parameters and repeated var bindings; initialize only new slots to JSL
+;; undefined. Initializers remain at their original execution positions. Script object-environment
+;; bindings and the implicit arguments object are explicitly outside this implementation boundary.
+(defn lower-instantiate-vars! [(stmts (ArrayList i64))] (-> i64)
+  (let [(mut names) (al-new [(slice u8)] (compiler-allocator))
+        scope (parser-node (.current-scope (parser-state)))]
+    (syntax-collect-declarations! stmts false (mut names))
+    (al-for [name (load names)]
+            (if (< (scope-find scope name) 0)
+                (do
+                  (if (= name "arguments")
+                      (unimplemented "implicit arguments object binding"
+                                     "docs/GAPS.md — function environments")
+                      0)
+                  (scope-define! scope
+                                 name
+                                 (ty-dyn TAG-ANY)
+                                 false
+                                 (lower-singleton "JsUndefined")))
+                0))
+    0))
+
+;; Simple has no JavaScript CaseBlock. Its ordinary If/CProj/Scope diamonds and jumpTo exits
+;; provide the graph machinery; JSL IsStrictlyEqual supplies case matching. First evaluate the
+;; discriminant outside the switch lexical scope. Instantiate that scope once, then evaluate case
+;; selectors in source order on only the unmatched path. Default receives the final unmatched
+;; path even when it appears in the middle. Finally lower bodies in source order, merging each
+;; selected entry with the preceding fallthrough. Thus fallthrough never re-evaluates a selector.
+;; All clauses share one lexical scope. Runtime TDZ state across differently initialized case
+;; paths is still unsupported by Scope and must refuse, not join TOP as a JavaScript value.
+(defn syntax-case-body [(id i64)] (-> (ArrayList i64))
+  (match (syntax-stmt-node id)
+    (SsCase [selector body] body)
+    (_ (do
+         (broken "syntax-case-body: switch clause is not a case")
+         (al-new [i64] (compiler-allocator))))))
+
+(defn lower-switch [(discriminant i64) (cases (ArrayList i64))] (-> i64)
+  (let [value (lower-syntax-expr discriminant)
+        outer (parser-node (.current-scope (parser-state)))
+        exit (scope-dup outer false)
+        (mut entries) (al-new [i64] (compiler-allocator))
+        (mut default-index) -1
+        (mut i) 0
+        (mut fallthrough) 0]
+    (n-keep! value)
+    (scope-set-ctrl! exit (xctrl-make))
+    (parser-push-jump! exit JUMP-SWITCH)
+    (scope-push! outer)
+    (lower-instantiate-lexicals! cases)
+    (loop (if (>= (load i) (len cases))
+              (break 0)
+              (let [selector-id
+                      (match (syntax-stmt-node (get cases (load i)))
+                        (SsCase [selector body] selector)
+                        (_ (do
+                             (broken "lower-switch: clause is not a case")
+                             (None [i64]))))]
+                (match selector-id
+                  (None []
+                        (do
+                          (set! (mut default-index) (load i))
+                          ;; A parser-only pending entry, patched after all selectors, never a value.
+                          (push! [i64] (mut entries) 0)))
+                  (Some [selector-expr]
+                        (let [selector (lower-syntax-expr selector-expr)
+                              predicate
+                                (lower-js-truthy (lower-js-binary value
+                                                                  selector
+                                                                  "JsStrictEqual"))
+                              selected
+                                (parser-node (.current-scope (parser-state)))
+                              iff (if-make (scope-ctrl selected) predicate)
+                              arms (if-arms! iff)
+                              unmatched (scope-dup selected false)]
+                          (scope-set-ctrl! selected (arms-true arms))
+                          (scope-set-ctrl! unmatched (arms-false arms))
+                          (n-keep! selected)
+                          (push! [i64] (mut entries) (n-nid selected))
+                          (parser-use-scope! unmatched))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (n-unkeep! value)
+    (let [unmatched (parser-node (.current-scope (parser-state)))]
+      (if (>= (load default-index) 0)
+          (do
+            (n-keep! unmatched)
+            (set! (mut entries) (load default-index) (n-nid unmatched)))
+          (do (scope-pop! unmatched) (scope-merge! exit unmatched) 0)))
+    (set! (mut i) 0)
+    (loop (if (>= (load i) (len cases))
+              (break 0)
+              (let [entry (parser-node (get (load entries) (load i)))]
+                (n-unkeep! entry)
+                (parser-use-scope! (if (= (load fallthrough) 0)
+                                       entry
+                                       (scope-merge! entry
+                                                     (parser-node (load fallthrough)))))
+                (let [terminated
+                        (lower-syntax-statements (syntax-case-body (get cases
+                                                                        (load i))))
+                      current (parser-node (.current-scope (parser-state)))]
+                  (if (= terminated 0)
+                      (set! (mut fallthrough) (n-nid current))
+                      (do (set! (mut fallthrough) 0) (n-kill! current))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (if (!= (load fallthrough) 0)
+        (let [last (parser-node (load fallthrough))]
+          (scope-pop! last)
+          (scope-merge! exit last)
+          0)
+        0)
+    (let [target (parser-pop-jump!)]
+      (parser-use-scope! exit)
+      (if (or (< (load default-index) 0)
+              (!= (load fallthrough) 0)
+              (> (.count target) 0))
+          0
+          1))))
+
+(defn lower-block [(body (ArrayList i64))] (-> i64)
+  (let [scope (parser-node (.current-scope (parser-state)))]
+    (scope-push! scope)
+    (lower-instantiate-lexicals! body)
+    (let [nested-return (lower-syntax-statements body)]
+      ;; A loop replaces the active Scope with its exit Scope. Pop the live environment, never
+      ;; the stale entry handle.
+      (scope-pop! (parser-node (.current-scope (parser-state))))
+      nested-return)))
+
+(defn lower-if [(condition-id i64) (then-stmt i64) (else-stmt (Option i64))] (-> i64)
+  (let [condition (lower-js-truthy (lower-syntax-expr condition-id))
+        iff (if-make (parser-node (.current-ctrl (parser-state))) condition)
+        arms (if-arms! iff)
+        true-scope (parser-node (.current-scope (parser-state)))
+        false-scope (scope-dup true-scope false)
+        guard (lower-relational-guard condition-id)]
+    (lower-apply-relational-guards! guard
+                                    true-scope
+                                    (arms-true arms)
+                                    false-scope
+                                    (arms-false arms))
+    (scope-set-ctrl! true-scope (arms-true arms))
+    (set! (.current-ctrl (parser-state)) (n-nid (arms-true arms)))
+    (let [true-return (lower-syntax-statement then-stmt)
+          true-exit (parser-node (.current-scope (parser-state)))]
+      (set! (.current-scope (parser-state)) (n-nid false-scope))
+      (scope-set-ctrl! false-scope (arms-false arms))
+      (set! (.current-ctrl (parser-state)) (n-nid (arms-false arms)))
+      (let [false-return
+              (match else-stmt
+                (Some [e] (lower-syntax-statement e))
+                (None [] 0))
+            merged
+              (scope-merge! true-exit
+                            (parser-node (.current-scope (parser-state))))]
+        (set! (.current-scope (parser-state)) (n-nid merged))
+        (set! (.current-ctrl (parser-state)) (n-nid (scope-ctrl merged)))
+        (if (and (!= true-return 0) (!= false-return 0)) 1 0)))))
+
+;; Every loop follows final Simple's atomic protocol: an open Loop and lazy binding Phis are built
+;; first, then `scope-end-loop!` installs the control backedge and every materialized Phi backedge
+;; without exposing an intermediate graph. The condition and body can resolve every lazy sentinel
+;; (notably memory plus all assigned variables). The resulting edge replacements may leave the
+;; parser's raw `entry` pointer as its only owner, so it is held from before construction until
+;; `scope-end-loop!` has consumed every entry slot.
+(defn lower-loop-head! [] (-> (dyn NodeOps))
+  (let [entry (parser-node (.current-scope (parser-state)))
+        head (loop-make (scope-ctrl entry))]
+    (n-keep! entry)
+    (scope-set-ctrl! entry head)
+    (parser-use-scope! (scope-dup entry true))
+    entry))
+
+;; `while (test) body` and `for (…; test; update) body`. An absent `for` test is Simple's `con(1)`.
+;; The exit Scope sees the predicate's effects and the false edge; the body continues on true.
+(defn lower-test-loop [(test (Option i64)) (update (Option i64)) (body i64)] (-> i64)
+  (let [entry (lower-loop-head!)
+        condition
+          (match test
+            (Some [e] (lower-js-truthy (lower-syntax-expr e)))
+            (None [] (con-int 1)))
+        condition-scope (parser-node (.current-scope (parser-state)))
+        iff (if-make (scope-ctrl condition-scope) condition)
+        arms (if-arms! iff)
+        guard
+          (match test
+            (Some [e] (lower-relational-guard e))
+            (None [] (None [RelationalGuard])))]
+    (scope-set-ctrl! condition-scope (arms-false arms))
+    (let [exit-scope (scope-dup condition-scope false)]
+      (lower-apply-relational-guards! guard
+                                      condition-scope
+                                      (arms-true arms)
+                                      exit-scope
+                                      (arms-false arms))
+      (parser-push-jump! exit-scope JUMP-LOOP)
+      (scope-set-ctrl! condition-scope (arms-true arms))
+      (set! (.current-ctrl (parser-state)) (n-nid (arms-true arms)))
+      (let [terminated (lower-syntax-statement body)
+            live (parser-close-continues! terminated)]
+        ;; The update runs after the body and every continue, only on a live path.
+        (if live
+            (match update (Some [e] (do (lower-syntax-expr e) 0)) (None [] 0))
+            0)
+        ;; This is one atomic protocol: backedge control first, then all materialized Phi
+        ;; backedges, before any peephole can run.
+        (scope-end-loop! entry
+                         (parser-node (.current-scope (parser-state)))
+                         exit-scope)
+        (parser-pop-jump!)
+        (n-unkeep! entry)
+        (parser-use-scope! exit-scope)
+        0))))
+
+(defn lower-while [(condition-id i64) (body i64)] (-> i64)
+  (lower-test-loop (Some condition-id) (None [i64]) body))
+
+;; `do body while (test)`. The exit Scope cannot be the predicate's false edge before the body
+;; exists, so it starts dead (XCtrl) and receives breaks and the false edge by merge, exactly as
+;; the switch exit does. When nothing reaches the condition, the backedge is dead and the code
+;; after the loop is unreachable unless a break reached the exit.
+(defn lower-do-while [(body i64) (condition-id i64)] (-> i64)
+  (let [entry (lower-loop-head!)
+        exit-scope
+          (scope-dup (parser-node (.current-scope (parser-state))) false)]
+    (scope-set-ctrl! exit-scope (xctrl-make))
+    (parser-push-jump! exit-scope JUMP-LOOP)
+    (let [terminated (lower-syntax-statement body)
+          live (parser-close-continues! terminated)]
+      (if live
+          (let [condition (lower-js-truthy (lower-syntax-expr condition-id))
+                condition-scope (parser-node (.current-scope (parser-state)))
+                iff (if-make (scope-ctrl condition-scope) condition)
+                arms (if-arms! iff)
+                false-scope (scope-dup condition-scope false)]
+            (scope-set-ctrl! false-scope (arms-false arms))
+            (scope-merge! exit-scope false-scope)
+            (scope-set-ctrl! condition-scope (arms-true arms))
+            (scope-end-loop! entry condition-scope exit-scope))
+          (scope-end-loop! entry
+                           (parser-node (.current-scope (parser-state)))
+                           exit-scope))
+      (let [target (parser-pop-jump!)]
+        (n-unkeep! entry)
+        (parser-use-scope! exit-scope)
+        (if (and (not live) (= (.count target) 0)) 1 0)))))
+
+(defn lower-instantiate-lexical-stmt! [(stmt i64)] (-> i64)
+  (let [(mut one) (al-new [i64] (compiler-allocator))]
+    (push! [i64] (mut one) stmt)
+    (lower-instantiate-lexicals! (load one))
+    (al-free! [i64] (mut one))
+    0))
+
+;; Final Simple parseFor pushes a block scope for the index variables, parses the declaration,
+;; runs the shared looping protocol and pops that scope. A head `let` is one binding here, not a
+;; per-iteration copy: without closures the per-iteration environment is unobservable, and this
+;; must change when captured environments arrive.
+(defn lower-for [(init ForInit)
+                 (test (Option i64))
+                 (update (Option i64))
+                 (body i64)] (-> i64)
+  (do
+    (scope-push! (parser-node (.current-scope (parser-state))))
+    (match init
+      (ForNoInit [] 0)
+      (ForInitDecl [stmt]
+                   (do
+                     (lower-instantiate-lexical-stmt! stmt)
+                     (lower-syntax-statement stmt)))
+      (ForInitExpr [e] (do (lower-syntax-expr e) 0))
+      (ForInitPattern [pattern]
+                      (unimplemented "destructuring for-in/of heads"
+                                     "docs/GAPS.md — destructuring")))
+    (let [terminated (lower-test-loop test update body)]
+      (scope-pop! (parser-node (.current-scope (parser-state))))
+      terminated)))
+
+;; A label on a loop or switch names that statement's jump target; the labels accumulate until
+;; the target is pushed. Any other labelled statement is a break-only block target.
+(defn syntax-stmt-takes-labels? [(id i64)] (-> bool)
+  (match (syntax-stmt-node id)
+    (SsLabeled [label body] true)
+    (SsSwitch [discriminant cases] true)
+    (_ (syntax-iteration-stmt? id))))
+
+(defn lower-labeled [(label (slice u8)) (body i64)] (-> i64)
+  (do
+    (push! [(slice u8)] (mut (.pending-labels (parser-state))) label)
+    (if (syntax-stmt-takes-labels? body)
+        (lower-syntax-statement body)
+        (let [current (parser-node (.current-scope (parser-state)))
+              exit (scope-dup current false)]
+          (scope-set-ctrl! exit (xctrl-make))
+          (parser-push-jump! exit JUMP-BLOCK)
+          (let [terminated (lower-syntax-statement body)
+                target (parser-pop-jump!)
+                merged
+                  (scope-merge! (parser-node (.current-scope (parser-state)))
+                                exit)]
+            (parser-use-scope! merged)
+            (if (and (!= terminated 0) (= (.count target) 0)) 1 0))))))
+
+;; Return 1 when every path exits; each exit has transferred ownership to its return/break target.
+(defn lower-syntax-statement [(id i64)] (-> i64)
+  (match (syntax-stmt-node id)
+    (SsLet [name init final annotation]
+           (let [value
+                   (match init
+                     (Some [e] (lower-syntax-expr e))
+                     (None [] (lower-singleton "JsUndefined")))]
+             (if (>= (scope-find (parser-node (.current-scope (parser-state)))
+                                 name)
+                     0)
+                 (lower-binding-initialize! name value)
+                 (if (and (syntax-script-root? (.current-fun (parser-state)))
+                          (syntax-script-binding? name))
+                     (do
+                       (lower-script-declaration-effect! "JsInitializeGlobalLexicalBinding"
+                                                         name
+                                                         (Some value))
+                       ;; The realm cell remains published for callbacks and later Scripts.
+                       ;; Within this Script, successful initialization dominates every later
+                       ;; read of this immutable binding. Unknown calls cannot rebind a const.
+                       ;; Reuse its SSA value just as Simple's Scope does for local definitions.
+                       ;; Mutable let bindings remain memory-dependent realm reads.
+                       (if final
+                           (scope-define-realm-constant! (parser-node (.current-scope (parser-state)))
+                                                         name
+                                                         value)
+                           0))
+                     (panic "lower-syntax-statement: lexical declaration has no binding")))
+             0))
+    (SsVar [name init annotation]
+           (match init
+             (Some [e]
+                   ;; VariableDeclaration evaluation resolves its Reference before the
+                   ;; initializer, then performs PutValue (ECMA-262 14.3.2.1). Declaration
+                   ;; instantiation has already created the binding; this is assignment.
+                   (let [(mut ref) (primitive/zeroed SyntaxRef)]
+                     (lower-ref-name-prepare! (mut ref) name)
+                     (let [value (lower-syntax-expr e)]
+                       (n-keep! value)
+                       (lower-ref-put! (load ref) value)
+                       (lower-ref-release! (load ref))
+                       (n-unkeep! value))
+                     0))
+             (None [] 0)))
+    ;; `let {a} = o;` and `var [x] = xs;`: the initializer is one value, and the pattern binds
+    ;; every name it names (§14.3.3.5, §14.3.2.1).
+    (SsLetPattern [pattern init final]
+                  (let [value
+                          (match init
+                            (Some [e] (lower-syntax-expr e))
+                            (None [] (lower-singleton "JsUndefined")))]
+                    (lower-pattern-bind! pattern value PATTERN-LET)
+                    0))
+    (SsVarPattern [pattern init]
+                  (let [value
+                          (match init
+                            (Some [e] (lower-syntax-expr e))
+                            (None [] (lower-singleton "JsUndefined")))]
+                    (lower-pattern-bind! pattern value PATTERN-VAR)
+                    0))
+    (SsDeclList [decls] (lower-syntax-statements decls))
+    (SsReturn [value]
+              (lower-return-completion! (match value
+                                          (Some [e] (lower-syntax-expr e))
+                                          (None [] (dyn-undefined-make)))))
+    (SsExpr [expr] (do (lower-syntax-expr expr) 0))
+    (SsBlock [body] (lower-block body))
+    (SsIf [condition then-stmt else-stmt]
+          (lower-if condition then-stmt else-stmt))
+    (SsWhile [condition body] (lower-while condition body))
+    (SsEmpty [] 0)
+    (SsBreak [label] (parser-record-jump! label false))
+    (SsContinue [label] (parser-record-jump! label true))
+    (SsSwitch [discriminant cases] (lower-switch discriminant cases))
+    (SsCase [selector body]
+            (do
+              (broken "lower-syntax-statement: case clause outside its switch")
+              0))
+    (SsDoWhile [body condition] (lower-do-while body condition))
+    (SsFor [init test update body] (lower-for init test update body))
+    (SsForIn [head of right body awaited]
+             (if awaited
+                 (unimplemented "for-await-of asynchronous iteration"
+                                "docs/GAPS.md — iteration statements")
+                 (if of
+                     (lower-for-of head right body)
+                     (lower-for-in head right body))))
+    (SsLabeled [label body] (lower-labeled label body))
+    (SsThrow [value] (lower-throw value))
+    (SsTry [body catch-param catch-body finally-body]
+           (lower-try body catch-param catch-body finally-body))
+    (SsWith [object body]
+            (unimplemented "with object environment" "docs/GAPS.md — with"))
+    ;; `debugger` has no observable semantics outside a debugger and lowers to nothing.
+    (SsDebugger [] 0)
+    ;; A hoisted top-level declaration is already a Fun; nothing executes at its statement.
+    ;; A nested declaration was bound on entry; nothing executes at the statement itself.
+    (SsFunctionDecl [fun]
+                    (if (syntax-fun-lowered? fun)
+                        0
+                        (unimplemented "generator and async function declarations"
+                                       "docs/GAPS.md — function environments")))
+    (SsClassDecl [cls] (lower-class-declaration! cls))))
+
+(defn lower-syntax-statements [(stmts (ArrayList i64))] (-> i64)
+  (let [(mut i) 0
+        (mut terminated) 0]
+    (loop (if (or (>= (load i) (len stmts)) (!= (load terminated) 0))
+              (break 0)
+              (do
+                (set! (mut terminated)
+                      (lower-syntax-statement (get stmts (load i))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load terminated)))

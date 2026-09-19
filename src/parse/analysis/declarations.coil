@@ -1,0 +1,326 @@
+;; Which names a scope declares: hoisted vars and functions, lexicals, Script declarations and globals.
+
+(module aot.parse.analysis.declarations)
+(import "aot.codegen.compunit"
+        :use
+        [CuScriptDecl
+         CuScriptDeclarations
+         cu-script-declarations-copy
+         CU-SCRIPT-VAR
+         CU-SCRIPT-FUNCTION
+         CU-SCRIPT-LET
+         CU-SCRIPT-CONST
+         CU-SCRIPT-CLASS
+         CU-SCRIPT-PROPERTY-WRITE])
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.parse.parser" :use [syntax-find-fun])
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.early" :use *)
+(import "aot.parse.realm.globals" :use *)
+
+(defn parser-source-entry-index [] (-> i64)
+  (if (.script-mode (parser-state))
+      (.script-index (parser-state))
+      (syntax-find-fun "main")))
+
+(defn syntax-direct-lexical? [(stmts (ArrayList i64)) (name (slice u8))] (-> bool)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len stmts))
+              (break false)
+              (let [found
+                      (match (syntax-stmt-node (get stmts (load i)))
+                        (SsLet [declared init final annotation]
+                               (= declared name))
+                        (SsLetPattern [pattern init final]
+                                      (let [(mut names)
+                                              (al-new [(slice u8)]
+                                                      (compiler-allocator))]
+                                        (syntax-pattern-names! pattern
+                                                               (mut names))
+                                        (let [hit
+                                                (syntax-labels-contain? (load names)
+                                                                        name)]
+                                          (al-free! [(slice u8)] (mut names))
+                                          hit)))
+                        (SsDeclList [decls] (syntax-direct-lexical? decls name))
+                        (SsClassDecl [cls]
+                                     (let [c (get (.classes (parser-state)) cls)]
+                                       (= (.name c) name)))
+                        (_ false))]
+                (if found
+                    (break true)
+                    (do (set! (mut i) (+ (load i) 1)) (continue))))))))
+
+(defn syntax-script-binding? [(name (slice u8))] (-> bool)
+  (if (not (.script-mode (parser-state)))
+      false
+      (let [root (syntax-fun-at (.script-index (parser-state)))]
+        (syntax-direct-lexical? (.body root) name))))
+
+;; Syntax-only BoundNames collection. VarDeclaredNames crosses blocks/branches; lexical names
+;; cross only declaration-list grouping and the shared switch CaseBlock. Function bodies live in
+;; separate SyntaxFun records and must not be traversed as part of an enclosing declaration set.
+;; A FunctionDeclaration is var-like at the top level of a function body (TopLevelVarDeclaredNames)
+;; and lexical inside a Block or CaseBlock. Top-level Script functions are hoisted Funs, not
+;; bindings this collector reports. `top` is true only for the function body's own list.
+(defn syntax-collect-declarations! [(stmts (ArrayList i64))
+                                    (lexical bool)
+                                    (names (mut (ArrayList (slice u8))))] (-> i64)
+  (syntax-collect-declarations-at! stmts lexical false (mut names)))
+
+(defn syntax-function-decl-names! [(stmts (ArrayList i64))
+                                   (names (mut (ArrayList (slice u8))))] (-> i64)
+  (do
+    (al-for [id stmts]
+            (match (syntax-stmt-node id)
+              (SsFunctionDecl [fun]
+                              (let [f (syntax-fun-at fun)]
+                                (push! [(slice u8)] (mut names) (.name f))))
+              (_ 0)))
+    0))
+
+(defn syntax-collect-declarations-at! [(stmts (ArrayList i64))
+                                       (lexical bool)
+                                       (top bool)
+                                       (names (mut (ArrayList (slice u8))))] (-> i64)
+  (do
+    (al-for [id stmts]
+            (let [(mut children) (al-new [i64] (compiler-allocator))
+                  grouping
+                    (match (syntax-stmt-node id)
+                      (SsClassDecl [cls]
+                                   (do
+                                     (if lexical
+                                         (let [c
+                                                 (get (.classes (parser-state))
+                                                      cls)]
+                                           (push! [(slice u8)]
+                                                  (mut names)
+                                                  (.name c)))
+                                         0)
+                                     false))
+                      (SsFunctionDecl [fun]
+                                      (let [f (syntax-fun-at fun)]
+                                        (if (not (.hoisted f))
+                                            (if (= lexical (not top))
+                                                (push! [(slice u8)]
+                                                       (mut names)
+                                                       (.name f))
+                                                0)
+                                            0)
+                                        false))
+                      (SsLet [name init final annotation]
+                             (do
+                               (if lexical
+                                   (push! [(slice u8)] (mut names) name)
+                                   0)
+                               false))
+                      (SsVar [name init annotation]
+                             (do
+                               (if lexical
+                                   0
+                                   (push! [(slice u8)] (mut names) name))
+                               false))
+                      (SsLetPattern [pattern init final]
+                                    (do
+                                      (if lexical
+                                          (syntax-pattern-names! pattern
+                                                                 (mut names))
+                                          0)
+                                      false))
+                      (SsVarPattern [pattern init]
+                                    (do
+                                      (if lexical
+                                          0
+                                          (syntax-pattern-names! pattern
+                                                                 (mut names)))
+                                      false))
+                      (SsDeclList [decls] true)
+                      (SsCase [selector body] true)
+                      (_ false))]
+              (if (or (not lexical) grouping)
+                  (do
+                    (syntax-stmt-children! id (mut children))
+                    (syntax-collect-declarations-at! (load children)
+                                                     lexical
+                                                     (and top grouping)
+                                                     (mut names)))
+                  0)
+              (al-free! [i64] (mut children))))
+    0))
+
+;; Every `this.name = …` target in a statement's own code (functions have their own `this`; their
+;; bodies are separate records and are not entered).
+(defn syntax-collect-this-properties! [(stmt i64)
+                                       (names (mut (ArrayList (slice u8))))] (-> i64)
+  (let [(mut exprs) (al-new [i64] (compiler-allocator))
+        (mut stmts) (al-new [i64] (compiler-allocator))]
+    (syntax-stmt-exprs! stmt (mut exprs))
+    (al-for [e (load exprs)]
+            (syntax-collect-this-properties-expr! e (mut names)))
+    (syntax-stmt-children! stmt (mut stmts))
+    (al-for [child (load stmts)]
+            (syntax-collect-this-properties! child (mut names)))
+    (al-free! [i64] (mut exprs))
+    (al-free! [i64] (mut stmts))
+    0))
+
+(defn syntax-collect-this-properties-expr! [(id i64)
+                                            (names (mut (ArrayList (slice u8))))] (-> i64)
+  (do
+    (match (syntax-node id)
+      (SxAssign [target value]
+                (match (syntax-node (syntax-ungroup-id target))
+                  (SxMember [owner name optional]
+                            (match (syntax-node (syntax-ungroup-id owner))
+                              (SxThis []
+                                      (do
+                                        (push! [(slice u8)] (mut names) name)
+                                        0))
+                              (_ 0)))
+                  (_ 0)))
+      (_ 0))
+    (let [(mut kids) (al-new [i64] (compiler-allocator))]
+      (syntax-expr-children! id (mut kids))
+      (al-for [k (load kids)]
+              (syntax-collect-this-properties-expr! k (mut names)))
+      (al-free! [i64] (mut kids))
+      0)))
+
+(defn syntax-script-lexicals! [(stmts (ArrayList i64))
+                               (entries (mut (ArrayList CuScriptDecl)))] (-> i64)
+  (al-for [id stmts]
+          (match (syntax-stmt-node id)
+            (SsLet [name init final annotation]
+                   (push! [CuScriptDecl]
+                          (mut entries)
+                          (CuScriptDecl
+                            :name name
+                            :kind (if final CU-SCRIPT-CONST CU-SCRIPT-LET)
+                            :function-ordinal -1)))
+            (SsLetPattern [pattern init final]
+                          (let [(mut names)
+                                  (al-new [(slice u8)] (compiler-allocator))]
+                            (syntax-pattern-names! pattern (mut names))
+                            (al-for [name (load names)]
+                                    (push! [CuScriptDecl]
+                                           (mut entries)
+                                           (CuScriptDecl
+                                             :name name
+                                             :kind
+                                               (if final
+                                                   CU-SCRIPT-CONST
+                                                   CU-SCRIPT-LET)
+                                             :function-ordinal -1)))
+                            (al-free! (mut names))))
+            (SsClassDecl [cls]
+                         (let [c (get (.classes (parser-state)) cls)]
+                           (push! [CuScriptDecl]
+                                  (mut entries)
+                                  (CuScriptDecl
+                                    :name (.name c)
+                                    :kind CU-SCRIPT-CLASS
+                                    :function-ordinal -1))))
+            (SsDeclList [decls] (syntax-script-lexicals! decls (mut entries)))
+            (_ 0)))
+  0)
+
+;; One declaration plan drives global collection and both instantiation paths. Names in these
+;; generation-local plans borrow syntax storage; capture below deep-copies them. Only the parser's
+;; parallel binding table knows SyntaxFun indices. The exported plan uses Script-local ordinals.
+(defn syntax-build-script-declarations! [(script i64)] (-> i64)
+  (let [p (parser-state)
+        root (syntax-fun-at (get (.scripts p) script))
+        (mut entries) (al-new [CuScriptDecl] (compiler-allocator))
+        (mut functions) (al-new [i64] (compiler-allocator))
+        (mut names) (al-new [(slice u8)] (compiler-allocator))]
+    (if (!= script (len (.script-declarations p)))
+        (panic "syntax-build-script-declarations!: plans must follow Script order")
+        0)
+    (al-for [id (.body root)]
+            (match (syntax-stmt-node id)
+              (SsFunctionDecl [fun]
+                              (let [f (syntax-fun-at fun)]
+                                (push! [CuScriptDecl]
+                                       (mut entries)
+                                       (CuScriptDecl
+                                         :name (.name f)
+                                         :kind CU-SCRIPT-FUNCTION
+                                         :function-ordinal
+                                           (len (load functions))))
+                                (push! [i64] (mut functions) fun)))
+              (_ 0)))
+    (syntax-collect-declarations! (.body root) false (mut names))
+    (al-for [name (load names)]
+            (push! [CuScriptDecl]
+                   (mut entries)
+                   (CuScriptDecl
+                     :name name
+                     :kind CU-SCRIPT-VAR
+                     :function-ordinal -1)))
+    (syntax-script-lexicals! (.body root) (mut entries))
+    (al-clear! (mut names))
+    (al-for [id (.body root)] (syntax-collect-this-properties! id (mut names)))
+    (al-for [name (load names)]
+            (push! [CuScriptDecl]
+                   (mut entries)
+                   (CuScriptDecl
+                     :name name
+                     :kind CU-SCRIPT-PROPERTY-WRITE
+                     :function-ordinal -1)))
+    (al-free! (mut names))
+    (push! [(ArrayList CuScriptDecl)]
+           (mut (.script-declarations p))
+           (load entries))
+    (push! [(ArrayList i64)] (mut (.script-functions p)) (load functions))
+    0))
+
+(defn parser-capture-script-declarations [(script i64)] (-> CuScriptDeclarations)
+  (let [p (parser-state)]
+    (if (or (< script 0) (>= script (len (.script-declarations p))))
+        (panic "parser-capture-script-declarations: unknown Script")
+        0)
+    (cu-script-declarations-copy (syntax-fun-strict (get (.scripts p) script))
+                                 (get (.script-declarations p) script))))
+
+(defn syntax-script-declared-function [(script i64) (ordinal i64)] (-> i64)
+  (let [p (parser-state)]
+    (if (or (< script 0) (>= script (len (.script-functions p))))
+        (panic "syntax-script-declared-function: unknown Script")
+        0)
+    (let [functions (get (.script-functions p) script)]
+      (if (or (< ordinal 0) (>= ordinal (len functions)))
+          (panic "syntax-script-declared-function: unknown declaration ordinal")
+          0)
+      (get functions ordinal))))
+
+(defn syntax-collect-globals! [] (-> i64)
+  (let [p (parser-state)
+        (mut si) 0]
+    (loop (if (>= (load si) (len (.scripts p)))
+              (break 0)
+              (do
+                (syntax-build-script-declarations! (load si))
+                (al-for [entry (get (.script-declarations p) (load si))]
+                        (let [e entry]
+                          (if (= (.kind e) CU-SCRIPT-FUNCTION)
+                              (syntax-global-declare! (.name e)
+                                                      (load si)
+                                                      (syntax-script-declared-function (load si)
+                                                                                       (.function-ordinal e)))
+                              (if (or (= (.kind e) CU-SCRIPT-VAR)
+                                      (= (.kind e) CU-SCRIPT-PROPERTY-WRITE))
+                                  (syntax-global-declare! (.name e)
+                                                          (load si)
+                                                          -1)
+                                  0))))
+                (set! (mut si) (+ (load si) 1))
+                (continue))))
+    (syntax-mark-assigned-globals!)
+    0))

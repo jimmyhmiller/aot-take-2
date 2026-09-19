@@ -1,0 +1,198 @@
+;; Calls from lowered source into the JSL runtime library.
+
+(module aot.parse.lower.jsl)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.jsl.lower" :use *)
+(import "aot.jsl.reader"
+        :use
+        [jsl-noinline? jsl-definition-form jsl-form-macro?])
+(import "aot.parse.state" :use *)
+(import "aot.parse.lower.exception" :use *)
+
+;; A source operator is admitted by the grammar before its semantics exist in the production JSL
+;; index. Refuse by the operator's JSL entry-point name so the missing definition is the message.
+(defn lower-require-jsl! [(name (slice u8))] (-> i64)
+  (if (jsl-defined? name)
+      0
+      (unimplemented name
+                     "jsl/compiler/index — this operator's JSL definition is not in the production registry")))
+
+;; JavaScript numeric operators are semantic calls for every admitted Number representation.
+;; Values cross the dynamic boundary into JSL; specialization may expose raw integer or binary64
+;; arithmetic, while mixed number/undefined flow retains the guarded generic path.
+;; The JSL entry a source operator lowers to: the operators that can meet an object (and so call
+;; user code through ToPrimitive) have operator definitions over their numeric cores
+;; (jsl/compiler/toprimitive.jsl); every other name is its own entry.
+(defn lower-operator-entry [(name (slice u8))] (-> (slice u8))
+  (if (= name "JsAdd")
+      "JsAddOperator"
+      (if (= name "JsSub")
+          "JsSubOperator"
+          (if (= name "JsMul")
+              "JsMulOperator"
+              (if (= name "JsDiv")
+                  "JsDivOperator"
+                  (if (= name "JsLt")
+                      "JsLtOperator"
+                      (if (= name "JsGt")
+                          "JsGtOperator"
+                          (if (= name "JsLe")
+                              "JsLeOperator"
+                              (if (= name "JsGe")
+                                  "JsGeOperator"
+                                  (if (= name "JsNegate")
+                                      "JsNegateOperator"
+                                      (if (= name "JsPositive")
+                                          "JsPositiveOperator"
+                                          name)))))))))))
+
+;; The language raising a TypeError at a source site: JsThrowTypeError with the message returns
+;; the sentinel, and the check unwinds it at once.
+(defn lower-throw-type-error! [(message (slice u8))] (-> i64)
+  (let [(mut values) (al-new [(dyn NodeOps)] (compiler-allocator))
+        text (lower-ascii-string message)]
+    (n-keep! text)
+    (push! [(dyn NodeOps)] (mut values) text)
+    (let [scope (parser-node (.current-scope (parser-state)))
+          r (lower-jsl-call-values "JsThrowTypeError" (load values))]
+      (n-unkeep! text)
+      (al-free! [(dyn NodeOps)] (mut values))
+      (parser-set-current-ctrl! (.ctrl r))
+      (scope-set-mem! scope (.mem r))
+      (lower-exception-check! (.value r))
+      0)))
+
+(defn lower-ascii-string [(text (slice u8))] (-> (dyn NodeOps))
+  (let [(mut units) (al-new [i64] (compiler-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) (len text))
+              (break 0)
+              (do
+                (push! [i64]
+                       (mut units)
+                       (primitive/cast i64 (get text (load i))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (let [scope (parser-node (.current-scope (parser-state)))
+          lowered
+            (jsl-lower-string-units (load units)
+                                    (parser-node (.current-ctrl (parser-state)))
+                                    (scope-mem scope))]
+      (al-free! [i64] (mut units))
+      (parser-set-current-ctrl! (.ctrl lowered))
+      (scope-set-mem! scope (.mem lowered))
+      (box-make-at (Some (.ctrl lowered)) (.value lowered)))))
+
+;; A JSL macro with no arguments at the current point.
+(defn lower-jsl-nullary [(name (slice u8))] (-> (dyn NodeOps))
+  (let [scope (parser-node (.current-scope (parser-state)))
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))
+        r
+          (jsl-lower-macro-values name
+                                  (load args)
+                                  (parser-node (.current-ctrl (parser-state)))
+                                  (scope-mem scope))]
+    (al-free! [(dyn NodeOps)] (mut args))
+    (parser-set-current-ctrl! (.ctrl r))
+    (scope-set-mem! scope (.mem r))
+    (.value r)))
+
+;; A JSL definition over one value at the current point. Its declaration chooses
+;; macro expansion versus an ordinary evidence-gated builtin call.
+(defn lower-jsl-unary-value [(name (slice u8)) (value (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [scope (parser-node (.current-scope (parser-state)))
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (push! [(dyn NodeOps)] (mut args) value)
+    (let [r
+            (match (jsl-definition-form name)
+              (None []
+                    (do
+                      (panic "lower-jsl-unary-value: unknown JSL definition")
+                      (jsl-expr-result (unreachable-node)
+                                       (parser-node (.current-ctrl (parser-state)))
+                                       (scope-mem scope))))
+              (Some [form]
+                    (if (jsl-form-macro? form)
+                        (jsl-lower-macro-values name
+                                                (load args)
+                                                (parser-node (.current-ctrl (parser-state)))
+                                                (scope-mem scope))
+                        (lower-jsl-call-values name (load args)))))]
+      (al-free! [(dyn NodeOps)] (mut args))
+      (parser-set-current-ctrl! (.ctrl r))
+      (scope-set-mem! scope (.mem r))
+      (.value r))))
+
+;; A call to a JSL builtin over already-lowered values, threaded through the current Scope.
+(defn lower-jsl-call-values [(name (slice u8))
+                             (values (ArrayList (dyn NodeOps)))] (-> JslExprResult)
+  (let [scope (parser-node (.current-scope (parser-state)))
+        target (jsl-call-target name)
+        c
+          (call-make-with-mem (parser-node (.current-ctrl (parser-state)))
+                              (scope-mem scope))]
+    (al-for [v values] (call-add-arg! c v))
+    (call-set-fptr! c target)
+    (let [end (callend-make c)]
+      (if (jsl-noinline? name) (callend-set-never-inline! end) 0)
+      (jsl-expr-result (proj-make end RETURN-VALUE "jsl.call.value")
+                       (cproj-make end RETURN-CTRL "jsl.call.ctrl")
+                       (proj-make end RETURN-MEM "jsl.call.mem")))))
+
+;; A JSL definition applied to already-lowered values, macro or builtin, threaded through the Scope.
+(defn lower-jsl-values [(name (slice u8)) (values (ArrayList (dyn NodeOps)))] (-> (dyn NodeOps))
+  (let [scope (parser-node (.current-scope (parser-state)))
+        r
+          (match (jsl-definition-form name)
+            (None []
+                  (do
+                    (panic "lower-jsl-values: unknown JSL definition")
+                    (jsl-expr-result (unreachable-node)
+                                     (scope-ctrl scope)
+                                     (scope-mem scope))))
+            (Some [form]
+                  (if (jsl-form-macro? form)
+                      (jsl-lower-macro-values name
+                                              values
+                                              (scope-ctrl scope)
+                                              (scope-mem scope))
+                      (lower-jsl-call-values name values))))]
+    (parser-set-current-ctrl! (.ctrl r))
+    (scope-set-mem! scope (.mem r))
+    (.value r)))
+
+(defn lower-jsl-values0 [(name (slice u8))] (-> (dyn NodeOps))
+  (let [(mut values) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (let [v (lower-jsl-values name (load values))]
+      (al-free! [(dyn NodeOps)] (mut values))
+      v)))
+
+(defn lower-jsl-values2 [(name (slice u8)) (a (dyn NodeOps)) (b (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [(mut values) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (push! [(dyn NodeOps)] (mut values) a)
+    (push! [(dyn NodeOps)] (mut values) b)
+    (let [v (lower-jsl-values name (load values))]
+      (al-free! [(dyn NodeOps)] (mut values))
+      v)))
+
+(defn lower-jsl-values3 [(name (slice u8))
+                         (a (dyn NodeOps))
+                         (b (dyn NodeOps))
+                         (c (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [(mut values) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (push! [(dyn NodeOps)] (mut values) a)
+    (push! [(dyn NodeOps)] (mut values) b)
+    (push! [(dyn NodeOps)] (mut values) c)
+    (let [v (lower-jsl-values name (load values))]
+      (al-free! [(dyn NodeOps)] (mut values))
+      v)))

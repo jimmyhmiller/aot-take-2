@@ -1,0 +1,595 @@
+;; Grammar of literals: numbers, strings and their escapes, templates, regular expressions, object and array literals.
+
+(module aot.parse.grammar.literal)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use [subslice])
+(import "coil.str" :use [sb-new sb-push-byte! sb-push-i64! sb-str sb-free!])
+(import "aot.node.dynamic" :use *)
+(import "aot.rt.number" :use [number-radix-value number-strtod!])
+(import "aot.shape" :use *)
+(import "aot.jsl.lower" :use *)
+(import "aot.parse.lexer" :use *)
+(import "aot.parse.regex" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.grammar.expression" :use *)
+(import "aot.parse.grammar.statement" :use *)
+(import "aot.parse.grammar.function" :use *)
+
+;; Final Simple Parser.parseString consumes the quote, copies ordinary characters, and delegates
+;; backslashes to escapedChar; EOF and unknown escapes fail at the literal. ECMAScript extends
+;; that scanner with hex/Unicode, identity and legacy decimal/octal escapes and line continuations
+;; (ECMA-262 12.9.4). Decode into code units, not UTF-8, to preserve lone surrogates. Raw spelling
+;; is retained for Directive Prologues. Legacy escapes are checked after scope strictness is
+;; known, including when a later directive makes an earlier literal strict. One growable buffer
+;; receives raw UTF-8 runs and decoded escapes; no per-character allocation or runtime decoder.
+(defn syntax-string-escape! [(units (mut (ArrayList i64)))
+                             (legacy (mut bool))
+                             (text (slice u8))
+                             (index (mut i64))] (-> i64)
+  (let [c (get text (load index))
+        (mut value) (cast i64 c)]
+    (set! index (+ (load index) 1))
+    (if (or (= c (cast u8 120)) (= c (cast u8 117)))
+        (let [braced
+                (and (= c (cast u8 117))
+                     (< (load index) (len text))
+                     (= (get text (load index)) (cast u8 123)))
+              limit (if (= c (cast u8 120)) 2 4)
+              (mut digits) 0]
+          (set! (mut value) 0)
+          (if braced (set! index (+ (load index) 1)) 0)
+          (loop (if (if braced
+                        (and (< (load index) (len text))
+                             (!= (get text (load index)) (cast u8 125)))
+                        (< (load digits) limit))
+                    (do
+                      (if (>= (load index) (len text))
+                          (syntax-error! "parser: truncated string escape")
+                          0)
+                      (let [digit (lex-digit-value (get text (load index)))]
+                        (if (< digit 0)
+                            (syntax-error! "parser: invalid hexadecimal string escape")
+                            0)
+                        (set! (mut value) (+ (* (load value) 16) digit))
+                        ;; Bound on every digit prevents overflow even with arbitrarily many digits.
+                        (if (> (load value) 0x10ffff)
+                            (syntax-error! "parser: Unicode escape exceeds code point range")
+                            0))
+                      (set! index (+ (load index) 1))
+                      (set! (mut digits) (+ (load digits) 1))
+                      (continue))
+                    (break 0)))
+          (if braced
+              (do
+                (if (or (= (load digits) 0) (>= (load index) (len text)))
+                    (syntax-error! "parser: incomplete braced Unicode escape")
+                    0)
+                (set! index (+ (load index) 1)))
+              0))
+        (if (lex-digit? c)
+            (do
+              (set! legacy
+                    (or (load legacy)
+                        (!= c (cast u8 48))
+                        (and (< (load index) (len text))
+                             (lex-digit? (get text (load index))))))
+              (if (<= c (cast u8 55))
+                  (let [limit (if (<= c (cast u8 51)) 3 2)
+                        (mut digits) 1]
+                    (set! (mut value) (- (cast i64 c) 48))
+                    (loop (if (and (< (load digits) limit)
+                                   (< (load index) (len text))
+                                   (lex-radix-digit? (get text (load index)) 8))
+                              (do
+                                (set! (mut value)
+                                      (+ (* (load value) 8)
+                                         (- (cast i64 (get text (load index)))
+                                            48)))
+                                (set! index (+ (load index) 1))
+                                (set! (mut digits) (+ (load digits) 1))
+                                (continue))
+                              (break 0))))
+                  0))
+            (set! (mut value)
+                  (if (= c (cast u8 98))
+                      8
+                      (if (= c (cast u8 102))
+                          12
+                          (if (= c (cast u8 110))
+                              10
+                              (if (= c (cast u8 114))
+                                  13
+                                  (if (= c (cast u8 116))
+                                      9
+                                      (if (= c (cast u8 118)) 11 (cast i64 c))))))))))
+    (if (<= (load value) 0xffff)
+        (push! [i64] (mut units) (load value))
+        (let [supplement (- (load value) 0x10000)]
+          (push! [i64] (mut units) (+ 0xd800 (primitive/ishr supplement 10)))
+          (push! [i64] (mut units) (+ 0xdc00 (& supplement 0x3ff)))))
+    0))
+
+;; Decode a string or template body into UTF-16 code units. `abs-start` is the source offset of
+;; `text` so line continuations can be measured in place. Template bodies (TV) additionally
+;; normalize CR and CRLF to LF and treat every legacy escape as a NotEscapeSequence error.
+(defn syntax-decode-string-body! [(text (slice u8))
+                                  (abs-start i64)
+                                  (template bool)
+                                  (units (mut (ArrayList i64)))
+                                  (legacy (mut bool))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len text))
+              (break 0)
+              (do
+                (if (= (get text (load i)) (cast u8 92))
+                    (do
+                      (set! (mut i) (+ (load i) 1))
+                      (if (>= (load i) (len text))
+                          (syntax-error! "parser: truncated string escape")
+                          0)
+                      (let [width (lex-line-width (+ abs-start (load i)))]
+                        (if (> width 0)
+                            (set! (mut i) (+ (load i) width))
+                            (if (< (get text (load i)) (cast u8 128))
+                                (do
+                                  (syntax-string-escape! (mut units)
+                                                         (mut legacy)
+                                                         text
+                                                         (mut i))
+                                  (if (and template (load legacy))
+                                      (syntax-error! "parser: octal escape sequence is not allowed in a template")
+                                      0))
+                                ;; Non-ASCII NonEscapeCharacter: the raw-run decoder below consumes
+                                ;; its entire scalar, not merely the first UTF-8 byte.
+                                0))))
+                    0)
+                (let [start (load i)]
+                  (loop (if (and (< (load i) (len text))
+                                 (!= (get text (load i)) (cast u8 92))
+                                 (not (and template
+                                           (= (get text (load i)) (cast u8 13)))))
+                            (do (set! (mut i) (+ (load i) 1)) (continue))
+                            (break 0)))
+                  (jsl-string-append-utf8! (subslice [u8] text start (load i))
+                                           (mut units))
+                  (if (and template
+                           (< (load i) (len text))
+                           (= (get text (load i)) (cast u8 13)))
+                      (do
+                        (push! [i64] (mut units) 10)
+                        (set! (mut i) (+ (load i) 1))
+                        (if (and (< (load i) (len text))
+                                 (= (get text (load i)) (cast u8 10)))
+                            (set! (mut i) (+ (load i) 1))
+                            0))
+                      0))
+                (continue))))
+    0))
+
+(defn syntax-string [(t Token)] (-> SyntaxExpr)
+  (let [text (subslice [u8] (token-text t) 1 (- (- (.end t) (.start t)) 1))
+        (mut units) (al-new [i64] (compiler-allocator))
+        (mut legacy) false]
+    (syntax-decode-string-body! text
+                                (+ (.start t) 1)
+                                false
+                                (mut units)
+                                (mut legacy))
+    (syntax-expr-new (SxString
+                       :raw text
+                       :units (load units)
+                       :legacy-escape (load legacy))
+                     (.start t)
+                     (.end t))))
+
+;; One template quasi. A tagged template keeps only raw text: its cooked value may be undefined
+;; and this compiler does not evaluate tagged templates yet.
+(defn syntax-template-quasi [(part Token) (tagged bool)] (-> i64)
+  (let [inner-end (- (.end part) (if (lex-template-continues? part) 2 1))
+        text (subslice [u8] (lex-source) (+ (.start part) 1) inner-end)
+        (mut units) (al-new [i64] (compiler-allocator))
+        (mut legacy) false]
+    (if tagged
+        0
+        (syntax-decode-string-body! text
+                                    (+ (.start part) 1)
+                                    true
+                                    (mut units)
+                                    (mut legacy)))
+    (syntax-add-node! (SxString
+                        :raw text
+                        :units (load units)
+                        :legacy-escape false)
+                      (.start part)
+                      (.end part))))
+
+;; Power-of-two radix integers: the exact conversion is shared with the runtime's StringToNumber
+;; (aot.rt.number, `number-radix-value`).
+(defn parse-radix-number [(text (slice u8)) (start i64) (width i64)] (-> f64)
+  (number-radix-value text start width))
+
+;; ECMAScript decimal integer literals denote binary64 Numbers, even when their spelling no longer
+;; fits the signed-48 immediate payload. Parse through `strtod` first, then choose the compact int
+;; representation only where binary64 is exact and the NaN-box payload can preserve every bit.
+;; Accumulating in i64 first silently wrapped long spellings before this decision could be made.
+(defn parse-number-value [(t Token)] (-> f64)
+  (let [text (token-text t)]
+    (if (= (.kind t) TOK-LEGACY-NUMBER)
+        (parse-radix-number text 0 3)
+        (if (and (> (len text) 2)
+                 (= (get text 0) (cast u8 48))
+                 (or (= (get text 1) (cast u8 120))
+                     (= (get text 1) (cast u8 88))
+                     (= (get text 1) (cast u8 98))
+                     (= (get text 1) (cast u8 66))
+                     (= (get text 1) (cast u8 111))
+                     (= (get text 1) (cast u8 79))))
+            (let [prefix (get text 1)]
+              (parse-radix-number text
+                                  2
+                                  (if (or (= prefix (cast u8 120))
+                                          (= prefix (cast u8 88)))
+                                      4
+                                      (if (or (= prefix (cast u8 98))
+                                              (= prefix (cast u8 66)))
+                                          1
+                                          3))))
+            (let [(mut normalized) (sb-new (compiler-allocator))]
+              (for c
+                (iter text)
+                (if (!= c (cast u8 95)) (sb-push-byte! (mut normalized) c) 0))
+              (let [size (len (sb-str (load normalized)))
+                    consumed (primitive/alloc-stack i64)
+                    value (number-strtod! (sb-str (load normalized)) consumed)]
+                (if (!= (load consumed) size)
+                    (parse-fail "parser: invalid numeric literal at byte" t)
+                    0)
+                (sb-free! (mut normalized))
+                value))))))
+
+(defn syntax-number [(t Token)] (-> SyntaxExpr)
+  (let [value (parse-number-value t)]
+    (syntax-expr-new (if (and (primitive/fcmp-le value 140737488355327.0)
+                              (primitive/fcmp-eq value
+                                                 (primitive/cast f64
+                                                                 (primitive/cast i64
+                                                                                 value))))
+                         (SxNumber
+                           :value (primitive/cast i64 value)
+                           :value-float 0.0
+                           :rep REP-INT)
+                         (SxNumber
+                           :value 0
+                           :value-float value
+                           :rep REP-DOUBLE))
+                     (.start t)
+                     (.end t))))
+
+;; PropertyName as an interned shape key. IdentifierNames, plain ASCII string literals and
+;; integral numeric literals canonicalize to the same key as the identifier spelling; escaped,
+;; non-ASCII and non-integral spellings fail closed.
+(defn syntax-property-key-name [(t Token)] (-> (slice u8))
+  (if (or (= (.kind t) TOK-IDENT) (= (.kind t) TOK-KEYWORD))
+      (token-text t)
+      (if (= (.kind t) TOK-STRING)
+          (let [inner
+                  (subslice [u8] (token-text t) 1 (- (- (.end t) (.start t)) 1))]
+            (for c
+              (iter inner)
+              (if (or (= c (cast u8 92)) (>= c (cast u8 128)))
+                  (parse-fail "parser: escaped or non-ASCII string property keys are outside the admitted subset at byte"
+                              t)
+                  0))
+            inner)
+          (if (or (= (.kind t) TOK-NUMBER) (= (.kind t) TOK-LEGACY-NUMBER))
+              (let [x (syntax-number t)]
+                (match (.node x)
+                  (SxNumber [value value-float rep]
+                            (if (= rep REP-INT)
+                                (let [(mut text) (sb-new (compiler-allocator))]
+                                  ;; The key outlives the parse; the builder is deliberately retained.
+                                  (sb-push-i64! (mut text) value)
+                                  (sb-str (load text)))
+                                (do
+                                  (parse-fail "parser: non-integral numeric property keys are outside the admitted subset at byte"
+                                              t)
+                                  "")))
+                  (_ "")))
+              (do
+                (parse-fail "parser: property key is outside the admitted subset at byte"
+                            t)
+                "")))))
+
+(defn token-property-name? [(t Token)] (-> bool)
+  (or (= (.kind t) TOK-IDENT)
+      (= (.kind t) TOK-KEYWORD)
+      (= (.kind t) TOK-STRING)
+      (= (.kind t) TOK-NUMBER)
+      (= (.kind t) TOK-LEGACY-NUMBER)
+      (= (.kind t) TOK-BIGINT)
+      (token-is t "[")
+      (token-is t "#")))
+
+;; After a complete list element only a separator or the closer may follow.
+(defn parse-list-separator! [(close (slice u8)) (message (slice u8))] (-> bool)
+  (let [t (peek-token)]
+    (if (token-is t ",")
+        (do (take-token) (take-is close))
+        (if (token-is t close)
+            (do (take-token) true)
+            (do
+              (syntax-error! message)
+              true)))))
+
+;; PropertyName: IdentifierName, string, number or `[expr]`, with what the definition needs to
+;; know about its spelling afterwards.
+(defstruct ParsedKey
+  [(key PropKey)
+   (name (slice u8))
+   (ident bool)  ; spelled as an Identifier, so shorthand is possible
+   (computed bool)
+   (named-proto bool)
+   (lo i64)
+   (hi i64)])
+
+(defn parse-syntax-property-key! [] (-> ParsedKey)
+  (let [(mut k) (primitive/zeroed ParsedKey)
+        t (peek-token)]
+    (set! (.lo (mut k)) (.start t))
+    (if (token-is t "[")
+        (let [saved-no-in (.no-in (parser-state))]
+          (take-token)
+          (set! (.no-in (parser-state)) false)
+          (let [expr (parse-syntax-assignment)]
+            (set! (.no-in (parser-state)) saved-no-in)
+            (require-closing! "]"
+                              "parser: expected `]` after computed property name")
+            (set! (.key (mut k)) (KeyComputed expr))
+            (set! (.name (mut k)) "")
+            (set! (.computed (mut k)) true)))
+        (if (token-is t "#")
+            (do
+              (syntax-error! "parser: private names are not allowed in object literals")
+              0)
+            (if (not (token-property-name? t))
+                (do
+                  (syntax-error! "parser: expected a property name in object literal")
+                  0)
+                (let [key-token (take-token)
+                      name (syntax-property-key-name key-token)]
+                  (set! (.key (mut k)) (KeyNamed (shape-key-intern name)))
+                  (set! (.name (mut k)) name)
+                  ;; Shorthand needs an Identifier; an escaped reserved word is only an IdentifierName.
+                  (set! (.ident (mut k))
+                        (and (= (.kind key-token) TOK-IDENT)
+                             (not (token-escaped-reserved? key-token))))
+                  (set! (.named-proto (mut k))
+                        (and (= name "__proto__")
+                             (!= (.kind key-token) TOK-NUMBER)))))))
+    (set! (.hi (mut k)) (lex-consumed-end))
+    (load k)))
+
+;; PropertyDefinition: `...spread`, `*gen(){}`, `get k(){}` / `set k(v){}` / `async k(){}` /
+;; `async *k(){}`, `k(){}`, `k: value`, shorthand `k`, or the cover form `k = init`.
+(defn parse-syntax-property-definition! [(saw-proto (mut bool))] (-> ObjectEntry)
+  (let [first (peek-token)]
+    (if (token-is first "...")
+        (do (take-token) (PropSpread (parse-syntax-assignment)))
+        (if (token-is first "*")
+            (do
+              (take-token)
+              (let [k (parse-syntax-property-key!)]
+                (parse-syntax-method! (.key k)
+                                      (.name k)
+                                      (FunMethod)
+                                      true
+                                      false
+                                      (.start first))))
+            (let [second (lex-peek-second false)
+                  prefix
+                    (and (= (.kind first) TOK-IDENT)
+                         (or (token-is first "get")
+                             (token-is first "set")
+                             (token-is first "async"))
+                         (or (token-property-name? second)
+                             (token-is second "*"))
+                         (not (and (token-is first "async") (.nl-before second))))]
+              (if prefix
+                  (do
+                    (take-token)
+                    (let [async (token-is first "async")
+                          generator (and async (take-is "*"))
+                          k (parse-syntax-property-key!)
+                          kind
+                            (if (token-is first "get")
+                                (FunGetter)
+                                (if (token-is first "set")
+                                    (FunSetter)
+                                    (FunMethod)))]
+                      (parse-syntax-method! (.key k)
+                                            (.name k)
+                                            kind
+                                            generator
+                                            async
+                                            (.start first))))
+                  (let [k (parse-syntax-property-key!)
+                        next (peek-token)]
+                    (if (token-is next "(")
+                        (parse-syntax-method! (.key k)
+                                              (.name k)
+                                              (FunMethod)
+                                              false
+                                              false
+                                              (.lo k))
+                        (if (token-is next ":")
+                            (do
+                              (take-token)
+                              (if (.named-proto k)
+                                  (if (load saw-proto)
+                                      (syntax-error! "parser: duplicate __proto__ object-literal setter")
+                                      (set! saw-proto true))
+                                  0)
+                              (PropValue (.key k) (parse-syntax-assignment)))
+                            (if (.computed k)
+                                (do
+                                  (syntax-error! "parser: computed property name requires a value")
+                                  (PropSpread 0))
+                                (if (= (.name k) "let")
+                                    ;; Sloppy shorthand `{let}`; strict code rejects the name.
+                                    (PropValue (.key k)
+                                               (syntax-add-node! (SxName "let")
+                                                                 (.lo k)
+                                                                 (.hi k)))
+                                    (if (not (.ident k))
+                                        (do
+                                          (syntax-error! "parser: shorthand property requires an identifier")
+                                          (PropSpread 0))
+                                        (if (token-is next "=")
+                                            (do
+                                              (take-token)
+                                              (PropCoverInit (.name k)
+                                                             (parse-syntax-assignment)))
+                                            (do
+                                              (syntax-check-binding-name! (.name k))
+                                              (PropValue (.key k)
+                                                         (syntax-add-node! (SxName (.name k))
+                                                                           (.lo k)
+                                                                           (.hi k)))))))))))))))))
+
+(defn parse-syntax-object-literal [(open Token)] (-> i64)
+  (let [(mut entries) (al-new [ObjectEntry] (compiler-allocator))
+        (mut saw-prototype-setter) false
+        (mut rest-comma) false]
+    (if (not (take-is "}"))
+        (loop (let [entry
+                      (parse-syntax-property-definition! (mut saw-prototype-setter))]
+                (push! [ObjectEntry] (mut entries) entry)
+                ;; `{...a,}` is a valid literal but never a pattern.
+                (set! (mut rest-comma)
+                      (match entry
+                        (PropSpread [e] (token-is (peek-token) ","))
+                        (_ false)))
+                (if (parse-list-separator! "}"
+                                           "parser: expected `,` or `}` in object literal")
+                    (break 0)
+                    (continue))))
+        0)
+    (let [id
+            (syntax-add-node! (SxObject (load entries))
+                              (.start open)
+                              (lex-consumed-end))]
+      (if (load rest-comma)
+          (push! [i64] (mut (.rest-comma (parser-state))) id)
+          0)
+      id)))
+
+(defn parse-syntax-array-literal [(open Token)] (-> i64)
+  (let [(mut elements) (al-new [ArrayElement] (compiler-allocator))
+        (mut rest-comma) false]
+    (if (not (take-is "]"))
+        (loop (let [first (peek-token)]
+                (if (token-is first ",")
+                    (do
+                      (take-token)
+                      (push! [ArrayElement] (mut elements) (ElemHole))
+                      (if (take-is "]") (break 0) (continue)))
+                    (do
+                      (if (token-is first "...")
+                          (do
+                            (take-token)
+                            (push! [ArrayElement]
+                                   (mut elements)
+                                   (ElemSpread (parse-syntax-assignment)))
+                            ;; `[...a,]` is a valid literal but never a pattern.
+                            (set! (mut rest-comma) (token-is (peek-token) ",")))
+                          (do
+                            (push! [ArrayElement]
+                                   (mut elements)
+                                   (ElemExpr (parse-syntax-assignment)))
+                            (set! (mut rest-comma) false)))
+                      (if (parse-list-separator! "]"
+                                                 "parser: expected `,` or `]` in array literal")
+                          (break 0)
+                          (continue))))))
+        0)
+    (let [id
+            (syntax-add-node! (SxArray (load elements))
+                              (.start open)
+                              (lex-consumed-end))]
+      (if (load rest-comma)
+          (push! [i64] (mut (.rest-comma (parser-state))) id)
+          0)
+      id)))
+
+(defn parse-syntax-template [(open Token) (tagged bool)] (-> i64)
+  (let [(mut quasis) (al-new [i64] (compiler-allocator))
+        (mut substitutions) (al-new [i64] (compiler-allocator))
+        (mut part) (lex-template-part! open)]
+    (loop (do
+            (push! [i64]
+                   (mut quasis)
+                   (syntax-template-quasi (load part) tagged))
+            (if (lex-template-continues? (load part))
+                (let [saved-no-in (.no-in (parser-state))]
+                  (set! (.no-in (parser-state)) false)
+                  (push! [i64] (mut substitutions) (parse-syntax-expression))
+                  (set! (.no-in (parser-state)) saved-no-in)
+                  (let [brace (peek-token)]
+                    (if (token-is brace "}")
+                        (do
+                          (set! (mut part) (lex-template-part! brace))
+                          (continue))
+                        (break (syntax-error! "parser: expected `}` after template substitution")))))
+                (break 0))))
+    (syntax-add-node! (SxTemplate (load quasis) (load substitutions))
+                      (.start open)
+                      (lex-consumed-end))))
+
+;; RegularExpressionFlags: each of d g i m s u v y at most once, and not both u and v.
+(defn syntax-check-regex-flags! [(flags (slice u8))] (-> i64)
+  (let [(mut seen) (al-new [u8] (compiler-allocator))]
+    (for c
+      (iter flags)
+      (do
+        (if (not (or (= c (cast u8 100))
+                     (= c (cast u8 103))
+                     (= c (cast u8 105))
+                     (= c (cast u8 109))
+                     (= c (cast u8 115))
+                     (= c (cast u8 117))
+                     (= c (cast u8 118))
+                     (= c (cast u8 121))))
+            (syntax-error! "parser: invalid regular expression flag")
+            0)
+        (al-for [earlier (load seen)]
+                (if (or (= earlier c)
+                        (and (= earlier (cast u8 117)) (= c (cast u8 118)))
+                        (and (= earlier (cast u8 118)) (= c (cast u8 117))))
+                    (syntax-error! "parser: duplicate or conflicting regular expression flag")
+                    0))
+        (push! [u8] (mut seen) c)))
+    (al-free! [u8] (mut seen))
+    0))
+
+(defn parse-syntax-regex [(slash Token)] (-> i64)
+  (let [t (lex-regex! slash)
+        text (token-text t)
+        (mut close) (- (len text) 1)]
+    (loop (if (= (get text (load close)) (cast u8 47))
+              (break 0)
+              (do (set! (mut close) (- (load close) 1)) (continue))))
+    (let [body (subslice [u8] text 1 (load close))
+          flags (subslice [u8] text (+ (load close) 1) (len text))]
+      (syntax-check-regex-flags! flags)
+      ;; The pattern grammar is an early error of the enclosing program; a classification the
+      ;; validator cannot make fails closed.
+      (match (regex-validate body flags)
+        (RegexOk [] 0)
+        (RegexError [message] (syntax-error! message))
+        (RegexUnknown [message] (parse-fail message t)))
+      (syntax-add-node! (SxRegex body flags) (.start t) (.end t)))))

@@ -1,0 +1,539 @@
+;; Grammar of functions: formal parameters, declarations, expressions, arrows, methods, and strictness.
+
+(module aot.parse.grammar.function)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.type.type" :use *)
+(import "aot.parse.lexer" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.grammar.expression" :use *)
+(import "aot.parse.grammar.pattern" :use *)
+(import "aot.parse.grammar.statement" :use *)
+(import "aot.parse.early" :use *)
+(import "aot.parse.realm.intrinsics" :use *)
+
+;; Refine cover-grammar items into ArrowFormalParameters: names, `name = default` and a trailing
+;; `...rest`. Patterns fail closed; anything else, or a `yield`/`await` expression inside a
+;; default, is a proven error. An async head reserves `await` as well.
+;; A nested arrow's parameter names, defaults and concise body are part of the enclosing head.
+(defn syntax-fun-params-mention? [(fun i64) (yield? bool) (await? bool)] (-> bool)
+  (let [f (syntax-fun-at fun)
+        (mut found) false]
+    (al-for [name (.params f)]
+            (if (or (and yield? (= name "yield")) (and await? (= name "await")))
+                (set! (mut found) true)
+                0))
+    (match (.rest-param f)
+      (Some [r]
+            (if (or (and yield? (= r "yield")) (and await? (= r "await")))
+                (set! (mut found) true)
+                0))
+      (None [] 0))
+    (al-for [d (.param-defaults f)]
+            (match d
+              (Some [e]
+                    (if (syntax-expr-contains? e yield? await?)
+                        (set! (mut found) true)
+                        0))
+              (None [] 0)))
+    ;; Destructured parameters: their bound names and the expressions they own.
+    (let [(mut names) (al-new [(slice u8)] (compiler-allocator))
+          (mut exprs) (al-new [i64] (compiler-allocator))]
+      (al-for [p (.param-patterns f)]
+              (match p
+                (Some [pat]
+                      (do
+                        (syntax-pattern-names! pat (mut names))
+                        (syntax-pattern-exprs! pat (mut exprs))))
+                (None [] 0)))
+      (match (.rest-pattern f)
+        (Some [pat]
+              (do
+                (syntax-pattern-names! pat (mut names))
+                (syntax-pattern-exprs! pat (mut exprs))))
+        (None [] 0))
+      (al-for [name (load names)]
+              (if (or (and yield? (= name "yield"))
+                      (and await? (= name "await")))
+                  (set! (mut found) true)
+                  0))
+      (al-for [e (load exprs)]
+              (if (syntax-expr-contains? e yield? await?)
+                  (set! (mut found) true)
+                  0))
+      (al-free! [(slice u8)] (mut names))
+      (al-free! [i64] (mut exprs)))
+    (match (.expression-body f)
+      (Some [e]
+            (if (syntax-expr-contains? e yield? await?)
+                (set! (mut found) true)
+                0))
+      (None [] 0))
+    (load found)))
+
+(defn parse-syntax-arrow-from-cover! [(lo i64)
+                                      (items (ArrayList i64))
+                                      (async bool)] (-> i64)
+  (let [(mut params) (al-new [(slice u8)] (compiler-allocator))
+        (mut defaults) (al-new [(Option i64)] (compiler-allocator))
+        (mut patterns) (al-new [(Option i64)] (compiler-allocator))
+        (mut rest) (None [(slice u8)])
+        (mut rest-pattern) (None [i64])
+        (mut simple) true
+        (mut i) 0]
+    (loop (if (>= (load i) (len items))
+              (break 0)
+              (let [item (get items (load i))]
+                (if (syntax-expr-contains? item
+                                           (parser-ctx-generator?)
+                                           (or async (parser-ctx-async?)))
+                    (syntax-error! "parser: yield or await is not allowed in arrow parameters")
+                    0)
+                (match (syntax-node item)
+                  (SxName [name]
+                          (do
+                            (if async
+                                (if (= name "await")
+                                    (syntax-error! "parser: await is not a valid async arrow parameter")
+                                    0)
+                                0)
+                            (push! [(slice u8)] (mut params) name)
+                            (push! [(Option i64)] (mut defaults) (None [i64]))
+                            (push! [(Option i64)] (mut patterns) (None [i64]))))
+                  (SxAssign [target value]
+                            (match (syntax-node target)
+                              (SxName [name]
+                                      (do
+                                        (set! (mut simple) false)
+                                        (push! [(slice u8)] (mut params) name)
+                                        (push! [(Option i64)]
+                                               (mut defaults)
+                                               (Some value))
+                                        (push! [(Option i64)]
+                                               (mut patterns)
+                                               (None [i64]))))
+                              (SxObject [entries]
+                                        (do
+                                          (set! (mut simple) false)
+                                          (push! [(slice u8)] (mut params) "")
+                                          (push! [(Option i64)]
+                                                 (mut defaults)
+                                                 (Some value))
+                                          (push! [(Option i64)]
+                                                 (mut patterns)
+                                                 (Some (syntax-cover-to-pattern! target
+                                                                                 true)))))
+                              (SxArray [elements]
+                                       (do
+                                         (set! (mut simple) false)
+                                         (push! [(slice u8)] (mut params) "")
+                                         (push! [(Option i64)]
+                                                (mut defaults)
+                                                (Some value))
+                                         (push! [(Option i64)]
+                                                (mut patterns)
+                                                (Some (syntax-cover-to-pattern! target
+                                                                                true)))))
+                              (_ (syntax-error! "parser: invalid arrow function parameter"))))
+                  (SxSpread [expr]
+                            (do
+                              (if (!= (load i) (- (len items) 1))
+                                  (syntax-error! "parser: rest parameter must be last")
+                                  0)
+                              (set! (mut simple) false)
+                              (match (syntax-node expr)
+                                (SxName [name]
+                                        (do (set! (mut rest) (Some name)) 0))
+                                (SxObject [entries]
+                                          (do
+                                            (set! (mut rest-pattern)
+                                                  (Some (syntax-cover-to-pattern! expr
+                                                                                  true)))
+                                            0))
+                                (SxArray [elements]
+                                         (do
+                                           (set! (mut rest-pattern)
+                                                 (Some (syntax-cover-to-pattern! expr
+                                                                                 true)))
+                                           0))
+                                (SxAssign [target value]
+                                          (syntax-error! "parser: rest parameter may not have a default"))
+                                (_ (syntax-error! "parser: invalid arrow function parameter")))))
+                  ;; `([a] = b) => …` parsed as a destructuring assignment; its pattern must be
+                  ;; a binding pattern.
+                  (SxDestructuringAssign [pattern value]
+                                         (do
+                                           (set! (mut simple) false)
+                                           (syntax-pattern-require-binding! pattern)
+                                           (push! [(slice u8)] (mut params) "")
+                                           (push! [(Option i64)]
+                                                  (mut defaults)
+                                                  (Some value))
+                                           (push! [(Option i64)]
+                                                  (mut patterns)
+                                                  (Some pattern))))
+                  (SxObject [entries]
+                            (do
+                              (set! (mut simple) false)
+                              (push! [(slice u8)] (mut params) "")
+                              (push! [(Option i64)] (mut defaults) (None [i64]))
+                              (push! [(Option i64)]
+                                     (mut patterns)
+                                     (Some (syntax-cover-to-pattern! item true)))))
+                  (SxArray [elements]
+                           (do
+                             (set! (mut simple) false)
+                             (push! [(slice u8)] (mut params) "")
+                             (push! [(Option i64)] (mut defaults) (None [i64]))
+                             (push! [(Option i64)]
+                                    (mut patterns)
+                                    (Some (syntax-cover-to-pattern! item true)))))
+                  (_ (syntax-error! "parser: invalid arrow function parameter")))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (parse-syntax-arrow-body! lo
+                              (load params)
+                              (load defaults)
+                              (load patterns)
+                              (load rest)
+                              (load rest-pattern)
+                              (load simple)
+                              async)))
+
+;; Reserve a SyntaxFun before its parameters are parsed so the record index is stable for nested
+;; functions and for the `SxFunction`/`SsFunctionDecl` that will reference it.
+(defn syntax-fun-reserve! [(name (slice u8))
+                           (kind FunKind)
+                           (generator bool)
+                           (async bool)
+                           (lo i64)] (-> i64)
+  (let [(mut f) (primitive/zeroed SyntaxFun)
+        index (len (.funs (parser-state)))]
+    (set! (.name (mut f)) name)
+    (set! (.kind (mut f)) kind)
+    (set! (.generator (mut f)) generator)
+    (set! (.async (mut f)) async)
+    (set! (.params (mut f)) (al-new [(slice u8)] (compiler-allocator)))
+    (set! (.param-annotations (mut f)) (al-new [i64] (compiler-allocator)))
+    (set! (.param-defaults (mut f))
+          (al-new [(Option i64)] (compiler-allocator)))
+    (set! (.param-patterns (mut f))
+          (al-new [(Option i64)] (compiler-allocator)))
+    (set! (.rest-param (mut f)) (None [(slice u8)]))
+    (set! (.rest-pattern (mut f)) (None [i64]))
+    (set! (.simple-params (mut f)) true)
+    (set! (.return-annotation (mut f)) (ty-dyn TAG-ANY))
+    (set! (.body (mut f)) (al-new [i64] (compiler-allocator)))
+    (set! (.expression-body (mut f)) (None [i64]))
+    (set! (.parent (mut f)) (parser-current-fun))
+    (set! (.in-class (mut f)) (> (.class-strict (parser-state)) 0))
+    (set! (.hoisted (mut f)) false)
+    (set! (.value-taken (mut f)) false)
+    (set! (.strict (mut f)) false)
+    (set! (.lo (mut f)) lo)
+    (set! (.script (mut f)) (.current-script (parser-state)))
+    (set! (.static-entry (mut f)) -1)
+    (set! (.class-index (mut f)) -1)
+    (set! (.env-names (mut f)) (al-new [(slice u8)] (compiler-allocator)))
+    (set! (.env-lexical (mut f)) (al-new [i64] (compiler-allocator)))
+    (push! [SyntaxFun] (mut (.funs (parser-state))) (load f))
+    index))
+
+;; FormalParameters after `(`, consuming `)`. Defaults, a rest element and destructuring
+;; patterns make the list non-simple; a destructured parameter keeps "" in `params`.
+(defn parse-syntax-formal-parameters! [(fp (ptr SyntaxFun))] (-> i64)
+  (do
+    (if (take-is ")")
+        0
+        (loop (if (token-is (peek-token) "...")
+                  (let [dots (take-token)]
+                    (set! (.simple-params fp) false)
+                    (if (or (token-is (peek-token) "[")
+                            (token-is (peek-token) "{"))
+                        (set! (.rest-pattern fp)
+                              (Some (parse-syntax-binding-pattern!)))
+                        (let [name (require-binding-identifier)]
+                          (set! (.rest-param fp) (Some (token-text name)))))
+                    (if (token-is (peek-token) "=")
+                        (syntax-error! "parser: rest parameter may not have a default")
+                        0)
+                    (if (take-is ")")
+                        0
+                        (syntax-error! "parser: rest parameter must be last"))
+                    (break 0))
+                  (let [pattern-param
+                          (or (token-is (peek-token) "[")
+                              (token-is (peek-token) "{"))
+                        pattern
+                          (if pattern-param
+                              (Some (parse-syntax-binding-pattern!))
+                              (None [i64]))
+                        name-text
+                          (if pattern-param
+                              ""
+                              (token-text (require-binding-identifier)))
+                        annotation (parse-optional-annotation)]
+                    (if pattern-param (set! (.simple-params fp) false) 0)
+                    (push! [(slice u8)] (mut (.params fp)) name-text)
+                    (push! [(Option i64)] (mut (.param-patterns fp)) pattern)
+                    (push! [i64] (mut (.param-annotations fp)) annotation)
+                    (if (take-is "=")
+                        (do
+                          (set! (.simple-params fp) false)
+                          (push! [(Option i64)]
+                                 (mut (.param-defaults fp))
+                                 (Some (parse-syntax-assignment))))
+                        (push! [(Option i64)]
+                               (mut (.param-defaults fp))
+                               (None [i64])))
+                    (if (take-is ",")
+                        (if (take-is ")") (break 0) (continue))
+                        (break (do
+                                 (require-closing! ")"
+                                                   "parser: expected `,` or `)` in parameter list")
+                                 0)))))))
+    0))
+
+;; Early errors every function shares once its parameters and body are known: duplicate
+;; parameters where UniqueFormalParameters or non-simple lists forbid them (strict duplicates are
+;; the strict pass's job), a `use strict` directive over a non-simple list, accessor arity, and
+;; parameter/lexical conflicts (checked with the other declarations later).
+(defn syntax-check-function-shape! [(index i64) (own-directive bool)] (-> i64)
+  (let [f (syntax-fun-at index)
+        unique
+          (or (not (.simple-params f))
+              (match (.kind f)
+                (FunArrow [] true)
+                (FunMethod [] true)
+                (FunGetter [] true)
+                (FunSetter [] true)
+                (_ false)))]
+    (if (and own-directive (not (.simple-params f)))
+        (syntax-error! "parser: use strict directive is not allowed with a non-simple parameter list")
+        0)
+    (if unique
+        (let [(mut bound) (syntax-fun-bound-names f)
+              (mut i) 0]
+          (loop (if (>= (load i) (len (load bound)))
+                    (break 0)
+                    (let [name (get (load bound) (load i))
+                          (mut j) (+ (load i) 1)]
+                      (loop (if (>= (load j) (len (load bound)))
+                                (break 0)
+                                (do
+                                  (if (= name (get (load bound) (load j)))
+                                      (syntax-error! "parser: duplicate parameter name")
+                                      0)
+                                  (set! (mut j) (+ (load j) 1))
+                                  (continue))))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (al-free! [(slice u8)] (mut bound)))
+        0)
+    (match (.kind f)
+      (FunGetter []
+                 (if (or (> (len (.params f)) 0)
+                         (match (.rest-param f) (Some [r] true) (None [] false)))
+                     (syntax-error! "parser: getter must not have parameters")
+                     0))
+      (FunSetter []
+                 (if (or (!= (len (.params f)) 1)
+                         (match (.rest-param f) (Some [r] true) (None [] false)))
+                     (syntax-error! "parser: setter must have exactly one parameter")
+                     0))
+      (_ 0))))
+
+;; Parameters, optional return annotation and a braced body for every non-arrow function kind.
+;; `name` was validated in the enclosing context; parameters and body use the function's own.
+(defn parse-syntax-function-rest! [(index i64)
+                                   (kind FunKind)
+                                   (generator bool)
+                                   (async bool)
+                                   (derived-constructor bool)] (-> i64)
+  (let [method
+          (match kind
+            (FunMethod [] true)
+            (FunGetter [] true)
+            (FunSetter [] true)
+            (_ false))]
+    (parser-push-context! index generator async false method)
+    (parser-mark-top-context! false false derived-constructor)
+    (require-token "(")
+    (parse-syntax-formal-parameters! (syntax-fun-ptr index))
+    (let [return-annotation (parse-optional-annotation)]
+      (parser-set-in-params! false)
+      (require-token "{")
+      (let [body (parse-syntax-statement-list)
+            close (require-token "}")
+            own-directive (syntax-body-strict? body)
+            fp (syntax-fun-ptr index)]
+        (parser-pop-context!)
+        (if own-directive (do (set! (.strict-pending (parser-state)) true) 0) 0)
+        (set! (.return-annotation fp) return-annotation)
+        (set! (.body fp) body)
+        (set! (.hi fp) (.end close))
+        (syntax-check-function-shape! index own-directive)
+        index))))
+
+;; `function` [*] name (…) {…} as a declaration statement. The name binds in the enclosing scope.
+(defn parse-syntax-function-declaration! [] (-> i64)
+  (let [first (take-token)
+        async (token-is first "async")]
+    (if async (do (require-token "function") 0) 0)
+    (let [generator (take-is "*")
+          name (require-binding-identifier)
+          index
+            (syntax-fun-reserve! (token-text name)
+                                 (FunDeclaration)
+                                 generator
+                                 async
+                                 (.start first))]
+      (parse-syntax-function-rest! index (FunDeclaration) generator async false)
+      (let [f (syntax-fun-at index)]
+        (syntax-stmt-add-node! (SsFunctionDecl index) (.start first) (.hi f))))))
+
+;; A function expression's own name is bound inside the function, so `function yield(){}` inside a
+;; generator body is legal while a generator expression named `yield` is not.
+(defn parse-syntax-function-expression-name [(generator bool) (async bool)] (-> (slice u8))
+  (let [t (take-token)
+        name (token-text t)]
+    (if (and (!= (.kind t) TOK-IDENT) (not (token-is t "let")))
+        (syntax-error! "parser: reserved word cannot be a function name")
+        ;; The name binds inside the expression, so only its own kind reserves yield/await.
+        (if (or (and (= name "yield") generator)
+                (and (= name "await") async))
+            (syntax-error! "parser: invalid function expression name")
+            0))
+    name))
+
+(defn parse-syntax-function-expression [(keyword Token) (async bool) (lo i64)] (-> i64)
+  (let [generator (take-is "*")
+        name
+          (if (token-is (peek-token) "(")
+              ""
+              (parse-syntax-function-expression-name generator async))]
+    (let [index (syntax-fun-reserve! name (FunExpression) generator async lo)]
+      (parse-syntax-function-rest! index (FunExpression) generator async false)
+      (let [f (syntax-fun-at index)]
+        (syntax-add-node! (SxFunction index) lo (.hi f))))))
+
+;; ArrowFunction body after its parameters are settled: `=>` then a braced FunctionBody or a
+;; ConciseBody AssignmentExpression. Arrows are never generators; `await` follows `async`.
+(defn parse-syntax-arrow-body! [(lo i64)
+                                (params (ArrayList (slice u8)))
+                                (defaults (ArrayList (Option i64)))
+                                (patterns (ArrayList (Option i64)))
+                                (rest (Option (slice u8)))
+                                (rest-pattern (Option i64))
+                                (simple bool)
+                                (async bool)] (-> i64)
+  (let [arrow (take-token)]
+    (if (not (token-is arrow "=>")) (syntax-error! "parser: expected =>") 0)
+    (if (.nl-before arrow)
+        (syntax-error! "parser: line terminator is not allowed before =>")
+        0)
+    (let [index (syntax-fun-reserve! "" (FunArrow) false async lo)
+          fp (syntax-fun-ptr index)]
+      (set! (.params fp) params)
+      (set! (.param-defaults fp) defaults)
+      (set! (.param-patterns fp) patterns)
+      (set! (.rest-param fp) rest)
+      (set! (.rest-pattern fp) rest-pattern)
+      (set! (.simple-params fp) simple)
+      (let [(mut i) 0]
+        (loop (if (>= (load i) (len params))
+                  (break 0)
+                  (do
+                    (push! [i64] (mut (.param-annotations fp)) (ty-dyn TAG-ANY))
+                    (set! (mut i) (+ (load i) 1))
+                    (continue)))))
+      (parser-push-context! index false async true false)
+      (parser-set-in-params! false)
+      (if (token-is (peek-token) "{")
+          (do
+            (take-token)
+            (let [body (parse-syntax-statement-list)
+                  close (require-token "}")
+                  own-directive (syntax-body-strict? body)
+                  fp2 (syntax-fun-ptr index)]
+              (parser-pop-context!)
+              (if own-directive
+                  (do (set! (.strict-pending (parser-state)) true) 0)
+                  0)
+              (set! (.body fp2) body)
+              (set! (.hi fp2) (.end close))
+              (syntax-check-function-shape! index own-directive)))
+          (let [value (parse-syntax-assignment)
+                fp2 (syntax-fun-ptr index)]
+            (parser-pop-context!)
+            (set! (.expression-body fp2) (Some value))
+            (set! (.hi fp2) (syntax-hi value))
+            (syntax-check-function-shape! index false)))
+      (let [f (syntax-fun-at index)]
+        (syntax-add-node! (SxFunction index) lo (.hi f))))))
+
+;; MethodDefinition inside an object literal: `key(…) {…}`, `get key() {…}`, `set key(v) {…}`,
+;; `*key(…)`, `async key(…)`, `async *key(…)`.
+(defn parse-syntax-method! [(key PropKey)
+                            (name (slice u8))
+                            (kind FunKind)
+                            (generator bool)
+                            (async bool)
+                            (lo i64)] (-> ObjectEntry)
+  (let [index (syntax-fun-reserve! name kind generator async lo)]
+    (parse-syntax-function-rest! index kind generator async false)
+    (PropMethod key index)))
+
+;; Strictness is settled after parsing: a function is strict when its own prologue says so, when
+;; its enclosing function is, or when the Script is. Parents precede children in the table.
+(defn syntax-settle-strictness! [] (-> i64)
+  (let [p (parser-state)
+        script-strict
+          (if (.script-mode p)
+              (let [root (syntax-fun-at (.script-index p))]
+                (syntax-body-strict? (.body root)))
+              false)
+        (mut i) 0]
+    (loop (if (>= (load i) (len (.funs p)))
+              (break 0)
+              (let [fp (syntax-fun-ptr (load i))
+                    own (syntax-body-strict? (.body fp))
+                    inherited
+                      (if (< (.parent fp) 0)
+                          false
+                          (syntax-fun-strict (.parent fp)))]
+                ;; A built-in (an intrinsic wrapper) is strict whatever the Script is: it receives
+                ;; `this` as passed (ECMA-262 §10.3).
+                (set! (.strict fp)
+                      (or script-strict
+                          own
+                          inherited
+                          (.in-class fp)
+                          (syntax-intrinsic-fun? (load i))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))
+
+;; Whether a statement list declares a nested function anywhere, which lowering cannot yet
+;; instantiate as a binding.
+(defn syntax-contains-function-decl? [(stmts (ArrayList i64))] (-> bool)
+  (let [(mut found) false]
+    (al-for [id stmts]
+            (let [(mut children) (al-new [i64] (compiler-allocator))]
+              (match (syntax-stmt-node id)
+                (SsFunctionDecl [fun]
+                                (let [f (syntax-fun-at fun)]
+                                  (if (not (.hoisted f))
+                                      (set! (mut found) true)
+                                      0)))
+                (_ 0))
+              (syntax-stmt-children! id (mut children))
+              (if (syntax-contains-function-decl? (load children))
+                  (set! (mut found) true)
+                  0)
+              (al-free! [i64] (mut children))))
+    (load found)))

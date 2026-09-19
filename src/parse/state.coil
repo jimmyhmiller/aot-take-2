@@ -1,0 +1,460 @@
+;; Parser state: the per-compilation singleton, function contexts, the token cursor and syntax errors.
+
+(module aot.parse.state)
+(import "aot.codegen.compunit" :use [CuScriptDecl])
+(import "aot.util.arena"
+        :use
+        [compiler-allocator compiler-state CompilerStateSlot])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.parse.lexer" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.lower.jump" :use *)
+
+;; A var-like global: a top-level `var` or function declaration of some Script of the realm. The
+;; realm's global object carries one property per binding from the start.
+(defstruct GlobalBinding
+  [(name (slice u8))
+   (script i64)  ; the first Script declaring the name
+   (fun i64)  ; the last function declaration for the name, or -1 for a plain var
+   (assigned bool)])  ; something in the realm may store to the name after instantiation
+
+;; The function being parsed. Arrows inherit `this`, `new.target` and `super` from the nearest
+;; enclosing non-arrow function, so those questions walk the stack through arrow contexts.
+(defstruct FunContext
+  [(fun i64)
+   (generator bool)
+   (async bool)
+   (arrow bool)
+   (method bool)
+   (in-params bool)
+   (script-root bool)  ; the Script's own statement list: not a function for `return`/`new.target`
+   (field-init bool)  ; a class field initializer: `arguments` is an error
+   (static-block bool)  ; a class static block: `return` and `await` are errors, `arguments` too
+   (derived-constructor bool)])  ; `super()` is allowed here and in nested arrows
+
+(defstruct ParserState
+  [(exprs (ArrayList SyntaxExpr))
+   (stmts (ArrayList SyntaxStmt))
+   (funs (ArrayList SyntaxFun))
+   (current-fun i64)
+   (current-ctrl i64)
+   (current-scope i64)
+   (return-ctrls (ArrayList i64))
+   (return-mems (ArrayList i64))
+   (return-values (ArrayList i64))
+   (jump-targets (ArrayList JumpTarget))
+   (pending-labels (ArrayList (slice u8)))
+   (entry-fun-nid i64)
+   (script-mode bool)
+   (syntax-only bool)
+   (strict-pending bool)
+   (script-index i64)
+   (fun-contexts (ArrayList FunContext))
+   (classes (ArrayList SyntaxClass))
+   (patterns (ArrayList SyntaxPattern))
+   (cover-consumed (ArrayList i64))  ; literals reinterpreted as patterns
+   (rest-comma (ArrayList i64))  ; literals whose final `...` element was followed by a comma
+   (annexb-blocks (ArrayList i64))  ; synthetic Blocks around `if (x) function f() {}`
+   (abi-slots i64)  ; program-wide maximum formal count: every function's argument slots
+   (abi-sig i64)  ; the shared boxed signature [ret this new.target slot…]
+   (class-depth i64)  ; open class bodies: private-name scope
+   (class-strict i64)  ; open class definitions, including name and heritage: strict code
+   (private-refs (ArrayList PrivateRef))
+   (new-callee bool)
+   (spread-trailing-comma bool)  ; the last argument list ended `...x ,)`
+   (no-in bool)
+   (current-script i64)  ; the Script whose source is being parsed, or -1
+   (scripts (ArrayList i64))  ; each Script's root function record, in evaluation order
+   (script-declarations (ArrayList (ArrayList CuScriptDecl)))
+   (script-functions (ArrayList (ArrayList i64)))  ; local declaration ordinal -> current SyntaxFun
+   (callable-roots (ArrayList i64))  ; SyntaxFun IDs whose generic adapters retain unknown callers
+   (callers-closed bool)
+   (external-mutation bool)  ; source lowering must not assume this source set contains all writes
+   (script-unit bool)  ; declarations and evaluation execute through retained Script initializers
+   (globals (ArrayList GlobalBinding))
+   (namespaces (ArrayList (slice u8)))  ; intrinsic namespace objects the realm materializes (`Math`)
+   (namespace-entries (ArrayList i64))  ; their image entries, once the realm is laid out
+   (jsl-loaded bool)  ; this compilation already loaded the JSL library
+   (pending-bodies (ArrayList i64))  ; records materialized mid-lowering whose bodies wait for a boundary
+   (lower-start i64)  ; the program Start and Stop once the passes run, for late materialization, or 0
+   (lower-stop i64)
+   (late-funs-cap i64)  ; capacities reserved for late materialization (`parser-reserve-late-materialization!`)
+   (late-exprs-cap i64)
+   (propagates bool)  ; the function being lowered emitted a path that returns the exception sentinel  ; the global object's one hidden class: every global added in table order
+   (booted bool)])
+
+(defn parser-state [] (-> (ptr ParserState))
+  (compiler-state [ParserState] (primitive/alloc-static CompilerStateSlot)))
+
+(defn parser-reset! [] (-> i64)
+  (let [p (parser-state)]
+    (if (not (.booted p))
+        (do
+          (set! (.exprs p) (al-new [SyntaxExpr] (compiler-allocator)))
+          (set! (.stmts p) (al-new [SyntaxStmt] (compiler-allocator)))
+          (set! (.funs p) (al-new [SyntaxFun] (compiler-allocator)))
+          (set! (.return-ctrls p) (al-new [i64] (compiler-allocator)))
+          (set! (.return-mems p) (al-new [i64] (compiler-allocator)))
+          (set! (.return-values p) (al-new [i64] (compiler-allocator)))
+          (set! (.jump-targets p)
+                (al-new [JumpTarget] (compiler-allocator)))
+          (set! (.pending-labels p)
+                (al-new [(slice u8)] (compiler-allocator)))
+          (set! (.entry-fun-nid p) 0)
+          (set! (.fun-contexts p) (al-new [FunContext] (compiler-allocator)))
+          (set! (.classes p) (al-new [SyntaxClass] (compiler-allocator)))
+          (set! (.patterns p) (al-new [SyntaxPattern] (compiler-allocator)))
+          (set! (.cover-consumed p) (al-new [i64] (compiler-allocator)))
+          (set! (.rest-comma p) (al-new [i64] (compiler-allocator)))
+          (set! (.annexb-blocks p) (al-new [i64] (compiler-allocator)))
+          (set! (.class-depth p) 0)
+          (set! (.class-strict p) 0)
+          (set! (.private-refs p) (al-new [PrivateRef] (compiler-allocator)))
+          (set! (.new-callee p) false)
+          (set! (.spread-trailing-comma p) false)
+          (set! (.no-in p) false)
+          (set! (.current-script p) -1)
+          (set! (.scripts p) (al-new [i64] (compiler-allocator)))
+          (set! (.script-declarations p)
+                (al-new [(ArrayList CuScriptDecl)] (compiler-allocator)))
+          (set! (.script-functions p)
+                (al-new [(ArrayList i64)] (compiler-allocator)))
+          (set! (.callable-roots p) (al-new [i64] (compiler-allocator)))
+          (set! (.callers-closed p) false)
+          (set! (.external-mutation p) false)
+          (set! (.script-unit p) false)
+          (set! (.globals p) (al-new [GlobalBinding] (compiler-allocator)))
+          (set! (.namespaces p) (al-new [(slice u8)] (compiler-allocator)))
+          (set! (.namespace-entries p) (al-new [i64] (compiler-allocator)))
+          (set! (.pending-bodies p) (al-new [i64] (compiler-allocator)))
+          (set! (.lower-start p) 0)
+          (set! (.lower-stop p) 0)
+          (set! (.jsl-loaded p) false)
+          (set! (.booted p) true)
+          0)
+        (do
+          (al-for [entry (.exprs p)]
+                  (let [expr entry]
+                    (match (.node expr)
+                      (SxString [raw units legacy]
+                                (let [(mut owned) units]
+                                  (al-free! [i64] (mut owned))))
+                      (_ 0))))
+          (al-clear! [SyntaxExpr] (mut (.exprs p)))
+          (al-clear! [SyntaxStmt] (mut (.stmts p)))
+          (al-clear! [SyntaxFun] (mut (.funs p)))
+          (al-clear! [i64] (mut (.return-ctrls p)))
+          (al-clear! [i64] (mut (.return-mems p)))
+          (al-clear! [i64] (mut (.return-values p)))
+          (al-clear! [JumpTarget] (mut (.jump-targets p)))
+          (al-clear! [(slice u8)] (mut (.pending-labels p)))
+          (set! (.entry-fun-nid p) 0)
+          (al-clear! [FunContext] (mut (.fun-contexts p)))
+          (al-clear! [SyntaxClass] (mut (.classes p)))
+          (al-clear! [SyntaxPattern] (mut (.patterns p)))
+          (al-clear! [i64] (mut (.cover-consumed p)))
+          (al-clear! [i64] (mut (.rest-comma p)))
+          (al-clear! [i64] (mut (.annexb-blocks p)))
+          (set! (.class-depth p) 0)
+          (set! (.class-strict p) 0)
+          (al-clear! [PrivateRef] (mut (.private-refs p)))
+          (set! (.new-callee p) false)
+          (set! (.no-in p) false)
+          (set! (.current-script p) -1)
+          (al-clear! [i64] (mut (.scripts p)))
+          (al-for [entries (.script-declarations p)]
+                  (let [(mut owned) entries] (al-free! (mut owned))))
+          (al-for [functions (.script-functions p)]
+                  (let [(mut owned) functions] (al-free! (mut owned))))
+          (al-clear! [(ArrayList CuScriptDecl)] (mut (.script-declarations p)))
+          (al-clear! [(ArrayList i64)] (mut (.script-functions p)))
+          (al-clear! (mut (.callable-roots p)))
+          (set! (.callers-closed p) false)
+          (set! (.external-mutation p) false)
+          (set! (.script-unit p) false)
+          (al-clear! [GlobalBinding] (mut (.globals p)))
+          (al-clear! [(slice u8)] (mut (.namespaces p)))
+          (al-clear! [i64] (mut (.namespace-entries p)))
+          (set! (.jsl-loaded p) false)
+          (al-clear! [i64] (mut (.pending-bodies p)))
+          (set! (.lower-start p) 0)
+          (set! (.lower-stop p) 0)
+          0))))
+
+(defn parse-fail [(what (slice u8)) (t Token)] (-> i64)
+  (do (panic-i what (.start t)) 0))
+
+;; Only proven grammar/early errors use this channel. A failure to recognize syntax in our
+;; incomplete grammar must NOT become a SyntaxError. The syntax-only API never evaluates code.
+;; When the token in front of the parser is one the lexer cannot classify (a non-ASCII identifier
+;; character, a decorator), the error is about our lexer, not the program, and fails closed.
+(defn syntax-error! [(message (slice u8))] (-> i64)
+  (let [next (peek-token)]
+    (if (token-lexically-unknown? next)
+        (parse-fail "parser: lexically unclassified token is outside the admitted subset at byte"
+                    next)
+        (if (.syntax-only (parser-state))
+            (parse-syntax-diagnostic! message)
+            (panic message)))))
+
+(defn take-token [] (-> Token)
+  (lex-next! false))
+
+(defn peek-token [] (-> Token)
+  (lex-peek false))
+
+(defn lex-second-is? [(text (slice u8))] (-> bool)
+  (token-is (lex-peek-second false) text))
+
+(defn lex-second-kind? [(kind i64)] (-> bool)
+  (let [second (lex-peek-second false)] (= (.kind second) kind)))
+
+(defn take-is [(text (slice u8))] (-> bool)
+  (if (token-is (peek-token) text) (do (take-token) true) false))
+
+(defn parser-in-function? [] (-> bool)
+  (let [contexts (.fun-contexts (parser-state))
+        (mut found) false]
+    (al-for [entry contexts]
+            (let [c entry]
+              (if (or (.script-root c) (.static-block c))
+                  0
+                  (set! (mut found) true))))
+    (load found)))
+
+;; The nearest non-arrow context: arrows inherit these questions from their home.
+(defn parser-ctx-home [] (-> FunContext)
+  (let [contexts (.fun-contexts (parser-state))
+        (mut i) (- (len contexts) 1)
+        (mut answer) (primitive/zeroed FunContext)]
+    (loop (if (< (load i) 0)
+              (break 0)
+              (let [c (get contexts (load i))]
+                (if (.arrow c)
+                    (do (set! (mut i) (- (load i) 1)) (continue))
+                    (break (do (set! (mut answer) c) 0))))))
+    (load answer)))
+
+(defn parser-ctx-forbids-arguments? [] (-> bool)
+  (let [home (parser-ctx-home)] (or (.field-init home) (.static-block home))))
+
+(defn parser-ctx-static-block? [] (-> bool)
+  (let [home (parser-ctx-home)] (.static-block home)))
+
+(defn parser-ctx-allows-super-call? [] (-> bool)
+  (let [home (parser-ctx-home)] (.derived-constructor home)))
+
+;; A `super.x` reference in the method the nearest non-arrow context is parsing: its function object
+;; carries the home object, and its entry passes that function object in the hidden callee slot.
+(defn parser-ctx-needs-home! [] (-> i64)
+  (let [home (parser-ctx-home)
+        fi (.fun home)]
+    (if (< fi 0)
+        (panic "parser-ctx-needs-home!: a super property reference outside every function")
+        (let [fp (syntax-fun-ptr fi)]
+          (set! (.needs-home fp) true)
+          (set! (.needs-callee fp) true)
+          0))))
+
+;; `return` is legal directly inside a function or arrow body, never in a static block or Script.
+(defn parser-return-allowed? [] (-> bool)
+  (let [contexts (.fun-contexts (parser-state))]
+    (if (= (len contexts) 0)
+        false
+        (let [top (get contexts (- (len contexts) 1))]
+          (or (.arrow top) (not (or (.script-root top) (.static-block top))))))))
+
+(defn parser-current-fun [] (-> i64)
+  (let [contexts (.fun-contexts (parser-state))]
+    (if (= (len contexts) 0)
+        -1
+        (let [top (get contexts (- (len contexts) 1))] (.fun top)))))
+
+(defn parser-ctx-generator? [] (-> bool)
+  (let [contexts (.fun-contexts (parser-state))]
+    (if (= (len contexts) 0)
+        false
+        (let [top (get contexts (- (len contexts) 1))] (.generator top)))))
+
+(defn parser-ctx-async? [] (-> bool)
+  (let [contexts (.fun-contexts (parser-state))]
+    (if (= (len contexts) 0)
+        false
+        (let [top (get contexts (- (len contexts) 1))] (.async top)))))
+
+(defn parser-ctx-in-params? [] (-> bool)
+  (let [contexts (.fun-contexts (parser-state))]
+    (if (= (len contexts) 0)
+        false
+        (let [top (get contexts (- (len contexts) 1))] (.in-params top)))))
+
+;; The nearest non-arrow context decides `this`, `new.target` and `super` questions.
+(defn parser-ctx-home-method? [] (-> bool)
+  (let [contexts (.fun-contexts (parser-state))
+        (mut i) (- (len contexts) 1)
+        (mut answer) false]
+    (loop (if (< (load i) 0)
+              (break 0)
+              (let [c (get contexts (load i))]
+                (if (.arrow c)
+                    (do (set! (mut i) (- (load i) 1)) (continue))
+                    (break (do (set! (mut answer) (.method c)) 0))))))
+    (load answer)))
+
+(defn parser-ctx-allows-new-target? [] (-> bool)
+  (let [contexts (.fun-contexts (parser-state))
+        (mut found) false]
+    (al-for [entry contexts]
+            (let [c entry]
+              (if (or (.arrow c) (.script-root c)) 0 (set! (mut found) true))))
+    (load found)))
+
+(defn parser-push-context! [(fun i64)
+                            (generator bool)
+                            (async bool)
+                            (arrow bool)
+                            (method bool)] (-> i64)
+  (let [(mut c) (primitive/zeroed FunContext)]
+    (set! (.fun (mut c)) fun)
+    (set! (.generator (mut c)) generator)
+    (set! (.async (mut c)) async)
+    (set! (.arrow (mut c)) arrow)
+    (set! (.method (mut c)) method)
+    (set! (.script-root (mut c)) false)
+    (set! (.field-init (mut c)) false)
+    (set! (.static-block (mut c)) false)
+    (set! (.derived-constructor (mut c)) false)
+    (set! (.in-params (mut c)) true)
+    (push! [FunContext] (mut (.fun-contexts (parser-state))) (load c))))
+
+;; The Script's statement list gets a context so nested functions have a parent, without being
+;; a function: `return`, `new.target` and `var` hoisting still see the Script.
+(defn parser-push-root-context! [(fun i64)] (-> i64)
+  (do
+    (parser-push-context! fun false false false false)
+    (let [count (len (.fun-contexts (parser-state)))
+          top
+            (al-elem [FunContext]
+                     (mut (.fun-contexts (parser-state)))
+                     (- count 1))]
+      (set! (.script-root top) true)
+      (set! (.in-params top) false)
+      0)))
+
+(defn parser-mark-top-context! [(field-init bool)
+                                (static-block bool)
+                                (derived bool)] (-> i64)
+  (let [count (len (.fun-contexts (parser-state)))
+        top
+          (al-elem [FunContext]
+                   (mut (.fun-contexts (parser-state)))
+                   (- count 1))]
+    (set! (.field-init top) field-init)
+    (set! (.static-block top) static-block)
+    (set! (.derived-constructor top) derived)
+    0))
+
+(defn parser-set-in-params! [(value bool)] (-> i64)
+  (let [count (len (.fun-contexts (parser-state)))
+        top
+          (al-elem [FunContext]
+                   (mut (.fun-contexts (parser-state)))
+                   (- count 1))]
+    (set! (.in-params top) value)
+    0))
+
+(defn parser-pop-context! [] (-> i64)
+  (match (pop! (mut (.fun-contexts (parser-state))))
+    (None [] (broken "parser-pop-context!: no function context"))
+    (Some [c] 0)))
+
+;; BindingIdentifier: a reserved word is a proven error; `yield` and `await` are reserved inside
+;; generator and async bodies respectively. A sloppy `let` binding fails closed.
+(defn syntax-check-binding-name! [(name (slice u8))] (-> i64)
+  (if (and (= name "yield") (parser-ctx-generator?))
+      (syntax-error! "parser: yield is not a valid binding identifier in a generator")
+      (if (and (= name "await")
+               (or (parser-ctx-async?) (parser-ctx-static-block?)))
+          (syntax-error! "parser: await is not a valid binding identifier here")
+          0)))
+
+(defn require-binding-identifier [] (-> Token)
+  (let [t (take-token)]
+    (if (= (.kind t) TOK-IDENT)
+        (do
+          (if (token-escaped-reserved? t)
+              (syntax-error! "parser: escaped reserved word cannot be a binding identifier")
+              0)
+          (syntax-check-binding-name! (token-text t))
+          t)
+        ;; `let` is a valid sloppy binding name; strict code rejects it in the strict pass and
+        ;; lexical declarations reject it where they parse.
+        (if (token-is t "let")
+            t
+            (if (= (.kind t) TOK-KEYWORD)
+                (do
+                  (syntax-error! "parser: reserved word cannot be a binding identifier")
+                  t)
+                ;; Every position that admits a BindingPattern parses it before asking for an
+                ;; identifier, so a pattern here (an object rest element, a function name) is a
+                ;; proven error. A token the lexer could not classify is not.
+                (do
+                  (if (token-lexically-unknown? t)
+                      (parse-fail "parser: non-ASCII identifier is outside the admitted subset at byte"
+                                  t)
+                      (syntax-error! "parser: expected a binding identifier"))
+                  t))))))
+
+;; Tokens this lexer cannot classify: non-ASCII identifiers, decorators. A
+;; grammar failure on one of these is not evidence about the program.
+(defn token-lexically-unknown? [(t Token)] (-> bool)
+  (and (= (.kind t) TOK-PUNCT)
+       (let [x (token-text t)]
+         (or (= x "@") (>= (get x 0) (cast u8 128))))))
+
+;; A required token that is absent proves a SyntaxError in JavaScript Script code once the grammar
+;; up to this point is complete; TypeScript entry mode keeps failing closed because annotations
+;; and generics are only partially admitted there.
+(defn required-token-missing! [(what (slice u8)) (t Token)] (-> i64)
+  (if (and (.script-mode (parser-state)) (not (token-lexically-unknown? t)))
+      (syntax-error! what)
+      (parse-fail what t)))
+
+(defn require-token [(text (slice u8))] (-> Token)
+  (let [t (take-token)]
+    (if (token-is t text)
+        t
+        (do (required-token-missing! "parser: unexpected token" t) t))))
+
+(defn require-ident [] (-> Token)
+  (let [t (take-token)]
+    (if (= (.kind t) TOK-IDENT)
+        t
+        (do (required-token-missing! "parser: expected an identifier" t) t))))
+
+;; Property IdentifierName permits reserved words, unlike a binding Identifier.
+(defn require-property-name [] (-> Token)
+  (let [t (take-token)]
+    (if (or (= (.kind t) TOK-IDENT) (= (.kind t) TOK-KEYWORD))
+        t
+        (do (required-token-missing! "parser: expected a property name" t) t))))
+
+(defn parser-node [(nid i64)] (-> (dyn NodeOps))
+  (match (arena-node nid) (Some [n] n) (None [] (unreachable-node))))
+
+(defn parser-set-current-ctrl! [(ctrl (dyn NodeOps))] (-> i64)
+  (do
+    (set! (.current-ctrl (parser-state)) (n-nid ctrl))
+    (scope-set-ctrl! (parser-node (.current-scope (parser-state))) ctrl)))
+
+(defn parser-use-scope! [(scope (dyn NodeOps))] (-> i64)
+  (do
+    (set! (.current-scope (parser-state)) (n-nid scope))
+    (set! (.current-ctrl (parser-state)) (n-nid (scope-ctrl scope)))
+    0))

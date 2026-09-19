@@ -1,0 +1,277 @@
+;; Lowering of for-in and for-of.
+
+(module aot.parse.lower.iteration)
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.type.type" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.lower.jsl" :use *)
+(import "aot.parse.lower.operator" :use *)
+(import "aot.parse.lower.reference" :use *)
+(import "aot.parse.lower.literal" :use *)
+(import "aot.parse.lower.exception" :use *)
+(import "aot.parse.lower.jump" :use *)
+(import "aot.parse.lower.statement" :use *)
+(import "aot.parse.lower.pattern" :use *)
+(import "aot.parse.lower.class" :use *)
+(import "aot.parse.lower.expression" :use *)
+
+;; The compiler-only Scope names a for-in loop carries across its iterations; the dot keeps them out
+;; of every IdentifierName, and an inner loop's names shadow an outer loop's in its own level.
+(const FOR-IN-OBJECT "$aot$.for-in.object")
+
+(const FOR-IN-KEYS "$aot$.for-in.keys")
+
+(const FOR-IN-CURSOR "$aot$.for-in.cursor")
+
+;; `for (head in right) body` (§14.7.5.6 ForIn/OfHeadEvaluation, §14.7.5.7 ForIn/OfBodyEvaluation).
+;; The head's lexical names are in their temporal dead zone while `right` evaluates; undefined and
+;; null enumerate nothing; otherwise JSL lists the enumerable string keys once, when the loop starts
+;; (`JsForInKeys`, EnumerateObjectProperties), and each iteration skips a key the object no longer
+;; has (`JsForInNext`), binds the key and runs the body. The loop itself is Simple's: a loop head,
+;; a predicate, the body on true, continues closed, the backedge. A `let` or `const` head is a fresh
+;; binding per iteration, a `var` or an expression head a PutValue through its Reference.
+(defn lower-for-in [(head ForInit) (right i64) (body i64)] (-> i64)
+  (do
+    (scope-push! (parser-node (.current-scope (parser-state))))
+    (match head
+      (ForInitDecl [stmt]
+                   (match (syntax-stmt-node stmt)
+                     (SsLet [name init final annotation]
+                            (lower-instantiate-lexical-stmt! stmt))
+                     ;; Annex B.3.5: a sloppy `var` head may carry an initializer, assigned first.
+                     (SsVar [name init annotation]
+                            (lower-syntax-statement stmt))
+                     ;; A pattern head declares its names here and binds them per iteration.
+                     (SsLetPattern [pattern init final]
+                                   (lower-instantiate-lexical-stmt! stmt))
+                     (SsVarPattern [pattern init] 0)
+                     (_ (broken "for-in/of head: not a binding statement"))))
+      (ForInitPattern [pattern]
+                      (unimplemented "destructuring for-in/of heads"
+                                     "docs/GAPS.md — destructuring"))
+      (_ 0))
+    (let [object (lower-syntax-expr right)]
+      (n-keep! object)
+      (scope-pop! (parser-node (.current-scope (parser-state))))
+      (let [keys
+              (lower-completion! (lower-jsl-unary-value "JsForInKeys" object))
+            scope (parser-node (.current-scope (parser-state)))]
+        (n-keep! keys)
+        (scope-push! scope)
+        (scope-define! scope FOR-IN-OBJECT (ty-dyn TAG-ANY) false object)
+        (scope-define! scope FOR-IN-KEYS (ty-dyn TAG-ANY) false keys)
+        (scope-define! scope
+                       FOR-IN-CURSOR
+                       (ty-dyn TAG-ANY)
+                       false
+                       (lower-singleton "JsForInFirst"))
+        (n-unkeep! keys)
+        (n-unkeep! object)
+        (let [entry (lower-loop-head!)
+              next
+                (lower-jsl-values3 "JsForInNext"
+                                   (lower-for-in-slot FOR-IN-OBJECT)
+                                   (lower-for-in-slot FOR-IN-KEYS)
+                                   (lower-for-in-slot FOR-IN-CURSOR))]
+          (n-keep! next)
+          (let [condition
+                  (lower-js-truthy (lower-jsl-unary-value "JsForInHasKey" next))
+                condition-scope (parser-node (.current-scope (parser-state)))
+                iff (if-make (scope-ctrl condition-scope) condition)
+                arms (if-arms! iff)]
+            (scope-set-ctrl! condition-scope (arms-false arms))
+            (let [exit-scope (scope-dup condition-scope false)]
+              (parser-push-jump! exit-scope JUMP-LOOP)
+              (scope-set-ctrl! condition-scope (arms-true arms))
+              (set! (.current-ctrl (parser-state)) (n-nid (arms-true arms)))
+              (let [key
+                      (lower-jsl-values2 "JsForInKeyAt"
+                                         (lower-for-in-slot FOR-IN-KEYS)
+                                         next)]
+                (n-keep! key)
+                (scope-update! (parser-node (.current-scope (parser-state)))
+                               FOR-IN-CURSOR
+                               (lower-jsl-unary-value "JsForInAfter" next))
+                (n-unkeep! next)
+                (scope-push! (parser-node (.current-scope (parser-state))))
+                (lower-for-in-bind! head key)
+                (n-unkeep! key)
+                (let [terminated (lower-syntax-statement body)]
+                  ;; The iteration's binding ends with the body; a continue already left it (its Scope
+                  ;; is cut to the loop's depth), and continues rejoin before the backedge with the
+                  ;; cursor already past this key.
+                  (scope-pop! (parser-node (.current-scope (parser-state))))
+                  (parser-close-continues! terminated)
+                  (scope-end-loop! entry
+                                   (parser-node (.current-scope (parser-state)))
+                                   exit-scope)
+                  (parser-pop-jump!)
+                  (n-unkeep! entry)
+                  (parser-use-scope! exit-scope)
+                  (scope-pop! (parser-node (.current-scope (parser-state))))
+                  0)))))))))
+
+;; The compiler-only Scope names a for-of loop carries across its iterations: the iterator and the
+;; `next` method read from it once, as GetIterator does (§7.4.2 step 5).
+(const FOR-OF-ITERATOR "$aot$.for-of.iterator")
+
+(const FOR-OF-NEXT "$aot$.for-of.next")
+
+;; True on every path through the body, false on the path the exhausted iterator takes: at the
+;; loop's exit it is the Phi that says whether control left early, and an early exit closes the
+;; iterator (§7.4.9). An iterator that answered `done` is already closed and must not be returned to.
+(const FOR-OF-EARLY "$aot$.for-of.early")
+
+;; ForIn/OfBodyEvaluation (§14.7.5.7) over the iteration protocol: the iterable is evaluated once,
+;; GetIterator answers the iterator and its `next`, and each iteration calls `next`, stops on a
+;; truthy `done`, and binds `value` in the head's own binding. A `break` or a `return` leaves through
+;; the exit scope, where the iterator is closed (§7.4.9) — the loop's normal end does not close it,
+;; because an exhausted iterator is already done.
+(defn lower-for-of [(head ForInit) (right i64) (body i64)] (-> i64)
+  (do
+    (scope-push! (parser-node (.current-scope (parser-state))))
+    (match head
+      (ForInitDecl [stmt]
+                   (match (syntax-stmt-node stmt)
+                     (SsLet [name init final annotation]
+                            (lower-instantiate-lexical-stmt! stmt))
+                     (SsVar [name init annotation]
+                            (lower-syntax-statement stmt))
+                     ;; A pattern head declares its names here and binds them per iteration.
+                     (SsLetPattern [pattern init final]
+                                   (lower-instantiate-lexical-stmt! stmt))
+                     (SsVarPattern [pattern init] 0)
+                     (_ (broken "for-in/of head: not a binding statement"))))
+      (ForInitPattern [pattern]
+                      (unimplemented "destructuring for-in/of heads"
+                                     "docs/GAPS.md — destructuring"))
+      (_ 0))
+    (let [iterable (lower-syntax-expr right)]
+      (n-keep! iterable)
+      (scope-pop! (parser-node (.current-scope (parser-state))))
+      (let [iterator
+              (lower-completion! (lower-jsl-values1 "JsGetIterator" iterable))]
+        (n-unkeep! iterable)
+        (n-keep! iterator)
+        (let [next
+                (lower-completion! (lower-jsl-values1 "JsIteratorNextMethod"
+                                                      iterator))
+              scope (parser-node (.current-scope (parser-state)))]
+          (n-keep! next)
+          (scope-push! scope)
+          (scope-define! scope FOR-OF-ITERATOR (ty-dyn TAG-ANY) false iterator)
+          (scope-define! scope FOR-OF-NEXT (ty-dyn TAG-ANY) false next)
+          (scope-define! scope
+                         FOR-OF-EARLY
+                         (ty-dyn TAG-ANY)
+                         false
+                         (lower-singleton "JsTrue"))
+          (n-unkeep! next)
+          (n-unkeep! iterator)
+          (let [entry (lower-loop-head!)
+                result
+                  (lower-completion! (lower-jsl-values2 "JsIteratorStep"
+                                                        (lower-for-in-slot FOR-OF-ITERATOR)
+                                                        (lower-for-in-slot FOR-OF-NEXT)))]
+            (n-keep! result)
+            (let [done
+                    (lower-js-truthy (lower-completion! (lower-jsl-values1 "JsIteratorDone"
+                                                                           result)))
+                  condition-scope (parser-node (.current-scope (parser-state)))
+                  iff (if-make (scope-ctrl condition-scope) done)
+                  arms (if-arms! iff)]
+              ;; `done` true leaves the loop; the false arm is the body.
+              (scope-set-ctrl! condition-scope (arms-true arms))
+              (let [exit-scope (scope-dup condition-scope false)]
+                ;; Only the exhausted path is not an early exit; the body keeps the true it was
+                ;; given, so a `break` carries it into this same scope and the Phi says so.
+                (scope-update! exit-scope
+                               FOR-OF-EARLY
+                               (lower-singleton "JsFalse"))
+                (parser-push-jump! exit-scope JUMP-LOOP)
+                (scope-set-ctrl! condition-scope (arms-false arms))
+                (set! (.current-ctrl (parser-state)) (n-nid (arms-false arms)))
+                (let [value
+                        (lower-completion! (lower-jsl-values1 "JsIteratorValue"
+                                                              result))]
+                  (n-keep! value)
+                  (n-unkeep! result)
+                  (scope-push! (parser-node (.current-scope (parser-state))))
+                  (lower-for-in-bind! head value)
+                  (n-unkeep! value)
+                  (let [terminated (lower-syntax-statement body)]
+                    (scope-pop! (parser-node (.current-scope (parser-state))))
+                    (parser-close-continues! terminated)
+                    (scope-end-loop! entry
+                                     (parser-node (.current-scope (parser-state)))
+                                     exit-scope)
+                    (parser-pop-jump!)
+                    (n-unkeep! entry)
+                    (parser-use-scope! exit-scope)
+                    (lower-for-of-close!)
+                    (scope-pop! (parser-node (.current-scope (parser-state))))
+                    0))))))))))
+
+;; At the loop's exit: the iterator is closed exactly when control left the body early.
+(defn lower-for-of-close! [] (-> i64)
+  (let [early (lower-js-truthy (lower-for-in-slot FOR-OF-EARLY))
+        scope (parser-node (.current-scope (parser-state)))
+        iff (if-make (scope-ctrl scope) early)
+        arms (if-arms! iff)
+        skipped (scope-dup scope false)]
+    (scope-set-ctrl! scope (arms-true arms))
+    (set! (.current-ctrl (parser-state)) (n-nid (arms-true arms)))
+    (lower-completion! (lower-jsl-values1 "JsIteratorClose"
+                                          (lower-for-in-slot FOR-OF-ITERATOR)))
+    (scope-set-ctrl! skipped (arms-false arms))
+    (let [merged
+            (scope-merge! (parser-node (.current-scope (parser-state))) skipped)]
+      (set! (.current-scope (parser-state)) (n-nid merged))
+      (set! (.current-ctrl (parser-state)) (n-nid (scope-ctrl merged)))
+      0)))
+
+(defn lower-for-in-slot [(name (slice u8))] (-> (dyn NodeOps))
+  (match (scope-lookup (parser-node (.current-scope (parser-state))) name)
+    (Some [v] v)
+    (None []
+          (do
+            (broken "lower-for-in-slot: loop state is not in scope")
+            (unreachable-node)))))
+
+(defn lower-for-in-bind! [(head ForInit) (key (dyn NodeOps))] (-> i64)
+  (match head
+    (ForInitDecl [stmt]
+                 (match (syntax-stmt-node stmt)
+                   (SsLet [name init final annotation]
+                          (scope-define! (parser-node (.current-scope (parser-state)))
+                                         name
+                                         (ty-dyn TAG-ANY)
+                                         final
+                                         key))
+                   (SsVar [name init annotation]
+                          (let [(mut ref) (primitive/zeroed SyntaxRef)]
+                            (lower-ref-name-prepare! (mut ref) name)
+                            (lower-ref-put! (load ref) key)
+                            (lower-ref-release! (load ref))
+                            0))
+                   ;; `for (const {a} of xs)`: each iteration's value binds the head's pattern.
+                   (SsLetPattern [pattern init final]
+                                 (lower-pattern-bind! pattern key PATTERN-PARAM))
+                   (SsVarPattern [pattern init]
+                                 (lower-pattern-bind! pattern key PATTERN-VAR))
+                   (_ (broken "lower-for-in-bind!: a head that is not a binding"))))
+    (ForInitExpr [target]
+                 (let [ref (lower-ref-prepare! target)]
+                   (lower-ref-put! ref key)
+                   (lower-ref-release! ref)
+                   0))
+    (_ (unimplemented "destructuring for-in/of heads"
+                      "docs/GAPS.md — destructuring"))))

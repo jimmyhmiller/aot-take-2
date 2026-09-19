@@ -1,0 +1,302 @@
+;; The realm's var-like globals: the binding table, assignment marking, and global loads and stores.
+
+(module aot.parse.realm.globals)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.property" :use *)
+(import "aot.node.gc" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.shape" :use *)
+(import "aot.heap" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.lower.jsl" :use *)
+(import "aot.parse.lower.exception" :use *)
+
+(defn syntax-restricted-global? [(name (slice u8))] (-> bool)
+  (or (= name "undefined") (= name "Infinity") (= name "NaN")))
+
+;; The value and function properties of the global object ECMA-262 §19 requires, and the
+;; well-known constructors and namespaces. None is provided yet; a program naming one must not be
+;; told the name is unresolvable (`typeof JSON` is "object" in every realm), so a read of one is
+;; a runtime refusal, never `undefined`.
+(defn syntax-standard-global? [(name (slice u8))] (-> bool)
+  (or (= name "globalThis")
+      (= name "eval")
+      (= name "isFinite")
+      (= name "isNaN")
+      (= name "parseFloat")
+      (= name "parseInt")
+      (= name "decodeURI")
+      (= name "decodeURIComponent")
+      (= name "encodeURI")
+      (= name "encodeURIComponent")
+      (= name "Array")
+      (= name "ArrayBuffer")
+      (= name "BigInt")
+      (= name "Boolean")
+      (= name "DataView")
+      (= name "Date")
+      (= name "Error")
+      (= name "EvalError")
+      (= name "Function")
+      (= name "Map")
+      (= name "Number")
+      (= name "Object")
+      (= name "Promise")
+      (= name "Proxy")
+      (= name "RangeError")
+      (= name "ReferenceError")
+      (= name "RegExp")
+      (= name "Set")
+      (= name "String")
+      (= name "Symbol")
+      (= name "SyntaxError")
+      (= name "TypeError")
+      (= name "URIError")
+      (= name "WeakMap")
+      (= name "WeakRef")
+      (= name "WeakSet")
+      (= name "FinalizationRegistry")
+      (= name "Atomics")
+      (= name "JSON")
+      (= name "Math")
+      (= name "Reflect")
+      (= name "AggregateError")
+      (= name "SharedArrayBuffer")
+      (= name "Iterator")
+      (= name "Int8Array")
+      (= name "Uint8Array")
+      (= name "Uint8ClampedArray")
+      (= name "Int16Array")
+      (= name "Uint16Array")
+      (= name "Int32Array")
+      (= name "Uint32Array")
+      (= name "Float32Array")
+      (= name "Float64Array")
+      (= name "BigInt64Array")
+      (= name "BigUint64Array")))
+
+;; ---------------------------------------------------------------------------
+;; The realm's var-like globals
+;;
+;; Every top-level `var` and function declaration of every Script is a property of the one global
+;; object from the start. Functions are recorded first so a same-Script `var` of the same name
+;; keeps the function's instantiation; a second function declaration anywhere means the name is
+;; reassigned at some Script's instantiation, so calls to it go through the loaded value.
+(defn syntax-script-root? [(i i64)] (-> bool)
+  (let [(mut found) false]
+    (al-for [root (.scripts (parser-state))]
+            (if (= root i) (set! (mut found) true) 0))
+    (load found)))
+
+(defn syntax-global-index [(name (slice u8))] (-> i64)
+  (let [globals (.globals (parser-state))
+        (mut i) 0]
+    (loop (if (>= (load i) (len globals))
+              (break -1)
+              (let [b (get globals (load i))]
+                (if (= (.name b) name)
+                    (break (load i))
+                    (do (set! (mut i) (+ (load i) 1)) (continue))))))))
+
+(defn syntax-global-ptr [(g i64)] (-> (ptr GlobalBinding))
+  (al-elem [GlobalBinding] (mut (.globals (parser-state))) g))
+
+(defn syntax-global-declare! [(name (slice u8)) (script i64) (fun i64)] (-> i64)
+  (let [existing (syntax-global-index name)]
+    (if (< existing 0)
+        (do
+          (push! [GlobalBinding]
+                 (mut (.globals (parser-state)))
+                 (GlobalBinding
+                   :name name
+                   :script script
+                   :fun fun
+                   :assigned false))
+          0)
+        (let [g (syntax-global-ptr existing)]
+          (if (>= fun 0)
+              (do
+                (if (>= (.fun g) 0) (set! (.assigned g) true) 0)
+                (set! (.fun g) fun))
+              0)
+          0))))
+
+(defn syntax-mark-assigned-global! [(name (slice u8))] (-> i64)
+  (let [g (syntax-global-index name)]
+    (if (>= g 0) (do (set! (.assigned (syntax-global-ptr g)) true) 0) 0)))
+
+;; Every name an assignment target can store to. Patterns are walked conservatively: any name
+;; appearing inside one counts, whether or not it is a binding position.
+(defn syntax-mark-assigned-target! [(target i64)] (-> i64)
+  (match (syntax-node target)
+    (SxName [name] (syntax-mark-assigned-global! name))
+    (SxGroup [inner] (syntax-mark-assigned-target! inner))
+    (SxArray [elements]
+             (do
+               (al-for [element elements]
+                       (match element
+                         (ElemHole [] 0)
+                         (ElemExpr [expr] (syntax-mark-assigned-target! expr))
+                         (ElemSpread [expr] (syntax-mark-assigned-target! expr))))
+               0))
+    (SxObject [entries]
+              (do
+                (al-for [entry entries]
+                        (match entry
+                          (PropValue [key value]
+                                     (syntax-mark-assigned-target! value))
+                          (PropCoverInit [name init]
+                                         (syntax-mark-assigned-global! name))
+                          (PropSpread [expr]
+                                      (syntax-mark-assigned-target! expr))
+                          (_ 0)))
+                0))
+    (SxAssign [inner value] (syntax-mark-assigned-target! inner))
+    (_ 0)))
+
+(defn syntax-mark-assigned-pattern! [(pattern i64)] (-> i64)
+  (let [(mut names) (al-new [(slice u8)] (compiler-allocator))]
+    (syntax-pattern-names! pattern (mut names))
+    (al-for [name (load names)] (syntax-mark-assigned-global! name))
+    (al-free! [(slice u8)] (mut names))
+    0))
+
+(defn syntax-mark-assigned-globals! [] (-> i64)
+  (do
+    (al-for [x (.exprs (parser-state))]
+            (let [expr x]
+              (match (.node expr)
+                (SxAssign [target value] (syntax-mark-assigned-target! target))
+                (SxCompoundAssign [op target value]
+                                  (syntax-mark-assigned-target! target))
+                (SxLogicalAssign [predicate rhs-on-true target value]
+                                 (syntax-mark-assigned-target! target))
+                (SxUpdate [op prefix target]
+                          (syntax-mark-assigned-target! target))
+                (_ 0))))
+    (al-for [st (.stmts (parser-state))]
+            (let [stmt st]
+              (match (.node stmt)
+                (SsVar [name init annotation]
+                       (match init
+                         (Some [e] (syntax-mark-assigned-global! name))
+                         (None [] 0)))
+                (SsVarPattern [pattern init]
+                              (syntax-mark-assigned-pattern! pattern))
+                (SsForIn [head of right body awaited]
+                         (match head
+                           (ForInitDecl [decl]
+                                        (match (syntax-stmt-node decl)
+                                          (SsVar [name init annotation]
+                                                 (syntax-mark-assigned-global! name))
+                                          (SsVarPattern [pattern init]
+                                                        (syntax-mark-assigned-pattern! pattern))
+                                          (_ 0)))
+                           (ForInitExpr [expr]
+                                        (syntax-mark-assigned-target! expr))
+                           (ForInitPattern [pattern]
+                                           (syntax-mark-assigned-pattern! pattern))
+                           (ForNoInit [] 0)))
+                (_ 0))))
+    0))
+
+;; The realm's global object as a proven raw object at the current point.
+(defn lower-global-object-raw [] (-> (dyn NodeOps))
+  (unbox-make (lower-global-object) REP-OBJECT))
+
+;; The Script whose code is being lowered.
+(defn parser-current-script [] (-> i64)
+  (let [f (syntax-fun-at (.current-fun (parser-state)))] (.script f)))
+
+;; The Fun a call to global `g` may name directly, or -1: a never-reassigned function declaration
+;; the calling Script can already see.
+(defn syntax-global-direct-fun [(g i64)] (-> i64)
+  (let [b (get (.globals (parser-state)) g)]
+    (if (and (not (.external-mutation (parser-state)))
+             (>= (.fun b) 0)
+             (not (.assigned b))
+             (<= (.script b) (parser-current-script)))
+        (.fun b)
+        -1)))
+
+;; Closed-program globals use their image address. Reusable Script units read the executing
+;; realm's root; the template retained by this compilation does not establish global identity.
+(defn lower-global-object [] (-> (dyn NodeOps))
+  (let [p (parser-state)
+        scope (parser-node (.current-scope p))]
+    (if (>= (heap-global-reference-entry) 0)
+        (box-make (staticref-make (heap-global-reference-entry) REP-OBJECT))
+        (realm-global-object-load (parser-node (.current-ctrl p))
+                                  (scope-mem scope)))))
+
+(defn lower-global-load [(name (slice u8))] (-> (dyn NodeOps))
+  ;; A declaration records a name, not permission to read its descriptor storage as a value.
+  ;; Another unit can replace a configurable global with an accessor or remove it. Use the same
+  ;; JSL environment read as an imported name, including its completion. Closed compilation
+  ;; retains its existing own-slot path and earlier-Script diagnostics.
+  (if (< (syntax-global-index name) 0)
+      (panic "lower-global-load: name is not a realm global")
+      0)
+  (if (.external-mutation (parser-state))
+      (lower-completion! (lower-jsl-unary-value "JsGlobalBindingRead"
+                                                (keyref-make (shape-key-intern name))))
+      (lower-closed-global-load name)))
+
+(defn lower-closed-global-load [(name (slice u8))] (-> (dyn NodeOps))
+  (let [g (syntax-global-index name)
+        p (parser-state)]
+    (if (< g 0) (panic "lower-global-load: name is not a realm global") 0)
+    ;; Top-level code of an earlier Script reading a global a later Script declares runs before
+    ;; that declaration is instantiated: a ReferenceError, unimplemented. A function body resolves
+    ;; the name when it is called, which is after every Script's instantiation in the common case
+    ;; (the harness's functions naming the test's globals); a call made too early reads the slot's
+    ;; initial undefined instead of the ReferenceError (docs/GAPS.md).
+    (let [b (get (.globals p) g)]
+      (if (and (> (.script b) (parser-current-script))
+               (syntax-script-root? (.current-fun p)))
+          (unimplemented "reference to a global declared only by a later Script (ReferenceError before its instantiation)"
+                         "docs/GAPS.md — shared global-object bindings")
+          0))
+    (let [object (lower-global-object-raw)
+          scope (parser-node (.current-scope p))
+          ;; An access on the global object, an image object: it folds to the image word or to a
+          ;; fixed-offset load once the closed-world facts are in (aot.node.property,
+          ;; prop-image-resolve!).
+          loaded
+            (prop-access-emit (parser-node (.current-ctrl p))
+                              (scope-mem scope)
+                              object
+                              (None [(dyn NodeOps)])
+                              (shape-key-intern name)
+                              PROP-LOAD)]
+      (parser-set-current-ctrl! (.ctrl loaded))
+      (scope-set-mem! scope (.mem loaded))
+      (.value loaded))))
+
+(defn lower-global-store! [(name (slice u8)) (value (dyn NodeOps))] (-> i64)
+  (let [g (syntax-global-index name)
+        p (parser-state)]
+    (if (< g 0) (panic "lower-global-store!: name is not a realm global") 0)
+    (n-keep! value)
+    (let [object (lower-global-object-raw)
+          scope (parser-node (.current-scope p))
+          stored
+            (prop-access-emit (parser-node (.current-ctrl p))
+                              (scope-mem scope)
+                              object
+                              (Some value)
+                              (shape-key-intern name)
+                              PROP-STORE)]
+      (n-unkeep! value)
+      (parser-set-current-ctrl! (.ctrl stored))
+      (scope-set-mem! scope (.mem stored))
+      0)))

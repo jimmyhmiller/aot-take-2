@@ -1,0 +1,190 @@
+;; How a function uses its arguments object.
+
+(module aot.parse.analysis.arguments)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.realm.globals" :use *)
+(import "aot.parse.lower.function" :use *)
+
+;; ---------------------------------------------------------------------------
+;; The arguments object (docs/DECISIONS.md, the arguments object)
+;;
+;; A function whose own code names `arguments`, with no parameter of that name, has an arguments
+;; object (FunctionDeclarationInstantiation, §10.2.11 steps 15-22). Making it when only a shadowing
+;; declaration is ever read is unobservable, so the syntactic mention decides. Its public entry
+;; builds it from the call's count and actuals and passes it in a hidden slot after the formals.
+;;
+;; A sloppy function with simple parameters gets a mapped object: its indices below the formal
+;; count alias the formals. That aliasing is observable only through a write — to a formal, or to an
+;; index of the object through any alias of it. So this compiler builds the object once, unaliased,
+;; exactly when that is indistinguishable: no formal is assigned anywhere in the function, and every
+;; mention of `arguments` is the owner of a property read (`arguments.length`, `arguments[i]`),
+;; never written, deleted, called as a receiver or passed on. Otherwise it refuses by name. With no
+;; formals nothing is mapped and every use is admitted.
+(defstruct ArgumentsScan [(names bool) (unmappable bool) (rebinds bool)])  ; rebinds: `arguments` itself is written
+
+(defn syntax-arguments-formal? [(fi i64) (name (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (al-for [p (.params (syntax-fun-ptr fi))]
+            (if (= p name) (set! (mut found) true) 0))
+    (load found)))
+
+(defn syntax-arguments-visit! [(fi i64)
+                               (id i64)
+                               (read-owner bool)
+                               (scan (mut ArgumentsScan))] (-> i64)
+  (match (syntax-node id)
+    (SxName [name]
+            (if (= name "arguments")
+                (do
+                  (set! (.names scan) true)
+                  (if read-owner 0 (set! (.unmappable scan) true))
+                  0)
+                0))
+    (SxGroup [inner] (syntax-arguments-visit! fi inner read-owner (mut scan)))
+    (SxMember [owner name optional]
+              (syntax-arguments-visit! fi owner true (mut scan)))
+    (SxIndex [owner key optional]
+             (do
+               (syntax-arguments-visit! fi owner true (mut scan))
+               (syntax-arguments-visit! fi key false (mut scan))))
+    (SxAssign [target value]
+              (do
+                (syntax-arguments-target! fi target (mut scan))
+                (syntax-arguments-visit! fi value false (mut scan))))
+    (SxCompoundAssign [op target value]
+                      (do
+                        (syntax-arguments-target! fi target (mut scan))
+                        (syntax-arguments-visit! fi value false (mut scan))))
+    (SxLogicalAssign [predicate rhs-on-true target value]
+                     (do
+                       (syntax-arguments-target! fi target (mut scan))
+                       (syntax-arguments-visit! fi value false (mut scan))))
+    (SxUpdate [op prefix target]
+              (syntax-arguments-target! fi target (mut scan)))
+    (SxDelete [operand] (syntax-arguments-target! fi operand (mut scan)))
+    (SxCall [callee args optional]
+            (do
+              ;; A member call passes its owner as the receiver: the object escapes.
+              (match (syntax-node (syntax-ungroup-id callee))
+                (SxMember [owner name opt]
+                          (syntax-arguments-visit! fi owner false (mut scan)))
+                (SxIndex [owner key opt]
+                         (do
+                           (syntax-arguments-visit! fi owner false (mut scan))
+                           (syntax-arguments-visit! fi key false (mut scan))))
+                (_ (syntax-arguments-visit! fi callee false (mut scan))))
+              (al-for [a args] (syntax-arguments-visit! fi a false (mut scan)))
+              0))
+    (_ (let [(mut kids) (al-new [i64] (compiler-allocator))]
+         (syntax-expr-children! id (mut kids))
+         (al-for [k (load kids)]
+                 (syntax-arguments-visit! fi k false (mut scan)))
+         (al-free! [i64] (mut kids))
+         0))))
+
+;; A write's target: a formal or `arguments` itself is written; a property of anything is written
+;; through its owner, which therefore escapes the read-only use.
+(defn syntax-arguments-target! [(fi i64)
+                                (target i64)
+                                (scan (mut ArgumentsScan))] (-> i64)
+  (let [t (syntax-ungroup-id target)]
+    (match (syntax-node t)
+      (SxName [name]
+              (do
+                (if (= name "arguments")
+                    (do (set! (.names scan) true) (set! (.rebinds scan) true) 0)
+                    0)
+                (if (or (= name "arguments") (syntax-arguments-formal? fi name))
+                    (set! (.unmappable scan) true)
+                    0)
+                0))
+      (SxMember [owner name optional]
+                (syntax-arguments-visit! fi owner false (mut scan)))
+      (SxIndex [owner key optional]
+               (do
+                 (syntax-arguments-visit! fi owner false (mut scan))
+                 (syntax-arguments-visit! fi key false (mut scan))))
+      (_ (syntax-arguments-visit! fi t false (mut scan))))))
+
+(defn syntax-arguments-stmt! [(fi i64) (id i64) (scan (mut ArgumentsScan))] (-> i64)
+  (do
+    (match (syntax-stmt-node id)
+      ;; `var x = …` redeclaring a formal assigns it.
+      (SsVar [name init annotation]
+             (match init
+               (Some [e]
+                     (if (syntax-arguments-formal? fi name)
+                         (set! (.unmappable scan) true)
+                         0))
+               (None [] 0)))
+      (SsForIn [head of right body awaited]
+               (match head
+                 (ForInitExpr [e] (syntax-arguments-target! fi e (mut scan)))
+                 (ForInitDecl [stmt]
+                              (match (syntax-stmt-node stmt)
+                                (SsVar [name init annotation]
+                                       (if (syntax-arguments-formal? fi name)
+                                           (set! (.unmappable scan) true)
+                                           0))
+                                (_ 0)))
+                 (_ 0)))
+      (_ 0))
+    (let [(mut exprs) (al-new [i64] (compiler-allocator))
+          (mut kids) (al-new [i64] (compiler-allocator))]
+      (syntax-stmt-exprs! id (mut exprs))
+      (al-for [e (load exprs)]
+              ;; A for-in expression head was visited as a target above.
+              (if (match (syntax-stmt-node id)
+                    (SsForIn [head of right body awaited]
+                             (match head (ForInitExpr [h] (= h e)) (_ false)))
+                    (_ false))
+                  0
+                  (syntax-arguments-visit! fi e false (mut scan))))
+      (syntax-stmt-children! id (mut kids))
+      (al-for [k (load kids)] (syntax-arguments-stmt! fi k (mut scan)))
+      (al-free! [i64] (mut exprs))
+      (al-free! [i64] (mut kids))
+      0)))
+
+;; Mark every non-root, non-intrinsic function that has an arguments object, and whether its object
+;; cannot stand for a mapped one.
+(defn syntax-analyze-arguments! [] (-> i64)
+  (let [(mut fi) 0]
+    (loop (if (>= (load fi) (len (.funs (parser-state))))
+              (break 0)
+              (do
+                (if (or (syntax-script-root? (load fi))
+                        (syntax-fun-forwarding? (load fi))
+                        ;; An arrow has no arguments object of its own: its mention is a capture.
+                        (match (.kind (syntax-fun-ptr (load fi)))
+                          (FunArrow [] true)
+                          (_ false))
+                        (syntax-arguments-formal? (load fi) "arguments"))
+                    0
+                    (let [fp (syntax-fun-ptr (load fi))
+                          (mut scan) (primitive/zeroed ArgumentsScan)]
+                      (al-for [s (.body fp)]
+                              (syntax-arguments-stmt! (load fi) s (mut scan)))
+                      (match (.expression-body fp)
+                        (Some [e]
+                              (syntax-arguments-visit! (load fi)
+                                                       e
+                                                       false
+                                                       (mut scan)))
+                        (None [] 0))
+                      (set! (.arguments-object fp) (.names scan))
+                      ;; Assigning `arguments` itself rebinds the object: refused with or without formals.
+                      (set! (.arguments-unmappable fp)
+                            (and (.names scan)
+                                 (or (.rebinds scan)
+                                     (and (.unmappable scan)
+                                          (> (len (.params fp)) 0)))))
+                      0))
+                (set! (mut fi) (+ (load fi) 1))
+                (continue))))))

@@ -1,0 +1,462 @@
+;; Which bindings a nested function captures, and who owns each captured binding.
+
+(module aot.parse.analysis.capture)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.analysis.declarations" :use *)
+(import "aot.parse.realm.globals" :use *)
+
+;; Final Simple ScopeNode.find searches Var inputs from innermost to outermost; lookup then
+;; materializes a lazy loop Phi through update. Our separately lowered functions do not share
+;; those Scope inputs. Before falling through to a realm name, recover the enclosing lexical
+;; scopes from the syntax tree. Only statements containing the child's definition contribute:
+;; sibling blocks, a switch discriminant and a catch's finally body have different environments.
+;; Syntax ranges are local to the owning function's Script; never scan another Script's tree.
+;; This identifies captures, not their storage: unsupported local environments still refuse.
+(defn syntax-stmt-contains-position? [(id i64) (position i64)] (-> bool)
+  (and (<= (syntax-stmt-lo id) position) (< position (syntax-stmt-hi id))))
+
+(defn syntax-capture-loop-head! [(head ForInit)
+                                 (names (mut (ArrayList (slice u8))))] (-> i64)
+  (match head
+    (ForInitDecl [stmt]
+                 (let [(mut declarations) (al-new [i64] (compiler-allocator))]
+                   (push! [i64] (mut declarations) stmt)
+                   (syntax-collect-declarations! (load declarations)
+                                                 true
+                                                 (mut names))
+                   (al-free! (mut declarations))
+                   0))
+    (_ 0)))
+
+(defn syntax-capture-blocks! [(stmts (ArrayList i64))
+                              (position i64)
+                              (names (mut (ArrayList (slice u8))))] (-> i64)
+  (al-for [id stmts]
+          (if (syntax-stmt-contains-position? id position)
+              (let [(mut children) (al-new [i64] (compiler-allocator))]
+                (match (syntax-stmt-node id)
+                  (SsBlock [body]
+                           (syntax-collect-declarations! body true (mut names)))
+                  (SsSwitch [discriminant cases]
+                            (let [(mut in-cases) false]
+                              (al-for [c cases]
+                                      (if (syntax-stmt-contains-position? c
+                                                                          position)
+                                          (set! (mut in-cases) true)
+                                          0))
+                              (if (load in-cases)
+                                  (syntax-collect-declarations! cases
+                                                                true
+                                                                (mut names))
+                                  0)))
+                  (SsFor [init test update body]
+                         (syntax-capture-loop-head! init (mut names)))
+                  (SsForIn [head of right body awaited]
+                           (syntax-capture-loop-head! head (mut names)))
+                  (SsTry [body catch-param catch-body finally-body]
+                         (match catch-body
+                           (Some [caught]
+                                 (if (syntax-stmt-contains-position? caught
+                                                                     position)
+                                     (match catch-param
+                                       (Some [pattern]
+                                             (syntax-pattern-names! pattern
+                                                                    (mut names)))
+                                       (None [] 0))
+                                     0))
+                           (None [] 0)))
+                  (_ 0))
+                (syntax-stmt-children! id (mut children))
+                (syntax-capture-blocks! (load children) position (mut names))
+                (al-free! (mut children))
+                0)
+              0))
+  0)
+
+;; Root Script declarations belong to the realm; nested blocks within a Script do not.
+;; A hoisted ordinary function still owns parameter/var/lexical bindings that children capture.
+(defn syntax-enclosing-binding? [(fun i64) (name (slice u8))] (-> bool)
+  (let [(mut current) (let [f (syntax-fun-at fun)] (.parent f))
+        (mut child) fun
+        (mut found) false]
+    (loop (if (or (load found) (< (load current) 0))
+              (break 0)
+              (let [f (syntax-fun-at (load current))
+                    child-fun (syntax-fun-at (load child))
+                    (mut names) (al-new [(slice u8)] (compiler-allocator))]
+                (syntax-capture-blocks! (.body f) (.lo child-fun) (mut names))
+                (if (syntax-script-root? (load current))
+                    0
+                    (do
+                      (al-for [p (.params f)]
+                              (push! [(slice u8)] (mut names) p))
+                      (match (.rest-param f)
+                        (Some [r] (push! [(slice u8)] (mut names) r))
+                        (None [] 0))
+                      (syntax-collect-declarations! (.body f) false (mut names))
+                      (syntax-collect-declarations! (.body f) true (mut names))
+                      (syntax-function-decl-names! (.body f) (mut names))
+                      (match (.kind f)
+                        (FunExpression []
+                                       (push! [(slice u8)]
+                                              (mut names)
+                                              (.name f)))
+                        (_ 0))
+                      0))
+                (al-for [n (load names)]
+                        (if (= n name) (set! (mut found) true) 0))
+                (al-free! [(slice u8)] (mut names))
+                (set! (mut child) (load current))
+                (set! (mut current) (.parent f))
+                (continue))))
+    (load found)))
+
+;; A record's own activation bindings: its parameters, its `var`s, its body function declarations
+;; and, for a function expression, its own name. These live exactly as long as one call does, which
+;; is what an environment record models.
+(defn syntax-fun-activation-names! [(fi i64) (out (mut (ArrayList (slice u8))))] (-> i64)
+  (let [f (syntax-fun-at fi)]
+    ;; A Script's root binds the realm: its `var`s are global properties and its declarations are
+    ;; the closed world's functions, neither of which a nested function captures.
+    (if (syntax-script-root? fi)
+        0
+        (do
+          (al-for [p (.params f)] (push! [(slice u8)] (mut out) p))
+          (match (.rest-param f)
+            (Some [r] (push! [(slice u8)] (mut out) r))
+            (None [] 0))
+          (syntax-collect-declarations! (.body f) false (mut out))
+          (syntax-function-decl-names! (.body f) (mut out))
+          (match (.kind f)
+            (FunExpression [] (push! [(slice u8)] (mut out) (.name f)))
+            (_ 0))
+          0))))
+
+;; A record's own block-scoped bindings: its body's `let`, `const` and `class` declarations, and
+;; those of the blocks enclosing `position`. Their lifetime is a block, or one loop iteration, which
+;; an activation's environment does not model, so capturing one still refuses by name.
+(defn syntax-fun-lexical-names! [(fi i64)
+                                 (position i64)
+                                 (out (mut (ArrayList (slice u8))))] (-> i64)
+  (let [f (syntax-fun-at fi)]
+    (syntax-capture-blocks! (.body f) position (mut out))
+    0))
+
+;; A record's own body-level `let`, `const` and `class` bindings. One activation has exactly one of
+;; each, so an environment slot models it — empty until its initialization, which is its temporal
+;; dead zone. A block's lexicals are not these: a block inside a loop has one per iteration.
+(defn syntax-fun-body-lexical-names! [(fi i64)
+                                      (out (mut (ArrayList (slice u8))))] (-> i64)
+  (let [f (syntax-fun-at fi)]
+    (if (syntax-script-root? fi)
+        0
+        (do (syntax-collect-declarations! (.body f) true (mut out)) 0))))
+
+;; Whether a captured binding of `owner` is one of its body lexicals, and so starts in its dead zone.
+;; The capture pass recorded it beside the slot, so this is the slot's own answer.
+(defn syntax-env-name-lexical? [(owner i64) (name (slice u8))] (-> bool)
+  (let [f (syntax-fun-ptr owner)
+        (mut i) 0
+        (mut found) false]
+    (al-for [n (.env-names f)]
+            (do
+              (if (and (= n name) (= (get (.env-lexical f) (load i)) 1))
+                  (set! (mut found) true)
+                  0)
+              (set! (mut i) (+ (load i) 1))
+              0))
+    (load found)))
+
+;; Where a name one record mentions is bound: the innermost enclosing record binding it, and whether
+;; that binding is one of the activation's own. A name the record binds itself, or that nothing
+;; encloses, answers -1 and is not a capture.
+(defstruct CaptureOwner [(fun i64) (activation bool)])
+
+;; The compiler-only binding an arrow's `this` reads: the receiver of the nearest function around it.
+(const THIS-CAPTURE-SLOT "$aot$.this-capture")
+
+;; The nearest enclosing record that has a receiver of its own, for an arrow's `this`.
+(defn syntax-receiver-owner [(fun i64)] (-> i64)
+  (let [(mut current) (let [f (syntax-fun-at fun)] (.parent f))]
+    (loop (if (< (load current) 0)
+              (break -1)
+              (let [f (syntax-fun-at (load current))]
+                (match (.kind f)
+                  (FunArrow [] (do (set! (mut current) (.parent f)) (continue)))
+                  (_ (break (load current)))))))))
+
+(defn syntax-capture-owner [(fun i64) (name (slice u8))] (-> CaptureOwner)
+  (if (= name THIS-CAPTURE-SLOT)
+      (if (syntax-fun-arrow? fun)
+          (CaptureOwner :fun (syntax-receiver-owner fun) :activation true)
+          (CaptureOwner :fun -1 :activation false))
+      (let [(mut owner) -1
+            (mut activation?) false
+            (mut current) (let [f (syntax-fun-at fun)] (.parent f))
+            (mut child) fun]
+        (loop (if (or (>= (load owner) 0) (< (load current) 0))
+                  (break 0)
+                  (let [child-fun (syntax-fun-at (load child))
+                        current-fun (syntax-fun-at (load current))
+                        (mut activation)
+                          (al-new [(slice u8)] (compiler-allocator))
+                        (mut lexical) (al-new [(slice u8)] (compiler-allocator))]
+                    (syntax-fun-activation-names! (load current)
+                                                  (mut activation))
+                    (syntax-fun-body-lexical-names! (load current)
+                                                    (mut activation))
+                    (syntax-fun-lexical-names! (load current)
+                                               (.lo child-fun)
+                                               (mut lexical))
+                    (if (syntax-names-contain? (load lexical) name)
+                        (do
+                          (set! (mut owner) (load current))
+                          (set! (mut activation?) false)
+                          0)
+                        (if (syntax-names-contain? (load activation) name)
+                            (do
+                              (set! (mut owner) (load current))
+                              (set! (mut activation?) true)
+                              0)
+                            0))
+                    (al-free! [(slice u8)] (mut activation))
+                    (al-free! [(slice u8)] (mut lexical))
+                    (set! (mut child) (load current))
+                    (set! (mut current) (.parent current-fun))
+                    (continue))))
+        (CaptureOwner :fun (load owner) :activation (load activation?)))))
+
+;; Every identifier one record's own code mentions, its nested records excluded — they ask the same
+;; question for themselves. A class body's heritage and computed keys belong to the record around
+;; the class; its methods and field initializers are records of their own.
+(defn syntax-fun-references! [(fi i64) (out (mut (ArrayList (slice u8))))] (-> i64)
+  (let [f (syntax-fun-at fi)]
+    (al-for [s (.body f)] (syntax-reference-walk-stmt! s (mut out)))
+    (match (.expression-body f)
+      (Some [e] (syntax-reference-walk-expr! e (mut out)))
+      (None [] 0))
+    (al-for [d (.param-defaults f)]
+            (match d
+              (Some [init] (syntax-reference-walk-expr! init (mut out)))
+              (None [] 0)))
+    0))
+
+(defn syntax-reference-walk-stmt! [(id i64) (out (mut (ArrayList (slice u8))))] (-> i64)
+  (match (syntax-stmt-node id)
+    ;; A nested record answers for itself; a class's own expressions belong to this record.
+    (SsFunctionDecl [fun] 0)
+    (SsClassDecl [cls] (syntax-reference-walk-class! cls (mut out)))
+    (_ (let [(mut exprs) (al-new [i64] (compiler-allocator))
+             (mut children) (al-new [i64] (compiler-allocator))]
+         (syntax-stmt-exprs! id (mut exprs))
+         (al-for [e (load exprs)] (syntax-reference-walk-expr! e (mut out)))
+         (syntax-stmt-children! id (mut children))
+         (al-for [c (load children)] (syntax-reference-walk-stmt! c (mut out)))
+         (al-free! [i64] (mut exprs))
+         (al-free! [i64] (mut children))
+         0))))
+
+(defn syntax-reference-walk-expr! [(id i64) (out (mut (ArrayList (slice u8))))] (-> i64)
+  (match (syntax-node id)
+    (SxName [name] (do (push! [(slice u8)] (mut out) name) 0))
+    ;; An arrow's `this` is the receiver of the function around it, which is a capture like any
+    ;; other; a non-arrow's is its own and is dropped by the resolution below. A `super` reference
+    ;; reads that same receiver, and needs the home object besides, which is what refuses.
+    (SxThis [] (do (push! [(slice u8)] (mut out) THIS-CAPTURE-SLOT) 0))
+    (SxSuper [] (do (push! [(slice u8)] (mut out) THIS-CAPTURE-SLOT) 0))
+    (SxFunction [fun] 0)
+    (SxClass [cls] (syntax-reference-walk-class! cls (mut out)))
+    (_ (let [(mut children) (al-new [i64] (compiler-allocator))]
+         (syntax-expr-children! id (mut children))
+         (al-for [c (load children)] (syntax-reference-walk-expr! c (mut out)))
+         (al-free! [i64] (mut children))
+         0))))
+
+(defn syntax-reference-walk-class! [(cls i64)
+                                    (out (mut (ArrayList (slice u8))))] (-> i64)
+  (let [(mut exprs) (al-new [i64] (compiler-allocator))]
+    (syntax-class-exprs! cls (mut exprs))
+    (al-for [e (load exprs)] (syntax-reference-walk-expr! e (mut out)))
+    (al-free! [i64] (mut exprs))
+    0))
+
+;; ---------------------------------------------------------------------------
+;; Which bindings a nested function captures (docs/DECISIONS.md, closures)
+;;
+;; A binding one activation owns and a nested function mentions cannot stay an SSA value: the two
+;; functions share it, and either may write it. Such a binding moves into the activation's
+;; environment record, a JS array whose element 0 is the enclosing environment and whose other
+;; elements are its captured bindings in a fixed order. A record that mentions a captured binding
+;; reaches the chain through the function object it was called with, so it needs the callee slot.
+;;
+;; The pass is one sweep: every record's own references, resolved against the records enclosing it.
+;; A name bound by a block, a `let`, a `const` or a class of an enclosing function is not an
+;; activation binding — its lifetime is a block or a loop iteration — and capturing it still refuses
+;; by name where it is written.
+;; Whether a record reads a captured `let`, `const` or `class` — its own or an enclosing
+;; activation's — whose slot is empty until its initialization runs. The capture pass recorded it.
+(defn syntax-fun-reads-captured-lexical? [(fi i64)] (-> bool)
+  (let [f (syntax-fun-ptr fi)] (.reads-captured-lexical f)))
+
+(defn syntax-compute-captures! [] (-> i64)
+  (let [p (parser-state)
+        count (len (.funs p))
+        (mut i) 0]
+    (loop (if (>= (load i) count)
+              (break 0)
+              (do
+                (syntax-capture-record! (load i))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))
+
+;; One record's references, resolved against the records enclosing it. The ancestor chain is walked
+;; once and each ancestor's names are collected once, with every name still unresolved tested
+;; against that level: the innermost binding wins, which is what dropping a name on resolution
+;; means. Resolving one name at a time would recollect an ancestor's declarations per name.
+(defn syntax-capture-record! [(fi i64)] (-> i64)
+  (let [(mut names) (al-new [(slice u8)] (compiler-allocator))]
+    (syntax-fun-references! fi (mut names))
+    (let [(mut pending) (al-new [(slice u8)] (compiler-allocator))]
+      ;; One entry per distinct name, so an ancestor level is tested once for each. An arrow's
+      ;; `this` is not bound by name: it is the receiver of the nearest function around it.
+      (al-for [name (load names)]
+              (if (= name THIS-CAPTURE-SLOT)
+                  (if (syntax-fun-arrow? fi)
+                      (let [owner (syntax-receiver-owner fi)]
+                        (if (>= owner 0)
+                            (syntax-capture-binding! owner name fi false)
+                            0))
+                      0)
+                  (if (syntax-names-contain? (load pending) name)
+                      0
+                      (do (push! [(slice u8)] (mut pending) name) 0))))
+      (al-free! [(slice u8)] (mut names))
+      (let [(mut child) fi
+            (mut current) (let [f (syntax-fun-at fi)] (.parent f))]
+        (loop (if (or (< (load current) 0) (= (len (load pending)) 0))
+                  (break 0)
+                  (let [child-fun (syntax-fun-at (load child))
+                        current-fun (syntax-fun-at (load current))
+                        (mut activation)
+                          (al-new [(slice u8)] (compiler-allocator))
+                        (mut lexical) (al-new [(slice u8)] (compiler-allocator))
+                        (mut unresolved)
+                          (al-new [(slice u8)] (compiler-allocator))]
+                    (syntax-fun-activation-names! (load current)
+                                                  (mut activation))
+                    (syntax-fun-lexical-names! (load current)
+                                               (.lo child-fun)
+                                               (mut lexical))
+                    (let [(mut body-lexical)
+                            (al-new [(slice u8)] (compiler-allocator))]
+                      (syntax-fun-body-lexical-names! (load current)
+                                                      (mut body-lexical))
+                      (al-for [name (load pending)]
+                              (if (syntax-names-contain? (load lexical) name)
+                                  ;; A block's binding: resolved here, and not capturable.
+                                  0
+                                  (if (syntax-names-contain? (load body-lexical)
+                                                             name)
+                                      (syntax-capture-binding! (load current)
+                                                               name
+                                                               fi
+                                                               true)
+                                      (if (syntax-names-contain? (load activation)
+                                                                 name)
+                                          (syntax-capture-binding! (load current)
+                                                                   name
+                                                                   fi
+                                                                   false)
+                                          (do
+                                            (push! [(slice u8)]
+                                                   (mut unresolved)
+                                                   name)
+                                            0)))))
+                      (al-free! [(slice u8)] (mut body-lexical)))
+                    (al-free! [(slice u8)] (mut activation))
+                    (al-free! [(slice u8)] (mut lexical))
+                    (al-free! [(slice u8)] (mut pending))
+                    (set! (mut pending) (load unresolved))
+                    (set! (mut child) (load current))
+                    (set! (mut current) (.parent current-fun))
+                    (continue))))
+        (al-free! [(slice u8)] (mut pending))
+        0))))
+
+;; `name` is a binding of `owner` that `user`, a function inside it, mentions: give it a slot in
+;; `owner`'s environment, and mark every record from `user` out to `owner` as needing the chain.
+;; A lexical binding's slot is empty until its initialization, so whoever reads it can throw.
+(defn syntax-capture-binding! [(owner i64)
+                               (name (slice u8))
+                               (user i64)
+                               (lexical bool)] (-> i64)
+  (let [op (syntax-fun-ptr owner)]
+    (if (syntax-names-contain? (.env-names op) name)
+        0
+        (do
+          (push! [(slice u8)] (mut (.env-names op)) name)
+          (push! [i64] (mut (.env-lexical op)) (if lexical 1 0))
+          0))
+    ;; Both sides read the slot through the checked load: the owner's own read of a binding it has
+    ;; put in the environment is the dead zone's ReferenceError too.
+    (if lexical
+        (do
+          (set! (.reads-captured-lexical (syntax-fun-ptr user)) true)
+          (set! (.reads-captured-lexical op) true)
+          0)
+        0)
+    (set! (.owns-env op) true)
+    (let [(mut current) user]
+      (loop (if (= (load current) owner)
+                (break 0)
+                (let [fp (syntax-fun-ptr (load current))]
+                  (set! (.uses-env fp) true)
+                  (set! (.needs-callee fp) true)
+                  (set! (mut current) (.parent fp))
+                  (if (< (load current) 0)
+                      (broken "syntax-capture-binding!: the owner does not enclose the user")
+                      0)
+                  (continue)))))
+    0))
+
+;; The slot `name` has in `owner`'s environment record.
+(defn syntax-environment-slot [(owner i64) (name (slice u8))] (-> i64)
+  (let [f (syntax-fun-ptr owner)
+        (mut slot) 1
+        (mut answer) -1]
+    (al-for [n (.env-names f)]
+            (do
+              (if (and (< (load answer) 0) (= n name))
+                  (set! (mut answer) (load slot))
+                  0)
+              (set! (mut slot) (+ (load slot) 1))
+              0))
+    (if (< (load answer) 0)
+        (broken "syntax-environment-slot: the owner has no slot for a captured binding")
+        0)
+    (load answer)))
+
+;; How many environment records separate the one `user` holds from `owner`'s: the records between
+;; them that own one, the user's own included when it does.
+(defn syntax-environment-depth [(user i64) (owner i64)] (-> i64)
+  (let [(mut depth) 0
+        (mut current) user]
+    (loop (if (= (load current) owner)
+              (break 0)
+              (let [f (syntax-fun-ptr (load current))]
+                (if (.owns-env f) (set! (mut depth) (+ (load depth) 1)) 0)
+                (set! (mut current) (.parent f))
+                (if (< (load current) 0)
+                    (break (do
+                             (broken "syntax-environment-depth: the owner does not enclose the user")
+                             0))
+                    (continue)))))
+    (load depth)))

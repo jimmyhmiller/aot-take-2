@@ -1,0 +1,188 @@
+;; Lowering of destructuring patterns.
+
+(module aot.parse.lower.pattern)
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.type.type" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.analysis.declarations" :use *)
+(import "aot.parse.realm.globals" :use *)
+(import "aot.parse.realm.instantiate" :use *)
+(import "aot.parse.lower.jsl" :use *)
+(import "aot.parse.lower.reference" :use *)
+(import "aot.parse.lower.literal" :use *)
+(import "aot.parse.lower.function" :use *)
+(import "aot.parse.lower.exception" :use *)
+(import "aot.parse.lower.class" :use *)
+(import "aot.parse.lower.environment" :use *)
+
+;; The iteration's key reaches the head: a fresh lexical binding, or PutValue through the var's or the
+;; expression's Reference, evaluated anew each iteration (§14.7.5.7 steps 6.g-6.i).
+;; ---------------------------------------------------------------------------
+;; Destructuring (docs/DECISIONS.md, destructuring)
+;;
+;; BindingInitialization (§8.6.2) and DestructuringAssignmentEvaluation (§13.15.5) are one walk over
+;; a pattern with a value: how a *leaf* is bound is the only difference between a declaration, a
+;; parameter and an assignment, so the walk takes that as a mode and everything else — defaults,
+;; nesting, an object pattern's property reads, an array pattern's iterator — is shared.
+
+;; A lexical declaration's binding: instantiated, and initialized here.
+(const PATTERN-LET 0)
+
+;; A `var` or a parameter: the binding exists and this writes it.
+(const PATTERN-VAR 1)
+
+;; An assignment pattern: every leaf is a Reference, which may be a member access.
+(const PATTERN-ASSIGN 2)
+
+;; A parameter or a catch clause: the binding is introduced here, by this walk.
+(const PATTERN-PARAM 3)
+
+(defn lower-pattern-bind! [(pattern i64) (value (dyn NodeOps)) (mode i64)] (-> i64)
+  (let [p (syntax-pattern-at pattern)
+        ;; `= default` applies when the value is undefined, whatever the target shape (§8.6.2).
+        bound
+          (parser-node (match (.default p)
+                         (Some [init]
+                               (n-nid (lower-parameter-default value init)))
+                         (None [] (n-nid value))))]
+    (n-keep! bound)
+    (match (.node p)
+      (PatName [name] (lower-pattern-name! name bound mode))
+      (PatTarget [expr]
+                 (let [ref (lower-ref-prepare! expr)]
+                   (lower-ref-put! ref bound)
+                   (lower-ref-release! ref)
+                   0))
+      (PatObject [props rest] (lower-pattern-object! props rest bound mode))
+      (PatArray [elements rest] (lower-pattern-array! elements rest bound mode)))
+    (n-unkeep! bound)
+    0))
+
+;; A leaf name, by mode.
+(defn lower-pattern-name! [(name (slice u8)) (value (dyn NodeOps)) (mode i64)] (-> i64)
+  (if (= mode PATTERN-PARAM)
+      (do
+        (scope-define! (parser-node (.current-scope (parser-state)))
+                       name
+                       (ty-dyn TAG-ANY)
+                       false
+                       value)
+        0)
+      (if (= mode PATTERN-LET)
+          (let [scope (parser-node (.current-scope (parser-state)))]
+            (if (>= (scope-find scope name) 0)
+                (lower-binding-initialize! name value)
+                (if (and (syntax-script-root? (.current-fun (parser-state)))
+                         (syntax-script-binding? name))
+                    (lower-script-declaration-effect! "JsInitializeGlobalLexicalBinding"
+                                                      name
+                                                      (Some value))
+                    (broken "lower-pattern-name!: the lexical binding was not instantiated"))))
+          (let [(mut ref) (primitive/zeroed SyntaxRef)]
+            (lower-ref-name-prepare! (mut ref) name)
+            (lower-ref-put! (load ref) value)
+            (lower-ref-release! (load ref))
+            0))))
+
+;; `{a, b: t, [k]: u}` (§13.15.5.5): each property is read from the value, in source order, and the
+;; read itself is what refuses an undefined or null value (RequireObjectCoercible).
+(defn lower-pattern-object! [(props (ArrayList PatProp))
+                             (rest (Option i64))
+                             (value (dyn NodeOps))
+                             (mode i64)] (-> i64)
+  (let [wants-rest (match rest (Some [_] true) (None [] false))
+        ;; `{a, ...rest}`: the properties the pattern names are excluded from the copy, by the key
+        ;; identity each one was read under — so a computed key is converted once, here.
+        excluded
+          (if wants-rest
+              (lower-jsl-values0 "JsExcludedKeys")
+              (dyn-undefined-make))]
+    (n-keep! value)
+    (n-keep! excluded)
+    (al-for [prop props]
+            (let [entry prop
+                  key
+                    (match (.key entry)
+                      (KeyNamed [k] (keyref-make k))
+                      (KeyComputed [e] (lower-literal-computed-key e)))]
+              (n-keep! key)
+              (if wants-rest
+                  (do
+                    (lower-jsl-values2 (match (.key entry)
+                                         (KeyNamed [k] "JsExcludeKey")
+                                         (KeyComputed [e]
+                                                      "JsExcludeComputedKey"))
+                                       excluded
+                                       key)
+                    0)
+                  0)
+              (let [read
+                      (lower-completion! (lower-jsl-values2 (match (.key entry)
+                                                              (KeyNamed [k]
+                                                                        "JsGetNamed")
+                                                              (KeyComputed [e]
+                                                                           "JsGetKeyed"))
+                                                            value
+                                                            key))]
+                (n-unkeep! key)
+                (lower-pattern-bind! (.pattern entry) read mode))))
+    (match rest
+      (Some [r]
+            (lower-pattern-bind! r
+                                 (lower-completion! (lower-jsl-values2 "JsObjectRest"
+                                                                       value
+                                                                       excluded))
+                                 mode))
+      (None [] 0))
+    (n-unkeep! excluded)
+    (n-unkeep! value)
+    0))
+
+;; `[a, , b, ...r]` (§8.6.2): the value is iterated, each target takes the next value — undefined
+;; once the iterator is done — and an iterator the pattern did not exhaust is closed.
+(defn lower-pattern-array! [(elements (ArrayList PatElem))
+                            (rest (Option i64))
+                            (value (dyn NodeOps))
+                            (mode i64)] (-> i64)
+  (let [iterator (lower-completion! (lower-jsl-values1 "JsGetIterator" value))]
+    (n-keep! iterator)
+    (let [next
+            (lower-completion! (lower-jsl-values1 "JsIteratorNextMethod"
+                                                  iterator))]
+      (n-keep! next)
+      (let [state (lower-jsl-values0 "JsDestructureState")]
+        (n-keep! state)
+        (al-for [element elements]
+                (let [taken
+                        (lower-completion! (lower-jsl-values3 "JsDestructureStep"
+                                                              iterator
+                                                              next
+                                                              state))]
+                  (match element
+                    (PatHole [] 0)
+                    (PatItem [pat] (lower-pattern-bind! pat taken mode)))))
+        (match rest
+          (Some [r]
+                (let [remaining
+                        (lower-completion! (lower-jsl-values3 "JsDestructureRest"
+                                                              iterator
+                                                              next
+                                                              state))]
+                  (lower-pattern-bind! r remaining mode)))
+          (None [] 0))
+        (lower-completion! (lower-jsl-values2 "JsDestructureClose"
+                                              iterator
+                                              state))
+        (n-unkeep! state)
+        (n-unkeep! next)
+        (n-unkeep! iterator)
+        0))))

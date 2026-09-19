@@ -1,0 +1,208 @@
+;; Lowering of member reads and optional chains.
+
+(module aot.parse.lower.member)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.control" :use *)
+(import "aot.node.phi" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.type.type" :use *)
+(import "aot.shape" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.lower.jsl" :use *)
+(import "aot.parse.lower.operator" :use *)
+(import "aot.parse.lower.exception" :use *)
+(import "aot.parse.lower.call" :use *)
+(import "aot.parse.lower.expression" :use *)
+
+;; `o[k]`: a runtime key; refuses at run time until keys intern and arrays exist.
+(defn lower-keyed-read [(owner-id i64) (key-id i64)] (-> (dyn NodeOps))
+  (let [owner (lower-syntax-expr owner-id)]
+    (n-keep! owner)
+    (let [k (lower-syntax-expr key-id)
+          answer (lower-value-keyed-read owner k)]
+      (n-unkeep! owner)
+      answer)))
+
+;; The same read over an owner and key the caller already evaluated and keeps alive.
+(defn lower-value-keyed-read [(owner (dyn NodeOps)) (k (dyn NodeOps))] (-> (dyn NodeOps))
+  (let [scope (parser-node (.current-scope (parser-state)))
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (n-keep! owner)
+    (n-keep! k)
+    (push! [(dyn NodeOps)] (mut args) owner)
+    (push! [(dyn NodeOps)] (mut args) k)
+    (let [r (lower-jsl-call-values "JsGetKeyed" (load args))]
+      (al-free! [(dyn NodeOps)] (mut args))
+      (n-unkeep! k)
+      (parser-set-current-ctrl! (.ctrl r))
+      (scope-set-mem! scope (.mem r))
+      (let [checked (lower-completion! (.value r))]
+        (n-unkeep! owner)
+        checked))))
+
+(defn lower-member-read [(owner-id i64) (name (slice u8))] (-> (dyn NodeOps))
+  (lower-value-member-read (lower-syntax-expr owner-id) name))
+
+;; The same read from an owner the caller already evaluated: what a `?.` link needs, since a chain
+;; evaluates its base once and then applies link after link to the value it holds.
+(defn lower-value-member-read [(owner (dyn NodeOps)) (name (slice u8))] (-> (dyn NodeOps))
+  (let [scope (parser-node (.current-scope (parser-state)))
+        (mut args) (al-new [(dyn NodeOps)] (compiler-allocator))]
+    (push! [(dyn NodeOps)] (mut args) owner)
+    (push! [(dyn NodeOps)] (mut args) (keyref-make (shape-key-intern name)))
+    (let [lowered (lower-jsl-call-values "JsGetNamed" (load args))]
+      (al-free! [(dyn NodeOps)] (mut args))
+      (parser-set-current-ctrl! (.ctrl lowered))
+      (scope-set-mem! scope (.mem lowered))
+      (lower-completion! (.value lowered)))))
+
+;; ---------------------------------------------------------------------------
+;; Optional chains (ECMA-262 §13.3.9)
+;;
+;; `a?.b.c(d)` evaluates `a` once; if it is null or undefined the WHOLE chain is undefined and
+;; nothing after the `?.` runs — not the `.c` read, not the call, not `d`. Skipping the rest of the
+;; chain rather than one link is why a chain lowers as a list rather than by recursion on the
+;; syntax tree: each `?.` opens a diamond whose nullish arm is an arrival at one merge past the
+;; last link, the way `break` arrives at a loop's exit. The chain's base is the operand of its
+;; first `?.`, lowered by the ordinary walk, so a direct call or a `super` base keeps its lowering.
+(defstruct ChainState
+  [(value (dyn NodeOps))
+   ;; The `this` a call link uses: the base of the member access it follows, undefined otherwise.
+   (receiver (dyn NodeOps))
+   ;; The Scope every short-circuited arm has arrived in, by nid; -1 before the first `?.`.
+   (arrivals i64)])
+
+;; The links of a chain, innermost first. The returned id is the chain's base.
+(defn syntax-chain-links! [(id i64) (out (mut (ArrayList i64)))] (-> i64)
+  (let [base
+          (match (syntax-node id)
+            (SxMember [owner name optional]
+                      (if optional owner (syntax-chain-links! owner (mut out))))
+            (SxIndex [owner key optional]
+                     (if optional owner (syntax-chain-links! owner (mut out))))
+            (SxCall [callee args optional]
+                    (if optional callee (syntax-chain-links! callee (mut out))))
+            (SxPrivateMember [owner name optional]
+                             (unimplemented "private class members"
+                                            "docs/GAPS.md — classes"))
+            (_ (broken "syntax-chain-links!: a chain link that is not a member, index or call")))]
+    (push! [i64] (mut out) id)
+    base))
+
+(defn syntax-chain-link-optional? [(id i64)] (-> bool)
+  (match (syntax-node id)
+    (SxMember [owner name optional] optional)
+    (SxIndex [owner key optional] optional)
+    (SxCall [callee args optional] optional)
+    (_ false)))
+
+(defn lower-optional-chain [(id i64)] (-> (dyn NodeOps))
+  (let [(mut links) (al-new [i64] (compiler-allocator))
+        base-id (syntax-chain-links! id (mut links))
+        (mut state) (primitive/zeroed ChainState)]
+    (set! (.value (mut state)) (lower-syntax-expr base-id))
+    (set! (.receiver (mut state)) (dyn-undefined-make))
+    (set! (.arrivals (mut state)) -1)
+    (let [final (lower-chain-links (load links) 0 (load state))]
+      (al-free! [i64] (mut links))
+      (lower-chain-merge final))))
+
+(defn lower-chain-links [(links (ArrayList i64))
+                         (i i64)
+                         (state ChainState)] (-> ChainState)
+  (if (>= i (len links))
+      state
+      (lower-chain-links links (+ i 1) (lower-chain-link (get links i) state))))
+
+;; One link: its `?.` guard, then the read or the call it performs.
+(defn lower-chain-link [(link i64) (state ChainState)] (-> ChainState)
+  (let [value (.value state)
+        receiver (.receiver state)]
+    (n-keep! value)
+    (n-keep! receiver)
+    (let [arrivals
+            (if (syntax-chain-link-optional? link)
+                (lower-chain-guard value (.arrivals state))
+                (.arrivals state))
+          (mut next) (primitive/zeroed ChainState)]
+      (set! (.arrivals (mut next)) arrivals)
+      (match (syntax-node link)
+        (SxMember [owner name optional]
+                  (do
+                    (set! (.receiver (mut next)) value)
+                    (set! (.value (mut next))
+                          (lower-value-member-read value name))
+                    0))
+        (SxIndex [owner key optional]
+                 (let [k (lower-syntax-expr key)]
+                   (set! (.receiver (mut next)) value)
+                   (set! (.value (mut next)) (lower-value-keyed-read value k))
+                   0))
+        (SxCall [callee args optional]
+                (do
+                  (set! (.value (mut next))
+                        (if (syntax-args-have-spread? args)
+                            (lower-spread-call value receiver args)
+                            (lower-value-call-with-receiver value
+                                                            receiver
+                                                            (dyn-undefined-make)
+                                                            args
+                                                            (lower-callee-message (syntax-callee-label callee)
+                                                                                  " is not a function"))))
+                  (set! (.receiver (mut next)) (dyn-undefined-make))
+                  0))
+        (_ (broken "lower-chain-link: a chain link that is not a member, index or call")))
+      (n-unkeep! receiver)
+      (n-unkeep! value)
+      (load next))))
+
+;; A `?.` whose base is nullish leaves the chain here, carrying the Scope it left in to the merge.
+(defn lower-chain-guard [(value (dyn NodeOps)) (arrivals i64)] (-> i64)
+  (let [predicate (lower-js-unary value "JsNullish")
+        arms
+          (if-arms! (if-make (parser-node (.current-ctrl (parser-state)))
+                             predicate))
+        live (parser-node (.current-scope (parser-state)))
+        skipped (scope-dup live false)]
+    (parser-set-current-ctrl! (arms-false arms))
+    (scope-set-ctrl! skipped (arms-true arms))
+    (if (< arrivals 0)
+        (do
+          (n-keep! skipped)
+          (n-nid skipped))
+        ;; A chain with several `?.` merges their arms as they appear. The value is undefined on
+        ;; every one of them, so only the Scope needs a Phi here.
+        (let [prior (parser-node arrivals)]
+          (scope-merge! prior skipped)
+          arrivals))))
+
+;; Past the last link: the chain's value on the live path, undefined on every short-circuited one.
+(defn lower-chain-merge [(state ChainState)] (-> (dyn NodeOps))
+  (if (< (.arrivals state) 0)
+      (do
+        (broken "lower-chain-merge: an optional chain with no `?.`")
+        (.value state))
+      (let [value (.value state)
+            live (parser-node (.current-scope (parser-state)))
+            arrivals (parser-node (.arrivals state))]
+        (n-keep! value)
+        ;; The merge kills the arrivals Scope, which a kept node refuses.
+        (n-unkeep! arrivals)
+        (let [merged (scope-merge! live arrivals)
+              region (scope-ctrl merged)
+              phi (phi-make region (ty-dyn TAG-ANY) "optional-chain")]
+          (phi-add-value! phi value)
+          (phi-add-value! phi (dyn-undefined-make))
+          (set! (.current-scope (parser-state)) (n-nid merged))
+          (set! (.current-ctrl (parser-state)) (n-nid region))
+          (n-unkeep! value)
+          phi))))

@@ -1,0 +1,315 @@
+;; Grammar of binding patterns, and the cover grammar that reinterprets a literal as a pattern.
+
+(module aot.parse.grammar.pattern)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.shape" :use *)
+(import "aot.parse.lexer" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.grammar.literal" :use *)
+(import "aot.parse.grammar.expression" :use *)
+
+;; BindingPattern: `[ elements ]` or `{ properties }` in a declaration, parameter or catch clause.
+;; Elements are names or nested patterns with an optional `= default`; a rest element takes no
+;; default and must be last; an object rest element is a plain name.
+(defn parse-syntax-binding-element! [] (-> i64)
+  (let [t (peek-token)
+        target
+          (if (or (token-is t "[") (token-is t "{"))
+              (parse-syntax-binding-pattern!)
+              (let [name (require-binding-identifier)]
+                (syntax-pattern-add! (PatName (token-text name))
+                                     (None [i64])
+                                     (.start name)
+                                     (.end name))))]
+    (if (take-is "=")
+        (let [value (parse-syntax-assignment)
+              x (syntax-pattern-at target)]
+          (syntax-pattern-add! (.node x) (Some value) (.lo x) (syntax-hi value)))
+        target)))
+
+(defn parse-syntax-binding-pattern! [] (-> i64)
+  (let [open (take-token)]
+    (if (token-is open "[")
+        (let [(mut elements) (al-new [PatElem] (compiler-allocator))
+              (mut rest) (None [i64])]
+          (loop (let [t (peek-token)]
+                  (if (token-is t "]")
+                      (break (do (take-token) 0))
+                      (if (token-is t ",")
+                          (do
+                            (take-token)
+                            (push! [PatElem] (mut elements) (PatHole))
+                            (continue))
+                          (if (token-is t "...")
+                              (do
+                                (take-token)
+                                (let [target
+                                        (if (or (token-is (peek-token) "[")
+                                                (token-is (peek-token) "{"))
+                                            (parse-syntax-binding-pattern!)
+                                            (let [name
+                                                    (require-binding-identifier)]
+                                              (syntax-pattern-add! (PatName (token-text name))
+                                                                   (None [i64])
+                                                                   (.start name)
+                                                                   (.end name))))]
+                                  (if (token-is (peek-token) "=")
+                                      (syntax-error! "parser: rest element may not have a default")
+                                      0)
+                                  (set! (mut rest) (Some target))
+                                  (if (take-is "]")
+                                      0
+                                      (syntax-error! "parser: rest element must be last"))
+                                  (break 0)))
+                              (do
+                                (push! [PatElem]
+                                       (mut elements)
+                                       (PatItem (parse-syntax-binding-element!)))
+                                (if (parse-list-separator! "]"
+                                                           "parser: expected `,` or `]` in array pattern")
+                                    (break 0)
+                                    (continue))))))))
+          (syntax-pattern-add! (PatArray (load elements) (load rest))
+                               (None [i64])
+                               (.start open)
+                               (lex-consumed-end)))
+        (let [(mut props) (al-new [PatProp] (compiler-allocator))
+              (mut rest) (None [i64])]
+          (loop (let [t (peek-token)]
+                  (if (token-is t "}")
+                      (break (do (take-token) 0))
+                      (if (token-is t "...")
+                          (do
+                            (take-token)
+                            (let [name (require-binding-identifier)]
+                              (set! (mut rest)
+                                    (Some (syntax-pattern-add! (PatName (token-text name))
+                                                               (None [i64])
+                                                               (.start name)
+                                                               (.end name)))))
+                            (if (take-is "}")
+                                0
+                                (syntax-error! "parser: rest element must be last"))
+                            (break 0))
+                          (let [k (parse-syntax-property-key!)
+                                (mut prop) (primitive/zeroed PatProp)]
+                            (set! (.key (mut prop)) (.key k))
+                            (if (take-is ":")
+                                (set! (.pattern (mut prop))
+                                      (parse-syntax-binding-element!))
+                                (do
+                                  (if (not (.ident k))
+                                      (syntax-error! "parser: shorthand binding property requires an identifier")
+                                      0)
+                                  (syntax-check-binding-name! (.name k))
+                                  (set! (.pattern (mut prop))
+                                        (let [target
+                                                (syntax-pattern-add! (PatName (.name k))
+                                                                     (None [i64])
+                                                                     (.lo k)
+                                                                     (.hi k))]
+                                          (if (take-is "=")
+                                              (let [value
+                                                      (parse-syntax-assignment)]
+                                                (syntax-pattern-add! (PatName (.name k))
+                                                                     (Some value)
+                                                                     (.lo k)
+                                                                     (syntax-hi value)))
+                                              target)))))
+                            (push! [PatProp] (mut props) (load prop))
+                            (if (parse-list-separator! "}"
+                                                       "parser: expected `,` or `}` in object pattern")
+                                (break 0)
+                                (continue)))))))
+          (syntax-pattern-add! (PatObject (load props) (load rest))
+                               (None [i64])
+                               (.start open)
+                               (lex-consumed-end))))))
+
+;; Reinterpret an object or array literal parsed by the cover grammar as a pattern. `binding`
+;; patterns accept only names at the leaves; assignment patterns also accept Reference
+;; expressions. Parentheses around a pattern, methods, call expressions, defaults on rest elements
+;; and non-final rest elements are proven errors.
+(defn syntax-mark-cover-consumed! [(expr i64)] (-> i64)
+  (push! [i64] (mut (.cover-consumed (parser-state))) expr))
+
+(defn syntax-cover-consumed? [(expr i64)] (-> bool)
+  (let [(mut found) false]
+    (al-for [id (.cover-consumed (parser-state))]
+            (if (= id expr) (set! (mut found) true) 0))
+    (load found)))
+
+(defn syntax-cover-leaf! [(expr i64) (binding bool)] (-> i64)
+  (let [x (syntax-at expr)]
+    (match (.node x)
+      (SxName [name]
+              (do
+                (if binding (syntax-check-binding-name! name) 0)
+                (syntax-pattern-add! (PatName name)
+                                     (None [i64])
+                                     (.lo x)
+                                     (.hi x))))
+      (SxMember [owner name optional]
+                (if (or binding (syntax-optional-chain? expr))
+                    (syntax-error! "parser: invalid destructuring target")
+                    (syntax-pattern-add! (PatTarget expr)
+                                         (None [i64])
+                                         (.lo x)
+                                         (.hi x))))
+      (SxPrivateMember [owner name optional]
+                       (if (or binding (syntax-optional-chain? expr))
+                           (syntax-error! "parser: invalid destructuring target")
+                           (syntax-pattern-add! (PatTarget expr)
+                                                (None [i64])
+                                                (.lo x)
+                                                (.hi x))))
+      (SxIndex [owner key optional]
+               (if (or binding (syntax-optional-chain? expr))
+                   (syntax-error! "parser: invalid destructuring target")
+                   (syntax-pattern-add! (PatTarget expr)
+                                        (None [i64])
+                                        (.lo x)
+                                        (.hi x))))
+      (_ (syntax-error! "parser: invalid destructuring target")))))
+
+(defn syntax-cover-to-element! [(expr i64) (binding bool)] (-> i64)
+  (let [x (syntax-at expr)]
+    (match (.node x)
+      (SxAssign [target value]
+                (let [element (syntax-cover-to-element! target binding)
+                      e (syntax-pattern-at element)]
+                  (match (.default e)
+                    (Some [d]
+                          (syntax-error! "parser: invalid destructuring target"))
+                    (None [] 0))
+                  (syntax-pattern-add! (.node e) (Some value) (.lo e) (.hi x))))
+      (SxObject [entries] (syntax-cover-to-pattern! expr binding))
+      (SxArray [elements] (syntax-cover-to-pattern! expr binding))
+      (SxGroup [inner]
+               (if binding
+                   (syntax-error! "parser: invalid binding pattern")
+                   (let [target (syntax-ungroup-id expr)]
+                     (match (syntax-node target)
+                       (SxObject [entries]
+                                 (syntax-error! "parser: a parenthesized pattern is not a valid target"))
+                       (SxArray [elements]
+                                (syntax-error! "parser: a parenthesized pattern is not a valid target"))
+                       ;; `(a)` is a Reference, not a binding: keep the parentheses so a later
+                       ;; reinterpretation as a binding pattern rejects it.
+                       (SxName [name]
+                               (syntax-pattern-add! (PatTarget expr)
+                                                    (None [i64])
+                                                    (.lo x)
+                                                    (.hi x)))
+                       (_ (syntax-cover-leaf! target binding))))))
+      (_ (syntax-cover-leaf! expr binding)))))
+
+(defn syntax-rest-comma? [(expr i64)] (-> bool)
+  (let [(mut found) false]
+    (al-for [id (.rest-comma (parser-state))]
+            (if (= id expr) (set! (mut found) true) 0))
+    (load found)))
+
+(defn syntax-cover-to-pattern! [(expr i64) (binding bool)] (-> i64)
+  (let [x (syntax-at expr)]
+    (syntax-mark-cover-consumed! expr)
+    (if (syntax-rest-comma? expr)
+        (syntax-error! "parser: rest element must be last")
+        0)
+    (match (.node x)
+      (SxObject [entries]
+                (let [(mut props) (al-new [PatProp] (compiler-allocator))
+                      (mut rest) (None [i64])
+                      (mut i) 0]
+                  (al-for [entry entries]
+                          (do
+                            (match (load rest)
+                              (Some [r]
+                                    (syntax-error! "parser: rest element must be last"))
+                              (None [] 0))
+                            (match entry
+                              (PropValue [key value]
+                                         (let [(mut prop)
+                                                 (primitive/zeroed PatProp)]
+                                           (set! (.key (mut prop)) key)
+                                           (set! (.pattern (mut prop))
+                                                 (syntax-cover-to-element! value
+                                                                           binding))
+                                           (push! [PatProp]
+                                                  (mut props)
+                                                  (load prop))))
+                              (PropCoverInit [name init]
+                                             (let [(mut prop)
+                                                     (primitive/zeroed PatProp)]
+                                               (if binding
+                                                   (syntax-check-binding-name! name)
+                                                   0)
+                                               (set! (.key (mut prop))
+                                                     (KeyNamed (shape-key-intern name)))
+                                               (set! (.pattern (mut prop))
+                                                     (syntax-pattern-add! (PatName name)
+                                                                          (Some init)
+                                                                          (.lo x)
+                                                                          (syntax-hi init)))
+                                               (push! [PatProp]
+                                                      (mut props)
+                                                      (load prop))))
+                              (PropSpread [e]
+                                          (do
+                                            (match (syntax-node e)
+                                              (SxObject [inner]
+                                                        (syntax-error! "parser: object rest element must be a simple target"))
+                                              (SxArray [inner]
+                                                       (syntax-error! "parser: object rest element must be a simple target"))
+                                              (SxAssign [target value]
+                                                        (syntax-error! "parser: rest element may not have a default"))
+                                              (_ 0))
+                                            (set! (mut rest)
+                                                  (Some (syntax-cover-to-element! e
+                                                                                  binding)))))
+                              (PropMethod [key fun]
+                                          (syntax-error! "parser: invalid destructuring target")))
+                            (set! (mut i) (+ (load i) 1))))
+                  (syntax-pattern-add! (PatObject (load props) (load rest))
+                                       (None [i64])
+                                       (.lo x)
+                                       (.hi x))))
+      (SxArray [elements]
+               (let [(mut items) (al-new [PatElem] (compiler-allocator))
+                     (mut rest) (None [i64])]
+                 (al-for [element elements]
+                         (do
+                           (match (load rest)
+                             (Some [r]
+                                   (syntax-error! "parser: rest element must be last"))
+                             (None [] 0))
+                           (match element
+                             (ElemHole []
+                                       (push! [PatElem] (mut items) (PatHole)))
+                             (ElemExpr [e]
+                                       (push! [PatElem]
+                                              (mut items)
+                                              (PatItem (syntax-cover-to-element! e
+                                                                                 binding))))
+                             (ElemSpread [e]
+                                         (do
+                                           (match (syntax-node e)
+                                             (SxAssign [target value]
+                                                       (syntax-error! "parser: rest element may not have a default"))
+                                             (_ 0))
+                                           (set! (mut rest)
+                                                 (Some (syntax-cover-to-element! e
+                                                                                 binding))))))))
+                 (syntax-pattern-add! (PatArray (load items) (load rest))
+                                      (None [i64])
+                                      (.lo x)
+                                      (.hi x))))
+      (_ (do
+           (broken "syntax-cover-to-pattern!: not an object or array literal")
+           0)))))

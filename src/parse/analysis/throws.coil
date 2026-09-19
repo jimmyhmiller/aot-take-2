@@ -1,0 +1,375 @@
+;; Which functions can complete with the exception sentinel.
+
+(module aot.parse.analysis.throws)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.jsl.reader" :use [jsl-throws?])
+(import "aot.parse.parser" :use [syntax-find-fun])
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.analysis.declarations" :use *)
+(import "aot.parse.analysis.capture" :use *)
+(import "aot.parse.realm.globals" :use *)
+(import "aot.parse.realm.intrinsics" :use *)
+(import "aot.parse.lower.jsl" :use *)
+(import "aot.parse.lower.function" :use *)
+
+;; ---------------------------------------------------------------------------
+;; Which functions can complete with the exception sentinel
+;;
+;; The truth is the type: a callee's return type carries TAG-EXCEPTION exactly when a throw path
+;; reaches its Return, and `lower-exception-check!` folds to nothing where the type excludes it.
+;; This syntactic fixpoint is an optimization over that truth: a direct call to a function it
+;; proves cannot throw gets no test built at all (the result is narrowed by a Cast instead), which
+;; keeps the parse volume and the optimizer's work proportional to the calls that can throw. A
+;; function throws directly when a `throw`, a call whose target the syntax cannot name (a value, a
+;; member, a constructor, a reassigned global), a property access (a TypeError on undefined or
+;; null), an `instanceof` (a TypeError on a non-callable right operand) or a strict write to a
+;; restricted global sits outside every try-with-catch in its body; it throws indirectly when a
+;; directly named callee may throw. Shadowing a hoisted name with a local binding still counts as a
+;; call to the hoisted function.
+;;
+;; The filter can only under-approximate by missing a throwing construct, and that is caught: a
+;; body whose lowering emits a propagation path (`parser-note-propagation!`) while the filter said
+;; it cannot throw is a hard error naming the function, never a silent miscompile.
+(defn syntax-fun-may-throw? [(i i64)] (-> bool)
+  (let [f (syntax-fun-at i)] (.may-throw f)))
+
+;; Whether evaluating an object literal can throw for a reason other than its property values, which
+;; the walk reaches on its own: a computed key's conversion to a property key
+;; (`JsComputedKeyPrimitive`), and an accessor definition, which is a DefinePropertyOrThrow on the
+;; literal under construction (`JsDefineLiteralAccessor`).
+(defn syntax-literal-defines-may-throw? [(entries (ArrayList ObjectEntry))] (-> bool)
+  (let [(mut found) false]
+    (al-for [entry entries]
+            (match entry
+              (PropValue [key value]
+                         (match key
+                           (KeyComputed [e] (set! (mut found) true))
+                           (_ 0)))
+              (PropMethod [key fun]
+                          (do
+                            (match key
+                              (KeyComputed [e] (set! (mut found) true))
+                              (_ 0))
+                            (match (.kind (syntax-fun-ptr fun))
+                              (FunGetter [] (set! (mut found) true))
+                              (FunSetter [] (set! (mut found) true))
+                              (_ 0))
+                            0))
+              ;; A spread reads every own enumerable property of its source and defines each one.
+              (PropSpread [expr] (set! (mut found) true))
+              (_ 0)))
+    (load found)))
+
+(defn syntax-throw-walk-expr! [(id i64)
+                               (protected bool)
+                               (direct (mut bool))
+                               (edges (mut (ArrayList i64)))] (-> i64)
+  (do
+    (match (syntax-node id)
+      ;; External object bindings can be absent or accessor-backed. This early syntactic pass
+      ;; has no Scope, so it conservatively includes local names; graph return types still
+      ;; eliminate sentinel checks once lowering proves a local read cannot throw.
+      (SxName [name]
+              ;; A Script's lexical binding is read from the realm, and a read before its
+              ;; initialization is the dead zone's ReferenceError.
+              (if (and (not protected)
+                       (or (.external-mutation (parser-state))
+                           (syntax-script-binding? name)))
+                  (set! direct true)
+                  0))
+      (SxCall [callee args optional]
+              (if protected
+                  0
+                  ;; A spread argument walks an iterable, which is user code and throws, whatever
+                  ;; the callee turns out to be.
+                  (if (syntax-args-have-spread? args)
+                      (set! direct true)
+                      (match (syntax-node (syntax-ungroup-id callee))
+                        (SxName [name]
+                                (let [idx (syntax-find-fun name)
+                                      g (syntax-global-index name)]
+                                  (if (or (< idx 0)
+                                          (and (>= g 0)
+                                               (or (.external-mutation (parser-state))
+                                                   (.assigned (syntax-global-ptr g)))))
+                                      (set! direct true)
+                                      (push! [i64] (mut edges) idx))))
+                        (_ (set! direct true))))))
+      (SxNew [callee args] (if protected 0 (set! direct true)))
+      ;; A delete throws on an undefined or null base and, in strict code, when [[Delete]] refuses.
+      (SxDelete [operand] (if protected 0 (set! direct true)))
+      ;; A substitution is ToString'd, which can call user code and throw.
+      (SxTemplate [quasis substitutions]
+                  (if (and (not protected) (> (len substitutions) 0))
+                      (set! direct true)
+                      0))
+      ;; A class definition defines its prototype links and members, each of which can throw.
+      (SxClass [cls] (if protected 0 (set! direct true)))
+      ;; A destructuring assignment reads properties or walks an iterator.
+      (SxDestructuringAssign [pattern value]
+                             (if protected 0 (set! direct true)))
+      ;; An array literal with a spread walks an iterable, which throws.
+      (SxArray [elements]
+               (if (or protected (not (syntax-elements-have-spread? elements)))
+                   0
+                   (set! direct true)))
+      ;; An object literal converts a computed key and defines an accessor, either of which throws.
+      (SxObject [entries]
+                (if (or protected
+                        (not (syntax-literal-defines-may-throw? entries)))
+                    0
+                    (set! direct true)))
+      ;; A property access on undefined or null is a TypeError.
+      (SxMember [owner name optional] (if protected 0 (set! direct true)))
+      (SxIndex [owner key optional] (if protected 0 (set! direct true)))
+      ;; `instanceof` with a non-callable right operand is a TypeError. The operator is recorded
+      ;; by its JSL entry point (a campaign found the source spelling compared here: the filter
+      ;; then cleared every function whose only throw was an `instanceof`).
+      (SxBinary [op left right]
+                (if (and (not protected) (syntax-operator-may-throw? op))
+                    (set! direct true)
+                    0))
+      ;; A unary, update or compound operator whose JSL can throw (ToPrimitive calls user code).
+      (SxUnary [op operand]
+               (if (and (not protected) (syntax-operator-may-throw? op))
+                   (set! direct true)
+                   0))
+      (SxUpdate [op prefix target] (if protected 0 (set! direct true)))
+      (SxCompoundAssign [op target value]
+                        (if (and (not protected)
+                                 (syntax-operator-may-throw? op))
+                            (set! direct true)
+                            0))
+      ;; A strict write to `undefined`, `NaN` or `Infinity` is a TypeError; sloppy code ignores it,
+      ;; but the filter does not know the function's strictness here and stays conservative.
+      (SxAssign [target value]
+                (if protected
+                    0
+                    (match (syntax-node (syntax-ungroup-id target))
+                      (SxName [name]
+                              (if (syntax-restricted-global? name)
+                                  (set! direct true)
+                                  0))
+                      (_ 0))))
+      (_ 0))
+    (let [(mut kids) (al-new [i64] (compiler-allocator))]
+      (syntax-expr-children! id (mut kids))
+      (al-for [k (load kids)]
+              (syntax-throw-walk-expr! k protected (mut direct) (mut edges)))
+      (al-free! [i64] (mut kids))
+      0)))
+
+(defn syntax-throw-walk-stmt! [(id i64)
+                               (protected bool)
+                               (direct (mut bool))
+                               (edges (mut (ArrayList i64)))] (-> i64)
+  (match (syntax-stmt-node id)
+    (SsVar [name init annotation]
+           (match init
+             (Some [e]
+                   (do
+                     ;; The implicit PutValue is not an expression child of this declaration.
+                     (if (and (not protected)
+                              (or (.external-mutation (parser-state))
+                                  (syntax-restricted-global? name)))
+                         (set! direct true)
+                         0)
+                     (syntax-throw-walk-expr! e
+                                              protected
+                                              (mut direct)
+                                              (mut edges))))
+             (None [] 0)))
+    (SsThrow [value]
+             (do
+               (if protected 0 (set! direct true))
+               (syntax-throw-walk-expr! value
+                                        protected
+                                        (mut direct)
+                                        (mut edges))))
+    (SsTry [body catch-param catch-body finally-body]
+           (do
+             (syntax-throw-walk-stmt! body
+                                      (or protected
+                                          (match catch-body
+                                            (Some [_] true)
+                                            (None [] false)))
+                                      (mut direct)
+                                      (mut edges))
+             ;; A destructured catch parameter reads properties of the thrown value or walks it as
+             ;; an iterator. That binding runs in the handler, which this try does not protect.
+             (match catch-param
+               (Some [pattern]
+                     (match (syntax-pattern-node pattern)
+                       (PatName [name] 0)
+                       (_ (if protected 0 (set! direct true)))))
+               (None [] 0))
+             (match catch-body
+               (Some [h]
+                     (syntax-throw-walk-stmt! h
+                                              protected
+                                              (mut direct)
+                                              (mut edges)))
+               (None [] 0))
+             (match finally-body
+               (Some [t]
+                     (syntax-throw-walk-stmt! t
+                                              protected
+                                              (mut direct)
+                                              (mut edges)))
+               (None [] 0))))
+    ;; A for-in head's PutValue, per iteration, is not an expression child: in a retained unit a var
+    ;; head is an environment write that can throw.
+    (SsForIn [head of right body awaited]
+             (do
+               ;; A for-of drives the iteration protocol: GetIterator, `next` and the result's
+               ;; property reads are all calls into user code, and each of them throws.
+               (if (and (not protected)
+                        (or of (.external-mutation (parser-state))))
+                   (set! direct true)
+                   0)
+               (syntax-throw-walk-parts! id protected (mut direct) (mut edges))))
+    ;; A class declaration evaluates the class: its member definitions can throw.
+    (SsClassDecl [cls] (if protected 0 (set! direct true)))
+    ;; A destructuring declaration reads properties or walks an iterator, and both throw.
+    (SsLetPattern [pattern init final]
+                  (do
+                    (if protected 0 (set! direct true))
+                    (syntax-throw-walk-parts! id
+                                              protected
+                                              (mut direct)
+                                              (mut edges))))
+    (SsVarPattern [pattern init]
+                  (do
+                    (if protected 0 (set! direct true))
+                    (syntax-throw-walk-parts! id
+                                              protected
+                                              (mut direct)
+                                              (mut edges))))
+    (_ (syntax-throw-walk-parts! id protected (mut direct) (mut edges)))))
+
+(defn syntax-throw-walk-parts! [(id i64)
+                                (protected bool)
+                                (direct (mut bool))
+                                (edges (mut (ArrayList i64)))] (-> i64)
+  (let [(mut kids) (al-new [i64] (compiler-allocator))
+        (mut exprs) (al-new [i64] (compiler-allocator))]
+    (syntax-stmt-exprs! id (mut exprs))
+    (al-for [e (load exprs)]
+            (syntax-throw-walk-expr! e protected (mut direct) (mut edges)))
+    (syntax-stmt-children! id (mut kids))
+    (al-for [k (load kids)]
+            (syntax-throw-walk-stmt! k protected (mut direct) (mut edges)))
+    (al-free! [i64] (mut exprs))
+    (al-free! [i64] (mut kids))
+    0))
+
+(defn syntax-compute-may-throw! [] (-> i64)
+  (let [p (parser-state)
+        count (len (.funs p))
+        (mut edge-from) (al-new [i64] (compiler-allocator))
+        (mut edge-to) (al-new [i64] (compiler-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) count)
+              (break 0)
+              (let [f (syntax-fun-ptr (load i))
+                    ;; Boundary mode is known during syntax collection; retained-unit mode is
+                    ;; selected afterward. An external Script's declaration checks may throw
+                    ;; even when its body contains only function declarations.
+                    (mut direct)
+                      (or (and (.external-mutation p)
+                               (syntax-script-root? (load i)))
+                          ;; A forwarding entry's builtin can complete with any exception, and a class
+                          ;; constructor throws when it is called without `new`.
+                          (> (len (.abi-builtin f)) 0)
+                          (.class-ctor f)
+                          ;; A captured lexical is read through its environment slot, which is empty
+                          ;; in its temporal dead zone: that read is a ReferenceError.
+                          (syntax-fun-reads-captured-lexical? (load i))
+                          ;; A destructuring parameter reads properties or walks an iterator, and
+                          ;; both of those throw.
+                          (syntax-fun-has-patterns? f))
+                    (mut edges) (al-new [i64] (compiler-allocator))]
+                (al-for [id (.body f)]
+                        (syntax-throw-walk-stmt! id
+                                                 false
+                                                 (mut direct)
+                                                 (mut edges)))
+                (match (.expression-body f)
+                  (Some [e]
+                        (syntax-throw-walk-expr! e
+                                                 false
+                                                 (mut direct)
+                                                 (mut edges)))
+                  (None [] 0))
+                ;; A parameter default is an expression of this function too.
+                (al-for [d (.param-defaults f)]
+                        (match d
+                          (Some [init]
+                                (syntax-throw-walk-expr! init
+                                                         false
+                                                         (mut direct)
+                                                         (mut edges)))
+                          (None [] 0)))
+                (set! (.may-throw f) (load direct))
+                (al-for [t (load edges)]
+                        (do
+                          (push! [i64] (mut edge-from) (load i))
+                          (push! [i64] (mut edge-to) t)))
+                (al-free! [i64] (mut edges))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    ;; Propagate along call edges to a fixpoint.
+    (let [(mut changed) true]
+      (loop (if (not (load changed))
+                (break 0)
+                (do
+                  (set! (mut changed) false)
+                  (let [(mut e) 0]
+                    (loop (if (>= (load e) (len (load edge-from)))
+                              (break 0)
+                              (let [from
+                                      (syntax-fun-ptr (get (load edge-from)
+                                                           (load e)))
+                                    to (get (load edge-to) (load e))]
+                                (if (and (not (.may-throw from))
+                                         (syntax-fun-may-throw? to))
+                                    (do
+                                      (set! (.may-throw from) true)
+                                      (set! (mut changed) true))
+                                    0)
+                                (set! (mut e) (+ (load e) 1))
+                                (continue)))))
+                  (continue)))))
+    (al-free! [i64] (mut edge-from))
+    (al-free! [i64] (mut edge-to))
+    0))
+
+;; May the JSL definition an operator lowers to complete abruptly? The syntactic may-throw filter asks
+;; before any graph exists, so it loads the library if collection has not.
+(defn syntax-operator-may-throw? [(op (slice u8))] (-> bool)
+  (do (parser-load-jsl!) (jsl-throws? (lower-operator-entry op))))
+
+;; An intrinsic record's may-throw: its body is one JSL builtin call over its parameters, so the
+;; syntactic walk has no call edges to other records.
+(defn syntax-intrinsic-may-throw! [(fi i64)] (-> i64)
+  (if (syntax-fun-forwarding? fi)
+      0
+      (let [f (syntax-fun-ptr fi)
+            (mut direct) false
+            (mut edges) (al-new [i64] (compiler-allocator))]
+        (match (.expression-body f)
+          (Some [e] (syntax-throw-walk-expr! e false (mut direct) (mut edges)))
+          (None []
+                (panic "syntax-intrinsic-may-throw!: an intrinsic record has no expression body")))
+        (if (> (len (load edges)) 0)
+            (panic "syntax-intrinsic-may-throw!: an intrinsic body calls a source function")
+            0)
+        (set! (.may-throw f) (load direct))
+        (al-free! [i64] (mut edges))
+        0)))

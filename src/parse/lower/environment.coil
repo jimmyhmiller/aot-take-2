@@ -1,0 +1,198 @@
+;; Environment records: where a captured binding lives and how closures reach it.
+
+(module aot.parse.lower.environment)
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.constant" :use *)
+(import "aot.node.dynamic" :use *)
+(import "aot.node.scope" :use *)
+(import "aot.type.type" :use *)
+(import "aot.parse.syntax" :use *)
+(import "aot.parse.state" :use *)
+(import "aot.parse.analysis.capture" :use *)
+(import "aot.parse.lower.name" :use *)
+(import "aot.parse.lower.jsl" :use *)
+(import "aot.parse.lower.function" :use *)
+(import "aot.parse.lower.exception" :use *)
+(import "aot.parse.lower.call" :use *)
+(import "aot.parse.lower.class" :use *)
+
+;; ---------------------------------------------------------------------------
+;; Environments (docs/DECISIONS.md, closures)
+
+;; The compiler-only Scope name holding the running activation's environment record.
+(const ENVIRONMENT-SLOT "$aot$.env")
+
+;; The environment a record hands to the function objects it creates: its own record when it owns
+;; one, else the environment it was called with, else null.
+(defn lower-environment-value [] (-> (dyn NodeOps))
+  (match (scope-lookup (parser-node (.current-scope (parser-state)))
+                       ENVIRONMENT-SLOT)
+    (Some [env] env)
+    (None [] (dyn-null-make))))
+
+;; A record's environment at entry: a fresh record over the one it was called with when nested
+;; functions capture its bindings, else that one unchanged. Its captured parameters are stored into
+;; their slots at once, so every later read of them is the slot.
+(defn lower-environment-entry! [(fi i64) (fun (dyn NodeOps))] (-> i64)
+  (let [f (syntax-fun-ptr fi)]
+    (if (and (.needs-home f) (.uses-env f))
+        (do
+          (unimplemented "a method that both reads `super` and captures a binding"
+                         "docs/GAPS.md — function values and closures")
+          0)
+        (if (not (or (.owns-env f) (.uses-env f)))
+            0
+            (let [scope (parser-node (.current-scope (parser-state)))
+                  outer
+                    (if (.uses-env f)
+                        (lower-completion! (lower-jsl-values1 "JsFunctionEnvironment"
+                                                              (lower-hidden-callee fi
+                                                                                   fun)))
+                        (dyn-null-make))]
+              (if (not (.owns-env f))
+                  (do
+                    (scope-define! scope
+                                   ENVIRONMENT-SLOT
+                                   (ty-dyn TAG-ANY)
+                                   true
+                                   outer)
+                    0)
+                  (let [env
+                          (lower-jsl-values2 "JsNewEnvironment"
+                                             outer
+                                             (con-int (len (.env-names f))))]
+                    (scope-define! scope
+                                   ENVIRONMENT-SLOT
+                                   (ty-dyn TAG-ANY)
+                                   true
+                                   env)
+                    ;; A captured parameter's actual is its first value; every other captured
+                    ;; binding is stored where its declaration or assignment runs.
+                    (lower-environment-parameters! fi)
+                    0)))))))
+
+;; Each captured binding of the running record becomes a Scope binding that lives in a slot: a
+;; parameter keeps the value its Parm already bound, and the rest start undefined.
+(defn lower-environment-parameters! [(fi i64)] (-> i64)
+  (let [f (syntax-fun-ptr fi)
+        (mut slot) 1]
+    (al-for [name (.env-names f)]
+            (let [scope (parser-node (.current-scope (parser-state)))]
+              (if (= name THIS-CAPTURE-SLOT)
+                  ;; The receiver an arrow inside this function reads as `this`.
+                  (if (.derived-ctor (syntax-fun-ptr fi))
+                      (unimplemented "an arrow that reads `this` in a derived constructor"
+                                     "docs/GAPS.md — classes")
+                      (do
+                        (lower-environment-store! (load slot) (lower-this))
+                        (scope-define-captured! scope
+                                                name
+                                                (ty-dyn TAG-ANY)
+                                                true
+                                                (load slot)
+                                                (dyn-undefined-make))))
+                  (if (>= (scope-find scope name) 0)
+                      ;; A parameter: its actual is the binding's first value, and the binding lives in
+                      ;; the slot from here on.
+                      (let [value (lower-name-uncaptured name)]
+                        (lower-environment-store! (load slot) value)
+                        (scope-mark-captured! (parser-node (.current-scope (parser-state)))
+                                              name
+                                              (load slot)))
+                      (if (syntax-env-name-lexical? fi name)
+                          ;; A body-level `let`, `const` or `class`: its slot stays empty until its
+                          ;; initialization runs, which is its temporal dead zone (§9.1.1.1.6).
+                          (scope-define-captured-lexical! scope
+                                                          name
+                                                          (ty-dyn TAG-ANY)
+                                                          false
+                                                          (load slot)
+                                                          (dyn-undefined-make))
+                          ;; A `var` or a body function declaration: undefined from instantiation on, as
+                          ;; FunctionDeclarationInstantiation binds it (§10.2.11 step 27); instantiation
+                          ;; then finds the binding here and leaves it alone, and each write goes to the
+                          ;; slot.
+                          (do
+                            (lower-environment-store! (load slot)
+                                                      (dyn-undefined-make))
+                            (scope-define-captured! scope
+                                                    name
+                                                    (ty-dyn TAG-ANY)
+                                                    false
+                                                    (load slot)
+                                                    (dyn-undefined-make))))))
+              (set! (mut slot) (+ (load slot) 1))
+              0))
+    0))
+
+;; InitializeBinding for a binding of the running activation: a captured lexical's slot was empty
+;; until now, and filling it ends its temporal dead zone.
+(defn lower-binding-initialize! [(name (slice u8)) (value (dyn NodeOps))] (-> i64)
+  (let [scope (parser-node (.current-scope (parser-state)))
+        slot (scope-env-slot scope name)]
+    (if (>= slot 0)
+        (lower-environment-store! slot value)
+        (scope-initialize! scope name value))))
+
+;; A write to a binding of the running activation, wherever it lives.
+(defn lower-binding-write! [(name (slice u8)) (value (dyn NodeOps))] (-> i64)
+  (let [scope (parser-node (.current-scope (parser-state)))
+        slot (scope-env-slot scope name)]
+    (if (>= slot 0)
+        (lower-environment-store! slot value)
+        (scope-update! scope name value))))
+
+(defn lower-environment-store! [(slot i64) (value (dyn NodeOps))] (-> i64)
+  (lower-jsl-values3 "JsEnvStore"
+                     (lower-environment-value)
+                     (con-int slot)
+                     value)
+  0)
+
+(defn lower-environment-load [(slot i64)] (-> (dyn NodeOps))
+  (lower-jsl-values2 "JsEnvSlot" (lower-environment-value) (con-int slot)))
+
+;; A captured lexical's read: an empty slot is its temporal dead zone, which is a ReferenceError.
+(defn lower-environment-load-checked [(slot i64)] (-> (dyn NodeOps))
+  (lower-completion! (lower-jsl-values2 "JsEnvSlotInitialized"
+                                        (lower-environment-value)
+                                        (con-int slot))))
+
+;; A binding of an enclosing activation: the environment `depth` links above the running one, and
+;; its slot there. Depth counts the records between the two that own an environment.
+(defn lower-environment-outer [(owner i64) (name (slice u8))] (-> (dyn NodeOps))
+  (let [ancestor
+          (lower-jsl-values2 "JsEnvAncestor"
+                             (lower-environment-value)
+                             (con-int (syntax-environment-depth (.current-fun (parser-state))
+                                                                owner)))]
+    (if (syntax-env-name-lexical? owner name)
+        (lower-completion! (lower-jsl-values2 "JsEnvSlotInitialized"
+                                              ancestor
+                                              (con-int (syntax-environment-slot owner
+                                                                                name))))
+        (lower-jsl-values2 "JsEnvSlot"
+                           ancestor
+                           (con-int (syntax-environment-slot owner name))))))
+
+(defn lower-environment-outer-store! [(owner i64)
+                                      (name (slice u8))
+                                      (value (dyn NodeOps))] (-> i64)
+  (let [ancestor
+          (lower-jsl-values2 "JsEnvAncestor"
+                             (lower-environment-value)
+                             (con-int (syntax-environment-depth (.current-fun (parser-state))
+                                                                owner)))]
+    (n-keep! ancestor)
+    (let [slot (syntax-environment-slot owner name)]
+      (lower-completion! (lower-jsl-values3 "JsEnvStore"
+                                            ancestor
+                                            (con-int slot)
+                                            value))
+      (n-unkeep! ancestor)
+      0)))
