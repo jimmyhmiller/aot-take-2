@@ -1,0 +1,190 @@
+;; Scalar types: integers with ranges, floats, and booleans.      TypeInteger, TypeFloat
+
+(module aot.type.scalar)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.type.type"
+        :use
+        [TNil
+         TInt
+         TFlt
+         TTuple
+         TDyn
+         TY-BOT
+         ty-boot!
+         ty-kind
+         ty-intern
+         ty-constant?
+         ty-dual])
+(import "aot.type.fun" :use *)
+(import "aot.type.dyn" :use *)
+
+;; ---------------------------------------------------------------------------
+;; Constructors
+(defn ty-int-range-wide [(lo i64) (hi i64) (widen i64)] (-> i64)
+  (do
+    (ty-boot!)
+    (if (> lo hi) (panic "ty-int-range: empty range; the high int is TY-TOP") 0)
+    (if (or (< widen -3) (> widen 3))
+        (panic-i "ty-int-range: widen outside -3..3" widen)
+        0)
+    (ty-intern (TInt
+                 :lo lo
+                 :hi hi
+                 :widen (if (= lo hi) 0 widen)))))
+
+;; The same type without its widen stage: the stage records how a loop's Phi converged, not what
+;; the values are, so two passes that converged differently agree once it is erased.
+(defn ty-erase-widen [(t i64)] (-> i64)
+  (match (ty-kind t)
+    (TInt [lo hi widen]
+          (if (= widen 0)
+              t
+              ;; A high int is the dual of the range it inverts; erase on that range.
+              (if (> lo hi)
+                  (ty-dual (ty-int-range-wide hi lo 0))
+                  (ty-int-range-wide lo hi 0))))
+    ;; A dynamic integer component carries widen stages too, and a tuple — a Return, a CallEnd —
+    ;; carries them in its members.
+    (TDyn [tags high int identity]
+          (ty-dyn-state tags high (ty-erase-widen int) identity))
+    (TTuple [off ln]
+            (let [(mut members) (al-new [i64] (compiler-allocator))
+                  (mut i) 0]
+              (loop (if (>= (load i) ln)
+                        (break 0)
+                        (do
+                          (push! [i64]
+                                 (mut members)
+                                 (ty-erase-widen (ty-tuple-at t (load i))))
+                          (set! (mut i) (+ (load i) 1))
+                          (continue))))
+              (let [answer (ty-tuple (al-slice (load members)))]
+                (al-free! [i64] (mut members))
+                answer)))
+    (_ t)))
+
+(defn ty-int-range [(lo i64) (hi i64)] (-> i64)
+  (ty-int-range-wide lo hi 0))
+
+(defn ty-int-con [(v i64)] (-> i64)
+  (ty-int-range v v))
+
+(defn ty-int-bot [] (-> i64)
+  (ty-int-range-wide -9223372036854775808 9223372036854775807 3))
+
+;; ---------------------------------------------------------------------------
+;; Float constructors
+;;
+;; Simple's `TypeFloat._sz` encoding, ported exactly:  -64 high flt · -32 high f32 · 0 CONSTANT
+;; (the value lives in `bits`) · 32 low f32 · 64 low flt.  `isHigh` is `sz < 0`; a CONSTANT is
+;; SELF-DUAL, because it sits on the lattice centreline.
+(defn ty-flt [(sz i64)] (-> i64)
+  (do (ty-boot!) (ty-intern (TFlt sz 0))))
+
+(defn flt--bits [(v f64)] (-> i64)
+  (let [p (primitive/alloc-stack f64)]
+    (set! p v)
+    (load (primitive/cast (ptr i64) p))))
+
+(defn flt--from-bits [(bits i64)] (-> f64)
+  (let [p (primitive/alloc-stack i64)]
+    (set! p bits)
+    (load (primitive/cast (ptr f64) p))))
+
+;; Simple asks `(float)con == con`, which is false for a NaN, so a NaN constant never counts as an
+;; f32 there and F32 - F32 folding to NaN falls out of the lattice. Every NaN has an f32 form, so
+;; here a NaN is representable: the fold `f32 - f32 = NaN` stays below F32, as the type says.
+(defn flt--bits-f32? [(bits i64)] (-> bool)
+  (let [v (flt--from-bits bits)]
+    (or (not (primitive/fcmp-eq v v))
+        (primitive/fcmp-eq v (primitive/cast f64 (primitive/cast f32 v))))))
+
+(defn ty-flt-con [(v f64)] (-> i64)
+  (do (ty-boot!) (ty-intern (TFlt 0 (flt--bits v)))))
+
+(defn ty-flt-bot [] (-> i64)
+  (ty-flt 64))
+
+;; Which raw machine representation does this type name? The arithmetic families ask this to settle
+;; their one-shot mode, and it is deliberately NOT "is this a number": an int and a float are two
+;; representations, and conflating them is how an unboxed int reaches a double operand.
+(defn ty-int? [(t i64)] (-> bool)
+  (match (ty-kind t) (TInt [lo hi widen] true) (_ false)))
+
+(defn ty-flt? [(t i64)] (-> bool)
+  (match (ty-kind t) (TFlt [sz bits] true) (_ false)))
+
+;; The integer bounds, for a type that is an int range. Panics otherwise — a caller that has not
+;; checked `ty-int?` is asking a question with no answer.
+(defn ty-int-lo [(t i64)] (-> i64)
+  (match (ty-kind t)
+    (TInt [lo hi widen] lo)
+    (_ (panic "ty-int-lo: not an integer type"))))
+
+(defn ty-int-hi [(t i64)] (-> i64)
+  (match (ty-kind t)
+    (TInt [lo hi widen] hi)
+    (_ (panic "ty-int-hi: not an integer type"))))
+
+(defn ty-int-widen [(t i64)] (-> i64)
+  (match (ty-kind t)
+    (TInt [lo hi widen] widen)
+    (_ (do (panic "ty-int-widen: not an integer type") 0))))
+
+(defn ty-int-slightly-wider-than [(t i64) (minimum i64)] (-> i64)
+  (match (ty-kind t)
+    (TInt [lo hi widen]
+          (if (= lo hi)
+              t
+              (if (< widen 3)
+                  (ty-int-range-wide lo hi (+ widen 1))
+                  (if (ty-int? minimum) minimum (ty-int-bot)))))
+    (_ (do (panic "ty-int-slightly-wider-than: not an integer type") TY-BOT))))
+
+(defn ty-flt-value [(t i64)] (-> f64)
+  (match (ty-kind t)
+    (TFlt [sz bits] (flt--from-bits bits))
+    (_ (do (panic "ty-flt-value: not a float type") 0.0))))
+
+(defn ty-flt-size [(t i64)] (-> i64)
+  (match (ty-kind t)
+    (TFlt [sz bits] sz)
+    (_ (do (panic "ty-flt-size: not a float type") 0))))
+
+;; ECMAScript ToBoolean for the constant kinds represented on the raw lattice.  Both signed zeros
+;; compare equal to 0.0, and NaN is the sole float unequal to itself.
+(defn ty-js-falsy-constant? [(t i64)] (-> bool)
+  (if (not (ty-constant? t))
+      false
+      (match (ty-kind t)
+        (TNil [] true)
+        (TInt [lo hi widen] (= lo 0))
+        (TFlt [sz bits]
+              (let [v (flt--from-bits bits)]
+                (or (primitive/fcmp-eq v 0.0) (not (primitive/fcmp-eq v v)))))
+        (_ false))))
+
+;; ---------------------------------------------------------------------------
+;; Booleans are integers
+;;
+;; Simple has no separate boolean type: `BOOL` is the integer range [0..1], `TRUE` is the constant 1
+;; and `FALSE` is the constant 0. That is not a shortcut — it is what lets `If` take any integer as
+;; a predicate, and what makes `x == 0` and `!x` the same node after a peephole.
+(defn ty-bool [] (-> i64)
+  (ty-int-range-wide 0 1 3))
+
+(defn ty-true [] (-> i64)
+  (ty-int-con 1))
+
+(defn ty-false [] (-> i64)
+  (ty-int-con 0))
+
+;; The HIGH bool — `BOOL.dual()`. What a comparison reports while an operand is still unanalysed:
+;; "the answer will be a boolean, but nobody has computed which".
+(defn ty-bool-high [] (-> i64)
+  (ty-dual (ty-bool)))
