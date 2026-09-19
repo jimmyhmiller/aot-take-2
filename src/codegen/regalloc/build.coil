@@ -1,0 +1,386 @@
+;; Building live ranges from machine definitions, uses and phis.      BuildLRG
+
+(module aot.codegen.regalloc.build)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.codegen.codegen" :use *)
+(import "aot.codegen.machine" :use *)
+(import "aot.codegen.regmask" :use *)
+(import "aot.codegen.regalloc.lrg" :use *)
+(import "aot.codegen.regalloc.trace" :use *)
+
+(defn ra-assign-to-lrg! [(n (dyn NodeOps)) (id i64)] (-> i64)
+  (let [own (ra-lrg-of! n)
+        leader
+          (if (= own 0)
+              (do (n-set-lrg! n (ra-find! id)) (ra-find! id))
+              (ra-union! id own))]
+    (n-set-lrg! n leader)
+    leader))
+
+(defn ra-deeper-node-id [(old-id i64) (candidate (dyn NodeOps))] (-> i64)
+  (if (= old-id 0)
+      (n-nid candidate)
+      (match (arena-node old-id)
+        (Some [old]
+              (if (> (n-ltree-depth candidate) (n-ltree-depth old))
+                  (n-nid candidate)
+                  old-id))
+        (None [] (n-nid candidate)))))
+
+(defn ra-record-mach-def! [(id i64) (n (dyn NodeOps)) (mask (ptr RegMask))] (-> i64)
+  (let [state (ra-state)
+        leader (ra-find! id)
+        old (get (.mach-defs state) leader)]
+    (if (and (!= old 0) (!= old (n-nid n)))
+        (set! (mut (.multi-defs state)) leader true)
+        0)
+    ;; Like Simple, prefer a fixed-register endpoint as the representative.
+    (if (or (= old 0) (mask-singleton? mask))
+        (set! (mut (.mach-defs state)) leader (n-nid n))
+        0)
+    (if (mask-singleton? mask)
+        (set! (mut (.fixed-def-counts state))
+              leader
+              (+ (get (.fixed-def-counts state) leader) 1))
+        0)
+    (if (= (n-op n) OP-MACH-SPLIT)
+        (set! (mut (.split-defs state))
+              leader
+              (ra-deeper-node-id (get (.split-defs state) leader) n))
+        0)
+    0))
+
+(defn ra-record-mach-use! [(id i64)
+                           (use_ (dyn NodeOps))
+                           (idx i64)
+                           (mask (ptr RegMask))] (-> i64)
+  (let [state (ra-state)
+        leader (ra-find! id)
+        old (get (.mach-uses state) leader)]
+    (if (and (!= old 0) (!= old (n-nid use_)))
+        (set! (mut (.multi-uses state)) leader true)
+        0)
+    (if (or (= old 0) (mask-singleton? mask))
+        (do
+          (set! (mut (.mach-uses state)) leader (n-nid use_))
+          (set! (mut (.mach-use-inputs state)) leader idx))
+        0)
+    (if (mask-singleton? mask)
+        (set! (mut (.fixed-use-counts state))
+              leader
+              (+ (get (.fixed-use-counts state) leader) 1))
+        0)
+    (if (= (n-op use_) OP-MACH-SPLIT)
+        (set! (mut (.split-uses state))
+              leader
+              (ra-deeper-node-id (get (.split-uses state) leader) use_))
+        0)
+    0))
+
+(defn ra-build-def! [(n (dyn NodeOps)) (mach (dyn MachNode))] (-> i64)
+  (match (m-outregmap mach)
+    (None [] 0)
+    (Some [mask]
+          (let [two (m-two-address mach)
+                id
+                  (if (= two 0)
+                      (ra-new-lrg! n)
+                      (if (or (< two 1) (>= two (n-nins n)))
+                          (do
+                            (panic-i "ra-build-def!: invalid two-address input"
+                                     two)
+                            0)
+                          (let [input (n-in! n two)
+                                input-id
+                                  (if (= (ra-lrg-of! input) 0)
+                                      (ra-new-lrg! input)
+                                      (ra-lrg-of! input))]
+                            (ra-assign-to-lrg! n input-id))))]
+            (ra-lrg-and-mask! id mask)
+            (ra-record-mach-def! id n mask)
+            (if (= (m-ideal-op mach) OP-MACH-CALLEE-SAVE)
+                (set! (mut (.callee-save-defs (ra-state)))
+                      (ra-find! id)
+                      (n-nid n))
+                0)
+            (ra-find! id)))))
+
+(defn ra-build-phi! [(phi (dyn NodeOps)) (mach (dyn MachNode))] (-> i64)
+  (match (m-outregmap mach)
+    (None [] 0)
+    (Some [mask]
+          (let [(mut leader) (ra-lrg-of! phi)
+                (mut i) 1]
+            (if (= (load leader) 0)
+                (loop (if (>= (load i) (n-nins phi))
+                          (break 0)
+                          (do
+                            (match (n-in phi (load i))
+                              (Some [arm]
+                                    (if (!= (ra-lrg-of! arm) 0)
+                                        (do
+                                          (set! (mut leader) (ra-lrg-of! arm))
+                                          (break 0))
+                                        0))
+                              (None [] 0))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                0)
+            (if (= (load leader) 0)
+                (set! (mut leader) (ra-new-lrg! phi))
+                (set! (mut leader) (ra-assign-to-lrg! phi (load leader))))
+            (set! (mut i) 1)
+            (loop (if (>= (load i) (n-nins phi))
+                      (break 0)
+                      (do
+                        (match (n-in phi (load i))
+                          (Some [arm]
+                                (let [arm-id
+                                        (if (= (ra-lrg-of! arm) 0)
+                                            (ra-new-lrg! arm)
+                                            (ra-lrg-of! arm))]
+                                  (set! (mut leader)
+                                        (ra-union! (load leader) arm-id))
+                                  (n-set-lrg! arm (load leader))))
+                          (None [] 0))
+                        (set! (mut i) (+ (load i) 1))
+                        (continue))))
+            (n-set-lrg! phi (load leader))
+            (ra-lrg-and-mask! (load leader) mask)
+            (ra-record-mach-def! (load leader) phi mask)
+            (load leader)))))
+
+(defn ra-build-node! [(n (dyn NodeOps))] (-> i64)
+  (ra-trace-visit! n)
+  (match (mach-of n)
+    (None [] 0)
+    (Some [mach]
+          (let [op (m-ideal-op mach)]
+            (if (or (= op OP-PHI) (= op OP-MEMPHI))
+                (ra-build-phi! n mach)
+                (do
+                  (ra-build-def! n mach)
+                  (let [(mut i) 1]
+                    (loop (if (>= (load i) (n-nins n))
+                              (break 0)
+                              (do
+                                (match (n-in n (load i))
+                                  (Some [def]
+                                        (match (m-regmap mach (load i))
+                                          (Some [use-mask]
+                                                (let [id
+                                                        (if (= (ra-lrg-of! def)
+                                                               0)
+                                                            (ra-new-lrg! def)
+                                                            (ra-lrg-of! def))]
+                                                  (ra-lrg-and-mask! id use-mask)
+                                                  (ra-record-mach-use! id
+                                                                       n
+                                                                       (load i)
+                                                                       use-mask)))
+                                          (None [] 0)))
+                                  (None [] 0))
+                                (set! (mut i) (+ (load i) 1))
+                                (continue)))))
+                  (ra-lrg-of! n)))))))
+
+(defn ra-compress-node-lrgs! [] (-> i64)
+  (let [(mut id) 1]
+    (loop (if (> (load id) (arena-node-count))
+              (break 0)
+              (do
+                (match (arena-node (load id))
+                  (Some [n]
+                        (if (!= (n-lrg n) 0)
+                            (n-set-lrg! n (ra-find! (n-lrg n)))
+                            0))
+                  (None [] 0))
+                (set! (mut id) (+ (load id) 1))
+                (continue))))
+    0))
+
+(defn ra-success? [] (-> bool)
+  (let [(mut id) 1
+        (mut success) true]
+    (loop (if (or (> (load id) (ra-lrg-count)) (not (load success)))
+              (break 0)
+              (do
+                (if (and (= (ra-find! (load id)) (load id))
+                         (get (.failed (ra-state)) (load id)))
+                    (set! (mut success) false)
+                    0)
+                (set! (mut id) (+ (load id) 1))
+                (continue))))
+    (load success)))
+
+(defn ra-first-failed [] (-> i64)
+  (let [(mut id) 1
+        (mut found) 0]
+    (loop (if (or (> (load id) (ra-lrg-count)) (!= (load found) 0))
+              (break 0)
+              (do
+                (if (and (= (ra-find! (load id)) (load id))
+                         (get (.failed (ra-state)) (load id)))
+                    (set! (mut found) (load id))
+                    0)
+                (set! (mut id) (+ (load id) 1))
+                (continue))))
+    (load found)))
+
+(defn ra-lrg-sample-nid [(id i64)] (-> i64)
+  (let [leader (ra-find! id)
+        (mut nid) 1
+        (mut found) 0]
+    (loop (if (or (> (load nid) (arena-node-count)) (!= (load found) 0))
+              (break 0)
+              (do
+                (match (arena-node (load nid))
+                  (Some [n]
+                        (if (and (!= (n-lrg n) 0)
+                                 (= (ra-find! (n-lrg n)) leader))
+                            (set! (mut found) (load nid))
+                            0))
+                  (None [] 0))
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))
+    (load found)))
+
+(defn ra-lrg-sample-label [(id i64)] (-> (slice u8))
+  (match (arena-node (ra-lrg-sample-nid id))
+    (Some [n] (label n))
+    (None [] "missing-lrg-sample")))
+
+;; ---------------------------------------------------------------------------
+;; The four stages
+
+;; Build live ranges and intersect their allowed register sets. Fails the round on a live range
+;; whose allowed set is empty — a hard conflict, which is pre-split before anything else runs.
+(defn ra-build-lrg! [(round i64)] (-> bool)
+  (let [(mut ci) 0]
+    (set! (.round (ra-trace-cursor)) round)
+    (ra-reset-state! round)
+    (loop (if (>= (load ci) (code-cfg-count))
+              (break 0)
+              (let [block (code-cfg-at (load ci))]
+                (if (cfg-block-head-of? block)
+                    (let [(mut i) 0]
+                      (loop (if (>= (load i) (code-schedule-count block))
+                                (break 0)
+                                (do
+                                  (ra-build-node! (code-schedule-at block
+                                                                    (load i)))
+                                  (set! (mut i) (+ (load i) 1))
+                                  (continue)))))
+                    0)
+                (set! (mut ci) (+ (load ci) 1))
+                (continue))))
+    (ra-check-defined-lrgs!)
+    (ra-compress-node-lrgs!)
+    (ra-success?)))
+
+;; A register operand names a value some scheduled machine node must define into a register class.
+;; A live range with uses and no machine definition would be coloured from its uses alone and read
+;; from a location nothing ever writes; a selected placeholder with no register class is the way
+;; that happens, so it is a hard error here rather than a wrong answer at run time.
+(defn ra-check-defined-lrgs! [] (-> i64)
+  (let [state (ra-state)
+        (mut id) 1]
+    (loop (if (> (load id) (arena-node-count))
+              (break 0)
+              (do
+                (match (arena-node (load id))
+                  (Some [n]
+                        (if (and (!= (n-lrg n) 0)
+                                 (= (get (.mach-defs state)
+                                         (ra-find! (n-lrg n)))
+                                    0))
+                            (n-panic! "ra-build-lrg!: a live range is used in a register but has no machine definition"
+                                      n)
+                            0))
+                  (None [] 0))
+                (set! (mut id) (+ (load id) 1))
+                (continue))))
+    0))
+
+;; Build the interference graph — liveness and interference in ONE pass. A single-register def or
+;; use DENIES its register to neighbours rather than adding an edge.
+(defn ra-propagate-singleton-masks! [] (-> i64)
+  ;; Simple's IFG.do_block denies registers at single-register definitions and uses. Aggregate
+  ;; constraints can also leave a multi-definition Phi with one location (for example, X0 at a
+  ;; Return). That location is mandatory throughout the range, including interference edges far
+  ;; from the fixed use. Propagate those singleton domains before coloring, so a flexible neighbor
+  ;; cannot take the required register merely because the Phi was selected as a risky range.
+  ;; Each range enters the queue only on becoming singleton; every queued adjacency is visited
+  ;; once. Empty domains use the ordinary failure/splitting mechanism, never a relaxed constraint.
+  (let [(mut work) (al-new [i64] (compiler-allocator))
+        (mut i) 1
+        (mut next) 0]
+    (loop (if (> (load i) (ra-lrg-count))
+              (break 0)
+              (do
+                (if (= (ra-find! (load i)) (load i))
+                    (match (ra-lrg-mask (load i))
+                      (Some [mask]
+                            (if (mask-singleton? mask)
+                                (do (push! [i64] (mut work) (load i)) 0)
+                                0))
+                      (None [] 0))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (loop (if (>= (load next) (len (load work)))
+              (break 0)
+              (let [id (get (load work) (load next))]
+                (match (ra-lrg-mask id)
+                  (Some [mask]
+                        (if (mask-singleton? mask)
+                            (let [reg (mask-first mask)
+                                  (mut edge) (get (.adj-heads (ra-state)) id)]
+                              (loop (if (< (load edge) 0)
+                                        (break 0)
+                                        (let [raw
+                                                (get (.adj-to (ra-state))
+                                                     (load edge))]
+                                          (if (> raw 0)
+                                              (let [other (ra-find! raw)]
+                                                (if (!= other id)
+                                                    (match (ra-lrg-mask other)
+                                                      (Some [prior]
+                                                            (if (mask-test prior
+                                                                           reg)
+                                                                (do
+                                                                  (ra-lrg-deny-reg! other
+                                                                                    reg)
+                                                                  (match (ra-lrg-mask other)
+                                                                    (Some [remaining]
+                                                                          (if (mask-singleton? remaining)
+                                                                              (do
+                                                                                (push! [i64]
+                                                                                       (mut work)
+                                                                                       other)
+                                                                                0)
+                                                                              0))
+                                                                    (None [] 0))
+                                                                  0)
+                                                                0))
+                                                      (None [] 0))
+                                                    0))
+                                              0)
+                                          (set! (mut edge)
+                                                (get (.adj-next (ra-state))
+                                                     (load edge)))
+                                          (continue)))))
+                            0))
+                  (None [] 0))
+                (set! (mut next) (+ (load next) 1))
+                (continue))))
+    (al-free! (mut work))
+    0))

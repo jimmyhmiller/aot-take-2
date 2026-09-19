@@ -1,0 +1,304 @@
+;; Splitting self-conflicting live ranges.
+
+(module aot.codegen.regalloc.split-self)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.codegen.machine" :use *)
+(import "aot.codegen.regmask" :use *)
+(import "aot.codegen.regalloc.lrg" :use *)
+(import "aot.codegen.regalloc.ifg" :use *)
+(import "aot.codegen.regalloc.split" :use *)
+
+(defn ra-self-conflict-key [(lrg i64) (nid i64)] (-> i64)
+  (+ (* (ra-find! lrg) (.self-conflict-base (ra-state))) nid))
+
+(defn ra-self-conflict-node? [(lrg i64) (n (dyn NodeOps))] (-> bool)
+  (hm-contains? (.self-conflicts (ra-state))
+                (ra-self-conflict-key lrg (n-nid n))))
+
+(defn ra-lrg-has-self-conflict? [(lrg i64)] (-> bool)
+  (let [nids (.self-conflict-nids (ra-state))
+        (mut i) 0
+        (mut found) false]
+    (loop (if (or (>= (load i) (len nids)) (load found))
+              (break 0)
+              (do
+                (match (arena-node (get nids (load i)))
+                  (Some [n]
+                        (if (ra-self-conflict-node? lrg n)
+                            (set! (mut found) true)
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
+(defn ra-self-conflict-use-visits [] (-> i64)
+  (.self-conflict-use-visits (ra-state)))
+
+(defn ra-self-conflict-sift-down! [(values (mut (ArrayList i64)))
+                                   (start i64)
+                                   (end i64)] (-> i64)
+  (let [(mut root) start
+        (mut done) false]
+    (loop (if (load done)
+              (break 0)
+              (let [left (+ (* (load root) 2) 1)]
+                (if (>= left end)
+                    (set! (mut done) true)
+                    (let [(mut largest) (load root)
+                          right (+ left 1)]
+                      (if (< (get (load values) (load largest))
+                             (get (load values) left))
+                          (set! (mut largest) left)
+                          0)
+                      (if (and (< right end)
+                               (< (get (load values) (load largest))
+                                  (get (load values) right)))
+                          (set! (mut largest) right)
+                          0)
+                      (if (= (load largest) (load root))
+                          (set! (mut done) true)
+                          (let [tmp (get (load values) (load root))]
+                            (set! (mut values)
+                                  (load root)
+                                  (get (load values) (load largest)))
+                            (set! (mut values) (load largest) tmp)
+                            (set! (mut root) (load largest))))))
+                (continue))))
+    0))
+
+;; Heap sort keeps the deterministic nid order final Simple obtains from Arrays.sort, without
+;; turning a pathological function with many self-conflicts into quadratic compiler work.
+(defn ra-sort-self-conflicts! [(values (mut (ArrayList i64)))] (-> i64)
+  (let [(mut start) (- (/ (len (load values)) 2) 1)]
+    (loop (if (< (load start) 0)
+              (break 0)
+              (do
+                (ra-self-conflict-sift-down! (mut values)
+                                             (load start)
+                                             (len (load values)))
+                (set! (mut start) (- (load start) 1))
+                (continue))))
+    (let [(mut end) (- (len (load values)) 1)]
+      (loop (if (<= (load end) 0)
+                (break 0)
+                (let [tmp (get (load values) 0)]
+                  (set! (mut values) 0 (get (load values) (load end)))
+                  (set! (mut values) (load end) tmp)
+                  (ra-self-conflict-sift-down! (mut values) 0 (load end))
+                  (set! (mut end) (- (load end) 1))
+                  (continue)))))
+    0))
+
+;; Simple snapshots and nid-sorts the self-conflict set before graph surgery. Keep the same
+;; deterministic contract while walking only the sparse conflict index, not every arena slot.
+(defn ra-self-conflicts-for [(lrg i64)] (-> (ArrayList i64))
+  (let [a (compiler-allocator)
+        (mut conflicts) (al-new [i64] a)
+        nids (.self-conflict-nids (ra-state))
+        (mut i) 0]
+    (loop (if (>= (load i) (len nids))
+              (break 0)
+              (do
+                (match (arena-node (get nids (load i)))
+                  (Some [n]
+                        (if (ra-self-conflict-node? lrg n)
+                            (push! [i64] (mut conflicts) (n-nid n))
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (ra-sort-self-conflicts! (mut conflicts))
+    (load conflicts)))
+
+;; A live range that conflicts with ITSELF — typically a Phi whose inputs need different registers.
+;; Loop Phis are split cold-edges-first; see the header.
+;; Final Simple's insertBefore skips an existing Split only if it is in the effective use block,
+;; has that sole use, and the use is not fixed to one register. A Split after a Parm in the Fun
+;; block does NOT satisfy a Phi edge in a successor block: treating every Split as sufficient
+;; forces the two alternative values to be defined in the same LRG simultaneously.
+(defn ra-use-split-sufficient? [(use_ (dyn NodeOps)) (idx i64)] (-> bool)
+  (let [input (n-in! use_ idx)
+        block (ra-split-block-for-use use_ idx)]
+    (and (= (n-op input) OP-MACH-SPLIT)
+         (= (n-block-nid input) (n-nid block))
+         (= (n-nouts input) 1)
+         (match (mach-of use_)
+           (Some [mach]
+                 (match (m-regmap mach idx)
+                   (Some [mask] (not (mask-singleton? mask)))
+                   (None [] true)))
+           (None [] true)))))
+
+(defn ra-split-self-conflict! [(round i64) (lrg i64)] (-> bool)
+  (let [leader (ra-find! lrg)
+        a (compiler-allocator)
+        (mut defer-now) (hm-new [i64 bool] a (i64-keyops))
+        conflicts (ra-self-conflicts-for leader)
+        (mut nid) 0
+        (mut count) 0]
+    ;; Discover loop Phis touched by the conflict. A Phi absent from the persistent set gets one
+    ;; cold-only round; seeing it again means the cold split failed and hot edges are now eligible.
+    (loop (if (>= (load nid) (len conflicts))
+              (break 0)
+              (do
+                (match (arena-node (get conflicts (load nid)))
+                  (Some [def]
+                        (if (ra-self-conflict-node? leader def)
+                            (do
+                              (if (ra-loop-phi? def)
+                                  (if (not (hm-contains? (.deferred-loop-self (ra-state))
+                                                         (n-nid def)))
+                                      (do
+                                        (set! (mut defer-now) (n-nid def) true)
+                                        (set! (mut (.deferred-loop-self (ra-state)))
+                                              (n-nid def)
+                                              true))
+                                      0)
+                                  0)
+                              (let [(mut use-index) 0]
+                                (loop (if (>= (load use-index) (n-nouts def))
+                                          (break 0)
+                                          (do
+                                            (set! (mut (.self-conflict-use-visits (ra-state)))
+                                                  (+ (.self-conflict-use-visits (ra-state))
+                                                     1))
+                                            (match (n-out def (load use-index))
+                                              (Some [use_]
+                                                    (if (and (ra-loop-phi? use_)
+                                                             (> (n-nins use_) 2)
+                                                             (n-same? (n-in! use_
+                                                                             2)
+                                                                      def)
+                                                             (not (hm-contains? (.deferred-loop-self (ra-state))
+                                                                                (n-nid use_))))
+                                                        (do
+                                                          (set! (mut defer-now)
+                                                                (n-nid use_)
+                                                                true)
+                                                          (set! (mut (.deferred-loop-self (ra-state)))
+                                                                (n-nid use_)
+                                                                true))
+                                                        0))
+                                              (None [] 0))
+                                            (set! (mut use-index)
+                                                  (+ (load use-index) 1))
+                                            (continue)))))
+                              0)
+                            0))
+                  (None [] 0))
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))
+    ;; Split every conflict in nid order. Phi uses are placed in their matching predecessor block;
+    ;; two-address uses are split at the instruction. Deferred loop backedges and Phi definitions
+    ;; are the only hot pieces withheld on the first encounter.
+    (set! (mut nid) 0)
+    (loop (if (>= (load nid) (len conflicts))
+              (break 0)
+              (do
+                (match (arena-node (get conflicts (load nid)))
+                  (Some [def]
+                        (if (ra-self-conflict-node? leader def)
+                            (do
+                              (let [(mut use-index) 0]
+                                (loop (if (>= (load use-index) (n-nouts def))
+                                          (break 0)
+                                          (do
+                                            (set! (mut (.self-conflict-use-visits (ra-state)))
+                                                  (+ (.self-conflict-use-visits (ra-state))
+                                                     1))
+                                            (match (n-out def (load use-index))
+                                              (Some [use_]
+                                                    (let [(mut idx) 1]
+                                                      (loop (if (>= (load idx)
+                                                                    (n-nins use_))
+                                                                (break 0)
+                                                                (do
+                                                                  (match (n-in use_
+                                                                               (load idx))
+                                                                    (Some [input]
+                                                                          (if (n-same? input
+                                                                                       def)
+                                                                              (if (or (ra-phi? use_)
+                                                                                      (= (ra-two-address-input use_)
+                                                                                         (load idx)))
+                                                                                  (if (and (ra-loop-phi? use_)
+                                                                                           (= (load idx)
+                                                                                              2)
+                                                                                           (or (hm-contains? (load defer-now)
+                                                                                                             (n-nid use_))
+                                                                                               ;; Final Simple does not split a loop Phi's
+                                                                                               ;; backedge when the definition already comes
+                                                                                               ;; from deeper control inside that loop.
+                                                                                               (> (cfg-idepth-of (ra-ifg-block-of def))
+                                                                                                  (cfg-idepth-of (n-in! use_
+                                                                                                                        0)))))
+                                                                                      0
+                                                                                      (if (ra-use-split-sufficient? use_
+                                                                                                                    (load idx))
+                                                                                          0
+                                                                                          (do
+                                                                                            (ra-split-before-use-node! round
+                                                                                                                       leader
+                                                                                                                       use_
+                                                                                                                       (load idx)
+                                                                                                                       SPLIT-KIND-SELF)
+                                                                                            (set! (mut count)
+                                                                                                  (+ (load count)
+                                                                                                     1)))))
+                                                                                  0)
+                                                                              0))
+                                                                    (None [] 0))
+                                                                  (set! (mut idx)
+                                                                        (+ (load idx)
+                                                                           1))
+                                                                  (continue))))))
+                                              (None [] 0))
+                                            (set! (mut use-index)
+                                                  (+ (load use-index) 1))
+                                            (continue)))))
+                              (if (ra-phi? def)
+                                  (do
+                                    (if (not (hm-contains? (load defer-now)
+                                                           (n-nid def)))
+                                        (do
+                                          (ra-split-after-def-node! round
+                                                                    leader
+                                                                    def
+                                                                    SPLIT-KIND-SELF)
+                                          (set! (mut count) (+ (load count) 1)))
+                                        0)
+                                    (if (and (> (n-nins def) 1)
+                                             (not (ra-use-split-sufficient? def
+                                                                            1)))
+                                        (do
+                                          (ra-split-before-use-node! round
+                                                                     leader
+                                                                     def
+                                                                     1
+                                                                     SPLIT-KIND-SELF)
+                                          (set! (mut count) (+ (load count) 1)))
+                                        0))
+                                  (let [two (ra-two-address-input def)]
+                                    (if (> two 0)
+                                        (do
+                                          (ra-split-before-use-node! round
+                                                                     leader
+                                                                     def
+                                                                     two
+                                                                     SPLIT-KIND-SELF)
+                                          (set! (mut count) (+ (load count) 1)))
+                                        0)))
+                              0)
+                            0))
+                  (None [] 0))
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))
+    (> (load count) 0)))

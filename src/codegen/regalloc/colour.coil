@@ -1,0 +1,626 @@
+;; Colouring: simplify by risk score, biased colour selection, and colour propagation.      Color
+
+(module aot.codegen.regalloc.colour)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.codegen.codegen" :use *)
+(import "aot.codegen.looptree" :use [looptree-depth-of])
+(import "aot.codegen.machine" :use *)
+(import "aot.codegen.regmask" :use *)
+(import "aot.codegen.regalloc" :use [ra-enclosing-fun])
+(import "aot.codegen.regalloc.lrg" :use *)
+(import "aot.codegen.regalloc.build" :use *)
+(import "aot.codegen.regalloc.ifg" :use *)
+(import "aot.codegen.regalloc.split" :use *)
+
+(defn ra-colour-capacity [(id i64)] (-> i64)
+  (match (ra-lrg-mask id)
+    (None [] 0)
+    (Some [mask]
+          (let [size (mask-size mask)] (if (= size -1) 0x3fffffffffffffff size)))))
+
+;; Final Simple scores a risky LRG by scheduled area recovered divided by loop-scaled split cost.
+;; Whole-function CalleeSave ranges and separated cloneable definitions have concrete estimates;
+;; the fallback slightly disfavors multi-use ranges because they cost more copies to split.
+(defn ra-lrg-has-callee-save-def? [(id i64)] (-> bool)
+  (!= (get (.callee-save-defs (ra-state)) (ra-find! id)) 0))
+
+(defn ra-lrg-is-split-callee-save? [(id i64)] (-> bool)
+  (let [state (ra-state)
+        leader (ra-find! id)
+        def-id (get (.split-defs state) leader)
+        use-id (get (.split-uses state) leader)]
+    (and (!= def-id 0)
+         (and (!= use-id 0)
+              (match (arena-node def-id)
+                (Some [def]
+                      (and (> (n-nins def) 1)
+                           (and (= (ra-ideal-op (n-in! def 1))
+                                   OP-MACH-CALLEE-SAVE)
+                                (match (arena-node use-id)
+                                  (Some [use_]
+                                        (and (> (n-nouts use_) 0)
+                                             (match (n-out use_ 0)
+                                               (Some [out]
+                                                     (= (ra-ideal-op out)
+                                                        OP-RETURN))
+                                               (None [] false))))
+                                  (None [] false)))))
+                (None [] false))))))
+
+(defn ra-loop-cost-nid [(nid i64)] (-> i64)
+  (match (arena-node nid)
+    (None [] 1)
+    (Some [n]
+          (let [depth (looptree-depth-of (ra-ifg-block-of n))
+                (mut cost) 1
+                (mut i) 0]
+            ;; Each loop nesting level is eight times hotter, matching Simple's `1 << depth*3`.
+            ;; Saturation keeps malformed/extreme graphs from overflowing the risk comparison.
+            (loop (if (or (>= (load i) depth)
+                          (> (load cost) 0x0fffffffffffffff))
+                      (break 0)
+                      (do
+                        (set! (mut cost) (* (load cost) 8))
+                        (set! (mut i) (+ (load i) 1))
+                        (continue))))
+            (load cost)))))
+
+(defn ra-lrg-function [(id i64)] (-> (Option (dyn NodeOps)))
+  (let [state (ra-state)
+        leader (ra-find! id)
+        sample
+          (let [def (get (.mach-defs state) leader)]
+            (if (!= def 0)
+                def
+                (let [use (get (.mach-uses state) leader)]
+                  (if (!= use 0) use (ra-lrg-sample-nid leader)))))]
+    (match (arena-node sample)
+      (Some [n] (ra-enclosing-fun (ra-ifg-block-of n)))
+      (None [] (None [(dyn NodeOps)])))))
+
+(defn ra-build-function-areas! [] (-> i64)
+  (let [state (ra-state)
+        (mut ci) 0]
+    (if (not (.function-area-ready state))
+        (do
+          (loop (if (>= (load ci) (code-cfg-count))
+                    (break 0)
+                    (let [block (code-cfg-at (load ci))]
+                      (set! (.function-area-block-visits state)
+                            (+ (.function-area-block-visits state) 1))
+                      (if (cfg-block-head-of? block)
+                          (match (ra-enclosing-fun block)
+                            (Some [owner]
+                                  (let [key (n-nid owner)
+                                        prior
+                                          (match (get (.function-areas state)
+                                                      key)
+                                            (Some [area] area)
+                                            (None [] 0))]
+                                    (set! (mut (.function-areas state))
+                                          key
+                                          (+ prior (code-schedule-count block)))))
+                            (None [] 0))
+                          0)
+                      (set! (mut ci) (+ (load ci) 1))
+                      (continue))))
+          (set! (.function-area-ready state) true))
+        0)
+    (len (.function-areas state))))
+
+(defn ra-function-area [(fun (dyn NodeOps))] (-> i64)
+  (do
+    (ra-build-function-areas!)
+    (match (get (.function-areas (ra-state)) (n-nid fun))
+      (Some [area] area)
+      (None [] 0))))
+
+(defn ra-function-area-block-visits [] (-> i64)
+  (.function-area-block-visits (ra-state)))
+
+(defn ra-area-score [(area i64) (cost i64)] (-> i64)
+  (+ 1000 (/ (* area 1024) (if (> cost 0) cost 1))))
+
+(defn ra-block-schedule-index [(block (dyn NodeOps)) (nid i64)] (-> i64)
+  (let [(mut i) 0
+        (mut answer) -1]
+    (loop (if (or (>= (load i) (code-schedule-count block))
+                  (>= (load answer) 0))
+              (break 0)
+              (do
+                (if (= (n-nid (code-schedule-at block (load i))) nid)
+                    (set! (mut answer) (load i))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load answer)))
+
+(defn ra-colour-risk-score [(id i64)] (-> i64)
+  (let [state (ra-state)
+        leader (ra-find! id)
+        def-id (get (.mach-defs state) leader)
+        use-id (get (.mach-uses state) leader)]
+    (if (or (ra-lrg-has-callee-save-def? leader)
+            (ra-lrg-is-split-callee-save? leader))
+        (match (ra-lrg-function leader)
+          (Some [fun]
+                (ra-area-score (ra-function-area fun)
+                               (if (ra-lrg-has-callee-save-def? leader)
+                                   (+ (ra-loop-cost-nid (get (.callee-save-defs state)
+                                                             leader))
+                                      (if (= use-id 0)
+                                          0
+                                          (ra-loop-cost-nid use-id)))
+                                   (+ (ra-loop-cost-nid (get (.split-defs state)
+                                                             leader))
+                                      (ra-loop-cost-nid (get (.split-uses state)
+                                                             leader))))))
+          (None [] 2000))
+        (if (and (not (get (.multi-defs state) leader))
+                 (!= def-id 0)
+                 (!= use-id 0)
+                 (match (arena-node def-id)
+                   (Some [def]
+                         (match (mach-of def)
+                           (Some [mach] (m-clone-cheap? mach))
+                           (None [] false)))
+                   (None [] false)))
+            (match (arena-node def-id)
+              (Some [def]
+                    (match (arena-node use-id)
+                      (Some [use_]
+                            (let [def-block (ra-ifg-block-of def)
+                                  use-block (ra-ifg-block-of use_)
+                                  area
+                                    (if (n-same? def-block use-block)
+                                        (- (- (ra-block-schedule-index use-block
+                                                                       use-id)
+                                              (ra-block-schedule-index def-block
+                                                                       def-id))
+                                           1)
+                                        (match (ra-lrg-function leader)
+                                          (Some [fun] (ra-function-area fun))
+                                          (None [] 0)))]
+                              (if (> area 0)
+                                  (ra-area-score area (ra-loop-cost-nid use-id))
+                                  (- 1000
+                                     (if (get (.multi-uses state) leader) 100 0)))))
+                      (None []
+                            (- 1000 (if (get (.multi-uses state) leader) 100 0)))))
+              (None [] (- 1000 (if (get (.multi-uses state) leader) 100 0))))
+            (- 1000 (if (get (.multi-uses state) leader) 100 0))))))
+
+(defn ra-colour-has-split? [(id i64)] (-> bool)
+  (let [state (ra-state)
+        leader (ra-find! id)]
+    (or (!= (get (.split-defs state) leader) 0)
+        (!= (get (.split-uses state) leader) 0))))
+
+;; Final Simple orders every currently trivial range so reverse coloring sees fixed ranges first,
+;; ordinary ranges next and Split-related ranges last, with the latter able to bias toward already
+;; assigned colors. Return true exactly when `candidate` should leave the IFG before `best`.
+(defn ra-colour-better? [(best i64) (candidate i64)] (-> bool)
+  (let [best-size (ra-colour-capacity best)
+        candidate-size (ra-colour-capacity candidate)
+        best-single (= best-size 1)
+        candidate-single (= candidate-size 1)
+        best-split (ra-colour-has-split? best)
+        candidate-split (ra-colour-has-split? candidate)]
+    (if (!= best-single candidate-single)
+        best-single
+        (if (!= best-split candidate-split)
+            candidate-split
+            (if best-single
+                (and (not (get (.multi-uses (ra-state)) (ra-find! best)))
+                     (get (.multi-uses (ra-state)) (ra-find! candidate)))
+                (< best-size candidate-size))))))
+
+(defn ra-colour-low-sift-up! [(start i64)] (-> i64)
+  (let [work (.colour-low-work (ra-state))
+        (mut child) start]
+    (loop (if (<= (load child) 0)
+              (break 0)
+              (let [parent (/ (- (load child) 1) 2)
+                    child-id (get work (load child))
+                    parent-id (get work parent)]
+                (if (ra-colour-better? parent-id child-id)
+                    (do
+                      (set! (mut (.colour-low-work (ra-state)))
+                            (load child)
+                            parent-id)
+                      (set! (mut (.colour-low-work (ra-state))) parent child-id)
+                      (set! (mut child) parent)
+                      (continue))
+                    (break 0)))))
+    0))
+
+(defn ra-colour-low-sift-down! [(start i64)] (-> i64)
+  (let [work (.colour-low-work (ra-state))
+        (mut root) start]
+    (loop (let [left (+ (* (load root) 2) 1)]
+            (if (>= left (len work))
+                (break 0)
+                (let [(mut best) (load root)
+                      right (+ left 1)]
+                  (if (ra-colour-better? (get work (load best)) (get work left))
+                      (set! (mut best) left)
+                      0)
+                  (if (and (< right (len work))
+                           (ra-colour-better? (get work (load best))
+                                              (get work right)))
+                      (set! (mut best) right)
+                      0)
+                  (if (= (load best) (load root))
+                      (break 0)
+                      (let [root-id (get work (load root))]
+                        (set! (mut (.colour-low-work (ra-state)))
+                              (load root)
+                              (get work (load best)))
+                        (set! (mut (.colour-low-work (ra-state)))
+                              (load best)
+                              root-id)
+                        (set! (mut root) (load best))
+                        (continue)))))))
+    0))
+
+(defn ra-colour-low-push! [(id i64)] (-> i64)
+  (let [state (ra-state)]
+    (if (or (get (.removed state) id) (get (.colour-low-on state) id))
+        0
+        (do
+          (set! (mut (.colour-low-on state)) id true)
+          (push! [i64] (mut (.colour-low-work state)) id)
+          (ra-colour-low-sift-up! (- (len (.colour-low-work state)) 1))))))
+
+(defn ra-colour-low-pop! [] (-> i64)
+  (let [state (ra-state)
+        work (.colour-low-work state)]
+    (if (= (len work) 0)
+        0
+        (let [answer (get work 0)]
+          (match (pop! [i64] (mut (.colour-low-work state)))
+            (Some [last]
+                  (if (> (len (.colour-low-work state)) 0)
+                      (do
+                        (set! (mut (.colour-low-work state)) 0 last)
+                        (ra-colour-low-sift-down! 0))
+                      0))
+            (None [] 0))
+          answer))))
+
+(defn ra-colour-init! [] (-> i64)
+  (let [state (ra-state)
+        (mut id) 1]
+    (al-clear! [i64] (mut (.color-stack state)))
+    (al-clear! [i64] (mut (.colour-low-work state)))
+    (loop (if (> (load id) (ra-lrg-count))
+              (break 0)
+              (do
+                (set! (mut (.degree state))
+                      (load id)
+                      (if (= (ra-find! (load id)) (load id))
+                          (ra-adj-degree (load id))
+                          0))
+                (set! (mut (.removed state)) (load id) false)
+                (set! (mut (.regs state)) (load id) -1)
+                (set! (mut (.colour-low-on state)) (load id) false)
+                (set! (mut id) (+ (load id) 1))
+                (continue))))
+    (set! (mut id) 1)
+    (loop (if (> (load id) (ra-lrg-count))
+              (break 0)
+              (do
+                (if (and (= (ra-find! (load id)) (load id))
+                         (< (get (.degree state) (load id))
+                            (ra-colour-capacity (load id))))
+                    (ra-colour-low-push! (load id))
+                    0)
+                (set! (mut id) (+ (load id) 1))
+                (continue))))
+    0))
+
+(defn ra-colour-pick! [] (-> i64)
+  (let [state (ra-state)
+        (mut id) 1
+        (mut risky) 0
+        (mut risky-score) -1
+        low
+          (loop (let [candidate (ra-colour-low-pop!)]
+                  (if (= candidate 0)
+                      (break 0)
+                      (do
+                        (set! (mut (.colour-low-on state)) candidate false)
+                        (if (and (= (ra-find! candidate) candidate)
+                                 (not (get (.removed state) candidate))
+                                 (< (get (.degree state) candidate)
+                                    (ra-colour-capacity candidate)))
+                            (break candidate)
+                            (continue))))))]
+    (if (!= low 0)
+        low
+        (do
+          ;; Only a non-trivial clique needs a global risk comparison.
+          (loop (if (> (load id) (ra-lrg-count))
+                    (break 0)
+                    (do
+                      (if (and (= (ra-find! (load id)) (load id))
+                               (not (get (.removed state) (load id))))
+                          (let [score (ra-colour-risk-score (load id))]
+                            (if (or (= (load risky) 0)
+                                    (> score (load risky-score)))
+                                (do
+                                  (set! (mut risky) (load id))
+                                  (set! (mut risky-score) score))
+                                0))
+                          0)
+                      (set! (mut id) (+ (load id) 1))
+                      (continue))))
+          (load risky)))))
+
+(defn ra-colour-remove! [(id i64)] (-> i64)
+  (let [state (ra-state)
+        (mut edge) (get (.adj-heads (ra-state)) id)]
+    (set! (mut (.removed state)) id true)
+    (push! [i64] (mut (.color-stack state)) id)
+    (loop (if (< (load edge) 0)
+              (break 0)
+              (do
+                (let [raw-other (get (.adj-to state) (load edge))]
+                  (if (> raw-other 0)
+                      (let [other (ra-find! raw-other)]
+                        (if (and (!= other id)
+                                 (not (get (.removed state) other)))
+                            (let [degree (get (.degree state) other)]
+                              (if (<= degree 0)
+                                  (broken "ra-colour-remove!: degree underflow")
+                                  (do
+                                    (set! (mut (.degree state))
+                                          other
+                                          (- degree 1))
+                                    (if (< (- degree 1)
+                                           (ra-colour-capacity other))
+                                        (ra-colour-low-push! other)
+                                        0))))
+                            0))
+                      0))
+                (set! (mut edge) (get (.adj-next state) (load edge)))
+                (continue))))
+    0))
+
+(defn ra-biasable-input-index [(n (dyn NodeOps))] (-> i64)
+  (if (= (n-op n) OP-MACH-SPLIT)
+      1
+      (match (mach-of n)
+        (None [] 0)
+        (Some [mach]
+              (let [op (m-ideal-op mach)]
+                (if (or (= op OP-PHI) (= op OP-MEMPHI))
+                    (if (and (> (n-nins n) 0)
+                             (match (mach-of (n-in! n 0))
+                               (Some [ctrl] (= (m-ideal-op ctrl) OP-LOOP))
+                               (None [] false)))
+                        2
+                        1)
+                    (m-two-address mach)))))))
+
+(defn ra-bias-trim-neighbors! [(id i64) (choices (mut (ptr RegMask)))] (-> i64)
+  (let [state (ra-state)
+        leader (ra-find! id)
+        (mut edge) (get (.adj-heads state) leader)]
+    (loop (if (< (load edge) 0)
+              (break -1)
+              (let [raw (get (.adj-to state) (load edge))]
+                (if (> raw 0)
+                    (let [other (ra-find! raw)
+                          assigned (get (.regs state) other)
+                          forbidden
+                            (if (>= assigned 0)
+                                assigned
+                                (match (ra-lrg-mask other)
+                                  (Some [mask]
+                                        (if (mask-singleton? mask)
+                                            (mask-first mask)
+                                            -1))
+                                  (None [] -1)))]
+                      (if (>= forbidden 0)
+                          (let [trimmed
+                                  (mask-sub (load choices) (mask-of forbidden))]
+                            ;; Neighbor trimming is a preference, not an interference constraint.
+                            ;; Never discard the last legal color for the LRG being colored.
+                            (if (mask-empty? trimmed)
+                                0
+                                (do
+                                  (set! choices trimmed)
+                                  (if (mask-singleton? (load choices))
+                                      (break (mask-first (load choices)))
+                                      0))))
+                          0))
+                    0)
+                (set! (mut edge) (get (.adj-next state) (load edge)))
+                (continue))))))
+
+;; Final Simple follows both sides of a Split/Phi/two-address chain for at most ten steps. Prefer an
+;; already assigned color when legal; otherwise remove colors forced by already-colored or
+;; singleton neighbors of the chain. This is what makes adjacent spill halves converge on the same
+;; register often enough for post-color removal.
+(defn ra-bias-colour [(id i64) (base (ptr RegMask))] (-> i64)
+  (let [state (ra-state)
+        leader (ra-find! id)
+        (mut choices) base
+        (mut def-id) (get (.split-defs state) leader)
+        (mut use-id) (get (.split-uses state) leader)
+        (mut count) 0
+        (mut answer) -1]
+    (loop (if (or (> (load count) 10)
+                  (and (= (load def-id) 0) (= (load use-id) 0))
+                  (>= (load answer) 0))
+              (break 0)
+              (do
+                (if (!= (load def-id) 0)
+                    (match (arena-node (load def-id))
+                      (None [] (set! (mut def-id) 0))
+                      (Some [def]
+                            (let [chain-lrg (ra-lrg-of! def)
+                                  assigned
+                                    (if (= chain-lrg 0)
+                                        -1
+                                        (get (.regs state) chain-lrg))
+                                  advance (ra-biasable-input-index def)]
+                              (if (>= assigned 0)
+                                  (if (mask-test (load choices) assigned)
+                                      (set! (mut answer) assigned)
+                                      (set! (mut def-id) 0))
+                                  (if (= advance 0) (set! (mut def-id) 0) 0)))))
+                    0)
+                (if (and (< (load answer) 0) (!= (load use-id) 0))
+                    (match (arena-node (load use-id))
+                      (None [] (set! (mut use-id) 0))
+                      (Some [use_]
+                            (let [chain-lrg (ra-lrg-of! use_)
+                                  assigned
+                                    (if (= chain-lrg 0)
+                                        -1
+                                        (get (.regs state) chain-lrg))
+                                  advance (ra-biasable-input-index use_)]
+                              (if (>= assigned 0)
+                                  (if (mask-test (load choices) assigned)
+                                      (set! (mut answer) assigned)
+                                      (set! (mut use-id) 0))
+                                  (if (= advance 0) (set! (mut use-id) 0) 0)))))
+                    0)
+                (if (and (< (load answer) 0) (!= (load def-id) 0))
+                    (match (arena-node (load def-id))
+                      (None [] (set! (mut def-id) 0))
+                      (Some [def]
+                            (let [chain-lrg (ra-lrg-of! def)
+                                  biased
+                                    (if (= chain-lrg 0)
+                                        -1
+                                        (ra-bias-trim-neighbors! chain-lrg
+                                                                 (mut choices)))]
+                              (if (>= biased 0)
+                                  (set! (mut answer) biased)
+                                  (let [advance (ra-biasable-input-index def)]
+                                    (if (and (> advance 0)
+                                             (< advance (n-nins def)))
+                                        (let [next (n-in! def advance)]
+                                          (if (= (ra-lrg-of! next) 0)
+                                              (set! (mut def-id) 0)
+                                              (set! (mut def-id) (n-nid next))))
+                                        (set! (mut def-id) 0)))))))
+                    0)
+                (if (and (< (load answer) 0) (!= (load use-id) 0))
+                    (match (arena-node (load use-id))
+                      (None [] (set! (mut use-id) 0))
+                      (Some [use_]
+                            (let [chain-lrg (ra-lrg-of! use_)
+                                  biased
+                                    (if (= chain-lrg 0)
+                                        -1
+                                        (ra-bias-trim-neighbors! chain-lrg
+                                                                 (mut choices)))]
+                              (if (>= biased 0)
+                                  (set! (mut answer) biased)
+                                  (if (= (n-nouts use_) 0)
+                                      (set! (mut use-id) 0)
+                                      (match (n-out use_ 0)
+                                        (None [] (set! (mut use-id) 0))
+                                        (Some [next]
+                                              (if (= (ra-biasable-input-index next)
+                                                     0)
+                                                  (set! (mut use-id) 0)
+                                                  (set! (mut use-id)
+                                                        (n-nid next))))))))))
+                    0)
+                (set! (mut count) (+ (load count) 1))
+                (continue))))
+    (if (>= (load answer) 0) (load answer) (mask-first (load choices)))))
+
+(defn ra-colour-one! [(id i64)] (-> bool)
+  (match (ra-lrg-mask id)
+    (None [] (do (ra-fail! id) false))
+    (Some [base]
+          (let [(mut choices) base
+                (mut edge) (get (.adj-heads (ra-state)) id)]
+            (loop (if (< (load edge) 0)
+                      (break 0)
+                      (do
+                        (let [raw-other (get (.adj-to (ra-state)) (load edge))]
+                          (if (> raw-other 0)
+                              (let [other (ra-find! raw-other)]
+                                (if (and (!= other id)
+                                         (>= (get (.regs (ra-state)) other) 0))
+                                    (set! (mut choices)
+                                          (mask-sub (load choices)
+                                                    (mask-of (get (.regs (ra-state))
+                                                                  other))))
+                                    0))
+                              0))
+                        (set! (mut edge)
+                              (get (.adj-next (ra-state)) (load edge)))
+                        (continue))))
+            (if (mask-empty? (load choices))
+                (do (ra-fail! id) false)
+                (do
+                  (set! (mut (.regs (ra-state)))
+                        id
+                        (if (mask-singleton? (load choices))
+                            (mask-first (load choices))
+                            (ra-bias-colour id (load choices))))
+                  true))))))
+
+(defn ra-propagate-colours! [] (-> i64)
+  (let [(mut nid) 1]
+    (loop (if (> (load nid) (arena-node-count))
+              (break 0)
+              (do
+                (match (arena-node (load nid))
+                  (Some [n]
+                        (let [lrg (ra-lrg-of! n)]
+                          (if (= lrg 0)
+                              (n-set-reg! n -1)
+                              (n-set-reg! n (get (.regs (ra-state)) lrg)))))
+                  (None [] 0))
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))
+    0))
+
+;; Colour: remove trivially-colourable nodes first, then any, until the graph is empty; then assign
+;; colours in reverse removal order. False if some live range could not be coloured.
+(defn ra-colour! [(round i64)] (-> bool)
+  (do
+    round
+    (ra-colour-init!)
+    (let [(mut remaining) 0
+          (mut id) 1]
+      (loop (if (> (load id) (ra-lrg-count))
+                (break 0)
+                (do
+                  (if (= (ra-find! (load id)) (load id))
+                      (set! (mut remaining) (+ (load remaining) 1))
+                      0)
+                  (set! (mut id) (+ (load id) 1))
+                  (continue))))
+      (loop (if (= (load remaining) 0)
+                (break 0)
+                (let [pick (ra-colour-pick!)]
+                  (if (= pick 0)
+                      (do
+                        (broken "ra-colour!: simplify lost a live range")
+                        (break 0))
+                      (do
+                        (ra-colour-remove! pick)
+                        (set! (mut remaining) (- (load remaining) 1))
+                        (continue)))))))
+    (loop (match (pop! [i64] (mut (.color-stack (ra-state))))
+            (None [] (break 0))
+            (Some [id] (do (ra-colour-one! id) (continue)))))
+    (ra-propagate-colours!)
+    (ra-success?)))

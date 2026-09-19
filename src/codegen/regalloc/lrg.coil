@@ -1,0 +1,456 @@
+;; Live ranges: the allocator state, LRG kinds, union-find with mask intersection, and failure marking.      LRG
+
+(module aot.codegen.regalloc.lrg)
+(import "aot.util.arena"
+        :use
+        [compiler-allocator compiler-state CompilerStateSlot])
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.codegen.regmask" :use *)
+(import "aot.type.type" :use *)
+(import "aot.codegen.regalloc.trace" :use *)
+
+;; Simple's scalar cap is 8. Explicit moving-root stack boundaries require 14 in the native proof.
+(const RA-MAX-ROUNDS 8)
+
+;; Live-range kinds, for the stack map. Not in Simple; required by a moving collector.
+(const LRG-SCALAR 0)
+
+(const LRG-RAW-REF 1)
+
+(const LRG-BOXED 2)
+
+;; A NaN-boxed word proven not to contain a heap reference still benefits from an addressable spill
+;; home across calls, but must not be reported to the collector as a relocatable root.
+(const LRG-BOXED-SCALAR 3)
+
+;; Per-block backwards liveness. `defs` stores the representative definition nid for a live LRG;
+;; `ids` is the sparse iteration order and retains a key after it is killed, so reinsertion never
+;; duplicates work. This replaces one dense LRG-sized allocation and scan for every CFG block.
+;; The live set of the backwards IFG walk: per live-range leader, the node id of the definition
+;; that is live (0 = not live), dense over leaders, plus the list of leaders touched so the shared
+;; scratch clears in time proportional to its use rather than to the live-range count. Both are
+;; POINTERS into the allocator state: an ArrayList copied by value carries its own length, and a
+;; push through the copy would leave the state's list empty and the next block's clear a no-op.
+(defstruct RaLive
+  [(defs (ptr (ArrayList i64)))
+   (ids (ptr (ArrayList i64)))
+   (positions (ptr (ArrayList i64)))])
+
+;; Dense, compilation-owned LRG state. Index zero means "this node has no register value" and is
+;; never a union-find member. Lower numbered leaders always win, matching final Simple and making
+;; every later failed-set, IFG, and colouring traversal deterministic.
+(defstruct RaState
+  [(parent (ArrayList i64))
+   (masks (ArrayList (Option (ptr RegMask))))
+   (kinds (ArrayList i64))
+   (stack-required (ArrayList bool))
+   (allocatable-registers (Option (ptr RegMask)))
+   ;; The fixed entry definition for a whole-function saved register. Final Simple keeps this in
+   ;; LRG._machDef for spill-risk scoring; zero means this LRG has no such definition.
+   (callee-save-defs (ArrayList i64))
+   ;; Final Simple's LRG def/use evidence. Split endpoints drive biased coloring; multiplicity and
+   ;; representative machine endpoints drive spill-risk selection in non-trivial cliques.
+   (mach-defs (ArrayList i64))
+   (mach-uses (ArrayList i64))
+   (mach-use-inputs (ArrayList i64))
+   (split-defs (ArrayList i64))
+   (split-uses (ArrayList i64))
+   (multi-defs (ArrayList bool))
+   (multi-uses (ArrayList bool))
+   (fixed-def-counts (ArrayList i64))
+   (fixed-use-counts (ArrayList i64))
+   (failed (ArrayList bool))
+   (regs (ArrayList i64))
+   (liveouts (HashMap i64 i64))  ; (block,lrg) -> representative def nid
+   ;; Sparse per-block index into `liveouts`; one record is added on the first successful merge.
+   (liveout-heads (ArrayList i64))
+   (liveout-lrgs (ArrayList i64))
+   (liveout-next (ArrayList i64))
+   ;; Reused by the sequential IFG worklist; block revisits do not allocate another sparse set.
+   (live-scratch-defs (ArrayList i64))
+   (live-scratch-ids (ArrayList i64))
+   (live-scratch-positions (ArrayList i64))
+   (ifg (HashMap i64 bool))  ; canonical (low,high) interference pair
+   ;; Sparse symmetric adjacency. Hash keys deduplicate construction; these lists drive all hot
+   ;; degree, simplify, coalesce and coloring walks without scanning the complete LRG id space.
+   (adj-heads (ArrayList i64))
+   (adj-to (ArrayList i64))
+   (adj-next (ArrayList i64))
+   (visit-marks (ArrayList i64))
+   (visit-generation i64)
+   ;; Testable pass counter: coalescing must mutate sparse adjacency, never restart liveness/IFG.
+   (ifg-build-count i64)
+   (self-conflicts (HashMap i64 bool))  ; (lrg,def nid) pairs for deterministic splitting
+   ;; Sparse insertion-order index for self-conflicting definitions. The hash remains the
+   ;; membership oracle; this list prevents split selection from scanning the whole node arena.
+   (self-conflict-nids (ArrayList i64))
+   ;; Focused performance contract: count only actual def-use adjacency inspected while splitting.
+   (self-conflict-use-visits i64)
+   ;; Hash stride captured before a round's splitter adds nodes. Re-reading arena size while
+   ;; splitting would change keys midway through the conflict set and silently skip later defs.
+   (self-conflict-base i64)
+   (deferred-loop-self (HashMap i64 bool))  ; loop-Phi nid remembered across allocation rounds
+   (work (ArrayList i64))
+   (on-work (ArrayList bool))
+   (degree (ArrayList i64))
+   (removed (ArrayList bool))
+   (color-stack (ArrayList i64))
+   (colour-low-work (ArrayList i64))
+   (colour-low-on (ArrayList bool))
+   ;; Pure scheduled-area scores are shared by every risky LRG in a function. Build all function
+   ;; totals in one CFG pass instead of rescanning the whole CFG for every risk comparison.
+   (function-areas (HashMap i64 i64))
+   (function-area-ready bool)
+   (function-area-block-visits i64)
+   (round i64)
+   (booted bool)])
+
+(defn ra-state [] (-> (ptr RaState))
+  (compiler-state [RaState] (primitive/alloc-static CompilerStateSlot)))
+
+(defn ra-kind-of-node [(n (dyn NodeOps))] (-> i64)
+  (let [t (n-ty n)]
+    (if (ty-memptr? t)
+        LRG-RAW-REF
+        (if (ty-dyn? t)
+            (if (ty-dyn-may-reference? t) LRG-BOXED LRG-BOXED-SCALAR)
+            LRG-SCALAR))))
+
+(defn ra-kind-join [(a i64) (b i64)] (-> i64)
+  (if (= a b)
+      a
+      ;; A boxed word needs conservative stack-map treatment if a malformed or transitional LRG
+      ;; also contains scalar evidence. Raw references remain precise only when every member agrees.
+      (if (or (= a LRG-BOXED) (= b LRG-BOXED))
+          LRG-BOXED
+          (if (or (= a LRG-RAW-REF) (= b LRG-RAW-REF))
+              LRG-RAW-REF
+              LRG-BOXED-SCALAR))))
+
+(defn ra-reset-state! [(round i64)] (-> i64)
+  (let [a (compiler-allocator)
+        state (ra-state)
+        (mut id) 1]
+    (set! (.parent state) (al-new [i64] a))
+    (set! (.masks state) (al-new [(Option (ptr RegMask))] a))
+    (set! (.kinds state) (al-new [i64] a))
+    (set! (.stack-required state) (al-new [bool] a))
+    (set! (.allocatable-registers state) (None [(ptr RegMask)]))
+    (set! (.callee-save-defs state) (al-new [i64] a))
+    (set! (.mach-defs state) (al-new [i64] a))
+    (set! (.mach-uses state) (al-new [i64] a))
+    (set! (.mach-use-inputs state) (al-new [i64] a))
+    (set! (.split-defs state) (al-new [i64] a))
+    (set! (.split-uses state) (al-new [i64] a))
+    (set! (.multi-defs state) (al-new [bool] a))
+    (set! (.multi-uses state) (al-new [bool] a))
+    (set! (.fixed-def-counts state) (al-new [i64] a))
+    (set! (.fixed-use-counts state) (al-new [i64] a))
+    (set! (.failed state) (al-new [bool] a))
+    (set! (.regs state) (al-new [i64] a))
+    (set! (.liveouts state) (hm-new [i64 i64] a (i64-keyops)))
+    (set! (.liveout-heads state) (al-new [i64] a))
+    (set! (.liveout-lrgs state) (al-new [i64] a))
+    (set! (.liveout-next state) (al-new [i64] a))
+    (set! (.live-scratch-defs state) (al-new [i64] a))
+    (set! (.live-scratch-ids state) (al-new [i64] a))
+    (set! (.live-scratch-positions state) (al-new [i64] a))
+    (set! (.ifg state) (hm-new [i64 bool] a (i64-keyops)))
+    (set! (.adj-heads state) (al-new [i64] a))
+    (set! (.adj-to state) (al-new [i64] a))
+    (set! (.adj-next state) (al-new [i64] a))
+    (set! (.visit-marks state) (al-new [i64] a))
+    (set! (.visit-generation state) 0)
+    (set! (.ifg-build-count state) 0)
+    (set! (.self-conflicts state) (hm-new [i64 bool] a (i64-keyops)))
+    (set! (.self-conflict-nids state) (al-new [i64] a))
+    (set! (.self-conflict-use-visits state) 0)
+    (set! (.self-conflict-base state) (+ (arena-node-count) 1))
+    (if (or (= round 0) (not (.booted state)))
+        (set! (.deferred-loop-self state) (hm-new [i64 bool] a (i64-keyops)))
+        0)
+    (set! (.work state) (al-new [i64] a))
+    (set! (.on-work state) (al-new [bool] a))
+    (set! (.degree state) (al-new [i64] a))
+    (set! (.removed state) (al-new [bool] a))
+    (set! (.color-stack state) (al-new [i64] a))
+    (set! (.colour-low-work state) (al-new [i64] a))
+    (set! (.colour-low-on state) (al-new [bool] a))
+    (set! (.function-areas state) (hm-new [i64 i64] a (i64-keyops)))
+    (set! (.function-area-ready state) false)
+    (set! (.function-area-block-visits state) 0)
+    (push! [i64] (mut (.parent state)) 0)
+    (push! [(Option (ptr RegMask))] (mut (.masks state)) (None [(ptr RegMask)]))
+    (push! [i64] (mut (.kinds state)) LRG-SCALAR)
+    (push! [bool] (mut (.stack-required state)) false)
+    (push! [i64] (mut (.callee-save-defs state)) 0)
+    (push! [i64] (mut (.mach-defs state)) 0)
+    (push! [i64] (mut (.mach-uses state)) 0)
+    (push! [i64] (mut (.mach-use-inputs state)) 0)
+    (push! [i64] (mut (.split-defs state)) 0)
+    (push! [i64] (mut (.split-uses state)) 0)
+    (push! [bool] (mut (.multi-defs state)) false)
+    (push! [bool] (mut (.multi-uses state)) false)
+    (push! [i64] (mut (.fixed-def-counts state)) 0)
+    (push! [i64] (mut (.fixed-use-counts state)) 0)
+    (push! [bool] (mut (.failed state)) false)
+    (push! [i64] (mut (.regs state)) -1)
+    (push! [i64] (mut (.adj-heads state)) -1)
+    (push! [i64] (mut (.visit-marks state)) 0)
+    (push! [bool] (mut (.colour-low-on state)) false)
+    (push! [i64] (mut (.degree state)) 0)
+    (push! [bool] (mut (.removed state)) false)
+    (let [(mut i) 0]
+      (loop (if (> (load i) (arena-node-count))
+                (break 0)
+                (do
+                  (push! [bool] (mut (.on-work state)) false)
+                  (push! [i64] (mut (.liveout-heads state)) -1)
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    (set! (.round state) round)
+    (set! (.booted state) true)
+    (loop (if (> (load id) (arena-node-count))
+              (break 0)
+              (do
+                (match (arena-node (load id))
+                  (Some [n] (do (n-set-lrg! n 0) (n-set-reg! n -1)))
+                  (None [] 0))
+                (set! (mut id) (+ (load id) 1))
+                (continue))))
+    0))
+
+(defn ra-lrg-count [] (-> i64)
+  (if (.booted (ra-state)) (- (len (.parent (ra-state))) 1) 0))
+
+(defn ra-new-lrg! [(n (dyn NodeOps))] (-> i64)
+  (if (!= (n-lrg n) 0)
+      (ra-find! (n-lrg n))
+      (let [state (ra-state)
+            id (len (.parent state))]
+        (push! [i64] (mut (.parent state)) id)
+        (push! [(Option (ptr RegMask))]
+               (mut (.masks state))
+               (None [(ptr RegMask)]))
+        (push! [i64] (mut (.kinds state)) (ra-kind-of-node n))
+        (push! [bool] (mut (.stack-required state)) false)
+        (push! [i64] (mut (.callee-save-defs state)) 0)
+        (push! [i64] (mut (.mach-defs state)) 0)
+        (push! [i64] (mut (.mach-uses state)) 0)
+        (push! [i64] (mut (.mach-use-inputs state)) 0)
+        (push! [i64] (mut (.split-defs state)) 0)
+        (push! [i64] (mut (.split-uses state)) 0)
+        (push! [bool] (mut (.multi-defs state)) false)
+        (push! [bool] (mut (.multi-uses state)) false)
+        (push! [i64] (mut (.fixed-def-counts state)) 0)
+        (push! [i64] (mut (.fixed-use-counts state)) 0)
+        (push! [bool] (mut (.failed state)) false)
+        (push! [i64] (mut (.regs state)) -1)
+        (push! [i64] (mut (.adj-heads state)) -1)
+        (push! [i64] (mut (.visit-marks state)) 0)
+        (push! [bool] (mut (.colour-low-on state)) false)
+        (push! [i64] (mut (.degree state)) 0)
+        (push! [bool] (mut (.removed state)) false)
+        (n-set-lrg! n id)
+        id)))
+
+(defn ra-find! [(id i64)] (-> i64)
+  (let [state (ra-state)]
+    (if (or (<= id 0) (>= id (len (.parent state))))
+        (do (panic-i "ra-find!: invalid live-range id" id) 0)
+        (let [(mut leader) id]
+          (loop (if (= (get (.parent state) (load leader)) (load leader))
+                    (break 0)
+                    (do
+                      (set! (mut leader) (get (.parent state) (load leader)))
+                      (continue))))
+          (let [(mut cur) id]
+            (loop (if (= (load cur) (load leader))
+                      (break 0)
+                      (let [next (get (.parent state) (load cur))]
+                        (set! (mut (.parent state)) (load cur) (load leader))
+                        (set! (mut cur) next)
+                        (continue)))))
+          (load leader)))))
+
+(defn ra-lrg-of! [(n (dyn NodeOps))] (-> i64)
+  (if (= (n-lrg n) 0)
+      0
+      (let [leader (ra-find! (n-lrg n))]
+        (n-set-lrg! n leader)
+        leader)))
+
+(defn ra-fail! [(id i64)] (-> i64)
+  (let [leader (ra-find! id)]
+    (set! (mut (.failed (ra-state))) leader true)
+    0))
+
+(defn ra-lrg-failed? [(id i64)] (-> bool)
+  (get (.failed (ra-state)) (ra-find! id)))
+
+(defn ra-lrg-mask [(id i64)] (-> (Option (ptr RegMask)))
+  (get (.masks (ra-state)) (ra-find! id)))
+
+(defn ra-lrg-kind [(id i64)] (-> i64)
+  (get (.kinds (ra-state)) (ra-find! id)))
+
+(defn ra-lrg-reg [(id i64)] (-> i64)
+  (get (.regs (ra-state)) (ra-find! id)))
+
+(defn ra-lrg-and-mask! [(id i64) (mask (ptr RegMask))] (-> bool)
+  (let [leader (ra-find! id)
+        state (ra-state)
+        next
+          (match (get (.masks state) leader)
+            (Some [prior]
+                  (let [next (mask-and prior mask)]
+                    (ra-trace-tail-loss! leader "and-mask" prior mask next)
+                    next))
+            (None [] mask))]
+    (set! (mut (.masks state)) leader (Some next))
+    (if (mask-empty? next)
+        (do (ra-fail! leader) false)
+        true)))
+
+(defn ra-lrg-sub-mask! [(id i64) (deny (ptr RegMask))] (-> bool)
+  (let [leader (ra-find! id)
+        state (ra-state)]
+    (match (get (.masks state) leader)
+      (None []
+            (do
+              (panic-i "ra-lrg-sub-mask!: live range has no allowed mask"
+                       leader)
+              false))
+      (Some [prior]
+            (let [next (mask-sub prior deny)]
+              (ra-trace-tail-loss! leader "sub-mask" prior deny next)
+              (set! (mut (.masks state)) leader (Some next))
+              (if (mask-empty? next)
+                  (do (ra-fail! leader) false)
+                  true))))))
+
+(defn ra-lrg-deny-reg! [(id i64) (reg i64)] (-> bool)
+  (ra-lrg-sub-mask! id (mask-of reg)))
+
+(defn ra-union! [(a i64) (b i64)] (-> i64)
+  (let [la (ra-find! a)
+        lb (ra-find! b)]
+    (if (= la lb)
+        la
+        (let [leader (if (< la lb) la lb)
+              child (if (< la lb) lb la)
+              state (ra-state)
+              merged-mask
+                (match (get (.masks state) leader)
+                  (Some [lm]
+                        (match (get (.masks state) child)
+                          (Some [cm]
+                                (let [next (mask-and lm cm)]
+                                  (ra-trace-tail-loss! leader
+                                                       "union"
+                                                       lm
+                                                       cm
+                                                       next)
+                                  (Some next)))
+                          (None [] (Some lm))))
+                  (None [] (get (.masks state) child)))]
+          (set! (mut (.parent state)) child leader)
+          (set! (mut (.stack-required state))
+                leader
+                (or (get (.stack-required state) leader)
+                    (get (.stack-required state) child)))
+          (set! (mut (.masks state)) leader merged-mask)
+          (set! (mut (.kinds state))
+                leader
+                (ra-kind-join (get (.kinds state) leader)
+                              (get (.kinds state) child)))
+          (if (= (get (.callee-save-defs state) leader) 0)
+              (set! (mut (.callee-save-defs state))
+                    leader
+                    (get (.callee-save-defs state) child))
+              0)
+          ;; Simple's LRG.union: the representative definition prefers a fixed-register endpoint,
+          ;; so a Phi that merges a call result keeps that result as the def its empty-mask split
+          ;; isolates. Taking the leader's arbitrary def instead split a copy of a copy every round.
+          (let [leader-def (get (.mach-defs state) leader)
+                child-def (get (.mach-defs state) child)]
+            (if (= leader-def 0)
+                (set! (mut (.mach-defs state)) leader child-def)
+                (if (!= child-def 0)
+                    (do
+                      (if (!= leader-def child-def)
+                          (set! (mut (.multi-defs state)) leader true)
+                          0)
+                      (if (and (= (get (.fixed-def-counts state) leader) 0)
+                               (> (get (.fixed-def-counts state) child) 0))
+                          (set! (mut (.mach-defs state)) leader child-def)
+                          0))
+                    0)))
+          (set! (mut (.multi-defs state))
+                leader
+                (or (get (.multi-defs state) leader)
+                    (get (.multi-defs state) child)))
+          (let [leader-use (get (.mach-uses state) leader)
+                child-use (get (.mach-uses state) child)]
+            ;; Same preference for the representative use (Simple's LRG.union).
+            (if (or (= leader-use 0)
+                    (and (!= child-use 0)
+                         (= (get (.fixed-use-counts state) leader) 0)
+                         (> (get (.fixed-use-counts state) child) 0)))
+                (do
+                  (set! (mut (.mach-uses state)) leader child-use)
+                  (set! (mut (.mach-use-inputs state))
+                        leader
+                        (get (.mach-use-inputs state) child)))
+                (if (and (!= child-use 0) (!= leader-use child-use))
+                    (set! (mut (.multi-uses state)) leader true)
+                    0)))
+          (set! (mut (.multi-uses state))
+                leader
+                (or (get (.multi-uses state) leader)
+                    (get (.multi-uses state) child)))
+          (set! (mut (.fixed-def-counts state))
+                leader
+                (+ (get (.fixed-def-counts state) leader)
+                   (get (.fixed-def-counts state) child)))
+          (set! (mut (.fixed-use-counts state))
+                leader
+                (+ (get (.fixed-use-counts state) leader)
+                   (get (.fixed-use-counts state) child)))
+          (let [leader-split (get (.split-defs state) leader)
+                child-split (get (.split-defs state) child)]
+            (if (or (= leader-split 0)
+                    (and (!= child-split 0)
+                         (> (n-ltree-depth (match (arena-node child-split)
+                                             (Some [n] n)
+                                             (None [] (unreachable-node))))
+                            (n-ltree-depth (match (arena-node leader-split)
+                                             (Some [n] n)
+                                             (None [] (unreachable-node)))))))
+                (set! (mut (.split-defs state)) leader child-split)
+                0))
+          (let [leader-split (get (.split-uses state) leader)
+                child-split (get (.split-uses state) child)]
+            (if (or (= leader-split 0)
+                    (and (!= child-split 0)
+                         (> (n-ltree-depth (match (arena-node child-split)
+                                             (Some [n] n)
+                                             (None [] (unreachable-node))))
+                            (n-ltree-depth (match (arena-node leader-split)
+                                             (Some [n] n)
+                                             (None [] (unreachable-node)))))))
+                (set! (mut (.split-uses state)) leader child-split)
+                0))
+          (set! (mut (.failed state))
+                leader
+                (or (get (.failed state) leader) (get (.failed state) child)))
+          (match merged-mask
+            (Some [mask] (if (mask-empty? mask) (ra-fail! leader) 0))
+            (None [] 0))
+          leader))))

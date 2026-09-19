@@ -1,0 +1,192 @@
+;; AOT_RA_TRACE: narrating live ranges, tail losses and split policies.
+
+(module aot.codegen.regalloc.trace)
+(import "aot.util.arena" :use [compiler-state CompilerStateSlot])
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "aot.node.node" :use *)
+(import "aot.codegen.codegen" :use *)
+(import "aot.codegen.machine" :use *)
+(import "aot.codegen.regmask" :use *)
+(import "aot.codegen.regalloc.lrg" :use *)
+(import "aot.codegen.regalloc.build" :use *)
+(import "aot.codegen.regalloc.split-self" :use *)
+(import "aot.codegen.regalloc.split-empty" :use *)
+
+;; Trace: the node the allocator is visiting, so a mask event can name it.
+(defstruct RaTraceCursor [(nid i64) (round i64)])
+
+(defn ra-trace-cursor [] (-> (ptr RaTraceCursor))
+  (compiler-state [RaTraceCursor] (primitive/alloc-static CompilerStateSlot)))
+
+(defn ra-trace-visit! [(n (dyn NodeOps))] (-> i64)
+  (do (set! (.nid (ra-trace-cursor)) (n-nid n)) 0))
+
+;; Trace: a range whose mask just lost every stack location can never be spilled; name the step.
+(defn ra-trace-tail-loss! [(leader i64)
+                           (what (slice u8))
+                           (prior (ptr RegMask))
+                           (other (ptr RegMask))
+                           (next (ptr RegMask))] (-> i64)
+  (if (and (ra-trace?)
+           (and (!= (.stack-tail prior) 0) (= (.stack-tail next) 0)))
+      (do
+        (println "ra: round {} lrg {} lost its stack tail in {s}: other tail {} base {} words {} at {s}"
+                 (.round (ra-trace-cursor))
+                 leader
+                 what
+                 (.stack-tail other)
+                 (.stack-base other)
+                 (mask-nwords other)
+                 (match (arena-node (.nid (ra-trace-cursor)))
+                   (Some [n] (n-text n))
+                   (None [] "?")))
+        0)
+      0))
+
+;; Insert CalleeSave nodes, cache register masks for New and Call, then round after round of
+;; colour-or-split until coloured or the budget is exhausted.
+;; `AOT_RA_TRACE=1` narrates each failed round: the first failing live range, what it is, and the
+;; split policy applied. Diagnostic only; never changes the allocation.
+(defstruct RaTraceFlag [(state i64)])  ; 0 unread, 1 on, 2 off
+
+(defn ra-trace? [] (-> bool)
+  (let [f
+          (compiler-state [RaTraceFlag]
+                          (primitive/alloc-static CompilerStateSlot))]
+    (if (= (.state f) 0)
+        (set! (.state f)
+              (if (!= (primitive/cast i64 (os/getenv c"AOT_RA_TRACE")) 0) 1 2))
+        0)
+    (= (.state f) 1)))
+
+(defn ra-trace-lrg! [(round i64) (lrg i64)] (-> i64)
+  (if (not (ra-trace?))
+      0
+      (let [leader (ra-find! lrg)
+            state (ra-state)]
+        (println "ra: round {} failing lrg {} kind {} mask-empty {} fixed-defs {} fixed-uses {} multi-defs {} self-conflict {} stack-tail {}"
+                 round
+                 leader
+                 (ra-lrg-kind leader)
+                 (if (ra-lrg-mask-empty? leader) 1 0)
+                 (get (.fixed-def-counts state) leader)
+                 (get (.fixed-use-counts state) leader)
+                 (if (get (.multi-defs state) leader) 1 0)
+                 (if (ra-lrg-has-self-conflict? leader) 1 0)
+                 (match (ra-lrg-mask leader)
+                   (Some [m] (.stack-tail m))
+                   (None [] -1)))
+        ;; The neighbours that deny it registers.
+        (let [(mut edge) (get (.adj-heads state) leader)]
+          (loop (if (< (load edge) 0)
+                    (break 0)
+                    (let [raw-other (get (.adj-to state) (load edge))
+                          other (if (> raw-other 0) (ra-find! raw-other) 0)]
+                      (match (if (> other 0)
+                                 (arena-node (ra-lrg-sample-nid other))
+                                 (None [(dyn NodeOps)]))
+                        (Some [sample]
+                              (do
+                                (println "    neighbour lrg {} reg {} kind {} : {s}"
+                                         other
+                                         (ra-lrg-reg other)
+                                         (ra-lrg-kind other)
+                                         (n-text sample))
+                                0))
+                        (None [] 0))
+                      (set! (mut edge) (get (.adj-next state) (load edge)))
+                      (continue)))))
+        (let [(mut nid) 1]
+          (loop (if (> (load nid) (arena-node-count))
+                    (break 0)
+                    (do
+                      (match (arena-node (load nid))
+                        (Some [n]
+                              (if (and (!= (n-lrg n) 0)
+                                       (not (n-dead? n))
+                                       (= (ra-find! (n-lrg n)) leader))
+                                  (let [(mut oi) 0]
+                                    (println "    member: {s} out-tail {}"
+                                             (n-text n)
+                                             (match (mach-of n)
+                                               (Some [m]
+                                                     (match (m-outregmap m)
+                                                       (Some [om]
+                                                             (.stack-tail om))
+                                                       (None [] -1)))
+                                               (None [] -2)))
+                                    (loop (if (>= (load oi) (n-nouts n))
+                                              (break 0)
+                                              (do
+                                                (match (n-out n (load oi))
+                                                  (Some [use_]
+                                                        (do
+                                                          (println "      use: {s} (before-use -> {}, after-def -> {}) in-tail {}"
+                                                                   (n-text use_)
+                                                                   (code-before-use-target use_)
+                                                                   (code-after-def-target use_)
+                                                                   (match (mach-of use_)
+                                                                     (Some [um]
+                                                                           (let [(mut ii)
+                                                                                   1
+                                                                                 (mut tail)
+                                                                                   -1]
+                                                                             (loop (if (>= (load ii)
+                                                                                           (n-nins use_))
+                                                                                       (break 0)
+                                                                                       (do
+                                                                                         (match (n-in use_
+                                                                                                      (load ii))
+                                                                                           (Some [inp]
+                                                                                                 (if (n-same? inp
+                                                                                                              n)
+                                                                                                     (match (m-regmap um
+                                                                                                                      (load ii))
+                                                                                                       (Some [rm]
+                                                                                                             (set! (mut tail)
+                                                                                                                   (.stack-tail rm)))
+                                                                                                       (None []
+                                                                                                             (set! (mut tail)
+                                                                                                                   -3)))
+                                                                                                     0))
+                                                                                           (None []
+                                                                                                 0))
+                                                                                         (set! (mut ii)
+                                                                                               (+ (load ii)
+                                                                                                  1))
+                                                                                         (continue))))
+                                                                             (load tail)))
+                                                                     (None []
+                                                                           -2)))
+                                                          0))
+                                                  (None [] 0))
+                                                (set! (mut oi) (+ (load oi) 1))
+                                                (continue))))
+                                    (match (arena-node (n-block-nid n))
+                                      (Some [block]
+                                            (let [(mut si) 0]
+                                              (loop (if (>= (load si)
+                                                            (code-schedule-count block))
+                                                        (break 0)
+                                                        (do
+                                                          (println "      sched[{}]: {s}"
+                                                                   (load si)
+                                                                   (n-text (code-schedule-at block
+                                                                                             (load si))))
+                                                          (set! (mut si)
+                                                                (+ (load si) 1))
+                                                          (continue))))))
+                                      (None [] 0))
+                                    0)
+                                  0))
+                        (None [] 0))
+                      (set! (mut nid) (+ (load nid) 1))
+                      (continue)))))
+        0)))
+
+(defn ra-trace-policy! [(what (slice u8))] (-> i64)
+  (if (ra-trace?) (do (println "ra:   policy {s}" what) 0) 0))

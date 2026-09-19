@@ -1,0 +1,188 @@
+;; Coalescing split copies whose ends no longer interfere.
+
+(module aot.codegen.regalloc.coalesce)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
+(import "aot.node.node" :use *)
+(import "aot.node.control" :use *)
+(import "aot.codegen.codegen" :use *)
+(import "aot.codegen.regmask" :use *)
+(import "aot.codegen.regalloc.lrg" :use *)
+(import "aot.codegen.regalloc.trace" :use *)
+(import "aot.codegen.regalloc.build" :use *)
+(import "aot.codegen.regalloc.ifg" :use *)
+
+;; Count the distinct leaders adjacent to either side of a proposed merge. The direct edge between
+;; the pair is ignored here; callers reject it before asking for capacity.
+(defn ra-coalesce-degree [(a i64) (b i64)] (-> i64)
+  (ra-adj-union-degree a b))
+
+(defn ra-forget-coalesced-split! [(id i64) (split (dyn NodeOps))] (-> i64)
+  (let [state (ra-state)
+        leader (ra-find! id)
+        nid (n-nid split)]
+    (if (= (get (.mach-defs state) leader) nid)
+        (set! (mut (.mach-defs state)) leader 0)
+        0)
+    (if (= (get (.mach-uses state) leader) nid)
+        (do
+          (set! (mut (.mach-uses state)) leader 0)
+          (set! (mut (.mach-use-inputs state)) leader 0))
+        0)
+    (if (= (get (.split-defs state) leader) nid)
+        (set! (mut (.split-defs state)) leader 0)
+        0)
+    (if (= (get (.split-uses state) leader) nid)
+        (set! (mut (.split-uses state)) leader 0)
+        0)
+    0))
+
+;; Final Simple discovers copies from the authoritative per-block instruction lists. Walking those
+;; durable schedules keeps coalescing and postcolor proportional to emitted work, independent of
+;; dead declarations or disconnected constants retained elsewhere in the compilation arena.
+(defn ra-snapshot-scheduled-splits [] (-> (ArrayList i64))
+  (let [a (compiler-allocator)
+        (mut splits) (al-new [i64] a)
+        (mut ci) 0]
+    (loop (if (>= (load ci) (code-cfg-count))
+              (break 0)
+              (let [block (code-cfg-at (load ci))]
+                (if (cfg-block-head-of? block)
+                    (let [(mut i) 0]
+                      (loop (if (>= (load i) (code-schedule-count block))
+                                (break 0)
+                                (let [n (code-schedule-at block (load i))]
+                                  (if (and (not (n-dead? n))
+                                           (= (n-op n) OP-MACH-SPLIT)
+                                           (> (n-nins n) 1))
+                                      (push! [i64] (mut splits) (n-nid n))
+                                      0)
+                                  (set! (mut i) (+ (load i) 1))
+                                  (continue)))))
+                    0)
+                (set! (mut ci) (+ (load ci) 1))
+                (continue))))
+    (load splits)))
+
+;; Coalesce Split copies conservatively, following Simple's guards in order: the halves must be
+;; distinct, non-interfering, have overlapping masks, and the merged neighborhood must remain
+;; trivially colourable. Final Simple grows the larger adjacency with the smaller, unions the LRGs,
+;; then replaces the losing LRG in every neighbor. `ra-ifg-merge-adjacency!` performs that mutation
+;; directly: coalescing many copies is proportional to their incident edges, never one full liveness
+;; and IFG rebuild per copy.
+(defn ra-coalesce! [(round i64)] (-> bool)
+  (let [a (compiler-allocator)
+        splits (ra-snapshot-scheduled-splits)
+        (mut remove) (al-new [i64] a)
+        (mut progress) false]
+    (do round 0)
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (len splits))
+                (break 0)
+                (do
+                  (match (arena-node (get splits (load i)))
+                    (Some [split]
+                          (if (and (not (n-dead? split))
+                                   (> (n-nins split) 1)
+                                   (> (n-lrg split) 0)
+                                   (> (n-lrg (n-in! split 1)) 0))
+                              (let [left (ra-lrg-of! split)
+                                    right (ra-lrg-of! (n-in! split 1))]
+                                (if (= left right)
+                                    (do
+                                      (if (ra-trace?)
+                                          (do
+                                            (println "ra:   redundant split {s} (lrg {})"
+                                                     (n-text split)
+                                                     left)
+                                            0)
+                                          0)
+                                      (ra-forget-coalesced-split! left split)
+                                      (push! [i64] (mut remove) (n-nid split)))
+                                    ;; GC constraints were computed before coalescing. Merging a
+                                    ;; scalar range into a root range would retroactively require
+                                    ;; stack homes at the scalar's safepoints. Keep that copy;
+                                    ;; equal root kinds preserve the established constraints.
+                                    (if (and (= (ra-lrg-kind left)
+                                                (ra-lrg-kind right))
+                                             (not (ra-ifg-interferes? left
+                                                                      right)))
+                                        (match (ra-lrg-mask left)
+                                          (Some [left-mask]
+                                                (match (ra-lrg-mask right)
+                                                  (Some [right-mask]
+                                                        (let [merged-mask
+                                                                (mask-and left-mask
+                                                                          right-mask)
+                                                              capacity
+                                                                (mask-size merged-mask)]
+                                                          (if (and (not (mask-empty? merged-mask))
+                                                                   (or (= capacity
+                                                                          -1)
+                                                                       (< (ra-coalesce-degree left
+                                                                                              right)
+                                                                          capacity)))
+                                                              (do
+                                                                ;; Remove dying endpoint evidence
+                                                                ;; before union, as final Simple
+                                                                ;; does, so the other side's bias
+                                                                ;; metadata survives the fold.
+                                                                (ra-forget-coalesced-split! left
+                                                                                            split)
+                                                                (ra-forget-coalesced-split! right
+                                                                                            split)
+                                                                (let [winner
+                                                                        (ra-union! left
+                                                                                   right)
+                                                                      loser
+                                                                        (if (= winner
+                                                                               left)
+                                                                            right
+                                                                            left)]
+                                                                  (if (ra-trace?)
+                                                                      (do
+                                                                        (println "ra:   coalesced {s} (lrgs {} {})"
+                                                                                 (n-text split)
+                                                                                 left
+                                                                                 right)
+                                                                        0)
+                                                                      0)
+                                                                  (ra-ifg-merge-adjacency! winner
+                                                                                           loser)
+                                                                  (push! [i64]
+                                                                         (mut remove)
+                                                                         (n-nid split))
+                                                                  (set! (mut progress)
+                                                                        true)))
+                                                              0)))
+                                                  (None [] 0)))
+                                          (None [] 0))
+                                        0)))
+                              0))
+                    (None [] 0))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    (if (load progress) (ra-compress-node-lrgs!) 0)
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (len (load remove)))
+                (break 0)
+                (do
+                  (match (arena-node (get (load remove) (load i)))
+                    (Some [split]
+                          (if (and (not (n-dead? split))
+                                   (= (n-op split) OP-MACH-SPLIT)
+                                   (> (n-nins split) 1))
+                              (n-subsume! split (n-in! split 1))
+                              0))
+                    (None [] 0))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    ;; Final Simple removes the Split from the block's authoritative output list immediately.
+    ;; Our schedule is durable and separate from def-use outs, so refresh it after graph removal;
+    ;; otherwise dead zero-input Split entries reach layout and dereference a missing value input.
+    (if (> (len (load remove)) 0) (code-schedule-compact!) 0)
+    (ra-success?)))
