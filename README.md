@@ -48,15 +48,22 @@ by name.
 | Path | What it is |
 |---|---|
 | `src/node/` | The graph: header, dispatch trait, edges, peepholes, GVN — grouped by node family |
-| `src/type/` | Partial interned lattice: simple types, ints, floats, arbitrary tuples, function-index sets, and dynamic tags |
+| `src/type/` | The interned lattice: `type.coil` owns the sum, interning and `meet`; `scalar`, `fun`, `mem`, `dyn` own their families |
 | `src/shape.coil` | Implemented hidden-class transition tree with inherited aliases and stable property offsets |
-| `src/codegen/` | The one-way phase pipeline, from peepholes through to the object file |
-| `src/parse/` | The admitted JS/TS lexer, syntax arena, and Scope-driven SSA lowering |
-| `src/jsl/` | The reader, checker and graph lowering for JSL |
+| `src/codegen/` | The one-way phase pipeline, from peepholes through to the object file; `regalloc/`, `gcm/`, `encoding/`, `image/` hold the parts of the large phases |
+| `src/parse/` | `grammar/` tokens → syntax tree, `early.coil` early errors, `analysis/` facts about the tree, `lower/` tree → graph through Scope, `realm/` the global environment; `parser.coil` drives them |
+| `src/jsl/` | The reader, checker (`check/`) and graph lowering (`lower/`) for JSL |
+| `src/rt/` | The runtime, in Coil, one module per concern: heap, gc, statics, property, array, string, … |
 | `jsl/` | The JavaScript runtime library, written in JSL. Already written; we compile toward it |
 | `src/verify.coil` | Live graph verifier for the node families implemented so far |
 | `src/eval.coil` | Planned IR interpreter and differential oracle; currently a hard-error scaffold |
 | `tests/` | One suite per area; `coil test` runs them all |
+| `tools/lint/` | Project lint rules that run with every `coil lint`: unused imports, and `docs/LAYOUT.md` against the tree |
+| `tools/refactor/` | Refactoring metaprograms — split a module, rename a definition, gather functions into an `impl` — see [docs/REFACTORING.md](docs/REFACTORING.md) |
+
+A large module is a facade over a directory of the same name: `src/codegen/regalloc.coil` keeps the
+driver and re-exports `src/codegen/regalloc/*.coil`, so importers name only `aot.codegen.regalloc`.
+`coil lint --use aot.lint.size` lists the functions and files that have grown past a line budget.
 
 ## Status
 

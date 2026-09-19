@@ -73,6 +73,13 @@ recursive family — expression and statement lowering, say — live in separate
 
 4. **Add the rows** to `docs/LAYOUT.md`. `coil lint` reports each new file until you do.
 
+**Moving a definition a second time** — out of a facade that parts already import by name — leaves
+those parts seeing it twice: from `(import FACADE :use [name])` and from the new owner's `:use *`.
+`coil check` says so by name (`'name' is ambiguous — exported by :use'd modules A and B`); delete
+the name from the facade list in each part. The import rule deliberately does not do this for you:
+importing a name through a facade is exactly what every module OUTSIDE the family should do, and a
+rule cannot tell a part from a client.
+
 A split moves text; it changes no function body. The gate after a split is therefore the ordinary
 one, and a red test after a split means the split moved something it should not have — a duplicate
 `extern`, for instance, which one file tolerated by shadowing and two files do not.
