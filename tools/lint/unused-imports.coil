@@ -1,0 +1,360 @@
+;; Import hygiene: an import nothing in the module uses is reported, and `--fix` removes it.
+
+;;
+;;   coil lint --use aot.lint.unused-imports           report
+;;   coil lint --use aot.lint.unused-imports --diff    preview
+;;   coil lint --use aot.lint.unused-imports --fix     apply
+;;
+;; The compiler accepts an unused import silently, and this project imports mostly with `:use *`,
+;; so a module's import list only ever grows: a function moves away and the imports it needed stay
+;; behind, and after enough moves the list says nothing about what the module depends on. This
+;; rule makes the list mean something again. It is also the second half of `aot.refactor.split`,
+;; which hands a new module a copy of its parent's imports and leaves the narrowing to this rule.
+;;
+;; ── the analysis ─────────────────────────────────────────────────────────────────────────────
+;; It runs in the syntax phase, over authored forms, for two reasons: only that phase is handed the
+;; import declarations, and a macro call is still a call there — after expansion the name of a
+;; macro is gone and an import used only for its macros would look dead.
+;;
+;; Names are compared BARE, as in `coil.lint.unused`: `alias/foo`, `Type::foo` and `foo` all count
+;; as a mention of `foo` (and `Type::foo` of `Type`). A module's exports are every name its
+;; top-level forms introduce — definitions, sum variants, trait methods, and the methods of every
+;; `impl`, since an inherent method is only callable where its defining module is imported — plus,
+;; transitively, the exports of whatever it re-exports. Both sides over-approximate, and both err
+;; toward KEEPING an import: a local named after an export keeps the import alive. That is the only
+;; direction a deleting rule may err in.
+;;
+;; What is never touched:
+;;   * an import carrying `:reexport`, `:exclude` or `:rename` — its purpose is not local use;
+;;   * `coil.primitive`, which stdlib macro expansions reference unqualified at the call site;
+;;   * a `:use *` or alias-only import of a bundled `coil.*` namespace. Those are imported for
+;;     trait impls and macro support as often as for names, and nothing here can see either.
+;;     An explicit `:use [names]` list from a bundled namespace IS narrowed, because a listed name
+;;     that appears nowhere in the module is unused whatever the namespace provides.
+(module aot.lint.unused-imports)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use [HashMap hm-new hm-put! hm-contains?])
+(import "coil.slice" :use [subslice])
+(import "coil.str" :use [str-eq str-keyops])
+
+(defstruct ImportUse
+  [(aliased bool)  ; the import has an `:as` alias
+   (alias-used bool)
+   (star bool)  ; `:use *`
+   (listed bool)  ; `:use [names]`
+   (opaque bool)])  ; carries a clause this rule does not reason about
+
+;;; The last component of a possibly qualified symbol: `alias/foo` and `foo` are both `foo`.
+(defn ui-bare [(s (slice u8))] (-> (slice u8))
+  (let [n (len s)
+        (mut cut) 0
+        (mut i) 0]
+    (while (< (load i) n)
+      (when (= (primitive/cast i64 (get s (load i))) 47)
+        (set! cut (+ (load i) 1))
+        0)
+      (set! i (+ (load i) 1)))
+    (if (>= (load cut) n) s (subslice s (load cut) n))))
+
+;;; The offset of `::` in a symbol, or -1.
+(defn ui-path-separator [(s (slice u8))] (-> i64)
+  (let [n (len s)
+        (mut at) -1
+        (mut i) 0]
+    (while (and (< (load at) 0) (< (+ (load i) 1) n))
+      (when (and (= (primitive/cast i64 (get s (load i))) 58)
+                 (= (primitive/cast i64 (get s (+ (load i) 1))) 58))
+        (set! at (load i))
+        0)
+      (set! i (+ (load i) 1)))
+    (load at)))
+
+(defn ui-starts-with? [(s (slice u8)) (prefix (slice u8))] (-> bool)
+  (and (>= (len s) (len prefix)) (str-eq (subslice s 0 (len prefix)) prefix)))
+
+(defn ui-head? [(f Code) (head (slice u8))] (-> bool)
+  (and (primitive/code-list? f)
+       (> (len f) 0)
+       (primitive/code-sym? (get f 0))
+       (str-eq (primitive/code-sym (get f 0)) head)))
+
+(defn ui-note! [(names (ptr (HashMap (slice u8) i64))) (name (slice u8))] (-> i64)
+  (when (> (len name) 0) (hm-put! names name 1) 0)
+  0)
+
+;;; Record every name a symbol mentions.
+(defn ui-mention! [(names (ptr (HashMap (slice u8) i64))) (symbol (slice u8))] (-> i64)
+  (let [bare (ui-bare symbol)
+        separator (ui-path-separator bare)]
+    (if (< separator 0)
+        (ui-note! names bare)
+        (do
+          (ui-note! names (subslice bare 0 separator))
+          (ui-note! names (subslice bare (+ separator 2) (len bare)))))))
+
+;;; Every symbol anywhere inside `f` is a mention.
+(defn ui-walk! [(names (ptr (HashMap (slice u8) i64))) (f Code)] (-> i64)
+  (cond (primitive/code-sym? f) (ui-mention! names (primitive/code-sym f))
+        (or (primitive/code-list? f) (primitive/code-vector? f))
+          (do (for child (iter f) (ui-walk! names child)) 0)
+        :else 0))
+
+;;; The exported name a top-level list element of `impl`, `deftrait` or `defsum` introduces.
+(defn ui-note-member-heads! [(names (ptr (HashMap (slice u8) i64)))
+                             (f Code)
+                             (from i64)] (-> i64)
+  (for member
+    (iter (primitive/code-slice f from (len f)))
+    (when (and (primitive/code-list? member)
+               (> (len member) 0)
+               (primitive/code-sym? (get member 0)))
+      (ui-note! names (primitive/code-sym (get member 0)))
+      0))
+  0)
+
+(defn ui-definition? [(f Code)] (-> bool)
+  (or (ui-head? f "defn")
+      (ui-head? f "defn*")
+      (ui-head? f "defstruct")
+      (ui-head? f "defsum")
+      (ui-head? f "deftrait")
+      (ui-head? f "const")
+      (ui-head? f "def")
+      (ui-head? f "extern")
+      (ui-head? f "declare")
+      (ui-head? f "defannotation")
+      (ui-head? f "defcc")))
+
+(defn ui-find-module [(modules Code) (name (slice u8))] (-> Code)
+  (let [(mut found) `()]
+    (for m
+      (iter modules)
+      (when (and (> (len m) 0)
+                 (primitive/code-sym? (get m 0))
+                 (str-eq (primitive/code-sym (get m 0)) name))
+        (set! found m)
+        0))
+    (load found)))
+
+(defn ui-import-target [(f Code)] (-> (slice u8))
+  (if (and (> (len f) 1) (primitive/code-string? (get f 1)))
+      (primitive/code-str (get f 1))
+      ""))
+
+(defn ui-has-keyword? [(f Code) (keyword Code)] (-> bool)
+  (let [(mut hit) false]
+    (for clause
+      (iter (primitive/code-slice f 2 (len f)))
+      (when (= clause keyword) (set! hit true) 0))
+    (load hit)))
+
+;;; Add every name `module` makes available to an importer, following re-exports.
+(defn ui-collect-exports! [(names (ptr (HashMap (slice u8) i64)))
+                           (visited (ptr (HashMap (slice u8) i64)))
+                           (modules Code)
+                           (module (slice u8))] (-> i64)
+  (when (not (hm-contains? visited module))
+    (hm-put! visited module 1)
+    (let [m (ui-find-module modules module)]
+      (for f
+        (iter (primitive/code-slice m (if (> (len m) 0) 1 0) (len m)))
+        (cond (and (ui-definition? f)
+                   (> (len f) 1)
+                   (primitive/code-sym? (get f 1)))
+                (do
+                  (ui-note! names (primitive/code-sym (get f 1)))
+                  (when (or (ui-head? f "defsum") (ui-head? f "deftrait"))
+                    (ui-note-member-heads! names f 2)
+                    0)
+                  0)
+              (ui-head? f "impl") (ui-note-member-heads! names f 1)
+              (and (ui-head? f "import") (ui-has-keyword? f `:reexport))
+                (ui-collect-exports! names visited modules (ui-import-target f))
+              :else 0)))
+    0)
+  0)
+
+;;; Does anything `module` exports appear among `mentions`?
+(defn ui-any-export-mentioned? [(modules Code)
+                                (module (slice u8))
+                                (mentions (ptr (HashMap (slice u8) i64)))] (-> bool)
+  (let [(mut exports) (hm-new [(slice u8) i64] (malloc-allocator) (str-keyops))
+        (mut visited) (hm-new [(slice u8) i64] (malloc-allocator) (str-keyops))
+        (mut hit) false]
+    (ui-collect-exports! (mut exports) (mut visited) modules module)
+    (for name
+      (iter (load exports))
+      (when (hm-contains? mentions name) (set! hit true) 0))
+    (load hit)))
+
+(defn ui-alias-used? [(f Code) (alias (slice u8)) (module-forms Code)] (-> bool)
+  (let [(mut prefix-hit) false
+        (mut stack) (al-new [Code] (malloc-allocator))]
+    (for form
+      (iter module-forms)
+      (when (not (ui-head? form "import")) (push! (mut stack) form) 0))
+    (while (and (not (load prefix-hit)) (> (len (load stack)) 0))
+      (let [node (match (pop! (mut stack)) (Some [v] v) (None [] `()))]
+        (cond (primitive/code-sym? node)
+                (let [text (primitive/code-sym node)]
+                  (when (and (> (len text) (len alias))
+                             (ui-starts-with? text alias)
+                             (= (primitive/cast i64 (get text (len alias))) 47))
+                    (set! prefix-hit true)
+                    0)
+                  0)
+              (or (primitive/code-list? node) (primitive/code-vector? node))
+                (do (for child (iter node) (push! (mut stack) child)) 0)
+              :else 0)))
+    (load prefix-hit)))
+
+(defn ui-describe [(f Code) (module-forms Code)] (-> ImportUse)
+  (let [(mut aliased) false
+        (mut alias-used) false
+        (mut star) false
+        (mut listed) false
+        (mut opaque) false
+        n (len f)
+        (mut i) 2]
+    (while (< (load i) n)
+      (let [clause (get f (load i))]
+        (cond (= clause `:as)
+                (do
+                  (set! aliased true)
+                  (when (and (< (+ (load i) 1) n)
+                             (primitive/code-sym? (get f (+ (load i) 1))))
+                    (set! alias-used
+                          (ui-alias-used? f
+                                          (primitive/code-sym (get f
+                                                                   (+ (load i)
+                                                                      1)))
+                                          module-forms))
+                    0)
+                  (set! i (+ (load i) 1)))
+              (= clause `:use)
+                (do
+                  (when (< (+ (load i) 1) n)
+                    (if (primitive/code-vector? (get f (+ (load i) 1)))
+                        (set! listed true)
+                        (set! star true))
+                    0)
+                  (set! i (+ (load i) 1)))
+              :else (do (set! opaque true) 0)))
+      (set! i (+ (load i) 1)))
+    (let [a (load aliased)
+          u (load alias-used)
+          s (load star)
+          l (load listed)
+          o (load opaque)]
+      (ImportUse
+        :aliased a
+        :alias-used u
+        :star s
+        :listed l
+        :opaque o))))
+
+;;; The import with its `:use [names]` list cut down to `kept`; with none kept, without the clause.
+(defn ui-narrowed [(f Code) (kept Code)] (-> Code)
+  (let [(mut b) (primitive/code-list-new)
+        n (len f)
+        (mut i) 0]
+    (while (< (load i) n)
+      (if (and (= (get f (load i)) `:use) (< (+ (load i) 1) n))
+          (do
+            (when (> (len kept) 0)
+              (set! b (primitive/code-list-push! (load b) (get f (load i))))
+              (set! b (primitive/code-list-push! (load b) `[~@kept]))
+              0)
+            (set! i (+ (load i) 2)))
+          (do
+            (set! b (primitive/code-list-push! (load b) (get f (load i))))
+            (set! i (+ (load i) 1)))))
+    (primitive/code-list-done (load b))))
+
+(defn ui-check-listed! [(f Code)
+                        (use ImportUse)
+                        (mentions (ptr (HashMap (slice u8) i64)))] (-> i64)
+  (let [(mut kept) (primitive/code-list-new)
+        (mut kept-count) 0
+        (mut total) 0
+        n (len f)
+        (mut i) 2]
+    (while (< (load i) n)
+      (when (and (= (get f (load i)) `:use) (< (+ (load i) 1) n))
+        (for name
+          (iter (get f (+ (load i) 1)))
+          (set! total (+ (load total) 1))
+          (when (or (not (primitive/code-sym? name))
+                    (hm-contains? mentions (ui-bare (primitive/code-sym name))))
+            (set! kept (primitive/code-list-push! (load kept) name))
+            (set! kept-count (+ (load kept-count) 1))
+            0))
+        0)
+      (set! i (+ (load i) 1)))
+    (cond (= (load kept-count) (load total)) 0
+          (and (= (load kept-count) 0) (not (.alias-used use)))
+            (do
+              (primitive/delete f
+                                "unused import: nothing it names is used in this module")
+              0)
+          :else
+            (do
+              (primitive/suggest f
+                                 "import lists names this module does not use"
+                                 (ui-narrowed f
+                                              (primitive/code-list-done (load kept))))
+              0))))
+
+(defn ui-check-import! [(modules Code)
+                        (module-forms Code)
+                        (f Code)
+                        (mentions (ptr (HashMap (slice u8) i64)))] (-> i64)
+  (let [target (ui-import-target f)
+        use (ui-describe f module-forms)
+        bundled (ui-starts-with? target "coil.")]
+    (cond (or (.opaque use) (= (len target) 0) (str-eq target "coil.primitive"))
+            0
+          (.listed use) (ui-check-listed! f use mentions)
+          bundled 0
+          (.alias-used use) 0
+          (and (.star use) (ui-any-export-mentioned? modules target mentions)) 0
+          :else
+            (do
+              (primitive/delete f
+                                "unused import: nothing it exports is used in this module")
+              0))))
+
+(defn ui-check-module! [(modules Code) (m Code)] (-> i64)
+  (let [forms (primitive/code-slice m 1 (len m))
+        (mut mentions) (hm-new [(slice u8) i64] (malloc-allocator) (str-keyops))
+        (mut seen-lines) (al-new [i64] (malloc-allocator))]
+    (for f
+      (iter forms)
+      (when (not (ui-head? f "import")) (ui-walk! (mut mentions) f) 0))
+    ;; The syntax-phase program lists a module's imports twice; report each line once.
+    (for f
+      (iter forms)
+      (when (and (ui-head? f "import") (primitive/code-from-user? f))
+        (let [line (primitive/code-line f)
+              (mut seen) false]
+          (for previous
+            (iter (load seen-lines))
+            (when (= previous line) (set! seen true) 0))
+          (when (not (load seen))
+            (push! (mut seen-lines) line)
+            (ui-check-import! modules forms f (mut mentions))
+            0)
+          0)))
+    0))
+
+(defn lint-unused-imports [(modules Code)] (-> Code)
+  (for m
+    (iter modules)
+    (when (and (> (len m) 1) (primitive/code-from-user? (get m 1)))
+      (ui-check-module! modules m)
+      0))
+  `0)
+
+(checker lint-unused-imports :phase before-expand)
