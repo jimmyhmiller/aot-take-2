@@ -4231,7 +4231,7 @@ expression and statement lowering import each other. A cycle between layers rema
 error. The boundaries follow Simple's files wherever Simple has them (`regalloc/{lrg,build,ifg,
 colour}` for `LRG`, `BuildLRG`, `IFG`, `Color`; `node/fun.coil` for `FunNode` and `ParmNode`), and
 the concern otherwise (`parse/{grammar,analysis,lower,realm}`). `docs/LAYOUT.md` §5 states the
-convention and §6 has a row for each of the 120 new files.
+convention and §6 has a row for each of the 106 new files.
 
 No function body changed. Forms were moved by `tools/refactor/split.coil`, a Coil metaprogram that
 works from the compiler's own parse, and the one behavioural hazard of moving code is a name that
@@ -4267,5 +4267,8 @@ Not done, deliberately: the late-bound hooks (`set-con-hook!`, `set-cfg-ext!`,
 could now be direct calls; others are the layering this file records ("`aot.node.call` … still
 knows nothing about JavaScript"). Telling the two apart is a design review per hook, not a move.
 
-Measured: 922 tests green after each stage, zero lint warnings, the exported symbol set of
-`aot-runtime.o` unchanged, `coil check` 6.2 s before and 7.9 s after over 264 modules instead of 144.
+Measured: 922 tests green after each stage and zero lint warnings. The refactored compiler emits
+byte-identical objects for `benchmarks/binarytrees-aot.ts` and `benchmarks/fib-aot.ts`; the
+exported symbol set of `aot-runtime.o` is unchanged and binary trees, which lives in the collector,
+runs in 0.41 s against 0.42 s linked to the old runtime. `coil check` takes 7.1 s over 250 modules
+against 6.2 s over 144.
