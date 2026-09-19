@@ -4262,6 +4262,17 @@ and 250 take a struct. The node layer was already traits (`NodeOps`, `CFGOps`, `
 prefixed function names, as Coil's own library does; turning `ty-meet` into a method would mean
 wrapping every interned id in a newtype, which is a representation change, not a reorganization.
 
+**A staircase of `if`s is a `cond`.** `aot.lint.cond` is the third registered rule: three or more
+nested `if`s are reported and `--fix` rewrites them, arms byte-for-byte. It flattened 239 chains;
+`jsl-lower-expr` and `jsl-check-expr-type-in` had run past column 120. `cond` expands to the same
+`if`s, so this is the one change here that rewrote function bodies and still cannot change
+behaviour — but the syntax phase hands a checker some macro calls already expanded, and the first
+cut wrote 164 `let*` and two unrolled `for` loops into the source with `coil check` green. A
+per-file diff of token counts found it. The rule now restores a `let` arm from its children and
+leaves alone a chain it cannot return as written; the audit of the final run shows `if`, `cond`
+and `:else` as the only tokens added or removed in 85 files, and no comment lost. **A `--fix`
+built from nodes is checked by diffing tokens, not by compiling.**
+
 Not done, deliberately: the late-bound hooks (`set-con-hook!`, `set-cfg-ext!`,
 `jsl-set-closure-maker!`, …). Several exist only because a module cycle was assumed impossible, and
 could now be direct calls; others are the layering this file records ("`aot.node.call` … still
