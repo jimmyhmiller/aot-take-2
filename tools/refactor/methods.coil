@@ -1,0 +1,234 @@
+;; Gather a module's functions into an `impl` block: free functions become methods.
+
+;;
+;;   coil lint --use aot.refactor.methods \
+;;     --lint-param aot.methods.module=aot.codegen.regmask \
+;;     --lint-param aot.methods.impl=RegMask \
+;;     --lint-param "aot.methods.names=RegMask::new,has-reg?,union" \
+;;     --lint-param aot.methods.apply=1
+;;
+;; `aot.methods.impl` is everything between `(impl` and the first method: `RegMask` for an inherent
+;; impl, `Len RegMask` for a trait impl. Each named `defn` is removed from where it stands and
+;; re-emitted inside one `(impl …)` form placed where the FIRST of them stood, in their original
+;; order, each with the comment block above it. `(defn Type::name` and `(defn name` both become
+;; `(name`: a receiverless function is called as `Type::name` once it is a method, so rename it to
+;; that spelling first (aot.refactor.rename) and its call sites are already right.
+;;
+;; An inherent method is dispatched on its first argument, so call sites of the form `(name x …)`
+;; do not change. What does change is everything the language does not allow of a method: it has
+;; no address, so a function passed to `fnptr-of` must stay a function, and this tool refuses a
+;; name it finds under `fnptr-of` anywhere in the module. A generic function (`(defn f [T] […] …)`)
+;; is refused as well; decide by hand whether its parameters belong on the impl.
+;;
+;; The result is left unformatted — run `coil fmt --write` on the file, then `coil check`.
+(module aot.refactor.methods)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use [subslice])
+(import "coil.str"
+        :use
+        [sb-new sb-push-str! sb-str str-split str-trim str-find])
+(import "aot.refactor.source" :use *)
+
+;;; The index in `names` of the function this form defines, or -1.
+(defn methods-index-of [(names (ptr (ArrayList (slice u8))))
+                        (f (ptr SourceForm))] (-> i64)
+  (let [(mut found) -1
+        (mut i) 0]
+    (when (= (.head f) "defn")
+      (while (and (< (load found) 0) (< (load i) (len names)))
+        (when (= (get (load names) (load i)) (.name f)) (set! found (load i)) 0)
+        (set! i (+ (load i) 1)))
+      0)
+    (load found)))
+
+;;; `Type::name` -> `name`.
+(defn methods-method-name [(name (slice u8))] (-> (slice u8))
+  (match (str-find name "::")
+    (Some [at] (subslice name (+ at 2) (len name)))
+    (None [] name)))
+
+;;; The form's own text with its `(defn NAME` head respelled `(METHOD`.
+(defn methods-as-method [(text (slice u8))
+                         (starts (ArrayList i64))
+                         (f (ptr SourceForm))] (-> (slice u8))
+  (let [lead
+          (source-lines-text text starts (.lead-line f) (- (.first-line f) 1))
+        body (source-lines-text text starts (.first-line f) (.last-line f))
+        (mut head) (sb-new (malloc-allocator))
+        (mut sb) (sb-new (malloc-allocator))]
+    (sb-push-str! (mut head) "(defn ")
+    (sb-push-str! (mut head) (.name f))
+    (let [expected (sb-str (load head))]
+      (when (not (source-starts-with? body expected))
+        (source-fail "not a plain `(defn NAME` form: " (.name f))
+        0)
+      (sb-push-str! (mut sb) lead)
+      (sb-push-str! (mut sb) "(")
+      (sb-push-str! (mut sb) (methods-method-name (.name f)))
+      (sb-push-str! (mut sb) (source-after body expected))
+      (sb-str (load sb)))))
+
+;;; Refuse a name that appears under `fnptr-of`, and a generic function.
+(defn methods-refuse-unmethodable! [(names (ptr (ArrayList (slice u8))))
+                                    (f Code)] (-> i64)
+  (when (or (primitive/code-list? f) (primitive/code-vector? f))
+    (when (and (> (len f) 1)
+               (primitive/code-sym? (get f 0))
+               (primitive/code-sym? (get f 1))
+               (or (= (primitive/code-sym (get f 0)) "primitive/fnptr-of")
+                   (= (primitive/code-sym (get f 0)) "fnptr-of")))
+      (for name
+        (iter (load names))
+        (when (= name (primitive/code-sym (get f 1)))
+          (source-fail "its address is taken with fnptr-of, so it must stay a function: "
+                       name)
+          0))
+      0)
+    (when (and (> (len f) 2)
+               (primitive/code-sym? (get f 0))
+               (= (primitive/code-sym (get f 0)) "defn")
+               (primitive/code-sym? (get f 1))
+               (> (len f) 3)
+               (primitive/code-vector? (get f 2))
+               (primitive/code-vector? (get f 3)))
+      (for name
+        (iter (load names))
+        (when (= name (primitive/code-sym (get f 1)))
+          (source-fail "generic function; move it by hand: " name)
+          0))
+      0)
+    (for child (iter f) (methods-refuse-unmethodable! names child))
+    0)
+  0)
+
+(defn methods-applied [] (-> (ptr bool))
+  (primitive/alloc-static bool))
+
+(defn methods-require-defined! [(forms (ptr (ArrayList SourceForm)))
+                                (names (ptr (ArrayList (slice u8))))] (-> i64)
+  (for name
+    (iter (load names))
+    (let [(mut hit) false
+          (mut k) 0]
+      (while (< (load k) (len forms))
+        (let [f (al-elem forms (load k))]
+          (when (and (= (.head f) "defn") (= (.name f) name)) (set! hit true) 0))
+        (set! k (+ (load k) 1)))
+      ;; A typo must not silently leave a function behind.
+      (when (not (load hit))
+        (source-fail "no such function in the module: " name)
+        0)
+      0))
+  0)
+
+;;; The module's text with the named functions gathered into one impl where the first stood.
+(defn methods-text [(forms (ptr (ArrayList SourceForm)))
+                    (names (ptr (ArrayList (slice u8))))
+                    (text (slice u8))
+                    (starts (ArrayList i64))
+                    (header (slice u8))] (-> (slice u8))
+  (let [(mut sb) (sb-new (malloc-allocator))
+        (mut methods) (sb-new (malloc-allocator))
+        (mut emitted) false
+        (mut i) 0]
+    (while (< (load i) (len forms))
+      (when (>= (methods-index-of names (al-elem forms (load i))) 0)
+        (sb-push-str! (mut methods)
+                      (methods-as-method text starts (al-elem forms (load i))))
+        0)
+      (set! i (+ (load i) 1)))
+    (set! i 0)
+    (while (< (load i) (len forms))
+      (if (>= (methods-index-of names (al-elem forms (load i))) 0)
+          (when (not (load emitted))
+            (sb-push-str! (mut sb) "\n(impl ")
+            (sb-push-str! (mut sb) header)
+            (sb-push-str! (mut sb) (str-trim-end (sb-str (load methods))))
+            ;; On its own line: the last method may end in a line comment. `coil fmt` closes it up.
+            (sb-push-str! (mut sb) "\n)\n")
+            (set! emitted true)
+            0)
+          (do
+            (source-push-form! (mut sb)
+                               text
+                               starts
+                               (al-elem forms (load i))
+                               true)
+            0))
+      (set! i (+ (load i) 1)))
+    (when (> (len forms) 0)
+      (sb-push-str! (mut sb)
+                    (source-lines-text text
+                                       starts
+                                       (+ (.last-line (al-elem forms
+                                                               (- (len forms) 1)))
+                                          1)
+                                       (- (len starts) 1)))
+      0)
+    (sb-str (load sb))))
+
+(defn methods-run! [(modules Code) (module (slice u8))] (-> i64)
+  (let [m (source-find-module modules module)
+        (mut forms) (al-new [SourceForm] (malloc-allocator))
+        (mut names) (al-new [(slice u8)] (malloc-allocator))
+        header (primitive/lint-param "aot.methods.impl" "")]
+    (when (>= (len m) 2)
+      (when (= (len header) 0)
+        (source-fail "aot.methods.impl is required" "")
+        0)
+      (for raw
+        (iter (str-split (malloc-allocator)
+                         (primitive/lint-param "aot.methods.names" "")
+                         ","))
+        (when (> (len (str-trim raw)) 0) (push! (mut names) (str-trim raw)) 0))
+      (for f
+        (iter (primitive/code-slice m 1 (len m)))
+        (methods-refuse-unmethodable! (mut names) f))
+      (let [path (primitive/code-file (get m 1))
+            text
+              (match (source-read path)
+                (Some [bytes] bytes)
+                (None [] (do (source-fail "cannot read " path) "")))
+            starts (source-line-starts text)]
+        (source-collect-forms! (mut forms) m)
+        (source-sort-forms! (mut forms))
+        (source-assign-leads! (mut forms))
+        (methods-require-defined! (mut forms) (mut names))
+        (println "methods: {} functions of {} -> (impl {})"
+                 (len (load names))
+                 module
+                 header)
+        (when (= (primitive/lint-param "aot.methods.apply" "0") "1")
+          (source-write! path
+                         (methods-text (mut forms)
+                                       (mut names)
+                                       text
+                                       starts
+                                       header))
+          (set! (methods-applied) true)
+          (println "  rewrote {}" path)
+          0)
+        0)
+      0)
+    0))
+
+;;; `s` without its trailing newlines and spaces, so the impl's closing paren follows the last
+;;; method directly.
+(defn str-trim-end [(s (slice u8))] (-> (slice u8))
+  (let [(mut n) (len s)]
+    (while (and (> (load n) 0)
+                (or (= (primitive/cast i64 (get s (- (load n) 1))) 10)
+                    (= (primitive/cast i64 (get s (- (load n) 1))) 32)))
+      (set! n (- (load n) 1)))
+    (subslice s 0 (load n))))
+
+(defn refactor-methods [(modules Code)] (-> Code)
+  (let [module (primitive/lint-param "aot.methods.module" "")]
+    (when (and (> (len module) 0) (not (load (methods-applied))))
+      (methods-run! modules module)
+      0)
+    `0))
+
+(checker refactor-methods :phase before-expand)
