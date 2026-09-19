@@ -1,0 +1,230 @@
+;; Source editing shared by the refactoring metaprograms: a module's top-level forms with the lines that travel with them, and whole-file reads and writes.
+
+(module aot.refactor.source)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use [subslice])
+(import "coil.str" :use [StrBuf sb-new sb-push-str! sb-push-byte! sb-str])
+(import "coil.fs" :use [read-file])
+(import "coil.str" :use [str->cstr])
+(import "coil.slice" :use [slice-data])
+(import "coil.os" :as os)
+(import "aot.refactor.split" :use [SPLIT-STAY])
+
+;; `coil.fs/write-file` does not compile inside a syntax-phase checker: its open flags are published
+;; by a `(meta …)` generator that has not run when a checker module is built (coil-bugs pad,
+;; 2026-09-19). stdio names its mode with a string, so it needs no generated constant.
+(extern fopen :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+(extern fwrite :cc c [(ptr u8) i64 i64 (ptr i8)] (-> i64))
+
+(extern fclose :cc c [(ptr i8)] (-> i32))
+
+(extern mkdir :cc c [(ptr i8) i32] (-> i32))
+
+;;; One top-level form of the source module and the lines that travel with it.
+(defstruct SourceForm
+  [(name (slice u8))  ; the introduced name, or "" when the form introduces none
+   (head (slice u8))
+   (variants (slice u8))  ; for a `defsum`, its variant names, each preceded by a space
+   (first-line i64)  ; 1-based line the form starts on
+   (last-line i64)  ; 1-based line the form ends on
+   (lead-line i64)  ; 1-based first line of the comment block above it
+   (target i64)])  ; index into the targets, or SPLIT-STAY
+
+(defn source-fail [(message (slice u8)) (detail (slice u8))] (-> i64)
+  (println "aot.refactor.split: {}{}" message detail)
+  (os/_exit 2)
+  0)
+
+(defn source-starts-with? [(s (slice u8)) (prefix (slice u8))] (-> bool)
+  (and (>= (len s) (len prefix)) (= (subslice s 0 (len prefix)) prefix)))
+
+(defn source-after [(s (slice u8)) (prefix (slice u8))] (-> (slice u8))
+  (subslice s (len prefix) (len s)))
+
+(defn source-count-newlines [(s (slice u8))] (-> i64)
+  (let [(mut n) 0]
+    (for b
+      (iter s)
+      (when (= (primitive/cast i64 b) 10) (set! n (+ (load n) 1)) 0))
+    (load n)))
+
+;;; Byte offset of the start of every line, plus one final entry at end of text.
+(defn source-line-starts [(text (slice u8))] (-> (ArrayList i64))
+  (let [(mut starts) (al-new [i64] (malloc-allocator))
+        n (len text)
+        (mut i) 0]
+    (push! (mut starts) 0)
+    (while (< (load i) n)
+      (when (= (primitive/cast i64 (get text (load i))) 10)
+        (push! (mut starts) (+ (load i) 1))
+        0)
+      (set! i (+ (load i) 1)))
+    (when (!= (get (load starts) (- (len (load starts)) 1)) n)
+      (push! (mut starts) n)
+      0)
+    (load starts)))
+
+;;; The text of 1-based lines [lo, hi], newline included.
+(defn source-lines-text [(text (slice u8))
+                         (starts (ArrayList i64))
+                         (lo i64)
+                         (hi i64)] (-> (slice u8))
+  (if (> lo hi)
+      ""
+      (let [last (- (len starts) 1)
+            from (get starts (- lo 1))
+            to (if (>= hi last) (get starts last) (get starts hi))]
+        (subslice text from to))))
+
+(defn source-form-head [(f Code)] (-> (slice u8))
+  (if (and (primitive/code-list? f)
+           (and (> (len f) 0) (primitive/code-sym? (get f 0))))
+      (primitive/code-sym (get f 0))
+      ""))
+
+(defn source-definition-head? [(head (slice u8))] (-> bool)
+  (or (= head "defn")
+      (= head "defstruct")
+      (= head "defsum")
+      (= head "deftrait")
+      (= head "const")
+      (= head "def")
+      (= head "extern")
+      (= head "declare")
+      (= head "deftest")))
+
+(defn source-form-name [(f Code) (head (slice u8))] (-> (slice u8))
+  (if (and (source-definition-head? head)
+           (and (> (len f) 1) (primitive/code-sym? (get f 1))))
+      (primitive/code-sym (get f 1))
+      ""))
+
+;;; A sum's variants are names an importer needs alongside the sum itself.
+(defn source-sum-variants [(f Code) (head (slice u8))] (-> (slice u8))
+  (let [(mut sb) (sb-new (malloc-allocator))]
+    (when (= head "defsum")
+      (for member
+        (iter (primitive/code-slice f 2 (len f)))
+        (when (and (primitive/code-list? member)
+                   (> (len member) 0)
+                   (primitive/code-sym? (get member 0)))
+          (sb-push-byte! (mut sb) 32)
+          (sb-push-str! (mut sb) (primitive/code-sym (get member 0)))
+          0))
+      0)
+    (sb-str (load sb))))
+
+(defn source-find-module [(modules Code) (name (slice u8))] (-> Code)
+  (let [(mut found) `()]
+    (for m
+      (iter modules)
+      (when (and (> (len m) 0)
+                 (and (primitive/code-sym? (get m 0))
+                      (= (primitive/code-sym (get m 0)) name)))
+        (set! found m)
+        0))
+    (load found)))
+
+;;; The source module's forms in line order. The syntax-phase program lists a module's imports
+;;; twice, so a form whose first line was already seen is skipped.
+(defn source-collect-forms! [(forms (ptr (ArrayList SourceForm))) (m Code)] (-> i64)
+  (for f
+    (iter (primitive/code-slice m 1 (len m)))
+    (let [line (primitive/code-line f)
+          head (source-form-head f)
+          name (source-form-name f head)
+          variants (source-sum-variants f head)
+          last-line (+ line (source-count-newlines (primitive/code-src f)))
+          (mut seen) false
+          (mut i) 0]
+      (while (< (load i) (len forms))
+        (when (= (.first-line (al-elem forms (load i))) line)
+          (set! seen true)
+          0)
+        (set! i (+ (load i) 1)))
+      (when (not (load seen))
+        (push! forms
+               (SourceForm
+                 :name name
+                 :head head
+                 :variants variants
+                 :first-line line
+                 :last-line last-line
+                 :lead-line 0
+                 :target SPLIT-STAY))
+        0)))
+  0)
+
+;;; Insertion sort by first line; forms arrive nearly sorted already.
+(defn source-sort-forms! [(forms (ptr (ArrayList SourceForm)))] (-> i64)
+  (let [n (len forms)
+        (mut i) 1]
+    (while (< (load i) n)
+      (let [(mut j) (load i)]
+        (while (and (> (load j) 0)
+                    (> (.first-line (al-elem forms (- (load j) 1)))
+                       (.first-line (al-elem forms (load j)))))
+          (let [a (load (al-elem forms (- (load j) 1)))
+                b (load (al-elem forms (load j)))]
+            (set! (al-elem forms (- (load j) 1)) b)
+            (set! (al-elem forms (load j)) a)
+            (set! j (- (load j) 1)))))
+      (set! i (+ (load i) 1)))
+    0))
+
+(defn source-assign-leads! [(forms (ptr (ArrayList SourceForm)))] (-> i64)
+  (let [n (len forms)
+        (mut i) 0
+        (mut previous-last) 0]
+    (while (< (load i) n)
+      (let [f (al-elem forms (load i))]
+        (when (<= (.first-line f) (load previous-last))
+          (source-fail "two top-level forms share a line near " (.name f))
+          0)
+        (set! (.lead-line f) (+ (load previous-last) 1))
+        (set! previous-last (.last-line f)))
+      (set! i (+ (load i) 1)))
+    0))
+
+(defn source-header-form? [(f (ptr SourceForm))] (-> bool)
+  (or (= (.head f) "module") (= (.head f) "import")))
+
+(defn source-read [(path (slice u8))] (-> (Option (slice u8)))
+  (try (let [bytes (try-or! (read-file (malloc-allocator) path) (None))]
+         (Some bytes))))
+
+;;; Create every missing directory above `path`. An existing directory is not an error; a path
+;;; that still cannot be opened afterwards is reported by the write.
+(defn source-ensure-parent! [(path (slice u8))] (-> i64)
+  (let [(mut i) 1]
+    (while (< (load i) (len path))
+      (when (= (primitive/cast i64 (get path (load i))) 47)
+        (mkdir (str->cstr (malloc-allocator) (subslice path 0 (load i))) 493)
+        0)
+      (set! i (+ (load i) 1)))
+    0))
+
+(defn source-write! [(path (slice u8)) (text (slice u8))] (-> i64)
+  (source-ensure-parent! path)
+  (let [file (fopen (str->cstr (malloc-allocator) path) c"w")]
+    (when (= (primitive/cast i64 file) 0)
+      (source-fail "cannot open for writing: " path)
+      0)
+    (let [written (fwrite (slice-data text) 1 (len text) file)]
+      (fclose file)
+      (when (!= written (len text)) (source-fail "short write to " path) 0)
+      written)))
+
+(defn source-push-form! [(sb (mut StrBuf))
+                         (text (slice u8))
+                         (starts (ArrayList i64))
+                         (f (ptr SourceForm))
+                         (with-lead bool)] (-> i64)
+  (sb-push-str! (mut sb)
+                (source-lines-text text
+                                   starts
+                                   (if with-lead (.lead-line f) (.first-line f))
+                                   (.last-line f))))

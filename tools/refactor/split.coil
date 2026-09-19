@@ -59,29 +59,9 @@
 (import "coil.str" :use [str->cstr])
 (import "coil.slice" :use [slice-data])
 (import "coil.os" :as os)
-
-;; `coil.fs/write-file` does not compile inside a syntax-phase checker: its open flags are published
-;; by a `(meta …)` generator that has not run when a checker module is built (coil-bugs pad,
-;; 2026-09-19). stdio names its mode with a string, so it needs no generated constant.
-(extern fopen :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
-
-(extern fwrite :cc c [(ptr u8) i64 i64 (ptr i8)] (-> i64))
-
-(extern fclose :cc c [(ptr i8)] (-> i32))
-
-(extern mkdir :cc c [(ptr i8) i32] (-> i32))
+(import "aot.refactor.source" :use * :reexport)
 
 (const SPLIT-STAY -1)
-
-;;; One top-level form of the source module and the lines that travel with it.
-(defstruct SplitForm
-  [(name (slice u8))  ; the introduced name, or "" when the form introduces none
-   (head (slice u8))
-   (variants (slice u8))  ; for a `defsum`, its variant names, each preceded by a space
-   (first-line i64)  ; 1-based line the form starts on
-   (last-line i64)  ; 1-based line the form ends on
-   (lead-line i64)  ; 1-based first line of the comment block above it
-   (target i64)])  ; index into the targets, or SPLIT-STAY
 
 ;;; One destination module and how forms are chosen for it.
 (defstruct SplitTarget
@@ -92,17 +72,6 @@
    (forms i64)
    (lines i64)])
 
-(defn split-fail [(message (slice u8)) (detail (slice u8))] (-> i64)
-  (println "aot.refactor.split: {}{}" message detail)
-  (os/_exit 2)
-  0)
-
-(defn split-starts-with? [(s (slice u8)) (prefix (slice u8))] (-> bool)
-  (and (>= (len s) (len prefix)) (= (subslice s 0 (len prefix)) prefix)))
-
-(defn split-after [(s (slice u8)) (prefix (slice u8))] (-> (slice u8))
-  (subslice s (len prefix) (len s)))
-
 (defn split-key [(a (slice u8)) (b (slice u8)) (c (slice u8))] (-> (slice u8))
   (let [(mut sb) (sb-new (malloc-allocator))]
     (sb-push-str! (mut sb) a)
@@ -110,156 +79,11 @@
     (sb-push-str! (mut sb) c)
     (sb-str (load sb))))
 
-(defn split-count-newlines [(s (slice u8))] (-> i64)
-  (let [(mut n) 0]
-    (for b
-      (iter s)
-      (when (= (primitive/cast i64 b) 10) (set! n (+ (load n) 1)) 0))
-    (load n)))
-
-;;; Byte offset of the start of every line, plus one final entry at end of text.
-(defn split-line-starts [(text (slice u8))] (-> (ArrayList i64))
-  (let [(mut starts) (al-new [i64] (malloc-allocator))
-        n (len text)
-        (mut i) 0]
-    (push! (mut starts) 0)
-    (while (< (load i) n)
-      (when (= (primitive/cast i64 (get text (load i))) 10)
-        (push! (mut starts) (+ (load i) 1))
-        0)
-      (set! i (+ (load i) 1)))
-    (when (!= (get (load starts) (- (len (load starts)) 1)) n)
-      (push! (mut starts) n)
-      0)
-    (load starts)))
-
-;;; The text of 1-based lines [lo, hi], newline included.
-(defn split-lines-text [(text (slice u8))
-                        (starts (ArrayList i64))
-                        (lo i64)
-                        (hi i64)] (-> (slice u8))
-  (if (> lo hi)
-      ""
-      (let [last (- (len starts) 1)
-            from (get starts (- lo 1))
-            to (if (>= hi last) (get starts last) (get starts hi))]
-        (subslice text from to))))
-
-(defn split-form-head [(f Code)] (-> (slice u8))
-  (if (and (primitive/code-list? f)
-           (and (> (len f) 0) (primitive/code-sym? (get f 0))))
-      (primitive/code-sym (get f 0))
-      ""))
-
-(defn split-definition-head? [(head (slice u8))] (-> bool)
-  (or (= head "defn")
-      (= head "defstruct")
-      (= head "defsum")
-      (= head "deftrait")
-      (= head "const")
-      (= head "def")
-      (= head "extern")
-      (= head "declare")
-      (= head "deftest")))
-
-(defn split-form-name [(f Code) (head (slice u8))] (-> (slice u8))
-  (if (and (split-definition-head? head)
-           (and (> (len f) 1) (primitive/code-sym? (get f 1))))
-      (primitive/code-sym (get f 1))
-      ""))
-
-;;; A sum's variants are names an importer needs alongside the sum itself.
-(defn split-sum-variants [(f Code) (head (slice u8))] (-> (slice u8))
-  (let [(mut sb) (sb-new (malloc-allocator))]
-    (when (= head "defsum")
-      (for member
-        (iter (primitive/code-slice f 2 (len f)))
-        (when (and (primitive/code-list? member)
-                   (> (len member) 0)
-                   (primitive/code-sym? (get member 0)))
-          (sb-push-byte! (mut sb) 32)
-          (sb-push-str! (mut sb) (primitive/code-sym (get member 0)))
-          0))
-      0)
-    (sb-str (load sb))))
-
-(defn split-find-module [(modules Code) (name (slice u8))] (-> Code)
-  (let [(mut found) `()]
-    (for m
-      (iter modules)
-      (when (and (> (len m) 0)
-                 (and (primitive/code-sym? (get m 0))
-                      (= (primitive/code-sym (get m 0)) name)))
-        (set! found m)
-        0))
-    (load found)))
-
-;;; The source module's forms in line order. The syntax-phase program lists a module's imports
-;;; twice, so a form whose first line was already seen is skipped.
-(defn split-collect-forms! [(forms (ptr (ArrayList SplitForm))) (m Code)] (-> i64)
-  (for f
-    (iter (primitive/code-slice m 1 (len m)))
-    (let [line (primitive/code-line f)
-          head (split-form-head f)
-          name (split-form-name f head)
-          variants (split-sum-variants f head)
-          last-line (+ line (split-count-newlines (primitive/code-src f)))
-          (mut seen) false
-          (mut i) 0]
-      (while (< (load i) (len forms))
-        (when (= (.first-line (al-elem forms (load i))) line)
-          (set! seen true)
-          0)
-        (set! i (+ (load i) 1)))
-      (when (not (load seen))
-        (push! forms
-               (SplitForm
-                 :name name
-                 :head head
-                 :variants variants
-                 :first-line line
-                 :last-line last-line
-                 :lead-line 0
-                 :target SPLIT-STAY))
-        0)))
-  0)
-
-;;; Insertion sort by first line; forms arrive nearly sorted already.
-(defn split-sort-forms! [(forms (ptr (ArrayList SplitForm)))] (-> i64)
-  (let [n (len forms)
-        (mut i) 1]
-    (while (< (load i) n)
-      (let [(mut j) (load i)]
-        (while (and (> (load j) 0)
-                    (> (.first-line (al-elem forms (- (load j) 1)))
-                       (.first-line (al-elem forms (load j)))))
-          (let [a (load (al-elem forms (- (load j) 1)))
-                b (load (al-elem forms (load j)))]
-            (set! (al-elem forms (- (load j) 1)) b)
-            (set! (al-elem forms (load j)) a)
-            (set! j (- (load j) 1)))))
-      (set! i (+ (load i) 1)))
-    0))
-
-(defn split-assign-leads! [(forms (ptr (ArrayList SplitForm)))] (-> i64)
-  (let [n (len forms)
-        (mut i) 0
-        (mut previous-last) 0]
-    (while (< (load i) n)
-      (let [f (al-elem forms (load i))]
-        (when (<= (.first-line f) (load previous-last))
-          (split-fail "two top-level forms share a line near " (.name f))
-          0)
-        (set! (.lead-line f) (+ (load previous-last) 1))
-        (set! previous-last (.last-line f)))
-      (set! i (+ (load i) 1)))
-    0))
-
 (defn split-lines-selector-claims? [(selector (slice u8)) (line i64)] (-> bool)
-  (let [range (split-after selector "lines:")
+  (let [range (source-after selector "lines:")
         dash (match (str-find range "-") (Some [at] at) (None [] -1))]
     (if (< dash 0)
-        (do (split-fail "malformed lines selector " selector) false)
+        (do (source-fail "malformed lines selector " selector) false)
         (let [lo
                 (match (str-parse-int (subslice range 0 dash))
                   (Some [v] v)
@@ -269,29 +93,29 @@
                   (Some [v] v)
                   (None [] -1))]
           (when (or (< lo 0) (< hi lo))
-            (split-fail "malformed lines selector " selector)
+            (source-fail "malformed lines selector " selector)
             0)
           (and (>= line lo) (<= line hi))))))
 
 ;;; Which precedence tier a selector belongs to: 0 name, 1 lines, 2 prefix.
 (defn split-selector-tier [(selector (slice u8))] (-> i64)
-  (cond (split-starts-with? selector "name:") 0
-        (split-starts-with? selector "lines:") 1
-        (split-starts-with? selector "prefix:") 2
-        :else (do (split-fail "unknown selector " selector) -1)))
+  (cond (source-starts-with? selector "name:") 0
+        (source-starts-with? selector "lines:") 1
+        (source-starts-with? selector "prefix:") 2
+        :else (do (source-fail "unknown selector " selector) -1)))
 
-(defn split-selector-claims? [(selector (slice u8)) (f (ptr SplitForm))] (-> bool)
-  (cond (split-starts-with? selector "name:")
+(defn split-selector-claims? [(selector (slice u8)) (f (ptr SourceForm))] (-> bool)
+  (cond (source-starts-with? selector "name:")
           (and (> (len (.name f)) 0)
-               (= (split-after selector "name:") (.name f)))
-        (split-starts-with? selector "lines:")
+               (= (source-after selector "name:") (.name f)))
+        (source-starts-with? selector "lines:")
           (split-lines-selector-claims? selector (.first-line f))
         :else
           (and (> (len (.name f)) 0)
-               (split-starts-with? (.name f) (split-after selector "prefix:")))))
+               (source-starts-with? (.name f) (source-after selector "prefix:")))))
 
 (defn split-classify [(targets (ptr (ArrayList SplitTarget)))
-                      (f (ptr SplitForm))] (-> i64)
+                      (f (ptr SourceForm))] (-> i64)
   (let [(mut chosen) SPLIT-STAY
         (mut tier) 0]
     (while (and (= (load chosen) SPLIT-STAY) (< (load tier) 3))
@@ -308,7 +132,7 @@
       (set! tier (+ (load tier) 1)))
     (load chosen)))
 
-(defn split-name-defined? [(forms (ptr (ArrayList SplitForm)))
+(defn split-name-defined? [(forms (ptr (ArrayList SourceForm)))
                            (name (slice u8))] (-> bool)
   (let [(mut hit) false
         (mut i) 0]
@@ -318,15 +142,15 @@
     (load hit)))
 
 (defn split-check-name-selectors! [(targets (ptr (ArrayList SplitTarget)))
-                                   (forms (ptr (ArrayList SplitForm)))] (-> i64)
+                                   (forms (ptr (ArrayList SourceForm)))] (-> i64)
   (let [(mut t) 0]
     (while (< (load t) (len targets))
       (for selector
         (iter (.selectors (al-elem targets (load t))))
-        (when (and (split-starts-with? selector "name:")
+        (when (and (source-starts-with? selector "name:")
                    (not (split-name-defined? forms
-                                             (split-after selector "name:"))))
-          (split-fail "selector matches no definition: " selector)
+                                             (source-after selector "name:"))))
+          (source-fail "selector matches no definition: " selector)
           0))
       (set! t (+ (load t) 1)))
     0))
@@ -348,7 +172,7 @@
                 (primitive/lint-param (split-key "aot.split." module ".doc") "")
               (mut selectors) (al-new [(slice u8)] (malloc-allocator))]
           (when (= (len path) 0)
-            (split-fail "no path given for target " module)
+            (source-fail "no path given for target " module)
             0)
           (for s
             (iter (str-split (malloc-allocator) select ";"))
@@ -356,7 +180,7 @@
               (push! (mut selectors) (str-trim s))
               0))
           (when (= (len (load selectors)) 0)
-            (split-fail "no selectors given for target " module)
+            (source-fail "no selectors given for target " module)
             0)
           (let [chosen (load selectors)]
             (push! targets
@@ -370,55 +194,15 @@
           0))))
   0)
 
-(defn split-header-form? [(f (ptr SplitForm))] (-> bool)
-  (or (= (.head f) "module") (= (.head f) "import")))
-
-(defn split-read [(path (slice u8))] (-> (Option (slice u8)))
-  (try (let [bytes (try-or! (read-file (malloc-allocator) path) (None))]
-         (Some bytes))))
-
-;;; Create every missing directory above `path`. An existing directory is not an error; a path
-;;; that still cannot be opened afterwards is reported by the write.
-(defn split-ensure-parent! [(path (slice u8))] (-> i64)
-  (let [(mut i) 1]
-    (while (< (load i) (len path))
-      (when (= (primitive/cast i64 (get path (load i))) 47)
-        (mkdir (str->cstr (malloc-allocator) (subslice path 0 (load i))) 493)
-        0)
-      (set! i (+ (load i) 1)))
-    0))
-
-(defn split-write! [(path (slice u8)) (text (slice u8))] (-> i64)
-  (split-ensure-parent! path)
-  (let [file (fopen (str->cstr (malloc-allocator) path) c"w")]
-    (when (= (primitive/cast i64 file) 0)
-      (split-fail "cannot open for writing: " path)
-      0)
-    (let [written (fwrite (slice-data text) 1 (len text) file)]
-      (fclose file)
-      (when (!= written (len text)) (split-fail "short write to " path) 0)
-      written)))
-
 (defn split-push-import! [(sb (mut StrBuf)) (module (slice u8)) (reexport bool)] (-> i64)
   (sb-push-str! (mut sb) "(import \"")
   (sb-push-str! (mut sb) module)
   (sb-push-str! (mut sb) (if reexport "\" :use * :reexport)\n" "\" :use *)\n")))
 
-(defn split-push-form! [(sb (mut StrBuf))
-                        (text (slice u8))
-                        (starts (ArrayList i64))
-                        (f (ptr SplitForm))
-                        (with-lead bool)] (-> i64)
-  (sb-push-str! (mut sb)
-                (split-lines-text text
-                                  starts
-                                  (if with-lead (.lead-line f) (.first-line f))
-                                  (.last-line f))))
-
 ;;; Import from the source module exactly the names that stay in it. The source re-exports every
 ;;; target, so a `:use *` of it beside a `:use *` of a sibling would make each moved name ambiguous.
 (defn split-push-source-import! [(sb (mut StrBuf))
-                                 (forms (ptr (ArrayList SplitForm)))
+                                 (forms (ptr (ArrayList SourceForm)))
                                  (source (slice u8))] (-> i64)
   (let [(mut staying) 0
         (mut i) 0]
@@ -443,7 +227,7 @@
 (defn split-push-preamble! [(sb (mut StrBuf))
                             (text (slice u8))
                             (starts (ArrayList i64))
-                            (forms (ptr (ArrayList SplitForm)))
+                            (forms (ptr (ArrayList SourceForm)))
                             (targets (ptr (ArrayList SplitTarget)))
                             (index i64)
                             (source (slice u8))] (-> i64)
@@ -460,7 +244,7 @@
     (sb-push-str! (mut sb) ")\n")
     (while (< (load i) (len forms))
       (when (= (.head (al-elem forms (load i))) "import")
-        (split-push-form! (mut sb) text starts (al-elem forms (load i)) false)
+        (source-push-form! (mut sb) text starts (al-elem forms (load i)) false)
         0)
       (set! i (+ (load i) 1)))
     (split-push-source-import! (mut sb) forms source)
@@ -474,7 +258,7 @@
 ;;; The text of a target: a new file's preamble or the existing file, then the claimed forms.
 (defn split-target-text [(text (slice u8))
                          (starts (ArrayList i64))
-                         (forms (ptr (ArrayList SplitForm)))
+                         (forms (ptr (ArrayList SourceForm)))
                          (targets (ptr (ArrayList SplitTarget)))
                          (index i64)
                          (source (slice u8))
@@ -493,7 +277,7 @@
                                   source)))
     (while (< (load i) (len forms))
       (when (= (.target (al-elem forms (load i))) index)
-        (split-push-form! (mut sb) text starts (al-elem forms (load i)) true)
+        (source-push-form! (mut sb) text starts (al-elem forms (load i)) true)
         0)
       (set! i (+ (load i) 1)))
     (sb-str (load sb))))
@@ -501,21 +285,21 @@
 ;;; The source file with the moved forms removed and a re-export of each target added.
 (defn split-source-text [(text (slice u8))
                          (starts (ArrayList i64))
-                         (forms (ptr (ArrayList SplitForm)))
+                         (forms (ptr (ArrayList SourceForm)))
                          (targets (ptr (ArrayList SplitTarget)))] (-> (slice u8))
   (let [(mut sb) (sb-new (malloc-allocator))
         (mut last-header) -1
         (mut i) 0
         total-lines (- (len starts) 1)]
     (while (< (load i) (len forms))
-      (when (split-header-form? (al-elem forms (load i)))
+      (when (source-header-form? (al-elem forms (load i)))
         (set! last-header (load i))
         0)
       (set! i (+ (load i) 1)))
     (set! i 0)
     (while (< (load i) (len forms))
       (when (= (.target (al-elem forms (load i))) SPLIT-STAY)
-        (split-push-form! (mut sb) text starts (al-elem forms (load i)) true)
+        (source-push-form! (mut sb) text starts (al-elem forms (load i)) true)
         0)
       (when (= (load i) (load last-header))
         (let [(mut t) 0]
@@ -530,23 +314,23 @@
       (set! i (+ (load i) 1)))
     (when (> (len forms) 0)
       (sb-push-str! (mut sb)
-                    (split-lines-text text
-                                      starts
-                                      (+ (.last-line (al-elem forms
-                                                              (- (len forms) 1)))
-                                         1)
-                                      total-lines))
+                    (source-lines-text text
+                                       starts
+                                       (+ (.last-line (al-elem forms
+                                                               (- (len forms) 1)))
+                                          1)
+                                       total-lines))
       0)
     (sb-str (load sb))))
 
 ;;; Decide every form's destination and total up what each target receives.
-(defn split-assign-targets! [(forms (ptr (ArrayList SplitForm)))
+(defn split-assign-targets! [(forms (ptr (ArrayList SourceForm)))
                              (targets (ptr (ArrayList SplitTarget)))] (-> i64)
   (let [(mut i) 0
         (mut previous) SPLIT-STAY]
     (while (< (load i) (len forms))
       (let [f (al-elem forms (load i))]
-        (if (split-header-form? f)
+        (if (source-header-form? f)
             (set! (.target f) SPLIT-STAY)
             (let [claimed (split-classify targets f)]
               (set! (.target f)
@@ -565,7 +349,7 @@
 
 (defn split-report! [(source (slice u8))
                      (path (slice u8))
-                     (forms (ptr (ArrayList SplitForm)))
+                     (forms (ptr (ArrayList SourceForm)))
                      (targets (ptr (ArrayList SplitTarget)))] (-> i64)
   (let [(mut t) 0
         (mut i) 0
@@ -595,35 +379,35 @@
                     (path (slice u8))
                     (text (slice u8))
                     (starts (ArrayList i64))
-                    (forms (ptr (ArrayList SplitForm)))
+                    (forms (ptr (ArrayList SourceForm)))
                     (targets (ptr (ArrayList SplitTarget)))] (-> i64)
   (let [(mut t) 0]
     (while (< (load t) (len targets))
       (let [target (al-elem targets (load t))]
         (when (> (.forms target) 0)
-          (let [existing (split-read (.path target))]
-            (split-write! (.path target)
-                          (split-target-text text
-                                             starts
-                                             forms
-                                             targets
-                                             (load t)
-                                             source
-                                             existing))
+          (let [existing (source-read (.path target))]
+            (source-write! (.path target)
+                           (split-target-text text
+                                              starts
+                                              forms
+                                              targets
+                                              (load t)
+                                              source
+                                              existing))
             (println "  wrote {}{}"
                      (.path target)
                      (if (some? existing) " (appended)" ""))
             0)
           0))
       (set! t (+ (load t) 1)))
-    (split-write! path (split-source-text text starts forms targets))
+    (source-write! path (split-source-text text starts forms targets))
     (set! (split-applied) true)
     (println "  rewrote {}" path)
     0))
 
 (defn split-run [(modules Code) (source (slice u8))] (-> i64)
-  (let [m (split-find-module modules source)
-        (mut forms) (al-new [SplitForm] (malloc-allocator))
+  (let [m (source-find-module modules source)
+        (mut forms) (al-new [SourceForm] (malloc-allocator))
         (mut targets) (al-new [SplitTarget] (malloc-allocator))]
     (if (< (len m) 2)
         (do
@@ -633,14 +417,14 @@
           0)
         (let [path (primitive/code-file (get m 1))
               text
-                (match (split-read path)
+                (match (source-read path)
                   (Some [bytes] bytes)
-                  (None [] (do (split-fail "cannot read " path) "")))
-              starts (split-line-starts text)]
-          (split-collect-forms! (mut forms) m)
+                  (None [] (do (source-fail "cannot read " path) "")))
+              starts (source-line-starts text)]
+          (source-collect-forms! (mut forms) m)
           (split-read-targets! (mut targets))
-          (split-sort-forms! (mut forms))
-          (split-assign-leads! (mut forms))
+          (source-sort-forms! (mut forms))
+          (source-assign-leads! (mut forms))
           (when (= (primitive/lint-param "aot.split.index" "0") "1")
             (split-index! (mut forms))
             0)
@@ -653,11 +437,11 @@
           0))))
 
 ;;; `aot.split.index=1`: print `first-line length head name` for every form, to plan a split from.
-(defn split-index! [(forms (ptr (ArrayList SplitForm)))] (-> i64)
+(defn split-index! [(forms (ptr (ArrayList SourceForm)))] (-> i64)
   (let [(mut i) 0]
     (while (< (load i) (len forms))
       (let [f (al-elem forms (load i))]
-        (when (not (split-header-form? f))
+        (when (not (source-header-form? f))
           (println "{} {} {} {}"
                    (.first-line f)
                    (+ (- (.last-line f) (.lead-line f)) 1)

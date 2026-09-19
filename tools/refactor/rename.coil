@@ -1,0 +1,366 @@
+;; Rename top-level definitions everywhere they are mentioned.
+
+;;
+;;   coil lint --use aot.refactor.rename --lint-param "aot.rename.map=wl-on?=on?,wl-clear!=clear!"
+;;   coil lint --use aot.refactor.rename --lint-param "aot.rename.map=…" --lint-param aot.rename.apply=1
+;;
+;; Without `aot.rename.apply=1` the tool reports how many mentions of each name it would rewrite
+;; and in how many files. With it, every file is rewritten in one step. The edits are made here
+;; and not proposed as `--fix` rewrites because the lint driver applies fixes one FILE at a time
+;; and recompiles between files: a rename that spans two files is never compilable at that
+;; intermediate point, so the driver reverts it. Follow an applied rename with `coil check`.
+;;
+;; The match is on SYMBOLS the reader produced, never on text: `wl-on?` inside a string, a comment
+;; or a longer name (`wl-on?-slow`) is not a symbol `wl-on?` and is left alone. `alias/old` becomes
+;; `alias/new`, and a name inside an import's `:use [...]` list is renamed with the rest.
+;;
+;; `primitive/code-decl` does not resolve ordinary calls at a checker phase (coil.lint.names records
+;; the measurement), so a symbol cannot be tied to its definition. The tool is therefore only sound
+;; for a name that means one thing in the whole project, and it refuses anything else BY NAME
+;; before proposing a single rewrite:
+;;
+;;   * the old name must be introduced by exactly one top-level definition in the project;
+;;   * the old name must never be bound locally — a parameter, a `let` binder — anywhere;
+;;   * the new name must not already be a top-level definition.
+;;
+;; A new name that collides with an impl method or an ambient core name is not detected here; the
+;; type checker reports it.
+;;
+;; Every edit is located by the reader's own line and column for the symbol, and the bytes at that
+;; position are compared with the old spelling before anything is written. A mismatch — a stale
+;; span, a tab the column count did not expect — stops the rename with nothing changed.
+(module aot.refactor.rename)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use [subslice])
+(import "coil.str"
+        :use
+        [sb-new sb-push-str! sb-str str-split str-trim str-find])
+(import "coil.os" :as os)
+(import "aot.refactor.source"
+        :use
+        [source-read source-write! source-line-starts])
+
+;;; One symbol to respell: where it is, what it says now, and what it becomes.
+(defstruct RenameEdit
+  [(file (slice u8))
+   (line i64)  ; 1-based
+   (col i64)  ; 1-based
+   (old (slice u8))  ; the symbol as written, qualifier included
+   (new (slice u8))])
+
+(defstruct Renaming
+  [(old (slice u8))
+   (new (slice u8))
+   (definitions i64)  ; top-level definitions introducing `old`
+   (mentions i64)])
+
+(defn rename-fail [(message (slice u8)) (detail (slice u8))] (-> i64)
+  (println "aot.refactor.rename: {}{}" message detail)
+  (os/_exit 2)
+  0)
+
+(defn rename-read-map! [(renamings (ptr (ArrayList Renaming)))] (-> i64)
+  (for raw
+    (iter (str-split (malloc-allocator)
+                     (primitive/lint-param "aot.rename.map" "")
+                     ","))
+    (let [pair (str-trim raw)]
+      (when (> (len pair) 0)
+        (let [at (match (str-find pair "=") (Some [i] i) (None [] -1))]
+          (when (or (<= at 0) (>= (+ at 1) (len pair)))
+            (rename-fail "malformed pair: " pair)
+            0)
+          (let [old (subslice pair 0 at)
+                new (subslice pair (+ at 1) (len pair))]
+            (push! renamings
+                   (Renaming
+                     :old old
+                     :new new
+                     :definitions 0
+                     :mentions 0))
+            0)))))
+  0)
+
+;;; The offset just past the last `/` of a symbol: where its simple name starts.
+(defn rename-simple-start [(s (slice u8))] (-> i64)
+  (let [n (len s)
+        (mut cut) 0
+        (mut i) 0]
+    ;; A lone `/` is the division operator, not a qualifier.
+    (while (< (+ (load i) 1) n)
+      (when (= (primitive/cast i64 (get s (load i))) 47)
+        (set! cut (+ (load i) 1))
+        0)
+      (set! i (+ (load i) 1)))
+    (load cut)))
+
+;;; The index of the renaming whose old name is this symbol's simple name, or -1.
+(defn rename-index-of [(renamings (ptr (ArrayList Renaming)))
+                       (symbol (slice u8))] (-> i64)
+  (let [simple (subslice symbol (rename-simple-start symbol) (len symbol))
+        (mut found) -1
+        (mut i) 0]
+    (while (and (< (load found) 0) (< (load i) (len renamings)))
+      (when (= (.old (al-elem renamings (load i))) simple)
+        (set! found (load i))
+        0)
+      (set! i (+ (load i) 1)))
+    (load found)))
+
+(defn rename-head? [(f Code) (head (slice u8))] (-> bool)
+  (and (primitive/code-list? f)
+       (> (len f) 0)
+       (primitive/code-sym? (get f 0))
+       (= (primitive/code-sym (get f 0)) head)))
+
+(defn rename-definition? [(f Code)] (-> bool)
+  (or (rename-head? f "defn")
+      (rename-head? f "defstruct")
+      (rename-head? f "defsum")
+      (rename-head? f "deftrait")
+      (rename-head? f "const")
+      (rename-head? f "def")
+      (rename-head? f "extern")
+      (rename-head? f "declare")))
+
+;;; Count definitions of each old name, and refuse a new name that is already taken.
+(defn rename-survey-definitions! [(renamings (ptr (ArrayList Renaming)))
+                                  (modules Code)] (-> i64)
+  (for m
+    (iter modules)
+    (when (and (> (len m) 1) (primitive/code-from-user? (get m 1)))
+      (for f
+        (iter (primitive/code-slice m 1 (len m)))
+        (when (and (rename-definition? f)
+                   (> (len f) 1)
+                   (primitive/code-sym? (get f 1)))
+          (let [name (primitive/code-sym (get f 1))
+                (mut i) 0]
+            (while (< (load i) (len renamings))
+              (let [r (al-elem renamings (load i))]
+                (when (= (.old r) name)
+                  (set! (.definitions r) (+ (.definitions r) 1))
+                  0)
+                (when (= (.new r) name)
+                  (rename-fail "new name is already defined: " name)
+                  0))
+              (set! i (+ (load i) 1)))
+            0)))
+      0))
+  0)
+
+;;; Refuse when `binder` — a bare name or `(mut name)` — introduces an old name locally: some
+;;; mentions of that name would then mean the local, and nothing here can tell which.
+(defn rename-refuse-binder! [(renamings (ptr (ArrayList Renaming)))
+                             (binder Code)] (-> i64)
+  (let [name
+          (if (and (rename-head? binder "mut") (> (len binder) 1))
+              (get binder 1)
+              binder)]
+    (when (and (primitive/code-sym? name)
+               (= (rename-simple-start (primitive/code-sym name)) 0)
+               (>= (rename-index-of renamings (primitive/code-sym name)) 0))
+      (println "  at {}:{}"
+               (primitive/code-file name)
+               (primitive/code-line name))
+      (rename-fail "old name is also bound locally: " (primitive/code-sym name))
+      0)
+    0))
+
+;;; Visit the binders of every `let` — spelled `let*` where a surrounding macro already expanded it —
+;;; (even positions of its vector) and of every parameter vector
+;;; (the head of each `(name Type)` element of a vector directly inside a `defn`, `fn` or method).
+(defn rename-refuse-local-binders! [(renamings (ptr (ArrayList Renaming)))
+                                    (f Code)] (-> i64)
+  ;; `code-list?` answers true for a vector as well; only a real list has a head to dispatch on.
+  (when (and (primitive/code-list? f) (not (primitive/code-vector? f)))
+    (if (and (or (rename-head? f "let") (rename-head? f "let*"))
+             (> (len f) 1)
+             (primitive/code-vector? (get f 1)))
+        (let [bindings (get f 1)
+              (mut i) 0]
+          (while (< (load i) (len bindings))
+            (rename-refuse-binder! renamings (get bindings (load i)))
+            (set! i (+ (load i) 2)))
+          0)
+        (for element
+          (iter f)
+          (when (primitive/code-vector? element)
+            (for parameter
+              (iter element)
+              (when (and (primitive/code-list? parameter)
+                         (= (len parameter) 2)
+                         (not (rename-head? parameter "mut")))
+                (rename-refuse-binder! renamings (get parameter 0))
+                0))
+            0)))
+    0)
+  (when (or (primitive/code-list? f) (primitive/code-vector? f))
+    (for child (iter f) (rename-refuse-local-binders! renamings child))
+    0)
+  0)
+
+;;; Record the respelling of every symbol in `f` that names a renamed definition. A macro may hand
+;;; the same authored symbol to the program twice, so an edit already recorded is not repeated.
+(defn rename-walk! [(renamings (ptr (ArrayList Renaming)))
+                    (edits (ptr (ArrayList RenameEdit)))
+                    (f Code)] (-> i64)
+  (cond (primitive/code-sym? f)
+          (let [text (primitive/code-sym f)
+                index (rename-index-of renamings text)]
+            (when (and (>= index 0) (primitive/code-from-user? f))
+              (let [r (al-elem renamings index)
+                    file (primitive/code-file f)
+                    line (primitive/code-line f)
+                    col (primitive/code-int (primitive/code-col f))
+                    qualifier (subslice text 0 (rename-simple-start text))
+                    (mut sb) (sb-new (malloc-allocator))
+                    (mut known) false
+                    (mut i) 0]
+                (while (< (load i) (len edits))
+                  (let [e (al-elem edits (load i))]
+                    (when (and (= (.line e) line)
+                               (= (.col e) col)
+                               (= (.file e) file))
+                      (set! known true)
+                      0))
+                  (set! i (+ (load i) 1)))
+                (when (not (load known))
+                  (sb-push-str! (mut sb) qualifier)
+                  (sb-push-str! (mut sb) (.new r))
+                  (set! (.mentions r) (+ (.mentions r) 1))
+                  (let [respelled (sb-str (load sb))]
+                    (push! edits
+                           (RenameEdit
+                             :file file
+                             :line line
+                             :col col
+                             :old text
+                             :new respelled)))
+                  0)
+                0))
+            0)
+        (or (primitive/code-list? f) (primitive/code-vector? f))
+          (do (for child (iter f) (rename-walk! renamings edits child)) 0)
+        :else 0))
+
+;;; Is `e` the edit that comes last in its file among those not yet applied?
+(defn rename-later? [(a (ptr RenameEdit)) (b (ptr RenameEdit))] (-> bool)
+  (or (> (.line a) (.line b))
+      (and (= (.line a) (.line b)) (> (.col a) (.col b)))))
+
+;;; Rewrite one file: apply its edits from the last position to the first, so an earlier offset is
+;;; never moved by a later replacement.
+(defn rename-apply-file! [(edits (ptr (ArrayList RenameEdit)))
+                          (file (slice u8))] (-> i64)
+  (let [(mut text)
+          (match (source-read file)
+            (Some [bytes] bytes)
+            (None [] (do (rename-fail "cannot read " file) "")))
+        starts (source-line-starts (load text))
+        (mut applied) 0
+        (mut remaining) 0
+        (mut i) 0]
+    (while (< (load i) (len edits))
+      (when (= (.file (al-elem edits (load i))) file)
+        (set! remaining (+ (load remaining) 1))
+        0)
+      (set! i (+ (load i) 1)))
+    (while (> (load remaining) 0)
+      ;; Select the latest unapplied edit of this file; `line` 0 marks an applied one.
+      (let [(mut best) -1
+            (mut k) 0]
+        (while (< (load k) (len edits))
+          (let [e (al-elem edits (load k))]
+            (when (and (= (.file e) file)
+                       (> (.line e) 0)
+                       (or (< (load best) 0)
+                           (rename-later? e (al-elem edits (load best)))))
+              (set! best (load k))
+              0))
+          (set! k (+ (load k) 1)))
+        (let [e (al-elem edits (load best))
+              at (+ (get starts (- (.line e) 1)) (- (.col e) 1))
+              end (+ at (len (.old e)))
+              (mut sb) (sb-new (malloc-allocator))]
+          (when (or (> end (len (load text)))
+                    (not (= (subslice (load text) at end) (.old e))))
+            (println "  at {}:{}:{}" file (.line e) (.col e))
+            (rename-fail "source does not say what the reader saw: " (.old e))
+            0)
+          (sb-push-str! (mut sb) (subslice (load text) 0 at))
+          (sb-push-str! (mut sb) (.new e))
+          (sb-push-str! (mut sb) (subslice (load text) end (len (load text))))
+          (set! text (sb-str (load sb)))
+          (set! (.line e) 0)
+          (set! applied (+ (load applied) 1))
+          (set! remaining (- (load remaining) 1)))))
+    (source-write! file (load text))
+    (load applied)))
+
+;;; Apply every edit, one file at a time, each file exactly once.
+(defn rename-apply! [(edits (ptr (ArrayList RenameEdit)))] (-> i64)
+  (let [(mut i) 0
+        (mut files) 0]
+    (while (< (load i) (len edits))
+      (when (> (.line (al-elem edits (load i))) 0)
+        (let [file (.file (al-elem edits (load i)))]
+          (println "  {} ({} edits)" file (rename-apply-file! edits file))
+          (set! files (+ (load files) 1)))
+        0)
+      (set! i (+ (load i) 1)))
+    (load files)))
+
+;;; One application per process: the checker runs once per program the lint builds, and a second
+;;; run would apply spans that describe files as they were before the first.
+(defn rename-applied [] (-> (ptr bool))
+  (primitive/alloc-static bool))
+
+(defn rename-run! [(renamings (ptr (ArrayList Renaming))) (modules Code)] (-> i64)
+  (rename-survey-definitions! renamings modules)
+  (let [(mut edits) (al-new [RenameEdit] (malloc-allocator))
+        (mut missing) false
+        (mut i) 0]
+    (while (< (load i) (len renamings))
+      (let [r (al-elem renamings (load i))]
+        (when (> (.definitions r) 1)
+          (rename-fail "old name has several definitions: " (.old r))
+          0)
+        (when (= (.definitions r) 0) (set! missing true) 0))
+      (set! i (+ (load i) 1)))
+    ;; The lint builds several programs; only the one holding every definition is the project.
+    (when (not (load missing))
+      (for m
+        (iter modules)
+        (when (and (> (len m) 1) (primitive/code-from-user? (get m 1)))
+          (for f
+            (iter (primitive/code-slice m 1 (len m)))
+            (rename-refuse-local-binders! renamings f)
+            (rename-walk! renamings (mut edits) f))
+          0))
+      (set! i 0)
+      (while (< (load i) (len renamings))
+        (let [r (al-elem renamings (load i))]
+          (println "rename {} -> {}: {} mentions"
+                   (.old r)
+                   (.new r)
+                   (.mentions r)))
+        (set! i (+ (load i) 1)))
+      (when (= (primitive/lint-param "aot.rename.apply" "0") "1")
+        (println "rewrote {} files" (rename-apply! (mut edits)))
+        (set! (rename-applied) true)
+        0)
+      0)
+    0))
+
+(defn refactor-rename [(modules Code)] (-> Code)
+  (let [(mut renamings) (al-new [Renaming] (malloc-allocator))]
+    (rename-read-map! (mut renamings))
+    (when (and (> (len (load renamings)) 0) (not (load (rename-applied))))
+      (rename-run! (mut renamings) modules)
+      0)
+    `0))
+
+(checker refactor-rename :phase before-expand)
