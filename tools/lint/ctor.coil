@@ -1,0 +1,350 @@
+;; A struct zeroed and then filled field by field is a named constructor.
+
+;;
+;;   (let [(mut t) (primitive/zeroed Token)]        (Token :kind kind
+;;     (set! (.kind (mut t)) kind)           =>            :start start
+;;     (set! (.start (mut t)) start)                       :escaped false
+;;     (load t))                                           :decoded (primitive/zeroed (slice u8)))
+;;
+;; Registered in Coil.toml, so `coil lint` reports the builder and `--fix` rewrites it. The rewrite
+;; keeps behaviour exactly, which fixes its whole shape:
+;;
+;;   * A named constructor needs EVERY field (`constructor 'T' is missing field :f` otherwise), where
+;;     `zeroed` gave the unset ones zero. So the rule reads the `defstruct` and writes each field the
+;;     builder never set with its zero spelled out — `0` for `i64`, `false` for `bool`,
+;;     `(primitive/zeroed TYPE)` for anything else, which is the value `zeroed` gave it.
+;;   * Fields keep the order of the `set!`s: a constructor evaluates its fields as written, so the
+;;     values are computed in the order they were before. The unset fields follow, in declaration
+;;     order; a zero has no effect to order.
+;;   * The builder's binding moves to the END of its `let`: `zeroed` has no effect, and the `set!`s
+;;     that the constructor absorbs ran after every binding, which is where the constructor now runs.
+;;
+;; The shape, for `x` bound as `(mut x) (zeroed T)` with `T` a struct of this program:
+;;
+;;   (let [BINDINGS…]                   no other binding mentions `x`
+;;     (set! (.f (mut x)) VALUE)…       at least one; each field once; no VALUE mentions `x`
+;;     REST…)                           `x` appears in REST only as `(load x)`
+;;
+;; becomes `(let [BINDINGS… x (T :f VALUE… :g ZERO…)] REST…)` with each `(load x)` now `x`, and
+;; collapses further when REST is only `(load x)`: `(let [BINDINGS…] (T …))`, or just `(T …)`.
+;;
+;; Left alone, because they are not this shape: a builder that hands `(mut x)` to a helper, sets a
+;; field inside an `if` or a loop, or reads `x` between its `set!`s — the value genuinely changes as
+;; it is built. A struct of another program (a stdlib type) has no `defstruct` here to read.
+;;
+;; Every node the replacement carries is the author's own and prints back as their bytes; a builder
+;; whose parts the syntax phase has already expanded is skipped (`aot.lint.written`).
+(module aot.lint.ctor)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.str" :use [sb-new sb-push-str! sb-str])
+(import "coil.slice" :use [subslice])
+(import "aot.lint.written" :use [node-head written-head written-let? faithful? restore-written])
+
+;;; A `defstruct` found for a builder: its field vector, and the module that declares it.
+(defstruct CtorStruct
+  [(fields i64)  ; `code-opaque` handle of the `[(name type)…]` vector
+   (module (slice u8))])
+
+(defn ctor-sym? [(f Code) (s (slice u8))] (-> bool)
+  (and (primitive/code-sym? f) (= (primitive/code-sym f) s)))
+
+;;; Does the symbol `x` occur anywhere in `f`?
+(defn ctor-mentions? [(f Code) (x (slice u8))] (-> bool)
+  (cond (primitive/code-sym? f) (= (primitive/code-sym f) x)
+        (primitive/code-list? f)
+          (let [(mut hit) false]
+            (for child (iter f) (when (ctor-mentions? child x) (set! hit true) 0))
+            (load hit))
+        :else false))
+
+;;; `(load x)`.
+(defn ctor-load-of? [(f Code) (x (slice u8))] (-> bool)
+  (and (= (node-head f) "load") (= (len f) 2) (ctor-sym? (get f 1) x)))
+
+;;; Does `x` occur in `f` other than as `(load x)`?
+(defn ctor-mentions-beyond-load? [(f Code) (x (slice u8))] (-> bool)
+  (cond (ctor-load-of? f x) false
+        (primitive/code-sym? f) (= (primitive/code-sym f) x)
+        (primitive/code-list? f)
+          (let [(mut hit) false]
+            (for child
+              (iter f)
+              (when (ctor-mentions-beyond-load? child x) (set! hit true) 0))
+            (load hit))
+        :else false))
+
+;;; `(mut x)` binds `x`; "" for any other binder.
+(defn ctor-mut-binder [(f Code)] (-> (slice u8))
+  (if (and (= (node-head f) "mut") (= (len f) 2) (primitive/code-sym? (get f 1)))
+      (primitive/code-sym (get f 1))
+      ""))
+
+;;; `(zeroed T)` or `(alias/zeroed T)` with `T` a plain struct name.
+(defn ctor-zeroed-struct? [(f Code)] (-> bool)
+  (let [head (node-head f)]
+    (and (= (len f) 2)
+         (or (= head "zeroed")
+             (and (> (len head) 7) (= (subslice head (- (len head) 7) (len head)) "/zeroed")))
+         (primitive/code-sym? (get f 1)))))
+
+;;; `(set! (.f (mut x)) VALUE)` → `f`; "" for anything else.
+(defn ctor-set-field [(f Code) (x (slice u8))] (-> (slice u8))
+  (if (and (= (node-head f) "set!") (= (len f) 3))
+      (let [place (get f 1)
+            accessor (node-head place)]
+        (if (and (= (len place) 2)
+                 (> (len accessor) 1)
+                 (= (primitive/cast i64 (get accessor 0)) 46)
+                 (!= accessor "..")
+                 (= (ctor-mut-binder (get place 1)) x))
+            (subslice accessor 1 (len accessor))
+            ""))
+      ""))
+
+(defn ctor-module-name [(m Code)] (-> (slice u8))
+  (if (primitive/code-sym? (get m 0)) (primitive/code-sym (get m 0)) ""))
+
+;;; The field vector of `(defstruct NAME [fields…])` in module `m`, as a handle; -1 when `m` declares
+;;; no such struct. A generic struct (`(defstruct NAME [A] […])`) is never a builder's plain `T`.
+(defn ctor-declared-in [(m Code) (name (slice u8))] (-> i64)
+  (let [(mut found) -1]
+    (for f
+      (iter (primitive/code-slice m 1 (len m)))
+      (when (and (= (node-head f) "defstruct")
+                 (= (len f) 3)
+                 (ctor-sym? (get f 1) name)
+                 (primitive/code-vector? (get f 2)))
+        (set! found (primitive/code-opaque (get f 2)))
+        0))
+    (load found)))
+
+;;; The struct a builder in module `here` names `name`: its own module's if it declares one, else the
+;;; one module of the program that does. Two candidates and none local is not guessed at.
+(defn ctor-find-struct [(modules Code) (here (slice u8)) (name (slice u8))] (-> (Option CtorStruct))
+  (let [(mut local) -1
+        (mut other) -1
+        (mut other-module) ""
+        (mut others) 0]
+    (for m
+      (iter modules)
+      (let [fields (ctor-declared-in m name)]
+        (when (>= fields 0)
+          (if (= (ctor-module-name m) here)
+              (do (set! local fields) 0)
+              (do
+                (set! other fields)
+                (set! other-module (ctor-module-name m))
+                (set! others (+ (load others) 1))
+                0))
+          0)))
+    (cond (>= (load local) 0) (Some (CtorStruct :fields (load local) :module here))
+          (= (load others) 1) (Some (CtorStruct :fields (load other) :module (load other-module)))
+          :else (None))))
+
+;;; `:name` as a keyword node.
+(defn ctor-keyword [(name (slice u8))] (-> Code)
+  (let [(mut sb) (sb-new (malloc-allocator))]
+    (sb-push-str! (mut sb) ":")
+    (sb-push-str! (mut sb) name)
+    (primitive/code-symbol (sb-str (mut sb)))))
+
+;;; The value `zeroed` gave a field of type `ty`, spelled out.
+(defn ctor-zero [(ty Code) (zeroed Code)] (-> Code)
+  (cond (ctor-sym? ty "i64") `0
+        (ctor-sym? ty "bool") `false
+        :else `(~zeroed ~ty)))
+
+;;; Can `ty` be written in a module other than its struct's? Only a type every module can name.
+(defn ctor-portable-type? [(ty Code)] (-> bool)
+  (or (ctor-sym? ty "i64") (ctor-sym? ty "bool")))
+
+;;; `f` with each `(load x)` replaced by `xsym`. Every node rebuilt on the way prints child by child,
+;;; so each must be the author's own — `ctor-substitutable?` says whether that holds.
+(defn ctor-substitute [(f Code) (x (slice u8)) (xsym Code)] (-> Code)
+  (cond (ctor-load-of? f x) xsym
+        (and (primitive/code-list? f) (ctor-mentions? f x))
+          (let [out (primitive/code-list-new)]
+            (for child (iter f) (primitive/code-list-push! out (ctor-substitute child x xsym)))
+            (if (primitive/code-vector? f)
+                `[~@(primitive/code-list-done out)]
+                `(~@(primitive/code-list-done out))))
+        :else (restore-written f)))
+
+(defn ctor-substitutable? [(f Code) (x (slice u8))] (-> bool)
+  (cond (ctor-load-of? f x) true
+        (and (primitive/code-list? f) (ctor-mentions? f x))
+          (and (= (node-head f) (written-head f))
+               (let [(mut ok) true]
+                 (for child
+                   (iter f)
+                   (when (not (ctor-substitutable? child x)) (set! ok false) 0))
+                 (load ok)))
+        :else (faithful? f)))
+
+;;; The binding pair of `bindings` that is `(mut x) (zeroed T)`: its index, or -1.
+(defn ctor-builder-binding [(bindings Code)] (-> i64)
+  (let [(mut found) -1
+        (mut i) 0]
+    (while (and (< (load found) 0) (< (+ (load i) 1) (len bindings)))
+      (when (and (> (len (ctor-mut-binder (get bindings (load i)))) 0)
+                 (ctor-zeroed-struct? (get bindings (+ (load i) 1))))
+        (set! found (load i))
+        0)
+      (set! i (+ (load i) 2)))
+    (load found)))
+
+;;; How many leading body forms of `l` (from index 2) set a field of `(mut x)`, each field once and
+;;; with a value that neither mentions `x` nor is anything but the author's own node.
+(defn ctor-set-count [(l Code) (x (slice u8))] (-> i64)
+  (let [(mut n) 0
+        (mut open) true]
+    (while (and (load open) (< (+ 2 (load n)) (len l)))
+      (let [f (get l (+ 2 (load n)))
+            field (ctor-set-field f x)]
+        (if (and (> (len field) 0)
+                 (not (ctor-mentions? (get f 2) x))
+                 (faithful? (get f 2))
+                 (not (ctor-field-set-before? l x field (load n))))
+            (set! n (+ (load n) 1))
+            (set! open false))))
+    (load n)))
+
+;;; Did one of the first `n` setters of `l` already set `field`?
+(defn ctor-field-set-before? [(l Code) (x (slice u8)) (field (slice u8)) (n i64)] (-> bool)
+  (let [(mut hit) false]
+    (for f
+      (iter (primitive/code-slice l 2 (+ 2 n)))
+      (when (= (ctor-set-field f x) field) (set! hit true) 0))
+    (load hit)))
+
+;;; Is `name` a field of the struct, and — if the struct is declared in another module — is every
+;;; field the builder leaves unset one this module can name the zero of?
+(defn ctor-has-field? [(fields Code) (name (slice u8))] (-> bool)
+  (let [(mut hit) false]
+    (for fd (iter fields) (when (ctor-sym? (get fd 0) name) (set! hit true) 0))
+    (load hit)))
+
+(defn ctor-fields-fit? [(l Code) (x (slice u8)) (sets i64) (s CtorStruct) (here (slice u8))] (-> bool)
+  (let [fields (primitive/code-from-opaque (.fields s))
+        (mut ok) true]
+    (for f
+      (iter (primitive/code-slice l 2 (+ 2 sets)))
+      (when (not (ctor-has-field? fields (ctor-set-field f x))) (set! ok false) 0))
+    (when (!= (.module s) here)
+      (for fd
+        (iter fields)
+        (when (and (not (ctor-field-set-before? l x (primitive/code-sym (get fd 0)) sets))
+                   (not (ctor-portable-type? (get fd 1))))
+          (set! ok false)
+          0))
+      0)
+    (load ok)))
+
+;;; `(T :f VALUE… :g ZERO…)`.
+(defn ctor-constructor [(l Code) (x (slice u8)) (sets i64) (init Code) (s CtorStruct)] (-> Code)
+  (let [out (primitive/code-list-new)
+        fields (primitive/code-from-opaque (.fields s))]
+    (primitive/code-list-push! out (get init 1))
+    (for f
+      (iter (primitive/code-slice l 2 (+ 2 sets)))
+      (primitive/code-list-push! out (ctor-keyword (ctor-set-field f x)))
+      (primitive/code-list-push! out (restore-written (get f 2))))
+    (for fd
+      (iter fields)
+      (let [name (primitive/code-sym (get fd 0))]
+        (when (not (ctor-field-set-before? l x name sets))
+          (primitive/code-list-push! out (ctor-keyword name))
+          (primitive/code-list-push! out (ctor-zero (get fd 1) (get init 0)))
+          0)))
+    `(~@(primitive/code-list-done out))))
+
+;;; The rewrite of builder `l`, whose binding pair starts at `at` and whose first `sets` body forms
+;;; are its setters.
+(defn ctor-rewrite [(l Code) (at i64) (sets i64) (s CtorStruct)] (-> Code)
+  (let [bindings (get l 1)
+        x (ctor-mut-binder (get bindings at))
+        xsym (get (get bindings at) 1)
+        ctor (ctor-constructor l x sets (get bindings (+ at 1)) s)
+        rest (primitive/code-slice l (+ 2 sets) (len l))
+        others (primitive/code-list-new)]
+    (let [(mut i) 0]
+      (while (< (load i) (len bindings))
+        (when (!= (load i) at)
+          (primitive/code-list-push! others (restore-written (get bindings (load i))))
+          (primitive/code-list-push! others (restore-written (get bindings (+ (load i) 1))))
+          0)
+        (set! i (+ (load i) 2))))
+    (if (and (= (len rest) 1) (ctor-load-of? (get rest 0) x))
+        (if (= (len bindings) 2)
+            ctor
+            `(let [~@(primitive/code-list-done others)] ~ctor))
+        (let [body (primitive/code-list-new)]
+          (primitive/code-list-push! others xsym)
+          (primitive/code-list-push! others ctor)
+          (for f (iter rest) (primitive/code-list-push! body (ctor-substitute f x xsym)))
+          `(let [~@(primitive/code-list-done others)] ~@(primitive/code-list-done body))))))
+
+;;; Is `l` a builder? Report it, with its rewrite, if so.
+(defn ctor-check [(l Code) (modules Code) (here (slice u8))] (-> i64)
+  (let [bindings (if (> (len l) 2) (get l 1) l)
+        at (if (and (> (len l) 2) (primitive/code-vector? bindings))
+               (ctor-builder-binding bindings)
+               -1)]
+    (if (< at 0)
+        0
+        (let [x (ctor-mut-binder (get bindings at))
+              init (get bindings (+ at 1))
+              sets (ctor-set-count l x)
+              rest (primitive/code-slice l (+ 2 sets) (len l))
+              (mut ok) (and (> sets 0) (> (len rest) 0))
+              (mut i) 0]
+          (while (< (load i) (len bindings))
+            (when (and (!= (load i) at)
+                       (or (ctor-mentions? (get bindings (load i)) x)
+                           (ctor-mentions? (get bindings (+ (load i) 1)) x)
+                           (not (faithful? (get bindings (load i))))
+                           (not (faithful? (get bindings (+ (load i) 1))))))
+              (set! ok false)
+              0)
+            (set! i (+ (load i) 2)))
+          (for f
+            (iter rest)
+            (when (or (ctor-mentions-beyond-load? f x) (not (ctor-substitutable? f x)))
+              (set! ok false)
+              0))
+          (if (load ok)
+              (match (ctor-find-struct modules here (primitive/code-sym (get init 1)))
+                (Some [s]
+                  (if (ctor-fields-fit? l x sets s here)
+                      (do
+                        (primitive/suggest l
+                                           "a struct zeroed and filled by set! — write its named constructor"
+                                           (ctor-rewrite l at sets s))
+                        0)
+                      0))
+                (None [] 0))
+              0)))))
+
+(defn ctor-walk [(f Code) (modules Code) (here (slice u8))] (-> i64)
+  (when (primitive/code-list? f)
+    (when (or (= (node-head f) "let") (written-let? f))
+      (ctor-check f modules here)
+      0)
+    (for child (iter f) (ctor-walk child modules here))
+    0)
+  0)
+
+;; A module record is `(name form1 form2 …)`; every authored form is walked (see `aot.lint.cond`
+;; for why each form, not the first, is asked `code-from-user?`).
+(defn lint-constructor [(modules Code)] (-> Code)
+  (for m
+    (iter modules)
+    (let [here (ctor-module-name m)]
+      (for f
+        (iter (primitive/code-slice m 1 (len m)))
+        (when (primitive/code-from-user? f) (ctor-walk f modules here) 0))))
+  `0)
+
+;; The syntax phase: the forms as written, before `let` and the accessors are expanded.
+(checker lint-constructor :phase before-expand)

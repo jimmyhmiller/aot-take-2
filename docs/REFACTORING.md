@@ -15,6 +15,7 @@ or when `Coil.toml` lists it under `[lint] rules`.
 | Unused imports | `aot.lint.unused-imports` | every `coil lint` | reports an import the module does not use; `--fix` removes or narrows it |
 | Layout | `aot.lint.layout` | every `coil lint` | every source file has a row in `docs/LAYOUT.md` §6, and every row a file |
 | Cond | `aot.lint.cond` | every `coil lint` | a staircase of three or more nested `if`s; `--fix` rewrites it as a `cond`, arms byte-for-byte |
+| Constructor | `aot.lint.ctor` | every `coil lint` | a struct zeroed and filled field by field with `set!`; `--fix` writes its named constructor, unset fields as explicit zeros |
 | Size | `aot.lint.size` | on request | functions and files over a line budget — a report to choose work from, not a gate |
 | Split | `aot.refactor.split` | on request | moves top-level forms into other modules; the source re-exports them |
 | Rename | `aot.refactor.rename` | on request | respells a definition everywhere it is mentioned, atomically across files |

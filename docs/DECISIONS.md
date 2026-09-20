@@ -4273,6 +4273,21 @@ leaves alone a chain it cannot return as written; the audit of the final run sho
 and `:else` as the only tokens added or removed in 85 files, and no comment lost. **A `--fix`
 built from nodes is checked by diffing tokens, not by compiling.**
 
+**A struct is built by its named constructor.** `(let [(mut x) (primitive/zeroed T)] (set! (.f (mut
+x)) v)… (load x))` is `(T :f v …)` written the long way, and `aot.lint.ctor`, the fourth registered
+rule, reports it and `--fix` rewrites it; it converted 24 builders in 16 files. The one thing the
+long way did that a constructor does not: a named constructor requires every field (`constructor
+'T' is missing field :f`), where `zeroed` silently gave the unset ones zero. The rule therefore
+reads the `defstruct` and writes each unset field's zero explicitly — six such fields across the
+tree, `Token`'s `:escaped false :decoded (primitive/zeroed (slice u8))` among them — so a reader
+of the constructor sees every field's starting value. Behaviour is preserved by construction:
+fields stay in `set!` order and a constructor evaluates its fields as written; the builder's
+binding moves to the end of its `let`, where the `set!`s it absorbs used to run; `(load x)` in
+what follows becomes `x`. Builders that change as they are built — a field set inside a `cond`,
+`(mut x)` passed to a helper — are a different shape and are left alone. The helpers that decide
+whether a node is the author's moved from `aot.lint.cond` to `aot.lint.written`, which both
+fixing rules import.
+
 Not done, deliberately: the late-bound hooks (`set-con-hook!`, `set-cfg-ext!`,
 `jsl-set-closure-maker!`, …). Several exist only because a module cycle was assumed impossible, and
 could now be direct calls; others are the layering this file records ("`aot.node.call` … still
