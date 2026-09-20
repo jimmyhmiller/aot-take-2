@@ -77,6 +77,7 @@
 (import "coil.alloc" :as alloc)
 (import "coil.primitive" :as primitive)
 (import "coil.os" :as os)
+(import "coil.time" :as time)
 (import "coil.arraylist" :use *)
 (import "aot.util.panic" :use *)
 (import "aot.node.node" :use *)
@@ -175,7 +176,18 @@
                                 ;; call that sharpens enters the inline worklist without anyone
                                 ;; tracking candidates explicitly.
                                 (if (= (n-op n) OP-CALLEND)
-                                    (code-inline-push! (n-nid n))
+                                    (do
+                                      (code-inline-push! (n-nid n))
+                                      ;; The same visit makes it a SPECIALIZE candidate. A Call's
+                                      ;; visit does too, below: a site's proof reads its ARGUMENTS'
+                                      ;; types, and an argument that sharpens re-visits the Call
+                                      ;; without necessarily re-visiting the CallEnd.
+                                      (code-specialize-push! (n-nid n)))
+                                    0)
+                                (if (= (n-op n) OP-CALL)
+                                    (match (call-cend n)
+                                      (Some [end] (code-specialize-push! (n-nid end)))
+                                      (None [] 0))
                                     0)
                                 (match (n-peephole-opt! n)
                                   (None [] 0)
@@ -233,6 +245,39 @@
                     0)))))))
 
 ;; The outer loop: peepholes and inlining interleaved, to a fixpoint.
+;; `AOT_TIME=1`, read once, as `aot.codegen.codegen` reads it for the phase timer. This module sits
+;; below that one, so it asks the environment itself rather than importing upward.
+(defstruct IterTimeFlag [(state i64)])  ; 0 unread, 1 on, 2 off
+
+(defn iter--time? [] (-> bool)
+  (let [f (compiler-state [IterTimeFlag] (primitive/alloc-static CompilerStateSlot))]
+    (if (= (.state f) 0)
+        (set! (.state f)
+              (if (!= (primitive/cast i64 (os/getenv c"AOT_TIME")) 0) 1 2))
+        0)
+    (= (.state f) 1)))
+
+;; Zero when the clock cannot be read: a breakdown is a diagnostic, never a reason to fail.
+(defn iter--now-ms [] (-> i64)
+  (try (let [ms (try-or! (time/monotonic-now-ms) 0)] ms)))
+
+;; Queue every live CallEnd as a specialize candidate. One walk per fixpoint.
+(defn iter--seed-specialize-candidates! [] (-> i64)
+  (let [cnt (arena-node-count)
+        (mut i) 1]
+    (loop (if (> (load i) cnt)
+              (break 0)
+              (do
+                (match (arena-node (load i))
+                  (Some [n]
+                        (if (and (= (n-op n) OP-CALLEND) (not (n-dead? n)))
+                            (code-specialize-push! (n-nid n))
+                            0))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))
+
 (defn iter-run! [] (-> i64)
   ;; Simple's `iterate`, exactly:
   ;;
@@ -261,18 +306,40 @@
   ;;   sharpens becomes a candidate without anyone tracking that explicitly.
   (let [(mut did-inline) false
         (mut rounds) 0
+        ;; `AOT_TIME=1`: where a fixpoint's wall time went, by the four things a round does. The
+        ;; phase timer says "the optimizer is slow"; this says which quarter of it.
+        (mut t-peeps) 0
+        (mut t-specialize) 0
+        (mut t-inline) 0
+        (mut t-versions) 0
+        (mut n-specialized) 0
+        (mut n-inlined) 0
+        (mut n-visits) 0
         ;; Every round inlines exactly one call site and never creates a new source-level site,
         ;; so the number of rounds is bounded by the sites the graph ever holds. A round count far
         ;; beyond the arena means cloning keeps manufacturing sites: report the recent ones.
         (mut recent) (al-new [i64] (compiler-allocator))]
+    ;; Every live site is asked at least once per fixpoint, as the arena scan guaranteed — but
+    ;; ONCE here, not once per round. After this a site is asked again only when it is visited.
+    (iter--seed-specialize-candidates!)
     (loop (do
-            (iter-peeps!)
+            (let [t0 (if (iter--time?) (iter--now-ms) 0)
+                  visited (iter-peeps!)]
+              (set! (mut n-visits) (+ (load n-visits) visited))
+              (if (iter--time?)
+                  (set! (mut t-peeps) (+ (load t-peeps) (- (iter--now-ms) t0)))
+                  0))
             ;; One source expansion, like one clone inline, is followed by ordinary cleanup.
             ;; The shared generic callee may remain, so specialization is real code growth.
             ;; Admission has its own compilation-wide growth budget and preserves proof contracts.
-            (let [specialized (specialize-admit-round!)]
+            (let [t1 (if (iter--time?) (iter--now-ms) 0)
+                  specialized (specialize-admit-round!)]
+              (if (iter--time?)
+                  (set! (mut t-specialize) (+ (load t-specialize) (- (iter--now-ms) t1)))
+                  0)
               (if (> specialized 0)
                   (do
+                    (set! (mut n-specialized) (+ (load n-specialized) 1))
                     (set! (mut did-inline) true)
                     (set! (mut rounds) (+ (load rounds) 1))
                     (if (> (load rounds) (+ 1024 (arena-node-count)))
@@ -280,9 +347,14 @@
                         0)
                     (continue))
                   0))
-            (let [fired (iter--one-inline!)]
+            (let [t2 (if (iter--time?) (iter--now-ms) 0)
+                  fired (iter--one-inline!)]
+              (if (iter--time?)
+                  (set! (mut t-inline) (+ (load t-inline) (- (iter--now-ms) t2)))
+                  0)
               (if fired
                   (do
+                    (set! (mut n-inlined) (+ (load n-inlined) 1))
                     (set! (mut did-inline) true)
                     (set! (mut rounds) (+ (load rounds) 1))
                     (push! [i64] (mut recent) (iter-last-inlined))
@@ -300,7 +372,22 @@
                       (do
                         (set! (mut did-inline) false)
                         (iter--requeue-deferred!)
+                        (specialize-requeue-deferred!)
                         (continue)))))))
+    (if (iter--time?)
+        (do
+          (println "aot time:   iter-run: {} rounds ({} specialized, {} inlined); {} peephole visits, {} inline candidates asked; peeps {} ms, specialize {} ms, inline {} ms; arena {}"
+                   (load rounds)
+                   (load n-specialized)
+                   (load n-inlined)
+                   (load n-visits)
+                   (.asked (iter--inline-asked))
+                   (load t-peeps)
+                   (load t-specialize)
+                   (load t-inline)
+                   (arena-node-count))
+          0)
+        0)
     (load rounds)))
 
 ;; Seed every live node in the arena onto the worklist. Used to start a fixpoint over a graph that
@@ -549,11 +636,19 @@
             (println "inline: #{} -> (no single local callee)" (n-nid cend))
             0))))
 
+;; How many inline candidates were asked, for the `AOT_TIME` breakdown: a round that asks hundreds to
+;; admit one is where a quadratic hides.
+(defstruct IterInlineAsked [(asked i64)])
+
+(defn iter--inline-asked [] (-> (ptr IterInlineAsked))
+  (compiler-state [IterInlineAsked] (primitive/alloc-static CompilerStateSlot)))
+
 (defn iter--one-inline! [] (-> bool)
   (let [(mut fired) false]
     (loop (match (code-inline-pop!)
             (None [] (break 0))
             (Some [id]
+                  (set! (.asked (iter--inline-asked)) (+ (.asked (iter--inline-asked)) 1))
                   (match (arena-node id)
                     (None [] (continue))
                     (Some [cend]
