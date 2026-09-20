@@ -1,0 +1,935 @@
+; Regular expressions: the pattern compiler and the backtracking matcher (ECMA-262 §22.2).
+;
+; THE PATTERN IS COMPILED AT RUN TIME, HERE, AND NOT IN THE FRONTEND. `src/parse/regex/compile.coil`
+; emits the same program from a literal at compile time, and this is deliberately the same
+; instruction encoding — but `new RegExp(s)` over a computed string is not a corner case to refuse
+; later: acorn builds its keyword matchers with `new RegExp("^(?:" + words + ")$")` at module scope,
+; and so does most of npm. One compiler that both paths use is one set of semantics; the frontend's
+; emitter becomes an optimization that folds a literal's program into image data, not a second
+; implementation that can disagree.
+;
+; THE MATCHER BACKTRACKS, because §22.2.2 is defined by continuations over ordered alternatives.
+; `SPLIT` tries its first operand to exhaustion before its second, so `/a|ab/.exec("ab")` is "a".
+; A DFA would answer different capture groups for the same match, which `exec` makes observable.
+;
+; A program is a JavaScript array of integers, in the encoding `aot.parse.regex.program` documents:
+; an opcode followed by its operands, positions being indices into the same array. The class table
+; is a second array: `negated`, a range count, then that many inclusive `lo`/`hi` pairs.
+;
+; WHAT IS NOT HERE, AND WHY IT REFUSES RATHER THAN APPROXIMATES: lookaround, named groups, Unicode
+; property escapes, and the `i`, `u` and `v` flags. Each needs the matcher's side of it — case
+; folding, code-point rather than code-unit stepping — and a pattern that compiled without it would
+; answer a WRONG match instead of stopping.
+
+; ---------------------------------------------------------------------------
+; The instruction encoding. These numbers are shared with src/parse/regex/program.coil.
+
+(macro JsRxOpChar :params [] :ret int 1)
+
+(macro JsRxOpAny :params [] :ret int 2)
+
+(macro JsRxOpAnyNl :params [] :ret int 3)
+
+(macro JsRxOpClass :params [] :ret int 4)
+
+(macro JsRxOpSplit :params [] :ret int 5)
+
+(macro JsRxOpJmp :params [] :ret int 6)
+
+(macro JsRxOpSave :params [] :ret int 7)
+
+(macro JsRxOpMatch :params [] :ret int 8)
+
+(macro JsRxOpBol :params [] :ret int 9)
+
+(macro JsRxOpEol :params [] :ret int 10)
+
+(macro JsRxOpWordb :params [] :ret int 11)
+
+(macro JsRxOpBackref :params [] :ret int 12)
+
+; ---------------------------------------------------------------------------
+; A growable integer vector, over an ordinary array
+
+(builtin JsRxPush :transitioning true :params [(vec arr) (w int)] :ret int
+  (let [(n (%ArrayLen vec))
+        (stored (%ArrayStore vec n (%BoxInt w)))]
+    n))
+
+(builtin JsRxAt :transitioning true :params [(vec arr) (i int)] :ret int
+  (let [(v (%ArrayLoad vec i))] (if (%IsInt v) (%UnboxInt v) -1)))
+
+(builtin JsRxSet :transitioning true :params [(vec arr) (i int) (w int)] :ret int
+  (let [(stored (%ArrayStore vec i (%BoxInt w)))] 0))
+
+(builtin JsRxLen :transitioning true :params [(vec arr)] :ret int
+  (%ArrayLen vec))
+
+; Drop everything from `n` on: a quantified atom is emitted once, then dropped and re-emitted
+; inside the quantifier's branches.
+(builtin JsRxTruncate :transitioning true :params [(vec arr) (n int)] :ret int
+  (if (%Lt n (%ArrayLen vec))
+      (let [(shrunk (%ArraySetLength vec n))] 0)
+      0))
+
+; ---------------------------------------------------------------------------
+; The compile-time state, as a three-slot vector so the recursive descent can carry it
+;
+;   0  the next capturing group's index
+;   1  non-zero once a construct was refused
+;   2  the flag bits
+
+(builtin JsRxStateNew :transitioning true :params [(flags int)] :ret arr
+  (let [(st (%UnboxArray (JsNewArray 0)))
+        (a (JsRxPush st 0))
+        (b (JsRxPush st 0))
+        (c (JsRxPush st flags))]
+    st))
+
+(builtin JsRxRefuse :transitioning true :params [(st arr)] :ret int
+  (let [(set (JsRxSet st 1 1))] -1))
+
+(builtin JsRxRefused :transitioning true :params [(st arr)] :ret bool
+  (%Ne (JsRxAt st 1) 0))
+
+(builtin JsRxFlags :transitioning true :params [(st arr)] :ret int
+  (JsRxAt st 2))
+
+; ---------------------------------------------------------------------------
+; Character predicates over the pattern text
+
+(builtin JsRxUnit :transitioning true :params [(src str) (i int)] :ret int
+  (if (%Lt i (%StringLength src)) (%StringCharCode src i) -1))
+
+(builtin JsRxIsDigit :params [(c int)] :ret bool
+  (if (%Le 48 c) (%Le c 57) (%Eq 0 1)))
+
+(builtin JsRxHexValue :params [(c int)] :ret int
+  (if (%Le 48 c)
+      (if (%Le c 57) (%Sub c 48)
+      (if (%Le 65 c)
+          (if (%Le c 70) (%Sub c 55)
+          (if (%Le 97 c) (if (%Le c 102) (%Sub c 87) -1) -1))
+          -1))
+      -1))
+
+; A word character, for `\b` and for `\w`.
+(builtin JsRxIsWord :params [(c int)] :ret bool
+  (if (%Le 48 c)
+      (if (%Le c 57) (%Eq 0 0)
+      (if (%Le 65 c)
+          (if (%Le c 90) (%Eq 0 0)
+          (if (%Eq c 95) (%Eq 0 0)
+          (if (%Le 97 c) (%Le c 122) (%Eq 0 1))))
+          (%Eq 0 1)))
+      (%Eq 0 1)))
+
+(builtin JsRxIsLineTerminator :params [(c int)] :ret bool
+  (if (%Eq c 10) (%Eq 0 0)
+  (if (%Eq c 13) (%Eq 0 0)
+  (if (%Eq c 8232) (%Eq 0 0)
+  (if (%Eq c 8233) (%Eq 0 0) (%Eq 0 1))))))
+
+; ---------------------------------------------------------------------------
+; Character classes
+;
+; `\d`, `\w` and `\s` are expanded into ranges here so the matcher has one vocabulary. A negated
+; escape adds the same ranges to a class the matcher then complements.
+
+(builtin JsRxClassBegin :transitioning true :params [(cls arr) (negated int)] :ret int
+  (let [(at (JsRxLen cls))
+        (a (JsRxPush cls negated))
+        (b (JsRxPush cls 0))]
+    at))
+
+(builtin JsRxClassRange :transitioning true :params [(cls arr) (at int) (lo int) (hi int)] :ret int
+  (if (%Lt hi lo)
+      0
+      (let [(a (JsRxPush cls lo))
+            (b (JsRxPush cls hi))
+            (n (JsRxAt cls (%Add at 1)))
+            (bumped (JsRxSet cls (%Add at 1) (%Add n 1)))]
+        0)))
+
+(builtin JsRxAddDigits :transitioning true :params [(cls arr) (at int)] :ret int
+  (JsRxClassRange cls at 48 57))
+
+(builtin JsRxAddWords :transitioning true :params [(cls arr) (at int)] :ret int
+  (let [(a (JsRxClassRange cls at 48 57))
+        (b (JsRxClassRange cls at 65 90))
+        (c (JsRxClassRange cls at 95 95))
+        (d (JsRxClassRange cls at 97 122))]
+    0))
+
+; WhiteSpace and LineTerminator together, which is what `\s` is (§22.2.1).
+(builtin JsRxAddSpaces :transitioning true :params [(cls arr) (at int)] :ret int
+  (let [(a (JsRxClassRange cls at 9 13))
+        (b (JsRxClassRange cls at 32 32))
+        (c (JsRxClassRange cls at 160 160))
+        (d (JsRxClassRange cls at 5760 5760))
+        (e (JsRxClassRange cls at 8192 8239))
+        (f (JsRxClassRange cls at 8287 8287))
+        (g (JsRxClassRange cls at 12288 12288))
+        (h (JsRxClassRange cls at 65279 65279))]
+    0))
+
+; The ranges of one `\d`/`\w`/`\s`, by its lower-case letter.
+(builtin JsRxAddBuiltin :transitioning true :params [(cls arr) (at int) (kind int)] :ret int
+  (if (%Eq kind 100) (JsRxAddDigits cls at)
+  (if (%Eq kind 119) (JsRxAddWords cls at)
+  (if (%Eq kind 115) (JsRxAddSpaces cls at) 0))))
+
+; `d`, `w`, `s` answer themselves; `D`, `W`, `S` answer the lower-case letter; anything else zero.
+(builtin JsRxClassEscapeKind :params [(e int)] :ret int
+  (if (%Eq e 100) 100
+  (if (%Eq e 119) 119
+  (if (%Eq e 115) 115
+  (if (%Eq e 68) 100
+  (if (%Eq e 87) 119
+  (if (%Eq e 83) 115 0)))))))
+
+(builtin JsRxClassEscapeNegated :params [(e int)] :ret bool
+  (if (%Eq e 68) (%Eq 0 0)
+  (if (%Eq e 87) (%Eq 0 0)
+  (if (%Eq e 83) (%Eq 0 0) (%Eq 0 1)))))
+
+; ---------------------------------------------------------------------------
+; Escapes
+;
+; The value of a CharacterEscape, and the position after it, are returned through a two-slot
+; vector because JSL has one return value and both are needed.
+
+(builtin JsRxEscapeValue :transitioning true :params [(src str) (pos int) (out arr)] :ret int
+  (let [(e (JsRxUnit src pos))]
+    (if (%Eq e 110) (JsRxEscapeAnswer out 10 (%Add pos 1))
+    (if (%Eq e 114) (JsRxEscapeAnswer out 13 (%Add pos 1))
+    (if (%Eq e 116) (JsRxEscapeAnswer out 9 (%Add pos 1))
+    (if (%Eq e 118) (JsRxEscapeAnswer out 11 (%Add pos 1))
+    (if (%Eq e 102) (JsRxEscapeAnswer out 12 (%Add pos 1))
+    (if (%Eq e 48) (JsRxEscapeAnswer out 0 (%Add pos 1))
+    (if (%Eq e 120) (JsRxHexEscape src pos out)
+    (if (%Eq e 117) (JsRxUnicodeEscape src pos out)
+    (if (%Eq e 99) (JsRxControlEscape src pos out)
+        (JsRxEscapeAnswer out e (%Add pos 1)))))))))))))
+
+(builtin JsRxEscapeAnswer :transitioning true :params [(out arr) (value int) (pos int)] :ret int
+  (let [(a (JsRxSet out 0 value))] pos))
+
+(builtin JsRxHexEscape :transitioning true :params [(src str) (pos int) (out arr)] :ret int
+  (let [(h0 (JsRxHexValue (JsRxUnit src (%Add pos 1))))
+        (h1 (JsRxHexValue (JsRxUnit src (%Add pos 2))))]
+    (if (%Lt h0 0)
+        (JsRxEscapeAnswer out 120 (%Add pos 1))
+        (if (%Lt h1 0)
+            (JsRxEscapeAnswer out 120 (%Add pos 1))
+            (JsRxEscapeAnswer out (%Add (%Mul h0 16) h1) (%Add pos 3))))))
+
+; `\uHHHH`, and `\u{H...}` which this stage refuses along with the `u` flag it belongs to.
+(builtin JsRxUnicodeEscape :transitioning true :params [(src str) (pos int) (out arr)] :ret int
+  (let [(h0 (JsRxHexValue (JsRxUnit src (%Add pos 1))))
+        (h1 (JsRxHexValue (JsRxUnit src (%Add pos 2))))
+        (h2 (JsRxHexValue (JsRxUnit src (%Add pos 3))))
+        (h3 (JsRxHexValue (JsRxUnit src (%Add pos 4))))]
+    (if (%Lt h0 0)
+        (JsRxEscapeAnswer out 117 (%Add pos 1))
+        (if (%Lt h1 0)
+            (JsRxEscapeAnswer out 117 (%Add pos 1))
+            (if (%Lt h2 0)
+                (JsRxEscapeAnswer out 117 (%Add pos 1))
+                (if (%Lt h3 0)
+                    (JsRxEscapeAnswer out 117 (%Add pos 1))
+                    (JsRxEscapeAnswer out
+                                      (%Add (%Mul h0 4096)
+                                            (%Add (%Mul h1 256) (%Add (%Mul h2 16) h3)))
+                                      (%Add pos 5))))))))
+
+(builtin JsRxControlEscape :transitioning true :params [(src str) (pos int) (out arr)] :ret int
+  (let [(l (JsRxUnit src (%Add pos 1)))]
+    (if (JsRxIsWord l)
+        (JsRxEscapeAnswer out (%And l 31) (%Add pos 2))
+        (JsRxEscapeAnswer out 92 pos))))
+
+; ---------------------------------------------------------------------------
+; ClassRanges
+
+(builtin JsRxParseClass :transitioning true
+  :params [(src str) (pos int) (prog arr) (cls arr) (st arr)] :ret int
+  (let [(negated (if (%Eq (JsRxUnit src (%Add pos 1)) 94) 1 0))
+        (at (JsRxClassBegin cls negated))
+        (start (if (%Eq negated 1) (%Add pos 2) (%Add pos 1)))
+        (after (JsRxClassBody src start prog cls st at))]
+    (if (%Lt after 0)
+        -1
+        (let [(emitted (JsRxPush prog (JsRxOpClass)))
+              (operand (JsRxPush prog at))]
+          after))))
+
+(builtin JsRxClassBody :transitioning true :noinline true
+  :params [(src str) (pos int) (prog arr) (cls arr) (st arr) (at int)] :ret int
+  (let [(c (JsRxUnit src pos))]
+    (if (%Eq c 93)
+        (%Add pos 1)
+        (if (%Lt c 0)
+            (JsRxRefuse st)
+            (let [(out (JsRxStateNew 0))
+                  (after (JsRxClassAtom src pos cls st at out))]
+              (if (%Lt after 0)
+                  -1
+                  (let [(lo (JsRxAt out 0))]
+                    (if (%Lt lo 0)
+                        (JsRxClassBody src after prog cls st at)
+                        (JsRxClassMaybeRange src after prog cls st at lo out)))))))))
+
+(builtin JsRxClassMaybeRange :transitioning true
+  :params [(src str) (pos int) (prog arr) (cls arr) (st arr) (at int) (lo int) (out arr)] :ret int
+  (if (%Eq (JsRxUnit src pos) 45)
+      (if (%Eq (JsRxUnit src (%Add pos 1)) 93)
+          (let [(a (JsRxClassRange cls at lo lo))]
+            (JsRxClassBody src pos prog cls st at))
+          (let [(after (JsRxClassAtom src (%Add pos 1) cls st at out))]
+            (if (%Lt after 0)
+                -1
+                (let [(hi (JsRxAt out 0))]
+                  (if (%Lt hi 0)
+                      (JsRxRefuse st)
+                      (let [(a (JsRxClassRange cls at lo hi))]
+                        (JsRxClassBody src after prog cls st at)))))))
+      (let [(a (JsRxClassRange cls at lo lo))]
+        (JsRxClassBody src pos prog cls st at))))
+
+; One ClassAtom: its code point into `out`, or -1 there when it was a `\d`/`\w`/`\s` whose ranges
+; have already been added.
+(builtin JsRxClassAtom :transitioning true
+  :params [(src str) (pos int) (cls arr) (st arr) (at int) (out arr)] :ret int
+  (let [(c (JsRxUnit src pos))]
+    (if (%Eq c 92)
+        (let [(e (JsRxUnit src (%Add pos 1)))
+              (kind (JsRxClassEscapeKind e))]
+          (if (%Ne kind 0)
+              (if (JsRxClassEscapeNegated e)
+                  (JsRxRefuse st)
+                  (let [(a (JsRxAddBuiltin cls at kind))
+                        (b (JsRxSet out 0 -1))]
+                    (%Add pos 2)))
+              (JsRxEscapeValue src (%Add pos 1) out)))
+        (JsRxEscapeAnswer out c (%Add pos 1)))))
+
+; ---------------------------------------------------------------------------
+; Quantifiers
+;
+; `q` carries min, max (-1 unbounded), greedy and the position after it.
+
+(builtin JsRxQuantifier :transitioning true :params [(src str) (pos int) (q arr)] :ret int
+  (let [(c (JsRxUnit src pos))]
+    (if (%Eq c 42) (JsRxQuantAnswer src (%Add pos 1) q 0 -1)
+    (if (%Eq c 43) (JsRxQuantAnswer src (%Add pos 1) q 1 -1)
+    (if (%Eq c 63) (JsRxQuantAnswer src (%Add pos 1) q 0 1)
+    (if (%Eq c 123) (JsRxBraced src pos q) 0))))))
+
+(builtin JsRxQuantAnswer :transitioning true
+  :params [(src str) (pos int) (q arr) (lo int) (hi int)] :ret int
+  (let [(lazy (if (%Eq (JsRxUnit src pos) 63) 1 0))
+        (a (JsRxSet q 0 lo))
+        (b (JsRxSet q 1 hi))
+        (c (JsRxSet q 2 (if (%Eq lazy 1) 0 1)))]
+    (if (%Eq lazy 1) (%Add pos 1) pos)))
+
+(builtin JsRxBraced :transitioning true :params [(src str) (pos int) (q arr)] :ret int
+  (let [(scan (JsRxDigits src (%Add pos 1) 0 0))
+        (after (JsRxAt scan 1))
+        (count (JsRxAt scan 2))]
+    (if (%Eq count 0)
+        0
+        (let [(lo (JsRxAt scan 0))
+              (c (JsRxUnit src after))]
+          (if (%Eq c 125)
+              (JsRxQuantAnswer src (%Add after 1) q lo lo)
+              (if (%Eq c 44)
+                  (let [(scan2 (JsRxDigits src (%Add after 1) 0 0))
+                        (after2 (JsRxAt scan2 1))
+                        (count2 (JsRxAt scan2 2))]
+                    (if (%Eq (JsRxUnit src after2) 125)
+                        (JsRxQuantAnswer src (%Add after2 1) q lo
+                                         (if (%Eq count2 0) -1 (JsRxAt scan2 0)))
+                        0))
+                  0))))))
+
+; Decimal digits from `pos`: [value, position after, digit count].
+(builtin JsRxDigits :transitioning true :noinline true
+  :params [(src str) (pos int) (value int) (count int)] :ret arr
+  (let [(c (JsRxUnit src pos))]
+    (if (JsRxIsDigit c)
+        (JsRxDigits src (%Add pos 1) (%Add (%Mul value 10) (%Sub c 48)) (%Add count 1))
+        (let [(out (%UnboxArray (JsNewArray 0)))
+              (a (JsRxPush out value))
+              (b (JsRxPush out pos))
+              (c2 (JsRxPush out count))]
+          out))))
+
+; ---------------------------------------------------------------------------
+; The walk
+
+(builtin JsRxParseDisjunction :transitioning true :noinline true
+  :params [(src str) (pos int) (prog arr) (cls arr) (st arr)] :ret int
+  (if (JsRxHasBar src pos 0 0)
+      (let [(split (JsRxLen prog))
+            (a (JsRxPush prog (JsRxOpSplit)))
+            (b (JsRxPush prog 0))
+            (c (JsRxPush prog 0))
+            (d (JsRxSet prog (%Add split 1) (JsRxLen prog)))
+            (after (JsRxParseAlternative src pos prog cls st))]
+        (if (%Lt after 0)
+            -1
+            (let [(jmp (JsRxLen prog))
+                  (e (JsRxPush prog (JsRxOpJmp)))
+                  (f (JsRxPush prog 0))
+                  (g (JsRxSet prog (%Add split 2) (JsRxLen prog)))
+                  (rest (JsRxParseDisjunction src (%Add after 1) prog cls st))]
+              (if (%Lt rest 0)
+                  -1
+                  (let [(h (JsRxSet prog (%Add jmp 1) (JsRxLen prog)))]
+                    rest)))))
+      (JsRxParseAlternative src pos prog cls st)))
+
+; Is there a `|` at this nesting level before the group or the pattern ends?
+(builtin JsRxHasBar :transitioning true :noinline true
+  :params [(src str) (pos int) (depth int) (in-class int)] :ret bool
+  (let [(c (JsRxUnit src pos))]
+    (if (%Lt c 0) (%Eq 0 1)
+    (if (%Eq c 92) (JsRxHasBar src (%Add pos 2) depth in-class)
+    (if (%Ne in-class 0)
+        (JsRxHasBar src (%Add pos 1) depth (if (%Eq c 93) 0 1))
+    (if (%Eq c 91) (JsRxHasBar src (%Add pos 1) depth 1)
+    (if (%Eq c 40) (JsRxHasBar src (%Add pos 1) (%Add depth 1) 0)
+    (if (%Eq c 41) (if (%Eq depth 0) (%Eq 0 1) (JsRxHasBar src (%Add pos 1) (%Sub depth 1) 0))
+    (if (%Eq c 124) (if (%Eq depth 0) (%Eq 0 0) (JsRxHasBar src (%Add pos 1) depth 0))
+        (JsRxHasBar src (%Add pos 1) depth 0))))))))))
+
+(builtin JsRxParseAlternative :transitioning true :noinline true
+  :params [(src str) (pos int) (prog arr) (cls arr) (st arr)] :ret int
+  (let [(c (JsRxUnit src pos))]
+    (if (%Lt c 0) pos
+    (if (%Eq c 124) pos
+    (if (%Eq c 41) pos
+        (let [(after (JsRxParseTerm src pos prog cls st))]
+          (if (%Lt after 0)
+              -1
+              (JsRxParseAlternative src after prog cls st))))))))
+
+; Term :: Atom Quantifier?
+(builtin JsRxParseTerm :transitioning true
+  :params [(src str) (pos int) (prog arr) (cls arr) (st arr)] :ret int
+  (let [(before (JsRxLen prog))
+        (after (JsRxParseAtom src pos prog cls st))]
+    (if (%Lt after 0)
+        -1
+        (let [(q (JsRxStateNew 0))
+              (d (JsRxPush q 0))
+              (quant-end (JsRxQuantifier src after q))]
+          (if (%Eq quant-end 0)
+              after
+              (let [(dropped (JsRxTruncate prog before))]
+                (JsRxEmitRepeat src pos prog cls st q quant-end)))))))
+
+; A quantified atom is re-emitted from its source span, never copied and relocated.
+(builtin JsRxEmitRepeat :transitioning true
+  :params [(src str) (body int) (prog arr) (cls arr) (st arr) (q arr) (after int)] :ret int
+  (let [(lo (JsRxAt q 0))
+        (hi (JsRxAt q 1))
+        (greedy (JsRxAt q 2))
+        (mandatory (JsRxEmitCopies src body prog cls st lo))]
+    (if (%Lt mandatory 0)
+        -1
+        (if (%Lt hi 0)
+            (let [(r (JsRxEmitStar src body prog cls st greedy))]
+              (if (%Lt r 0) -1 after))
+            (let [(r (JsRxEmitOptional src body prog cls st greedy (%Sub hi lo) (%UnboxArray (JsNewArray 0))))]
+              (if (%Lt r 0) -1 after))))))
+
+(builtin JsRxEmitCopies :transitioning true :noinline true
+  :params [(src str) (body int) (prog arr) (cls arr) (st arr) (n int)] :ret int
+  (if (%Le n 0)
+      0
+      (let [(after (JsRxParseAtom src body prog cls st))]
+        (if (%Lt after 0)
+            -1
+            (JsRxEmitCopies src body prog cls st (%Sub n 1))))))
+
+; L: SPLIT body, out ; body ; JMP L ; out:  — greedy. Lazy swaps the SPLIT's operands, and that
+; single difference is the whole of greediness.
+(builtin JsRxEmitStar :transitioning true
+  :params [(src str) (body int) (prog arr) (cls arr) (st arr) (greedy int)] :ret int
+  (let [(loop-at (JsRxLen prog))
+        (a (JsRxPush prog (JsRxOpSplit)))
+        (b (JsRxPush prog 0))
+        (c (JsRxPush prog 0))
+        ;; A SPLIT is three words, so the body begins at `loop-at + 3`. Reading the length back
+        ;; here instead is a PURE read among mutations, and it was reordered after the emits that
+        ;; follow — both operands came out as the loop exit and every quantifier behaved as lazy.
+        (body-at (%Add loop-at 3))
+        (emitted (JsRxParseAtom src body prog cls st))]
+    (if (%Lt emitted 0)
+        -1
+        (let [(d (JsRxPush prog (JsRxOpJmp)))
+              (e (JsRxPush prog loop-at))
+              (out (JsRxLen prog))
+              (f (JsRxSet prog (%Add loop-at 1) (if (%Eq greedy 1) body-at out)))
+              (g (JsRxSet prog (%Add loop-at 2) (if (%Eq greedy 1) out body-at)))]
+          0))))
+
+; `{n,m}`: the optional copies, each behind its own SPLIT to the end.
+(builtin JsRxEmitOptional :transitioning true :noinline true
+  :params [(src str) (body int) (prog arr) (cls arr) (st arr) (greedy int) (n int) (splits arr)] :ret int
+  (if (%Le n 0)
+      (JsRxPatchSplits prog splits 0 (JsRxLen prog) greedy)
+      (let [(split (JsRxLen prog))
+            (a (JsRxPush prog (JsRxOpSplit)))
+            (b (JsRxPush prog 0))
+            (c (JsRxPush prog 0))
+            (body-at (%Add split 3))
+            (d (JsRxPush splits split))
+            (emitted (JsRxParseAtom src body prog cls st))]
+        (if (%Lt emitted 0)
+            -1
+            (let [(e (JsRxSet prog (%Add split (if (%Eq greedy 1) 1 2)) body-at))]
+              (JsRxEmitOptional src body prog cls st greedy (%Sub n 1) splits))))))
+
+(builtin JsRxPatchSplits :transitioning true :noinline true
+  :params [(prog arr) (splits arr) (i int) (out int) (greedy int)] :ret int
+  (if (%Lt i (JsRxLen splits))
+      (let [(split (JsRxAt splits i))
+            (a (JsRxSet prog (%Add split (if (%Eq greedy 1) 2 1)) out))]
+        (JsRxPatchSplits prog splits (%Add i 1) out greedy))
+      0))
+
+(builtin JsRxParseAtom :transitioning true
+  :params [(src str) (pos int) (prog arr) (cls arr) (st arr)] :ret int
+  (let [(c (JsRxUnit src pos))]
+    (if (%Eq c 94) (let [(a (JsRxPush prog (JsRxOpBol)))] (%Add pos 1))
+    (if (%Eq c 36) (let [(a (JsRxPush prog (JsRxOpEol)))] (%Add pos 1))
+    (if (%Eq c 46)
+        (let [(a (JsRxPush prog (if (%Eq (%And (JsRxFlags st) 4) 0)
+                                    (JsRxOpAny)
+                                    (JsRxOpAnyNl))))]
+          (%Add pos 1))
+    (if (%Eq c 91) (JsRxParseClass src pos prog cls st)
+    (if (%Eq c 40) (JsRxParseGroup src pos prog cls st)
+    (if (%Eq c 92) (JsRxParseEscapeAtom src pos prog cls st)
+    (if (%Lt c 0) (JsRxRefuse st)
+        (let [(a (JsRxPush prog (JsRxOpChar)))
+              (b (JsRxPush prog c))]
+          (%Add pos 1)))))))))))
+
+(builtin JsRxParseEscapeAtom :transitioning true
+  :params [(src str) (pos int) (prog arr) (cls arr) (st arr)] :ret int
+  (let [(e (JsRxUnit src (%Add pos 1)))
+        (kind (JsRxClassEscapeKind e))]
+    (if (%Ne kind 0)
+        (let [(at (JsRxClassBegin cls (if (JsRxClassEscapeNegated e) 1 0)))
+              (a (JsRxAddBuiltin cls at kind))
+              (b (JsRxPush prog (JsRxOpClass)))
+              (c (JsRxPush prog at))]
+          (%Add pos 2))
+        (if (%Eq e 98)
+            (let [(a (JsRxPush prog (JsRxOpWordb))) (b (JsRxPush prog 0))] (%Add pos 2))
+        (if (%Eq e 66)
+            (let [(a (JsRxPush prog (JsRxOpWordb))) (b (JsRxPush prog 1))] (%Add pos 2))
+        (if (%Eq e 112) (JsRxRefuse st)
+        (if (%Eq e 80) (JsRxRefuse st)
+        (if (%Eq e 107) (JsRxRefuse st)
+        (if (%Eq e 0) (JsRxRefuse st)
+        (if (JsRxIsDigit e)
+            (if (%Eq e 48)
+                (let [(a (JsRxPush prog (JsRxOpChar))) (b (JsRxPush prog 0))] (%Add pos 2))
+                (let [(scan (JsRxDigits src (%Add pos 1) 0 0))
+                      (a (JsRxPush prog (JsRxOpBackref)))
+                      (b (JsRxPush prog (JsRxAt scan 0)))]
+                  (JsRxAt scan 1)))
+            (let [(out (JsRxStateNew 0))
+                  (after (JsRxEscapeValue src (%Add pos 1) out))
+                  (a (JsRxPush prog (JsRxOpChar)))
+                  (b (JsRxPush prog (JsRxAt out 0)))]
+              after)))))))))))
+
+(builtin JsRxParseGroup :transitioning true
+  :params [(src str) (pos int) (prog arr) (cls arr) (st arr)] :ret int
+  (if (%Eq (JsRxUnit src (%Add pos 1)) 63)
+      (if (%Eq (JsRxUnit src (%Add pos 2)) 58)
+          (let [(after (JsRxParseDisjunction src (%Add pos 3) prog cls st))]
+            (if (%Lt after 0)
+                -1
+                (if (%Eq (JsRxUnit src after) 41) (%Add after 1) (JsRxRefuse st))))
+          (JsRxRefuse st))
+      (let [(index (%Add (JsRxAt st 0) 1))
+            (bumped (JsRxSet st 0 index))
+            (a (JsRxPush prog (JsRxOpSave)))
+            (b (JsRxPush prog (%Mul index 2)))
+            (after (JsRxParseDisjunction src (%Add pos 1) prog cls st))]
+        (if (%Lt after 0)
+            -1
+            (let [(c (JsRxPush prog (JsRxOpSave)))
+                  (d (JsRxPush prog (%Add (%Mul index 2) 1)))]
+              (if (%Eq (JsRxUnit src after) 41) (%Add after 1) (JsRxRefuse st)))))))
+
+; ---------------------------------------------------------------------------
+; The matcher
+;
+; Recursive backtracking, as §22.2.2's continuations are. `SAVE` recurses too, so a capture written
+; down a branch that later fails is restored — the specification's "if the match fails, the
+; capture is left as it was".
+
+(builtin JsRxClassMatches :transitioning true :noinline true
+  :params [(cls arr) (at int) (c int) (i int)] :ret bool
+  (let [(count (JsRxAt cls (%Add at 1)))]
+    (if (%Lt i count)
+        (let [(lo (JsRxAt cls (%Add (%Add at 2) (%Mul i 2))))
+              (hi (JsRxAt cls (%Add (%Add at 3) (%Mul i 2))))]
+          (if (%Le lo c)
+              (if (%Le c hi) (%Eq 0 0) (JsRxClassMatches cls at c (%Add i 1)))
+              (JsRxClassMatches cls at c (%Add i 1))))
+        (%Eq 0 1))))
+
+(builtin JsRxClassTest :transitioning true :params [(cls arr) (at int) (c int)] :ret bool
+  (let [(inside (JsRxClassMatches cls at c 0))]
+    (if (%Eq (JsRxAt cls at) 1) (if inside (%Eq 0 1) (%Eq 0 0)) inside)))
+
+(builtin JsRxWordAt :transitioning true :params [(input str) (i int)] :ret bool
+  (if (%Lt i 0)
+      (%Eq 0 1)
+      (if (%Lt i (%StringLength input)) (JsRxIsWord (%StringCharCode input i)) (%Eq 0 1))))
+
+; Run the program from `pc` with the cursor at `sp`. Answers the end position of the match, or -1.
+(builtin JsRxRun :transitioning true :noinline true
+  :params [(prog arr) (cls arr) (input str) (pc int) (sp int) (caps arr) (flags int)] :ret int
+  (let [(op (JsRxAt prog pc))]
+    (if (%Eq op (JsRxOpMatch)) sp
+    (if (%Eq op (JsRxOpChar))
+        (if (%Lt sp (%StringLength input))
+            (if (%Eq (%StringCharCode input sp) (JsRxAt prog (%Add pc 1)))
+                (JsRxRun prog cls input (%Add pc 2) (%Add sp 1) caps flags)
+                -1)
+            -1)
+    (if (%Eq op (JsRxOpAny))
+        (if (%Lt sp (%StringLength input))
+            (if (JsRxIsLineTerminator (%StringCharCode input sp))
+                -1
+                (JsRxRun prog cls input (%Add pc 1) (%Add sp 1) caps flags))
+            -1)
+    (if (%Eq op (JsRxOpAnyNl))
+        (if (%Lt sp (%StringLength input))
+            (JsRxRun prog cls input (%Add pc 1) (%Add sp 1) caps flags)
+            -1)
+    (if (%Eq op (JsRxOpClass))
+        (if (%Lt sp (%StringLength input))
+            (if (JsRxClassTest cls (JsRxAt prog (%Add pc 1)) (%StringCharCode input sp))
+                (JsRxRun prog cls input (%Add pc 2) (%Add sp 1) caps flags)
+                -1)
+            -1)
+    (if (%Eq op (JsRxOpJmp))
+        (JsRxRun prog cls input (JsRxAt prog (%Add pc 1)) sp caps flags)
+    (if (%Eq op (JsRxOpSplit))
+        (let [(first (JsRxRun prog cls input (JsRxAt prog (%Add pc 1)) sp caps flags))]
+          (if (%Le 0 first)
+              first
+              (JsRxRun prog cls input (JsRxAt prog (%Add pc 2)) sp caps flags)))
+    (if (%Eq op (JsRxOpSave))
+        (let [(slot (JsRxAt prog (%Add pc 1)))
+              (old (JsRxAt caps slot))
+              (set (JsRxSet caps slot sp))
+              (r (JsRxRun prog cls input (%Add pc 2) sp caps flags))]
+          (if (%Le 0 r) r (let [(undo (JsRxSet caps slot old))] -1)))
+    (if (%Eq op (JsRxOpBol))
+        (if (%Eq sp 0)
+            (JsRxRun prog cls input (%Add pc 1) sp caps flags)
+            (if (%Eq (%And flags 2) 0)
+                -1
+                (if (JsRxIsLineTerminator (%StringCharCode input (%Sub sp 1)))
+                    (JsRxRun prog cls input (%Add pc 1) sp caps flags)
+                    -1)))
+    (if (%Eq op (JsRxOpEol))
+        (if (%Eq sp (%StringLength input))
+            (JsRxRun prog cls input (%Add pc 1) sp caps flags)
+            (if (%Eq (%And flags 2) 0)
+                -1
+                (if (JsRxIsLineTerminator (%StringCharCode input sp))
+                    (JsRxRun prog cls input (%Add pc 1) sp caps flags)
+                    -1)))
+    (if (%Eq op (JsRxOpWordb))
+        (let [(before (JsRxWordAt input (%Sub sp 1)))
+              (after (JsRxWordAt input sp))
+              (boundary (if before (if after (%Eq 0 1) (%Eq 0 0)) (if after (%Eq 0 0) (%Eq 0 1))))
+              (want (%Eq (JsRxAt prog (%Add pc 1)) 0))]
+          (if (if boundary want (if want (%Eq 0 1) (%Eq 0 0)))
+              (JsRxRun prog cls input (%Add pc 2) sp caps flags)
+              -1))
+    (if (%Eq op (JsRxOpBackref))
+        (JsRxBackref prog cls input pc sp caps flags)
+        -1))))))))))))))
+
+(builtin JsRxBackref :transitioning true
+  :params [(prog arr) (cls arr) (input str) (pc int) (sp int) (caps arr) (flags int)] :ret int
+  (let [(n (JsRxAt prog (%Add pc 1)))
+        (start (JsRxAt caps (%Mul n 2)))
+        (end (JsRxAt caps (%Add (%Mul n 2) 1)))]
+    (if (%Lt start 0)
+        (JsRxRun prog cls input (%Add pc 2) sp caps flags)
+        (if (%Lt end 0)
+            (JsRxRun prog cls input (%Add pc 2) sp caps flags)
+            (if (JsRxTextEquals input start end sp)
+                (JsRxRun prog cls input (%Add pc 2) (%Add sp (%Sub end start)) caps flags)
+                -1)))))
+
+(builtin JsRxTextEquals :transitioning true :noinline true
+  :params [(input str) (start int) (end int) (sp int)] :ret bool
+  (if (%Le end start)
+      (%Eq 0 0)
+      (if (%Lt sp (%StringLength input))
+          (if (%Eq (%StringCharCode input start) (%StringCharCode input sp))
+              (JsRxTextEquals input (%Add start 1) end (%Add sp 1))
+              (%Eq 0 1))
+          (%Eq 0 1))))
+
+; ---------------------------------------------------------------------------
+; RegExp objects
+;
+; The compiled program, its class table, the source text, the flag bits and the group count are
+; internal slots, so a program cannot reach them and a subclass cannot forge one.
+
+(builtin JsRxFlagBits :transitioning true :noinline true :params [(flags str) (i int) (bits int)] :ret int
+  (if (%Lt i (%StringLength flags))
+      (let [(c (%StringCharCode flags i))
+            (bit (JsRxFlagBit c))]
+        (if (%Lt bit 0)
+            -1
+            ;; A repeated flag is the SyntaxError of §22.2.3.1; checking for it is also what lets
+            ;; the bits be summed rather than or-ed, this generation of jsl/ having no `%BitOr`.
+            (if (%Ne (%And bits bit) 0)
+                -1
+                (JsRxFlagBits flags (%Add i 1) (%Add bits bit)))))
+      bits))
+
+; The bit of one flag letter, 0 for a flag that changes nothing the matcher reads, -1 for one this
+; engine refuses (`i`, `u`, `v`) or does not know.
+(builtin JsRxFlagBit :params [(c int)] :ret int
+  (if (%Eq c 109) 2
+  (if (%Eq c 115) 4
+  (if (%Eq c 103) 16
+  (if (%Eq c 121) 32
+  (if (%Eq c 100) 0
+      -1))))))
+
+; Compile `source` under `flags`. Answers the RegExp object, or undefined when a construct is
+; refused — the caller turns that into the refusal a program can see.
+(builtin JsRxBuild :transitioning true :throws true
+  :params [(target dyn) (source dyn) (flags dyn)] :ret dyn
+  (let [(text (JsToStringValue source))]
+    (if (%IsException text)
+        text
+        (let [(flag-text (if (%IsUndefined flags) (%Box "") (JsToStringValue flags)))]
+          (if (%IsException flag-text)
+              flag-text
+              (let [(bits (JsRxFlagBits (%UnboxString flag-text) 0 0))]
+                (if (%Lt bits 0)
+                    (%Undefined)
+                    (JsRxCompileInto target (%UnboxString text) bits))))))))
+
+(builtin JsRxCompileInto :transitioning true :throws true
+  :params [(target dyn) (src str) (bits int)] :ret dyn
+  (let [(prog-value (JsNewArray 0))
+        (cls-value (JsNewArray 0))
+        (prog (%UnboxArray prog-value))
+        (cls (%UnboxArray cls-value))
+        (st (JsRxStateNew bits))
+        (a (JsRxPush prog (JsRxOpSave)))
+        (b (JsRxPush prog 0))
+        (after (JsRxParseDisjunction src 0 prog cls st))]
+    (if (%Lt after 0)
+        (%Undefined)
+        (if (%Lt after (%StringLength src))
+            (%Undefined)
+            (let [(c (JsRxPush prog (JsRxOpSave)))
+                  (d (JsRxPush prog 1))
+                  (e (JsRxPush prog (JsRxOpMatch)))]
+              (JsRxInstall target prog-value cls-value src bits (JsRxAt st 0)))))))
+
+(builtin JsRxInstall :transitioning true :throws true
+  :params [(target dyn) (prog dyn) (cls dyn) (src str) (bits int) (groups int)] :ret dyn
+  (let [(raw (%UnboxObjectLike target))
+        (a (JsCreateDataPropertyAttrs raw (%InternalKey "%RegExpProgram%") prog 1))
+        (b (JsCreateDataPropertyAttrs raw (%InternalKey "%RegExpClasses%") cls 1))
+        (c (JsCreateDataPropertyAttrs raw (%InternalKey "%RegExpSource%") (%Box src) 1))
+        (d (JsCreateDataPropertyAttrs raw (%InternalKey "%RegExpBits%") (%BoxInt bits) 1))
+        (e (JsCreateDataPropertyAttrs raw (%InternalKey "%RegExpGroups%") (%BoxInt groups) 1))
+        (f (JsCreateDataPropertyAttrs raw (%PropertyKey "lastIndex") (%BoxInt 0) 7))
+        (g (JsCreateDataPropertyAttrs raw (%PropertyKey "source") (%Box src) 1))
+        (h (JsCreateDataPropertyAttrs raw (%PropertyKey "global")
+                                      (%BoxBool (%Ne (%And bits 16) 0)) 1))]
+    target))
+
+(macro JsRxIsRegExp :params [(value dyn)] :ret bool
+  (if (%IsObjectLike value)
+      (%PropHasOwnNamed (%UnboxObjectLike value) (%InternalKey "%RegExpProgram%"))
+      (%Eq 0 1)))
+
+(builtin JsRegExpConstructor :transitioning true :throws true
+  :params [(this dyn) (newtarget dyn) (callee dyn) (pattern dyn) (flags dyn)] :ret dyn
+  (let [(created (JsOrdinaryCreateFromConstructor
+                  (if (JsCalledAsFunction newtarget) callee newtarget)
+                  (%IntrinsicPrototype "RegExp.prototype")))]
+    (if (%IsException created)
+        created
+        ;; `new RegExp(re)` takes the source of an existing RegExp, and that read can throw, so it
+        ;; is tested before it becomes a pattern.
+        (let [(source (if (JsRxIsRegExp pattern)
+                          (JsRxSlot pattern (%InternalKey "%RegExpSource%"))
+                          pattern))]
+          (if (%IsException source)
+              source
+              (let [(built (JsRxBuild created source flags))]
+                (if (%IsException built)
+                    built
+                    (if (%IsUndefined built)
+                        (JsThrowSyntaxErrorMessage
+                         (%Box "this regular expression uses a construct the compiler does not implement"))
+                        built))))))))
+
+; A SyntaxError with a message: `JsThrowSyntaxError` carries none, and a refused pattern has to say
+; which one it was to be diagnosable at all.
+(builtin JsThrowSyntaxErrorMessage :transitioning true :noinline true :throws true
+  :params [(message dyn)] :ret never
+  (let [(error (JsSetObjectLiteralPrototype (JsNewObjectRaw)
+                                            (%IntrinsicPrototype "SyntaxError.prototype")))
+        (described (JsCreateDataPropertyAttrs error (%PropertyKey "message") message 5))]
+    (%SetPendingException (JsFinishObjectLiteral described))))
+
+(builtin JsRxReceiver :transitioning true :throws true :params [(this dyn) (what dyn)] :ret dyn
+  (if (JsRxIsRegExp this) this (JsThrowTypeError what)))
+
+; The capture vector: two slots per group, all -1 before the match.
+(builtin JsRxCapsNew :transitioning true :noinline true :params [(n int) (caps arr)] :ret arr
+  (if (%Le n 0)
+      caps
+      (let [(a (JsRxPush caps -1))]
+        (JsRxCapsNew (%Sub n 1) caps))))
+
+; Try the program at each start position from `from` (§22.2.7.2's loop over RegExpMatcher).
+(builtin JsRxSearch :transitioning true :noinline true
+  :params [(prog arr) (cls arr) (input str) (from int) (caps arr) (bits int) (slots int)] :ret int
+  (if (%Lt (%StringLength input) from)
+      -1
+      (let [(cleared (JsRxCapsClear caps 0 slots))
+            (end (JsRxRun prog cls input 0 from caps bits))]
+        (if (%Le 0 end)
+            from
+            (if (%Ne (%And bits 32) 0)
+                -1
+                (JsRxSearch prog cls input (%Add from 1) caps bits slots))))))
+
+(builtin JsRxCapsClear :transitioning true :noinline true
+  :params [(caps arr) (i int) (n int)] :ret int
+  (if (%Lt i n)
+      (let [(a (JsRxSet caps i -1))] (JsRxCapsClear caps (%Add i 1) n))
+      0))
+
+(builtin JsRegExpExec :transitioning true :throws true :params [(this dyn) (value dyn)] :ret dyn
+  (let [(re (JsRxReceiver this (%Box "RegExp.prototype.exec called on a non-RegExp")))]
+    (if (%IsException re)
+        re
+        (let [(text (JsToStringValue value))]
+          (if (%IsException text)
+              text
+              (JsRxExecOn re (%UnboxString text)))))))
+
+; An internal slot this engine wrote: an own data property, so the read cannot run a getter and
+; cannot throw. Going through `JsGetNamed` would make every slot read a possibly-exceptional value
+; that each caller has to test.
+(builtin JsRxSlot :transitioning true :params [(re dyn) (key int)] :ret dyn
+  (if (%IsObjectLike re) (%PropLoadOwnNamed (%UnboxObjectLike re) key) (%Undefined)))
+
+(builtin JsRxSlotInt :transitioning true :params [(re dyn) (key int)] :ret int
+  (let [(v (JsRxSlot re key))] (if (%IsInt v) (%UnboxInt v) 0)))
+
+(builtin JsRxExecOn :transitioning true :throws true :params [(re dyn) (input str)] :ret dyn
+  (let [(prog-value (JsRxSlot re (%InternalKey "%RegExpProgram%")))
+        (cls-value (JsRxSlot re (%InternalKey "%RegExpClasses%")))]
+    ;; Both slots were written by `JsRxInstall` as arrays; the test is what proves it here.
+    (if (%IsArray prog-value)
+        (if (%IsArray cls-value)
+            (JsRxExecWith re input (%UnboxArray prog-value) (%UnboxArray cls-value))
+            (%Null))
+        (%Null))))
+
+(builtin JsRxExecWith :transitioning true :throws true
+  :params [(re dyn) (input str) (prog arr) (cls arr)] :ret dyn
+  (let [(bits (JsRxSlotInt re (%InternalKey "%RegExpBits%")))
+        (groups (JsRxSlotInt re (%InternalKey "%RegExpGroups%")))
+        (slots (%Mul 2 (%Add groups 1)))
+        (caps (JsRxCapsNew slots (%UnboxArray (JsNewArray 0))))
+        (sticky (%Ne (%And bits 48) 0))
+        (from (if sticky (JsRxLastIndex re) 0))
+        (at (JsRxSearch prog cls input from caps bits slots))]
+    (if (%Lt at 0)
+        (let [(reset (if sticky (JsRxSetLastIndex re 0) 0))] (%Null))
+        (let [(end (JsRxAt caps 1))
+              (advanced (if sticky (JsRxSetLastIndex re end) 0))]
+          (JsRxResult re input caps groups at)))))
+
+(builtin JsRxLastIndex :transitioning true :throws true :params [(re dyn)] :ret int
+  (let [(v (JsGetNamed re (%PropertyKey "lastIndex")))]
+    (if (%IsException v) 0 (%ToInteger (JsPrimitiveNumber v)))))
+
+(builtin JsRxSetLastIndex :transitioning true :throws true :params [(re dyn) (n int)] :ret int
+  (let [(stored (JsSetKeyed re (%Box "lastIndex") (%BoxInt n) 0))] 0))
+
+; The result array of §22.2.7.2: the whole match, then each group, with `index` and `input`.
+(builtin JsRxResult :transitioning true :throws true
+  :params [(re dyn) (input str) (caps arr) (groups int) (at int)] :ret dyn
+  (let [(out (JsNewArray 0))
+        (filled (JsRxResultFill (%UnboxArray out) input caps 0 groups))
+        (a (JsCreateDataPropertyAttrs (%UnboxObjectLike out) (%PropertyKey "index") (%BoxInt at) 7))
+        (b (JsCreateDataPropertyAttrs (%UnboxObjectLike out) (%PropertyKey "input") (%Box input) 7))]
+    out))
+
+(builtin JsRxResultFill :transitioning true :noinline true
+  :params [(out arr) (input str) (caps arr) (i int) (groups int)] :ret int
+  (if (%Le i groups)
+      (let [(start (JsRxAt caps (%Mul i 2)))
+            (end (JsRxAt caps (%Add (%Mul i 2) 1)))
+            (value (if (%Lt start 0)
+                       (%Undefined)
+                       (if (%Lt end 0) (%Undefined) (%Box (%Substring input start end)))))
+            (stored (%ArrayStore out i value))]
+        (JsRxResultFill out input caps (%Add i 1) groups))
+      0))
+
+(builtin JsRegExpTest :transitioning true :throws true :params [(this dyn) (value dyn)] :ret dyn
+  (let [(r (JsRegExpExec this value))]
+    (if (%IsException r) r (%BoxBool (if (%IsNull r) (%Eq 0 1) (%Eq 0 0))))))
+
+(builtin JsRegExpSourceGetter :transitioning true :throws true :params [(this dyn)] :ret dyn
+  (let [(re (JsRxReceiver this (%Box "RegExp.prototype.source called on a non-RegExp")))]
+    (if (%IsException re) re (JsRxSlot re (%InternalKey "%RegExpSource%")))))
+
+(builtin JsRegExpToString :transitioning true :throws true :params [(this dyn)] :ret dyn
+  (let [(source (JsRegExpSourceGetter this))]
+    (if (%IsException source)
+        source
+        ;; The slot always holds the source text; the test is what proves it to the concatenation.
+        (if (%IsString source)
+            (JsConcatStrings (JsConcatStrings (%Box "/") source) (%Box "/"))
+            (%Box "/(?:)/")))))
+
+; A RegularExpressionLiteral. §22.2.4.1 makes a NEW object each time the literal is evaluated, so
+; this is a call and not a constant — two evaluations of the same literal are not the same object,
+; and `lastIndex` on one must not be visible through the other.
+(builtin JsRegExpLiteral :transitioning true :throws true :params [(source dyn) (flags dyn)] :ret dyn
+  (let [(created (JsFinishObjectLiteral
+                  (JsSetObjectLiteralPrototype (JsNewObjectRaw)
+                                               (%IntrinsicPrototype "RegExp.prototype"))))
+        (built (JsRxBuild created source flags))]
+    (if (%IsException built)
+        built
+        (if (%IsUndefined built)
+            (JsThrowSyntaxErrorMessage
+             (%Box "this regular expression uses a construct the compiler does not implement"))
+            built))))
