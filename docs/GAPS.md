@@ -1112,3 +1112,10 @@ CallEnd preserve Simple's final `control, memory, value, RPC` / `control, memory
 including concrete bulk memory, clearing RPC during trivial inlining and reconstructing the
 architectural RPC Parm before code generation. Persisted compilation units and their serialized
 envelope remain outside the implemented boundary.
+
+### 2026-09-20 — Both bugs of the 2026-09-20 entries above are fixed
+
+The swallowed exception was a missing `SxIntrinsic` arm in the may-throw walk; the SCCP panic was a
+call-target fact dropped by a later round. Each has a regression test in `tests/execution-test.coil`
+and the account of what was actually wrong is in its commit. The URI functions
+(`t262/uri-functions`) are unblocked by the first fix and can land once rebased.
