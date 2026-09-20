@@ -191,6 +191,7 @@ aot-take-2/
 │   ├── TEST262.md       ; pinned conformance campaign, denominator and runner contract
 │   ├── JSL.md           ; the runtime-library language
 │   ├── SPECIALIZE.md    ; proposal: a JSL definition carries its own idealization rules, and where to apply them
+│   ├── FUNCTION-VERSIONS.md ; bounded callable versions, entry contracts, research and validation
 │   ├── SEA-OF-NODES-AUDIT.md ; are we a proper sea of nodes: what was fixed, what remains, what the traces measured
 │   ├── REFACTORING.md   ; the refactoring and lint metaprograms in tools/, and the workflow that ties them together
 │   └── JOURNAL.md       ; why something looks the way it does
@@ -266,6 +267,7 @@ aot-take-2/
 │   │   ├── cfgcache.coil    ; CFG edit versioning; the idom, owner and depth caches it invalidates
 │   │   ├── boot.coil        ; one entry point that resets every compilation singleton
 │   │   ├── copy.coil        ; shallow shells and two-pass selected-subgraph copying
+│   │   ├── versions.coil    ; reusable callable versions, policy, contracts and graph lifetime
 │   │   ├── cfg.coil         ; CFGNode: idom, depth, blocks, loop depth, the loop tree
 │   │   ├── control.coil     ; Start, Stop, If, Never, XCtrl, Proj, CProj, Multi, Return; re-exports region, cfgof
 │   │   ├── region.coil      ; Region and Loop, their peepholes, dominators over them      RegionNode, LoopNode
@@ -453,6 +455,7 @@ aot-take-2/
 │   ├── test262-test.coil            ; metadata, runner policy and accounting regressions
 │   ├── web-test.coil                ; browser graph snapshots over the production frontend and optimizer
 │   ├── bloat-test.coil              ; graph-size budgets: node-count ceilings after optimization
+│   ├── versions-test.coil           ; callable version contracts, reuse, fallback and lifetime
 │   ├── budget-test.coil             ; compile-time budgets as gates: rounds, shape, wall time (docs/COMPILE-TIME.md §7)
 │   ├── execution-test.coil          ; cases that must RUN, not merely compile
 │   └── differential-test.coil       ; compiled output vs. a JavaScript engine

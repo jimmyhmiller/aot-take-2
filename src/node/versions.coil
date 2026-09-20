@@ -1,0 +1,745 @@
+;; Reusable callable versions, independent of inlining.
+
+;;
+;; Final Simple FunNode.copyBody selects a body, allocates shells, remaps edges, removes external
+;; callers, and repairs both halves of every call link. CallEndNode.doInline immediately folds
+;; that copy into its caller. We use the same copying protocol but retain the entry and Return.
+;; This version policy is an extension, not an algorithm supplied by Simple (docs/FUNCTION-VERSIONS.md).
+;;
+;; An optimized body can only be copied for a subset of its proven entry domain. Capture that
+;; domain before surgery, including memory and arguments whose Parms have folded away. Private
+;; entries hold those contracts while routing is open, then resume ordinary closed-world Parm
+;; typing. Recursive calls initially name the generic function and use the same proof as any call.
+(module aot.node.versions)
+(import "coil.primitive" :as primitive)
+(import "coil.arraylist" :use *)
+(import "coil.alloc" :as alloc)
+(import "coil.str" :as str)
+(import "coil.os" :as os)
+(import "aot.util.arena"
+        :use
+        [compiler-allocator compiler-state CompilerStateSlot])
+(import "aot.util.panic" :use [panic])
+(import "aot.type.type" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.copy" :use *)
+(import "aot.node.control" :use *)
+
+(const VERSION-DEFAULT-LIMIT 2)
+
+(const VERSION-NODE-BUDGET 4096)
+
+(const VERSION-BODY-LIMIT 1024)
+
+(defstruct FunctionVersion
+  [(source i64)
+   (name (slice u8))
+   (entry i64)
+   (fidx i64)
+   (contract (ArrayList i64))
+   (memory i64)
+   (accepted bool)])
+
+(defstruct VersionPolicy [(name (slice u8)) (limit i64)])
+
+(defstruct FunctionVersions
+  [(items (ArrayList FunctionVersion))
+   (policies (ArrayList VersionPolicy))
+   (nodes i64)
+   (changes i64)
+   (ready bool)
+   (closed bool)
+   (pending i64)
+   (pending-call i64)
+   (pending-size i64)
+   (growth-percent i64)
+   (growth-limit i64)
+   (retained-nodes i64)
+   (budgeted bool)])
+
+(defn function-versions [] (-> (ptr FunctionVersions))
+  (let [s
+          (compiler-state [FunctionVersions]
+                          (primitive/alloc-static CompilerStateSlot))]
+    (if (.ready s)
+        0
+        (do
+          (set! (.items s) (al-new [FunctionVersion] (compiler-allocator)))
+          (set! (.policies s) (al-new [VersionPolicy] (compiler-allocator)))
+          (set! (.ready s) true)
+          0))
+    s))
+
+(defn versions-reset! [] (-> i64)
+  (let [s (function-versions)]
+    (al-for [item (.items s)]
+            (let [(mut v) item] (al-free! (mut (.contract (mut v))))))
+    (al-clear! (mut (.items s)))
+    (al-for [item (.policies s)]
+            (let [policy item]
+              (alloc/free [u8] (compiler-allocator) (.name policy))))
+    (al-clear! (mut (.policies s)))
+    (set! (.nodes s) 0)
+    (set! (.changes s) 0)
+    (set! (.closed s) false)
+    (set! (.pending s) 0)
+    (set! (.growth-percent s) 1)
+    (set! (.growth-limit s) 0)
+    (set! (.retained-nodes s) 0)
+    (set! (.budgeted s) false)
+    (let [raw (os/getenv c"AOT_VERSION_GROWTH_PERCENT")]
+      (if (= (primitive/cast i64 raw) 0)
+          0
+          (let [text (str/cstr->str raw)]
+            (if (> (len text) 3)
+                (panic "AOT_VERSION_GROWTH_PERCENT: expected 0..100")
+                0)
+            (match (str/str-parse-int text)
+              (Some [percent]
+                    (if (or (< percent 0) (> percent 100))
+                        (panic "AOT_VERSION_GROWTH_PERCENT: expected 0..100")
+                        (do (set! (.growth-percent s) percent) 0)))
+              (None [] (panic "AOT_VERSION_GROWTH_PERCENT: expected 0..100"))))))
+    (let [raw (os/getenv c"AOT_FUNCTION_VERSIONS")]
+      (if (= (primitive/cast i64 raw) 0)
+          0
+          (versions-configure! (str/cstr->str raw))))))
+
+(defn versions-configure! [(text (slice u8))] (-> i64)
+  (let [(mut entries) (str/str-split (compiler-allocator) text ",")]
+    (al-for [entry (load entries)]
+            (let [(mut pair) (str/str-split (compiler-allocator) entry "=")]
+              (if (!= (len (load pair)) 2)
+                  (panic "AOT_FUNCTION_VERSIONS: expected name=count entries separated by commas")
+                  0)
+              (let [name (str/str-trim (get (load pair) 0))
+                    number (str/str-trim (get (load pair) 1))]
+                (if (or (= (len name) 0) (> (len number) 4))
+                    (panic "AOT_FUNCTION_VERSIONS: empty name or count outside 0..1024")
+                    0)
+                (match (str/str-parse-int number)
+                  (Some [limit]
+                        (if (or (< limit 0) (> limit 1024))
+                            (panic "AOT_FUNCTION_VERSIONS: count outside 0..1024")
+                            (versions-set-limit! name limit)))
+                  (None []
+                        (panic "AOT_FUNCTION_VERSIONS: count is not an integer"))))
+              (al-free! (mut pair))))
+    (al-free! (mut entries))
+    0))
+
+;; Last matching override wins; '*' sets the default. Configure before optimization.
+;; This policy is shared by JS and JSL and does not alter the inlining policy.
+(defn versions-set-limit! [(name (slice u8)) (limit i64)] (-> i64)
+  (if (< limit 0)
+      (panic "versions-set-limit!: negative version limit")
+      (let [(mut owned) (str/sb-new (compiler-allocator))]
+        (str/sb-push-str! (mut owned) name)
+        (let [copied (str/sb-finish! (mut owned))]
+          (push! [VersionPolicy]
+                 (mut (.policies (function-versions)))
+                 (VersionPolicy :name copied :limit limit)))
+        0)))
+
+(defn versions-limit [(fun (dyn NodeOps))] (-> i64)
+  (let [(mut limit) VERSION-DEFAULT-LIMIT]
+    (al-for [item (.policies (function-versions))]
+            (let [policy item]
+              (if (or (= (.name policy) "*") (= (.name policy) (fun-name fun)))
+                  (set! (mut limit) (.limit policy))
+                  0)))
+    (load limit)))
+
+(defn versions-count [(source i64)] (-> i64)
+  (let [(mut count) 0]
+    (al-for [item (.items (function-versions))]
+            (let [v item]
+              (if (and (.accepted v) (= (.source v) source))
+                  (set! (mut count) (+ (load count) 1))
+                  0)))
+    (load count)))
+
+;; Compile-time construction and retained code growth are different resources. Budget the latter
+;; against the live program before the first trial, rather than granting every small program the
+;; full construction allowance. A zero percentage disables admission; otherwise tiny entries have
+;; one inliner's tiny-body allowance. Charging accepted bodies even if later inlined is conservative.
+(defn versions-budget! [] (-> i64)
+  (let [s (function-versions)]
+    (if (.budgeted s)
+        0
+        (let [(mut i) 1
+              (mut live) 0]
+          (loop (if (> (load i) (arena-node-count))
+                    (break 0)
+                    (do
+                      (match (arena-node (load i))
+                        (Some [n]
+                              (if (n-dead? n)
+                                  0
+                                  (set! (mut live) (+ (load live) 1))))
+                        (None [] 0))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (let [scaled (/ (* (load live) (.growth-percent s)) 100)]
+            (set! (.growth-limit s)
+                  (if (= (.growth-percent s) 0)
+                      0
+                      (if (< scaled INLINE-TINY-SIZE) INLINE-TINY-SIZE scaled))))
+          (set! (.budgeted s) true)
+          0))))
+
+(defn versions-count-named [(name (slice u8))] (-> i64)
+  (let [(mut count) 0]
+    (al-for [item (.items (function-versions))]
+            (let [v item]
+              (if (and (.accepted v) (= (.name v) name))
+                  (set! (mut count) (+ (load count) 1))
+                  0)))
+    (load count)))
+
+(defn versions-attempted? [(source i64) (contract (ArrayList i64)) (memory i64)] (-> bool)
+  (let [(mut found) false]
+    (al-for [item (.items (function-versions))]
+            (let [v item
+                  (mut same)
+                    (and (= (.source v) source)
+                         (= (.memory v) memory)
+                         (= (len (.contract v)) (len contract)))
+                  (mut i) 0]
+              (loop (if (or (not (load same)) (>= (load i) (len contract)))
+                        (break 0)
+                        (do
+                          (if (!= (get (.contract v) (load i))
+                                  (get contract (load i)))
+                              (set! (mut same) false)
+                              0)
+                          (set! (mut i) (+ (load i) 1))
+                          (continue))))
+              (if (load same) (set! (mut found) true) 0)))
+    (load found)))
+
+;; Finite runtime categories, not constants or descending recursive integer intervals. Preserve
+;; the lattice's immutable image identities (especially known callable targets); erasing them
+;; would turn a direct call in a private body into arbitrary JavaScript dispatch. Object contents
+;; remain memory facts, never entry assumptions.
+(defn versions-category [(t i64)] (-> i64)
+  (cond (or (= t TY-INVALID) (ty-high? t)) TY-TOP
+        (ty-dyn? t)
+          (ty-with-identity (ty-dyn (ty-dyn-tags t)) (ty-value-identity t))
+        (ty-int? t) (ty-int-bot)
+        (ty-flt? t) (ty-flt-bot)
+        :else t))
+
+;; A live Parm is the authoritative bound under which its body was optimized. If a constant Parm
+;; disappeared, the current caller meet still lies within that bound: removing callers only
+;; sharpens it. Unknown entries instead use the declared signature. The memory slot participates
+;; in the same capture; a memory-specialized body cannot be reused for a wider memory state.
+(defn versions-input-bound [(fun (dyn NodeOps)) (slot i64)] (-> i64)
+  (let [parameter
+          (if (= slot CALL-MEM)
+              (fun-mem-parm fun)
+              (fun-parm fun (- slot CALL-ARG0)))]
+    (match parameter
+      (Some [p] (n-ty p))
+      (None []
+            (if (fun-unknown-callers? fun)
+                (if (= slot CALL-MEM)
+                    (ty-mem 1 TY-BOT)
+                    (ty-sig-arg (fun-sig fun) (- slot CALL-ARG0)))
+                (let [(mut path) 1
+                      (mut bound) TY-TOP]
+                  (loop (if (>= (load path) (n-nins fun))
+                            (break (load bound))
+                            (do
+                              (match (n-in fun (load path))
+                                (Some [c]
+                                      (if (and (= (n-op c) OP-CALL)
+                                               (not (ty-high? (n-ty c))))
+                                          (match (n-in c slot)
+                                            (Some [v]
+                                                  (if (= (n-ty v) TY-INVALID)
+                                                      0
+                                                      (set! (mut bound)
+                                                            (ty-meet (load bound)
+                                                                     (n-ty v)))))
+                                            (None []
+                                                  (set! (mut bound)
+                                                        (ty-mem 1 TY-BOT))))
+                                          0))
+                                (None [] 0))
+                              (set! (mut path) (+ (load path) 1))
+                              (continue))))))))))
+
+(defn versions-contract [(c (dyn NodeOps)) (fun (dyn NodeOps))] (-> (ArrayList i64))
+  (let [(mut types) (al-new [i64] (compiler-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) (call-nargs c))
+              (break 0)
+              (do
+                (push! [i64]
+                       (mut types)
+                       (ty-join (versions-category (n-ty (call-arg c (load i))))
+                                (versions-input-bound fun
+                                                      (+ CALL-ARG0 (load i)))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load types)))
+
+(defn versions-accepts? [(c (dyn NodeOps)) (contract (ArrayList i64))] (-> bool)
+  (let [(mut i) 0
+        (mut accepts) (= (call-nargs c) (len contract))]
+    (loop (if (or (not (load accepts)) (>= (load i) (len contract)))
+              (break 0)
+              (let [actual (n-ty (call-arg c (load i)))]
+                (if (or (= actual TY-INVALID)
+                        (ty-high? actual)
+                        (not (ty-isa? actual (get contract (load i)))))
+                    (set! (mut accepts) false)
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load accepts)))
+
+(defn versions-useful? [(contract (ArrayList i64)) (fun (dyn NodeOps))] (-> bool)
+  (let [(mut i) 0
+        (mut useful) false]
+    (loop (if (>= (load i) (len contract))
+              (break 0)
+              (do
+                (match (fun-parm fun (load i))
+                  (Some [p]
+                        (let [(mut used) false
+                              (mut use) 0
+                              (mut path) 1
+                              (mut callers) TY-TOP]
+                          (loop (if (>= (load use) (n-nouts p))
+                                    (break 0)
+                                    (do
+                                      (match (n-out p (load use))
+                                        (Some [_] (set! (mut used) true))
+                                        (None [] 0))
+                                      (set! (mut use) (+ (load use) 1))
+                                      (continue))))
+                          (loop (if (>= (load path) (n-nins fun))
+                                    (break 0)
+                                    (do
+                                      (match (n-in fun (load path))
+                                        (Some [c]
+                                              (if (and (= (n-op c) OP-CALL)
+                                                       (not (ty-high? (n-ty c)))
+                                                       (< (load i)
+                                                          (call-nargs c)))
+                                                  (let [t
+                                                          (n-ty (call-arg c
+                                                                          (load i)))]
+                                                    (if (= t TY-INVALID)
+                                                        0
+                                                        (set! (mut callers)
+                                                              (ty-meet (load callers)
+                                                                       t))))
+                                                  0))
+                                        (None [] 0))
+                                      (set! (mut path) (+ (load path) 1))
+                                      (continue))))
+                          ;; Do not clone for unused ABI slots or facts the one shared body will
+                          ;; already learn when its caller set closes. Partition only distinct
+                          ;; runtime categories reaching an actually used parameter.
+                          (let [shared
+                                  (versions-category (if (fun-unknown-callers? fun)
+                                                         (versions-input-bound fun
+                                                                               (+ CALL-ARG0
+                                                                                  (load i)))
+                                                         (load callers)))
+                                wanted
+                                  (versions-category (get contract (load i)))]
+                            (if (and (load used)
+                                     (not (ty-high? wanted))
+                                     (!= wanted shared)
+                                     (ty-isa? wanted shared))
+                                (set! (mut useful) true)
+                                0))))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load useful)))
+
+(defn versions-route! [(c (dyn NodeOps))
+                       (source (dyn NodeOps))
+                       (entry (dyn NodeOps))
+                       (fidx i64)] (-> i64)
+  (let [fp (funptr-make entry fidx)]
+    (if (!= (primitive/cast i64 (os/getenv c"AOT_VERSION_TRACE")) 0)
+        (do
+          (println "version: Call #{} {s} -> #{} ({s})"
+                   (n-nid c)
+                   (fun-name source)
+                   (n-nid entry)
+                   (fun-code-name entry))
+          0)
+        0)
+    (call-unlink! c source)
+    (n-set-def! c (- (n-nins c) 1) (Some fp))
+    (call-link! c entry)
+    (code-add! c)
+    (code-add-outputs! c)
+    (set! (.changes (function-versions)) (+ (.changes (function-versions)) 1))
+    (fun-size-epoch-bump!)
+    (invalidate-cfg!)
+    1))
+
+;; Reuse must preserve the caller's already-proven full continuation state, as well as the
+;; entry's parameter assumptions. Independently optimized copies can have different precision.
+(defn versions-result-fits? [(end (dyn NodeOps)) (entry (dyn NodeOps))] (-> bool)
+  (match (fun-ret entry)
+    (Some [ret]
+          (let [state (n-ty ret)
+                old (n-ty end)]
+            (and (!= state TY-INVALID)
+                 (!= old TY-INVALID)
+                 (ty-isa? (cend--state-with-declared-ret state
+                                                         (ty-sig-ret (fun-sig entry)))
+                          old))))
+    (None [] false)))
+
+(defn versions-memory-fits? [(c (dyn NodeOps)) (bound i64)] (-> bool)
+  (match (n-in c CALL-MEM)
+    (Some [memory]
+          (and (!= (n-ty memory) TY-INVALID)
+               (not (ty-high? (n-ty memory)))
+               (ty-isa? (n-ty memory) bound)))
+    (None [] (= bound (ty-mem 1 TY-BOT)))))
+
+(defn versions-reuse-count [(source (dyn NodeOps))
+                            (entry (dyn NodeOps))
+                            (contract (ArrayList i64))
+                            (memory i64)] (-> i64)
+  (let [(mut path) 1
+        (mut count) 0]
+    (loop (if (>= (load path) (n-nins source))
+              (break (load count))
+              (do
+                (match (n-in source (load path))
+                  (Some [c]
+                        (if (and (= (n-op c) OP-CALL)
+                                 (not (ty-high? (n-ty c)))
+                                 (versions-accepts? c contract)
+                                 (versions-memory-fits? c memory)
+                                 (match (call-cend c)
+                                   (Some [end]
+                                         (versions-result-fits? end entry))
+                                   (None [] false)))
+                            (set! (mut count) (+ (load count) 1))
+                            0))
+                  (None [] 0))
+                (set! (mut path) (+ (load path) 1))
+                (continue))))))
+
+(defn versions-create! [(c (dyn NodeOps))
+                        (source (dyn NodeOps))
+                        (contract (ArrayList i64))] (-> i64)
+  (let [before (arena-node-count)
+        fidx (next-inline-fidx!)
+        memory (versions-input-bound source CALL-MEM)
+        fresh (fun-copy-version-body! source fidx)
+        src (primitive/cast (ptr FunNode) (hdr source))
+        dst (primitive/cast (ptr FunNode) (hdr fresh))]
+    (let [(mut symbol) (str/sb-new (compiler-allocator))]
+      (str/sb-push-str! (mut symbol) ".aot.version.")
+      (str/sb-push-i64! (mut symbol) fidx)
+      (set! (.code-name dst) (str/sb-finish! (mut symbol))))
+    (set! (.version-root src) (n-nid source))
+    (set! (.version-root dst) (n-nid source))
+    (set! (.version-entry dst) true)
+    (set! (.version-open dst) true)
+    ;; Use the existing unknown-caller control hook for the unpublished trial. It is removed
+    ;; before publishing or discarding the entry; no new executable control-node semantics.
+    (fun-add-unknown-callers! fresh (start-make TY-BOT))
+    (match (fun-mem-parm fresh)
+      (Some [p]
+            (do
+              (set! (.declared (primitive/cast (ptr ParmNode) (hdr p))) memory)
+              (code-add! p)
+              0))
+      (None [] 0))
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (len contract))
+                (break 0)
+                (do
+                  (match (fun-parm fresh (load i))
+                    (Some [p]
+                          (do
+                            (set! (.declared (primitive/cast (ptr ParmNode)
+                                                             (hdr p)))
+                                  (get contract (load i)))
+                            (code-add! p)
+                            0))
+                    (None [] 0))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    (match (fun-ret fresh)
+      (Some [ret] (n-keep! ret))
+      (None [] (panic "versions-create!: copied function has no Return")))
+    ;; Register before any optimizer visit: recursion can now find this entry without cloning it.
+    (push! [FunctionVersion]
+           (mut (.items (function-versions)))
+           (FunctionVersion
+             :source (n-nid source)
+             :name (fun-name source)
+             :entry (n-nid fresh)
+             :fidx fidx
+             :contract contract
+             :memory memory
+             :accepted false))
+    (set! (.nodes (function-versions))
+          (+ (.nodes (function-versions)) (- (arena-node-count) before)))
+    (set! (.pending (function-versions)) (len (.items (function-versions))))
+    (set! (.pending-call (function-versions)) (n-nid c))
+    (set! (.pending-size (function-versions)) (fun-live-body-size source))
+    (code-add! fresh)
+    (code-add-outputs! fresh)
+    1))
+
+;; Clean a trial before publishing its entry. Until this point no caller can fold using its
+;; result, so an unprofitable body can be discarded without undoing any caller optimization.
+(defn versions-finish-trial! [] (-> i64)
+  (let [s (function-versions)]
+    (if (= (.pending s) 0)
+        0
+        (let [index (- (.pending s) 1)
+              v (get (.items s) index)
+              entry
+                (match (arena-node (.entry v))
+                  (Some [f] f)
+                  (None [] (unreachable-node)))
+              source
+                (match (arena-node (.source v))
+                  (Some [f] f)
+                  (None [] (unreachable-node)))
+              c
+                (match (arena-node (.pending-call s))
+                  (Some [n] n)
+                  (None [] (unreachable-node)))
+              ret
+                (match (fun-ret entry)
+                  (Some [r] r)
+                  (None [] (unreachable-node)))
+              size (fun-live-body-size entry)
+              source-result (ty-sig-ret (fun-sig source))
+              result (ty-sig-ret (fun-sig entry))
+              reuse
+                (versions-reuse-count source entry (.contract v) (.memory v))
+              profitable
+                (or (and (>= reuse 2) (<= (* size 2) (.pending-size s)))
+                    (and (<= size INLINE-MAX-SIZE)
+                         (!= source-result result)
+                         (ty-isa? result source-result)))
+              end (call-cend c)
+              acceptable
+                (and profitable
+                     (<= (+ (.retained-nodes s) size) (.growth-limit s))
+                     (not (n-dead? c))
+                     (call-linked? c source)
+                     (versions-accepts? c (.contract v))
+                     (versions-memory-fits? c (.memory v))
+                     (match end
+                       (Some [e] (versions-result-fits? e entry))
+                       (None [] false)))]
+          (set! (.pending s) 0)
+          (fun-drop-unknown-callers! entry)
+          (if acceptable
+              (do
+                (if (!= (primitive/cast i64 (os/getenv c"AOT_VERSION_TRACE")) 0)
+                    (do
+                      (println "version: keep {s}, body {} -> {} nodes, result {s} -> {s}"
+                               (fun-name source)
+                               (.pending-size s)
+                               size
+                               (ty-text source-result)
+                               (ty-text result))
+                      0)
+                    0)
+                (set! (mut (.items s))
+                      index
+                      (FunctionVersion
+                        :source (.source v)
+                        :name (.name v)
+                        :entry (.entry v)
+                        :fidx (.fidx v)
+                        :contract (.contract v)
+                        :memory (.memory v)
+                        :accepted true))
+                (fun-set-approx-size! entry size)
+                (set! (.retained-nodes s) (+ (.retained-nodes s) size))
+                (versions-route! c source entry (.fidx v)))
+              (do
+                (if (!= (primitive/cast i64 (os/getenv c"AOT_VERSION_TRACE")) 0)
+                    (do
+                      (println "version: discard {s}, body {} -> {} nodes"
+                               (fun-name source)
+                               (.pending-size s)
+                               size)
+                      0)
+                    0)
+                (n-unkill! ret)
+                (code-add! entry)
+                (code-add-outputs! entry)
+                1))))))
+
+(defn versions-try! [(end (dyn NodeOps))] (-> i64)
+  (versions-budget!)
+  (if (or (.closed (function-versions))
+          (> (.pending (function-versions)) 0)
+          (cend-folding? end)
+          (!= (n-nins end) 2))
+      0
+      (match (return-fun (n-in! end 1))
+        (None [] 0)
+        (Some [source]
+              (let [c (cend-call end)]
+                (if (or (fun-version-entry? source)
+                        (and (> (fun-version-root source) 0)
+                             (!= (fun-version-root source) (n-nid source)))
+                        (not (call-linked? c source))
+                        (ty-high? (n-ty c))
+                        (!= (call-nargs c) (ty-sig-nargs (fun-sig source)))
+                        (not (ty-funptr-single? (n-ty (call-fptr c)))))
+                    0
+                    (let [(mut reused) 0]
+                      (al-for [item (.items (function-versions))]
+                              (let [v item]
+                                (if (and (.accepted v)
+                                         (= (load reused) 0)
+                                         (= (.source v) (n-nid source))
+                                         (versions-accepts? c (.contract v))
+                                         (versions-memory-fits? c (.memory v)))
+                                    (match (arena-node (.entry v))
+                                      (Some [entry]
+                                            (if (or (n-dead? entry)
+                                                    (fun-folding? entry)
+                                                    (not (versions-result-fits? end
+                                                                                entry)))
+                                                0
+                                                (set! (mut reused)
+                                                      (versions-route! c
+                                                                       source
+                                                                       entry
+                                                                       (.fidx v)))))
+                                      (None [] 0))
+                                    0)))
+                      (if (> (load reused) 0)
+                          (load reused)
+                          (if (or (>= (versions-count (n-nid source))
+                                      (versions-limit source))
+                                  ;; The initial unknown-caller hook itself defers inlining. Do not
+                                  ;; mistake that temporary barrier for an out-of-line boundary.
+                                  (and (not (fun-no-inline? source))
+                                       (< (fun-live-body-size source)
+                                          INLINE-MAX-SIZE)
+                                       (not (fun-self-recursive? source)))
+                                  (> (callend-inline-candidate end) 0)
+                                  (not (versions-result-fits? end source))
+                                  (not (versions-memory-fits? c
+                                                              (versions-input-bound source
+                                                                                    CALL-MEM)))
+                                  (>= (fun-live-body-size source)
+                                      VERSION-BODY-LIMIT)
+                                  (> (+ (.nodes (function-versions))
+                                        (+ (fun-live-body-size source) 1))
+                                     VERSION-NODE-BUDGET))
+                              0
+                              (let [(mut contract) (versions-contract c source)]
+                                (if (and (versions-accepts? c (load contract))
+                                         (not (versions-attempted? (n-nid source)
+                                                                   (load contract)
+                                                                   (versions-input-bound source
+                                                                                         CALL-MEM)))
+                                         (versions-useful? (load contract)
+                                                           source))
+                                    (versions-create! c source (load contract))
+                                    (do (al-free! (mut contract)) 0))))))))))))
+
+;; One rewrite per drained worklist. All argument proofs are re-read after ordinary cleanup.
+(defn versions-admit-round! [] (-> i64)
+  (if (.closed (function-versions))
+      0
+      (if (> (.pending (function-versions)) 0)
+          (versions-finish-trial!)
+          (let [limit (arena-node-count)
+                (mut i) 1
+                (mut changed) 0]
+            (loop (if (or (> (load i) limit) (> (load changed) 0))
+                      (break (load changed))
+                      (do
+                        (match (arena-node (load i))
+                          (Some [n]
+                                (if (and (not (n-dead? n))
+                                         (= (n-op n) OP-CALLEND)
+                                         (!= (n-pesi-ty n) TY-INVALID))
+                                    (set! (mut changed) (versions-try! n))
+                                    0))
+                          (None [] 0))
+                        (set! (mut i) (+ (load i) 1))
+                        (continue))))))))
+
+;; Once admission finishes, private entries can sharpen below their admission contracts. Their
+;; closed caller sets now use exactly the normal Fun/Parm rules, including memory propagation.
+(defn versions-close-admission! [] (-> i64)
+  (let [(mut count) 0]
+    (if (> (.pending (function-versions)) 0)
+        (panic "versions-close-admission!: specialization trial has not finished")
+        0)
+    (set! (.closed (function-versions)) true)
+    (al-for [item (.items (function-versions))]
+            (let [v item]
+              (if (not (.accepted v))
+                  0
+                  (match (arena-node (.entry v))
+                    (Some [entry]
+                          (if (or (n-dead? entry) (fun-folding? entry))
+                              0
+                              (do
+                                ;; No further routing can widen this caller set. The entry now becomes an
+                                ;; ordinary Fun/Parm merge and may sharpen below its original admission key.
+                                (set! (.version-open (primitive/cast (ptr FunNode)
+                                                                     (hdr entry)))
+                                      false)
+                                (code-add! entry)
+                                (code-add-outputs! entry)
+                                (set! (mut count) (+ (load count) 1)))))
+                    (None [] 0)))))
+    (load count)))
+
+(defn versions-finish-opto! [(stop (dyn NodeOps))] (-> i64)
+  (do
+    (al-for [item (.items (function-versions))]
+            (let [v item]
+              (if (not (.accepted v))
+                  0
+                  (match (arena-node (.entry v))
+                    (Some [entry]
+                          (match (fun-ret entry)
+                            (Some [ret]
+                                  (if (n-dead? ret)
+                                      0
+                                      (do
+                                        (if (and (not (n-dead? entry))
+                                                 (not (fun-folding? entry))
+                                                 (not (ty-high? (n-ty entry))))
+                                            (stop-add-return! stop ret)
+                                            0)
+                                        (n-unkill! ret))))
+                            (None [] 0)))
+                    (None [] 0)))))
+    0))
+
+(defn versions-prepare-codegen! [(start (dyn NodeOps))] (-> i64)
+  (do
+    (al-for [item (.items (function-versions))]
+            (let [v item]
+              (if (not (.accepted v))
+                  0
+                  (match (arena-node (.entry v))
+                    (Some [entry] (fun-prepare-codegen! entry start))
+                    (None [] 0)))))
+    0))

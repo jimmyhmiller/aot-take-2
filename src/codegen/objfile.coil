@@ -117,6 +117,8 @@
   [(booted bool)
    (fixup-symbol (ArrayList i64))  ; per fixup: its symbol index
    (code-symbol (ArrayList i64))  ; per image code word: the definition it relocates against
+   (elf-symbol (ArrayList i64))  ; canonical index -> ELF index, with every local before globals
+   (elf-first-global i64)
    (undefined-names (ArrayList (slice u8)))])  ; deduplicated, first appearance first
 
 (defn obj-symbols [] (-> (ptr ObjSymbols))
@@ -128,6 +130,8 @@
         (let [a (compiler-allocator)]
           (set! (.fixup-symbol t) (al-new [i64] a))
           (set! (.code-symbol t) (al-new [i64] a))
+          (set! (.elf-symbol t) (al-new [i64] a))
+          (set! (.elf-first-global t) 2)
           (set! (.undefined-names t) (al-new [(slice u8)] a))
           (set! (.booted t) true)
           t))))
@@ -510,7 +514,7 @@
               (break 0)
               (do
                 (obj-put4! (mut out) (get (load def-strx) (load i)))
-                (obj-put1! (mut out) 0x0f)
+                (obj-put1! (mut out) (if (enc-definition-local? (load i)) 0x0e 0x0f))
                 (obj-put1! (mut out) 1)
                 (obj-put2! (mut out) 0)
                 (obj-put8! (mut out) (enc-definition-offset (load i)))
@@ -559,8 +563,56 @@
     offset))
 
 (defn elf-symbol-index-for-fixup [(fixup i64)] (-> i64)
-  ;; Null and local .text section symbols occupy indices zero and one.
-  (+ 2 (macho-symbol-index-for-fixup fixup)))
+  (get (.elf-symbol (obj-symbols)) (macho-symbol-index-for-fixup fixup)))
+
+;; ELF requires all STB_LOCAL symbols before sh_info, the first non-local index. Canonical
+;; object indices remain encoder definitions / image entries / undefined targets. Build the
+;; permutation once, rather than scanning definitions again for every relocation.
+(defn elf-build-symbol-order! [] (-> i64)
+  (let [t (obj-symbols) ndefs (enc-definition-count) nimage (heap-count)
+        count (+ ndefs (+ nimage (macho-undefined-count)))
+        (mut i) 0 (mut next) 2]
+    (al-clear! (mut (.elf-symbol t)))
+    (loop (if (>= (load i) count) (break 0)
+              (do (push! [i64] (mut (.elf-symbol t)) 0)
+                  (set! (mut i) (+ (load i) 1)) (continue))))
+    (set! (mut i) 0)
+    (loop (if (>= (load i) ndefs) (break 0)
+              (do (if (enc-definition-local? (load i))
+                      (do (set! (mut (.elf-symbol t)) (load i) (load next))
+                          (set! (mut next) (+ (load next) 1))) 0)
+                  (set! (mut i) (+ (load i) 1)) (continue))))
+    (set! (mut i) 0)
+    (loop (if (>= (load i) nimage) (break 0)
+              (do (set! (mut (.elf-symbol t)) (+ ndefs (load i)) (load next))
+                  (set! (mut next) (+ (load next) 1))
+                  (set! (mut i) (+ (load i) 1)) (continue))))
+    (set! (.elf-first-global t) (load next))
+    (set! (mut i) 0)
+    (loop (if (>= (load i) ndefs) (break 0)
+              (do (if (enc-definition-local? (load i)) 0
+                      (do (set! (mut (.elf-symbol t)) (load i) (load next))
+                          (set! (mut next) (+ (load next) 1))))
+                  (set! (mut i) (+ (load i) 1)) (continue))))
+    (set! (mut i) (+ ndefs nimage))
+    (loop (if (>= (load i) count) (break 0)
+              (do (set! (mut (.elf-symbol t)) (load i) (load next))
+                  (set! (mut next) (+ (load next) 1))
+                  (set! (mut i) (+ (load i) 1)) (continue))))
+    0))
+
+(defn elf-put-definitions! [(out (mut (ArrayList u8)))
+                            (strx (ArrayList i64)) (local bool)] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (enc-definition-count)) (break 0)
+              (do (if (= (enc-definition-local? (load i)) local)
+                      (do (obj-put4! (mut out) (get strx (load i)))
+                          (obj-put1! (mut out) (if local 0x02 0x12))
+                          (obj-put1! (mut out) 0)
+                          (obj-put2! (mut out) 1)
+                          (obj-put8! (mut out) (enc-definition-offset (load i)))
+                          (obj-put8! (mut out) (enc-definition-size (load i)))) 0)
+                  (set! (mut i) (+ (load i) 1)) (continue))))))
 
 (defn elf-put-section-header! [(out (mut (ArrayList u8)))
                                (name i64)
@@ -587,6 +639,7 @@
 
 (defn elf-bytes [] (-> (slice u8))
   (obj-symbols-build!)
+  (elf-build-symbol-order!)
   (let [a (compiler-allocator)
         (mut out) (al-new [u8] a)
         (mut strtab) (al-new [u8] a)
@@ -733,18 +786,7 @@
       (obj-put2! (mut out) 1)
       (obj-put8! (mut out) 0)
       (obj-put8! (mut out) 0)
-      (set! (mut i) 0)
-      (loop (if (>= (load i) ndefs)
-                (break 0)
-                (do
-                  (obj-put4! (mut out) (get (load def-strx) (load i)))
-                  (obj-put1! (mut out) 0x12)
-                  (obj-put1! (mut out) 0)
-                  (obj-put2! (mut out) 1)
-                  (obj-put8! (mut out) (enc-definition-offset (load i)))
-                  (obj-put8! (mut out) (enc-definition-size (load i)))
-                  (set! (mut i) (+ (load i) 1))
-                  (continue))))
+      (elf-put-definitions! (mut out) (load def-strx) true)
       ;; Image entries: local object symbols in .aot_heap at each payload.
       (set! (mut i) 0)
       (loop (if (>= (load i) nimage)
@@ -759,6 +801,7 @@
                              (heap-entry-payload-bytes (load i)))
                   (set! (mut i) (+ (load i) 1))
                   (continue))))
+      (elf-put-definitions! (mut out) (load def-strx) false)
       (set! (mut i) 0)
       (loop (if (>= (load i) nundef)
                 (break 0)
@@ -797,8 +840,8 @@
                       (do
                         (obj-put8! (mut out) (heap-code-fixup-offset (load i)))
                         (obj-put8! (mut out)
-                                   (| (primitive/ishl (+ 2
-                                                         (macho-code-fixup-symbol (load i)))
+                                   (| (primitive/ishl (get (.elf-symbol (obj-symbols))
+                                                           (macho-code-fixup-symbol (load i)))
                                                       32)
                                       ELF-RELOC-ABS64))
                         (obj-put8! (mut out) 0)
@@ -828,7 +871,8 @@
                                1
                                8
                                24)
-      (elf-put-section-header! (mut out) sym-name 2 0 sym-off sym-size 4 2 8 24)
+      (elf-put-section-header! (mut out) sym-name 2 0 sym-off sym-size 4
+                               (.elf-first-global (obj-symbols)) 8 24)
       (elf-put-section-header! (mut out)
                                str-name
                                3

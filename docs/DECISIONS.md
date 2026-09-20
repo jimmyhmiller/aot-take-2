@@ -4298,3 +4298,19 @@ byte-identical objects for `benchmarks/binarytrees-aot.ts` and `benchmarks/fib-a
 exported symbol set of `aot-runtime.o` is unchanged and binary trees, which lives in the collector,
 runs in 0.41 s against 0.42 s linked to the old runtime. `coil check` takes 7.1 s over 250 modules
 against 6.2 s over 144.
+
+## 2026-09-19 — Callable function versions, bounded and independent of inlining
+
+Local source functions and local JSL graphs may have bounded reusable callable versions,
+independently of inlining. This supersedes the earlier absence of a shared specialized-body cache;
+it does not change imported-provider fallback semantics. See [FUNCTION-VERSIONS.md](FUNCTION-VERSIONS.md)
+for the research, proof obligations, policy and validation status.
+
+A body is copied only under captured entry bounds at least as precise as the source's proven
+parameter and memory domain. Private entry contracts stay fixed while routing remains open and
+every incoming call must prove compatibility. Unpublished trials are optimized before acceptance.
+Version copying preserves JavaScript function identity; only internal code entries get fresh
+symbols — which is what `fun-code-name` is, beside `fun-name`. Recursive calls use ordinary contract
+selection and ordinary optimistic graph typing. After admission, private entries resume ordinary
+closed-world caller-meet typing. No deoptimization or handwritten semantic summary is
+introduced.
