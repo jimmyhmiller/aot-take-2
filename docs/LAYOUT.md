@@ -187,6 +187,7 @@ aot-take-2/
 │   ├── DECISIONS.md     ; law: load-bearing choices with their reasoning
 │   ├── BACKEND.md       ; backend consumer assumptions and their ideal-graph producers
 │   ├── COMPILE-TIME.md  ; what a compile may cost: graph shape, frame model, budgets, the road
+│   ├── SCALING.md       ; proposal and plan: whole-program analysis, per-function optimization; what was measured
 │   ├── GAPS.md          ; complete inventory of absent and partial implementation
 │   ├── TEST262.md       ; pinned conformance campaign, denominator and runner contract
 │   ├── JSL.md           ; the runtime-library language

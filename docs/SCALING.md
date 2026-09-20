@@ -1,0 +1,322 @@
+# Scaling: whole-program analysis, per-function optimization
+
+**Status: proposal with a plan.** Nothing here is built except where a section says "measured" or
+"exists". When a milestone lands, its decision moves to `docs/DECISIONS.md` and this file records
+what was learned. The two requirements are not traded against each other:
+
+1. **Compile time is linear in the program.** Twice the source costs about twice the time.
+2. **The generated code is as good as the global fixpoint's, or better.** Fast compiles that emit
+   worse code are a failure of this plan, not a version of it.
+
+---
+
+## 1. What was measured (2026-09-20)
+
+lodash 4.17.21 — one 17,209-line file — did not finish compiling: 15 minutes, one core pinned,
+1.8 GB resident, no output. `clang -O3` compiles 17k lines of C in a couple of seconds.
+
+The behaviour reproduces in seconds with N trivial functions and N calls to them:
+
+| N functions + N calls | lines | compile | |
+|---|---:|---:|---|
+| 250 | 500 | 7.0 s | |
+| 500 | 1,000 | 28 s | 4.0× for 2× source |
+| 1,000 | 2,000 | 69 s | |
+
+`AOT_TIME=1` now prints where a fixpoint's time went (rounds, specializations, inlines, peephole
+visits, inline candidates asked, wall time of each part of a round). That breakdown, not leaf-frame
+sampling, is what found every cause below; four guesses made from leaf frames were each measured,
+found useless, and reverted.
+
+**Everything outside the optimizer is already fine.** At N=250: parse 0.6 s, and selection + GCM +
+scheduling + register allocation + encoding together under 0.6 s. The optimizer phase was 6.3 s of
+7.0 s. The backend needs nothing from this plan except the parallelism it makes possible.
+
+### The structure of the cost
+
+`iter-run!` is Simple's `IterPeeps.iterate`: run peepholes to a fixpoint over the WHOLE graph, admit
+ONE inline, repeat. So **rounds ∝ call sites**, and anything a round does that touches the whole
+program makes the compile quadratic. Three such things were measured:
+
+| per-round cost | measurement | state |
+|---|---|---|
+| Specialization walked the entire arena every round | 1,370 walks over 37k–93k ids at N=250; ~1,200 CallEnds re-asked per walk; every verdict UNHANDLED but at most one — 1.6 M proof checks for 259 specializations, 44% of the optimizer | **fixed** (a candidate worklist, Simple's own `_workInline` design): 7.0 → 2.5 s, 28 → 7.7 s, 69 → 30 s |
+| Every fold into a GVN-shared constant re-queues all of that constant's users | 31,638 bulk pushes totalling **253 million** worklist entries at N=1000 | **open.** Skipping it halved the visits and CHANGED THE OUTCOME (4,493 inlines for 2,697), so those re-queues stand in for dependencies nothing registers |
+| Each inline *ask* grows with the program | 0.036 ms at N=250, 0.24 ms at N=1000 | **open.** The body-size cache is invalidated for every function after every inline |
+
+A fourth appeared only on lodash: `n-del-use!` finds the use to remove by scanning the def's output
+list from the front, and ~95% of samples were inside it scanning a list of Parms.
+
+### Why: hubs
+
+Simple's rules are O(1) in Simple's programs and O(program) in ours because a closed-world
+JavaScript unit is full of **hubs** — nodes with thousands of edges:
+
+- a GVN-shared constant (`undefined`, `0`, `true`): ~8,000 users at N=1,000;
+- `Stop`: every Return in the program is an input;
+- a shared runtime function (the JSL definition of `+`): a Fun whose inputs are **all of its call
+  sites**, and each of its Parms likewise — "a Parm is a Phi over its callers" makes every popular
+  function a hub by construction.
+
+Simple pushes `x._outputs` and `x._inputs` after a peephole and finds a use by linear scan. None of
+that is wrong. It is written for units of a few dozen lines.
+
+### How Simple itself handles scale, and what production compilers do
+
+Simple optimizes a whole **CompUnit** in one graph — one Start, one Stop, one global worklist — and
+its answer to scale is *separate compilation*: `Serialize` writes the ideal graph into the object
+file so another unit can link and inline across the boundary. It never claims the single graph
+scales; its units are small.
+
+Every production sea-of-nodes compiler is per-function: HotSpot C2 (the original) compiles one method
+plus its inlinees and bails out past roughly 80k nodes — our N=1,000 toy graph was 264k–356k.
+Graal/Truffle JS compiles one call target with a budgeted inliner. **Graal native-image is the one
+that matches this project**, because it is AOT and closed-world: a whole-program points-to
+*analysis* runs first over a cheap dedicated graph, and then every method is compiled
+independently, in parallel, consuming the analysis's results as facts.
+
+### Smaller units, measured
+
+`memory-run --retained` already compiles each input file as its own unit against the JSL runtime as
+a separate provider unit. The same 1,000 functions:
+
+| | optimizer time |
+|---|---:|
+| one unit of 1,000 | ~30 s |
+| each unit of 100 | ~0.62 s, steady across all ten |
+| ten units, sequentially | ~7 s — and independent, so ~1 s wall on twelve cores |
+| the JSL provider unit | 16 s, ONCE — identical for every program, so cacheable |
+
+And the cost was visible at once: the single unit performed **1,009 specializations; the split
+units performed 0.** Across the provider boundary `+` and `===` become calls to the generic
+out-of-line definition. Files are also the wrong granularity for lodash, which is one file. Units
+help and are not enough; precision has to cross the boundary some other way (§3).
+
+---
+
+## 2. The architecture
+
+**Global analysis decides what to build and who may call it. Local optimization builds it.**
+
+```
+parse ─ link ─ GLOBAL ANALYSIS ─ select contracts, route sites ─ FREEZE ─ unlink
+                                                                            │
+      ┌─────────────────────────────────────────────────────────────────────┘
+      ▼  for each (function, contract), callees before callers, under a node budget:
+   peepholes + inlining to a LOCAL fixpoint ─ select ─ GCM ─ schedule ─ allocate ─ encode
+```
+
+### What stays global, and why that is affordable
+
+Optimistic SCCP over the linked graph, the call graph it discovers, and the closed-world image
+facts (this property is never written; this prototype never changes; these are the functions a
+code word can hold). These are *analyses*: they read the graph and publish facts. At N=1,000 the
+optimizer phase was 25 s and `iter-run!` was 24 s of it — **SCCP is not the problem; the
+peephole-and-inline fixpoint is.** Keeping the analysis global costs almost nothing and is what
+keeps the closed world's power: interprocedural type inference still falls out of "a Parm is a Phi
+over its callers", because that is where SCCP reads it from.
+
+### The interface: an entry contract
+
+Today a function cannot be optimized alone, because its Parm types are the meet over every call
+site and can change whenever any caller changes. That single fact forces the global fixpoint, and
+it is also what makes Fun and Parm hubs.
+
+A **contract** fixes a function's parameter and memory types at entry. It is a signature. Once a
+function has one, nothing a caller does can invalidate its body: callers stop being *inputs* and
+become *obligations* — prove you satisfy this contract, or call the generic entry. That last clause
+is already the project's thesis: a failed guard is ordinary control flow into a generic version
+compiled into the same binary.
+
+`docs/FUNCTION-VERSIONS.md` already defines contracts precisely and `src/node/versions.coil`
+implements them: keys normalized to runtime categories, every redirected call must PROVE containment,
+unknown or incompatible sites keep the generic target, no speculative guards, and "private entries
+hold fixed parameter contracts while routing is open" (`version-open` in `parm-in-progress?`) — the
+mechanism that makes a Fun's types independent of its callers exists today. What changes is its
+ROLE: versions are now a bounded add-on admitted late, after the inliner drains; here they become
+the primary interface, selected from the analysis BEFORE any peephole runs. Expect rework of the
+admission policy, not reuse as-is.
+
+### What becomes local
+
+Peepholes, inlining, specialization and the whole backend run on one (function, contract) at a
+time, **callees before callers** over the call graph's strongly connected components:
+
+- By the time `g` considers inlining `f`, `f` is already optimized and its size is final. Simple's
+  policy is "no real heuristic, first come, first served"; bottom-up order with finished callees is
+  what production inliners use because it produces *better* code, not only faster compiles.
+- A function's return type is known once its body is optimized under its contract, and callers
+  read it as a summary. Inside a recursive component a small local fixpoint (assume TOP, iterate)
+  is bounded by the component, not the program.
+- Cost is proportional to the body plus what it inlines, under a node budget, as in C2.
+- The hubs stop existing rather than being special-cased: an unlinked Fun has no caller inputs; a
+  per-function graph has per-function constants; Stop has one function's Returns.
+
+---
+
+## 3. "Optimal code": every source of precision, and where it goes
+
+The global fixpoint buys precision from six places. The plan must account for each; this table is
+the contract this proposal makes about code quality.
+
+| Today's source of precision | Where it comes from in the new design |
+|---|---|
+| Parameter types: the meet over a function's callers | Global SCCP, unchanged. Its per-site argument types select the contracts. A function called with `(int,int)` and `(string,string)` gets TWO precise bodies instead of one body typed `dyn` — strictly better than the meet |
+| Return types flowing back to callers | Bottom-up summaries; a local fixpoint inside a recursive component |
+| Closed-world folds: never-written properties, fixed prototypes, known call targets | The same image facts, published by the analysis before optimization starts |
+| TypeScript annotations discharged by proof | The same SCCP types; an undischarged annotation keeps its guard, as now |
+| JSL operator specialization (`+` on two ints becomes an integer add) | Contracts cross unit boundaries: the provider exports `JsAdd[int,int]` as an entry and the site routes to it. This is what recovers the measured 1,009 → 0 |
+| Feedback: a fold inside `f` sharpens a parameter of an unrelated `g` in the same run | **The one real loss.** Recovered only by a second analysis round after local optimization. Milestone 6 measures the gap before deciding whether the round is worth its cost |
+
+One more row the measurements forced: **dependencies nobody wrote down.** Skipping the constant
+re-queue changed the optimizer's outcome, so some peephole's correctness of *scheduling* currently
+leans on being re-visited by accident. Early unlinking will surface every such case as a lost
+optimization. That is a reason to run the experiment behind a flag, and each one found gets a real
+`n-add-dep!` — which improves the current architecture too.
+
+---
+
+## 4. The plan
+
+Each milestone lands on its own, green, and is useful even if the ones after it never happen. The
+order is leverage over risk. "Gate" is what must be true to call it done; the numbers are measured
+on the pinned scaling benchmark and the quality baseline of M0, never estimated.
+
+### M0 — Instruments and baselines
+
+*Build the ruler before building anything it measures.*
+
+- **Scaling benchmark as a deterministic test.** Generate the N-functions program at N = 250, 500,
+  1,000 inside a test; assert on COUNTS, never wall time (`CLAUDE.md`: a wall-clock assertion
+  measures the machine's load): peephole visits per node, inline candidates asked per inline,
+  bulk-push entries per node. The assertion is a ratio between sizes — visits at 2N ≤ 2.2 × visits
+  at N — which is the linearity requirement written as a gate.
+- **Quality baseline**, recorded once from today's global pipeline and compared on every milestone:
+  generated-code time for `benchmarks/v8/` plus fib and binary trees (warmed, per `CLAUDE.md`);
+  STATIC counts from the same compiles — specializations, inlines, guards discharged, final machine
+  nodes; and the 3,000-file test262 sample as the correctness backstop.
+- **Real programs**: lodash, acorn, and the test262 harness, timed by phase.
+
+Gate: the scaling test exists and FAILS on main for the right reason; the baseline table is checked in.
+
+### M1 — The measured quadratics, in the current architecture
+
+Worth doing under either design, and each is days, not weeks.
+
+- **Body-size invalidation.** `fun-size-epoch-bump!` invalidates every function's cached size after
+  every inline. An inline changes the caller's body and, if it folded, the callee's. The cache's own
+  safety argument — a stale size is only stale upward, which delays an inline and never admits one
+  wrongly — covers invalidating exactly those two.
+- **`n-del-use!` on a hub.** O(1) removal needs the use to know its position in the def's output
+  list. Measure first whether scanning from the END (recently added uses die first) is enough.
+- **The constant storm.** Do not skip the re-queue: FIND what it is standing in for. Instrument
+  which re-visited users actually change, register those as real dependencies, and only then remove
+  the storm — verified by an unchanged outcome, not by an argument.
+
+Gate: the M0 scaling ratios improve with **byte-identical objects** for the quality baseline, or a
+difference that is explained and measured equal-or-better.
+
+### M2 — Cache the provider (Simple's own answer)
+
+The JSL runtime is one unit, identical for every program: compile it once, key it by the content
+hash of `jsl/` and the compiler, keep the object and its serialized graph on disk. The source cache
+in `aot.codegen.sourcecache` already does this in memory for the test262 runner.
+
+Gate: a second compile of any program spends no time on JSL; the 16 s provider cost is paid once
+per change to `jsl/`.
+
+### M3 — Every node knows its function
+
+Scoping work to a function needs an owner for every node, and in a sea of nodes only CONTROL nodes
+have one (`cfg-owner-fun`); an Add floats. Two ways, to be decided by a spike, not by argument:
+
+- *an owner derived on demand* — from a data node's control-dependent inputs — cached under the
+  control-edit version the way `owner-nid` already is; or
+- *per-function arenas* — what C2 does: each function's nodes, GVN table and constants are its own,
+  so ownership is structural and the constant hub cannot form.
+
+Gate: `verify-all` checks that no edge crosses functions except through a Call, a FunPtr or a
+declared boundary node. (That check is worth having today: it is the unlinked-graph invariant the
+backend already assumes.)
+
+### M4 — The flagged prototype: `AOT_PER_FUNCTION=1`
+
+Both pipelines in one binary, selected like `AOT_NO_SPECIALIZE`, so every comparison is the same
+compiler on the same input.
+
+`link → global SCCP under facts → record each Parm's proven type as its contract → FREEZE → unlink
+early → for each component bottom-up: local peepholes + inlining under a node budget → backend`.
+
+This milestone uses ONE contract per function (its SCCP meet — exactly today's precision, no
+versions yet). Its purpose is to isolate one question: **what does early unlinking alone cost and
+buy?** Every lost optimization is a dependency from §3's last row; each gets fixed or recorded.
+
+Gate: the M0 scaling test passes under the flag; test262 sample unchanged; the quality table is
+filled in for the flag, with every regression explained by name.
+
+### M5 — Contracts as the primary mechanism
+
+Contract selection moves in front of optimization: from SCCP's per-site argument types, choose the
+contracts each function gets (the policy and budgets of `FUNCTION-VERSIONS.md`, re-tuned — the
+default of two private entries was chosen for a late add-on), route every site that proves
+containment, leave the rest on the generic entry. Exported contracts cross unit boundaries, so a
+provider's `JsAdd[int,int]` is reachable from a client.
+
+Gate: static specialization counts under the flag ≥ the global baseline (recovering 1,009 → 0 in
+the split configuration), and no benchmark slower than baseline beyond noise.
+
+### M6 — Summaries, recursion, and the feedback gap
+
+Return-type summaries; the local fixpoint inside a recursive component; then MEASURE the one real
+loss of §3 — how many parameter types would sharpen if a second analysis round ran after local
+optimization — on the V8 suite and lodash. Build the second round only if the number says so.
+
+Gate: the gap is a number in this file, and the decision it led to is in `DECISIONS.md`.
+
+### M7 — Isolation pays out: parallelism and per-function caching
+
+With per-function graphs the backend runs across cores, and an unchanged (function, contract,
+callee-summaries) triple need not be recompiled.
+
+Gate: lodash compiles in seconds on twelve cores; an edit to one function recompiles that function
+and its dependents only.
+
+### M8 — Flip the default and delete the global fixpoint
+
+When the flag's quality table is equal-or-better everywhere and the scaling gate holds, the flag
+becomes the pipeline. `DECISIONS.md` records the divergence from Simple (next section), `DESIGN.md`
+and `LAYOUT.md` are rewritten for the new phase order, and the global `iter-run!` path is removed —
+two pipelines are kept only for as long as the comparison needs them.
+
+---
+
+## 5. The divergence from Simple, stated once
+
+`CLAUDE.md` makes fidelity to Simple the default and a divergence a recorded decision. This is one:
+
+- **Kept:** the node, the lattice, GVN, peepholes, `compute`/`idealize`, ScopeNode SSA, memory SSA,
+  "a Fun is a Region, a Parm is a Phi" *as the representation the analysis reads*, optimistic SCCP
+  discovering the call graph, and the entire backend.
+- **Changed:** the pessimistic fixpoint stops being global. Simple iterates one worklist over the
+  unit and inlines first-come-first-served; this design optimizes one function at a time, callees
+  first, against a frozen contract. Simple's own scale mechanism — separate units with serialized
+  IR — is kept and leaned on (M2), but it cannot be the whole answer when one file is 17k lines.
+- **Why it is forced:** JavaScript makes the unit large (a program drags in a runtime library that
+  C-like Simple does not have) and makes it hub-shaped (every operator is a call to a shared
+  definition). Those are properties of the language, not mistakes in the port.
+
+---
+
+## 6. Risks
+
+- **The first quality numbers will look worse than the last.** Early unlinking exposes every
+  accidental dependency at once. That is the experiment working; the flag is what makes it safe.
+- **Version explosion.** Contracts multiply bodies. The budgets exist (`AOT_FUNCTION_VERSIONS`, the
+  growth-percent cap) but were tuned for a different role; M5 re-tunes them against code size as
+  well as speed.
+- **Ownership (M3) is the milestone most likely to be larger than it looks.** Per-function arenas
+  touch the `CODE` singleton, nids and the GVN table. That is why it is a spike with a decision at
+  the end rather than a task with an estimate.
+- **The analysis could become the next bottleneck.** It is 4% of the optimizer today; at 100× the
+  program it may not be. If so, the answer is native-image's: run it over summaries, not over the
+  optimizer's graph. Not needed until a measurement says so.

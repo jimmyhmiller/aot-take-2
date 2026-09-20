@@ -21,6 +21,12 @@ what the frontend hands the backend, what a frame promises, and what the allocat
 
 ## 1. The standard
 
+> **Read `docs/SCALING.md` beside this file.** The budgets below are per NODE and assume the node
+> count is proportional to the source. On 2026-09-20 the compile was found to be QUADRATIC in the
+> program — 500 lines 7 s, 1,000 lines 28 s, lodash not finishing — for a reason no per-node budget
+> can see: the optimizer admits one inline per round and each round touched the whole program.
+> SCALING.md has the measurements, the causes, and the plan.
+
 A compiler's time is spent per node, and its nodes should be proportional to the source. Both
 have budgets, and both are gated (§7).
 
