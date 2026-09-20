@@ -55,6 +55,46 @@ pull-down covers every currently implemented eligible unary and binary scalar ar
 
 ## Partial frontend and JavaScript semantics
 
+### 2026-09-20 — Reflect
+
+Eleven of the thirteen methods execute (`jsl/compiler/reflect.jsl`): `apply`, `construct`,
+`defineProperty`, `deleteProperty`, `get`, `getOwnPropertyDescriptor`, `getPrototypeOf`, `has`,
+`isExtensible`, `preventExtensions`, `set`. They are the specified argument handling in front of
+internal methods that already existed for the `Object` statics and for the frontend's own property
+access — not a second object model. The one thing they add is the refusal: `Reflect` never performs
+ToObject, so `Reflect.getPrototypeOf(1)` is a TypeError where `Object.getPrototypeOf(1)` answers
+`%Number.prototype%`.
+
+`Reflect.construct` is why this was worth doing before the larger gaps: the upstream harness file
+`isConstructor.js` is defined in terms of it, and **644 files of the corpus include it**, so all of
+them failed at their first harness Script.
+
+Two methods are ABSENT, not approximated — nothing declares them, so `typeof Reflect.ownKeys` is
+`"undefined"`:
+
+- **`ownKeys`** must answer own symbol keys beside own string keys. `%ObjectOwnNames` answers
+  strings, and `rt-shape-keys!` filters symbol keys out deliberately (`shapes-key-symbol?`).
+  Recovering the symbol VALUE from its interned shape key needs a key-to-symbol registry the runtime
+  does not keep — the same missing capability as `Object.getOwnPropertySymbols` and as JSON's
+  unserialized symbol keys. String keys alone would silently drop properties.
+- **`setPrototypeOf`** would re-point an existing object's [[Prototype]]. `%SetObjectPrototype`
+  writes the representation slot of a freshly allocated literal, where the compiler still owns the
+  shape; mutating a chain the image analysis has already proven over is the gap that also keeps
+  `Object.setPrototypeOf` absent.
+
+Two narrow divergences, each deliberate:
+
+- **`defineProperty` throws where it should answer `false`.** `JsDefineFromDescriptor` reports an
+  invalid descriptor and a refused definition through the one exception sentinel, so a refusal —
+  defining on a non-extensible object, redefining a non-configurable property — raises that
+  TypeError instead of answering false. An accepted definition answers `true` and an invalid
+  descriptor throws, both as specified. Splitting the two needs the sentinel to carry which it was.
+- **`set` with a Receiver other than the target is a TypeError naming the gap.** §10.1.9.2's
+  OrdinarySetWithOwnDescriptor creates the property on the Receiver rather than on the target;
+  `%PropStoreNamed` writes through the base it is given and has no Receiver operand. Every
+  three-argument call — the Receiver is then the target — is the ordinary guarded store and answers
+  the specified boolean.
+
 ### 2026-09-16 — Well-known symbols
 
 The thirteen well-known Symbols exist as values on the `Symbol` constructor, with the right

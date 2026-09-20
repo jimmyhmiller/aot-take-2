@@ -233,6 +233,7 @@ aot-take-2/
 │           ; array-methods.jsl splice, fill, flat, reduceRight and the searches from the end
 │           ; string-more.jsl replace/replaceAll, ASCII case conversion, Number.prototype.toFixed
 │           ; int-arith.jsl the integer arms of `+`, `-` and the relations, and their generic out-of-line forms
+│           ; reflect.jsl the Reflect namespace: the specified argument handling over the internal methods
 │       function/ array-buffer/ data-view/ typed-array/
 ├── src/
 │   ├── main.coil            ; CLI driver: compile, emit, run, dump; `AOT_SEED=N` compiles under a test's arena seed
