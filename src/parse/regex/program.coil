@@ -1,0 +1,203 @@
+;; The compiled form of a regular expression: a program for a backtracking matcher.
+
+;;
+;; Simple has no regular expressions, so there is no chapter to follow here. The shape is the one
+;; docs/GAPS.md settled on (2026-09-16, "Regular expressions: what is there and what the next change
+;; is") and the reasons are worth keeping beside the code:
+;;
+;; **The pattern is COMPILED, not interpreted.** A RegularExpressionLiteral's pattern is known at
+;; compile time, so the same grammar walk that validates it emits a program into image data. Only
+;; `new RegExp(s)` over a value the compiler cannot see needs the walk at run time.
+;;
+;; **The matcher BACKTRACKS, because the specification does.** ECMA-262 §22.2.2 is defined by
+;; continuations over ordered alternatives, not by leftmost-longest: `SPLIT` tries its first branch
+;; to exhaustion before its second. A DFA would answer different capture groups for the same match,
+;; which is observable through `exec`.
+;;
+;; A program is a flat vector of i64 words — the encoding a JSL matcher can read out of image data
+;; without a second object model. Each instruction is its opcode followed by its operands:
+;;
+;;     CHAR cp           the one code point
+;;     ANY               any code point; `RXOP-ANY-NL` is the `s` flag's form, which also takes
+;;                       the line terminators
+;;     CLASS i           the class at `i` in the class table
+;;     SPLIT x y         try `x`; on failure try `y`. Order is the greedy/lazy choice
+;;     JMP x             continue at `x`
+;;     SAVE n            record the current position in capture slot `n`
+;;     MATCH             the whole pattern has matched
+;;     BOL / EOL         Assertion `^` and `$`; the `m` flag is carried in the program's flags
+;;     WORDB neg         `\b`, or `\B` when `neg` is 1
+;;     BACKREF n         the text captured by group `n`
+;;
+;; Positions are word indices into the same vector, so a program is relocatable and printable.
+;;
+;; The class table is a second flat vector. A class is `negated`, then a range count, then that many
+;; `lo`/`hi` code-point pairs, inclusive at both ends. `\d`, `\w`, `\s` and their negations are
+;; ordinary classes: the walk expands them here rather than giving the matcher a second vocabulary.
+(module aot.parse.regex.program)
+(import "aot.util.arena" :use [compiler-allocator compiler-state CompilerStateSlot])
+(import "coil.primitive" :as primitive)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+
+;; ---------------------------------------------------------------------------
+;; Opcodes
+
+(const RXOP-CHAR 1)
+
+(const RXOP-ANY 2)
+
+(const RXOP-ANY-NL 3)  ; the `s` flag's `.`: a line terminator matches too
+
+(const RXOP-CLASS 4)
+
+(const RXOP-SPLIT 5)
+
+(const RXOP-JMP 6)
+
+(const RXOP-SAVE 7)
+
+(const RXOP-MATCH 8)
+
+(const RXOP-BOL 9)
+
+(const RXOP-EOL 10)
+
+(const RXOP-WORDB 11)
+
+(const RXOP-BACKREF 12)
+
+;; The flags a program carries, as a bit set. Only the ones the matcher reads are here: `g`, `y`
+;; and `d` belong to the RegExp object, not to the match.
+(const RXFLAG-IGNORE-CASE 1)
+
+(const RXFLAG-MULTILINE 2)
+
+(const RXFLAG-DOT-ALL 4)
+
+(const RXFLAG-UNICODE 8)
+
+;; ---------------------------------------------------------------------------
+;; The program under construction
+
+(defstruct RegexProgram
+  [(code (ArrayList i64))
+   (classes (ArrayList i64))
+   (flags i64)
+   (group-count i64)  ; capturing groups, so capture slots are 2 * (group-count + 1)
+   (initialized bool)])
+
+(defn rxp-program [] (-> (ptr RegexProgram))
+  (compiler-state [RegexProgram] (primitive/alloc-static CompilerStateSlot)))
+
+(defn rxp-reset! [(flags i64) (group-count i64)] (-> i64)
+  (let [p (rxp-program)]
+    (if (.initialized p)
+        (do
+          (al-clear! [i64] (mut (.code p)))
+          (al-clear! [i64] (mut (.classes p)))
+          0)
+        (do
+          (set! (.code p) (al-new [i64] (compiler-allocator)))
+          (set! (.classes p) (al-new [i64] (compiler-allocator)))
+          (set! (.initialized p) true)
+          0))
+    (set! (.flags p) flags)
+    (set! (.group-count p) group-count)
+    0))
+
+;; The index the next emitted word will occupy: a jump target taken before emitting.
+(defn rxp-here [] (-> i64)
+  (len (.code (rxp-program))))
+
+(defn rxp-word! [(w i64)] (-> i64)
+  (do (push! [i64] (mut (.code (rxp-program))) w) 0))
+
+(defn rxp-emit0! [(op i64)] (-> i64)
+  (let [at (rxp-here)] (rxp-word! op) at))
+
+(defn rxp-emit1! [(op i64) (a i64)] (-> i64)
+  (let [at (rxp-here)] (rxp-word! op) (rxp-word! a) at))
+
+(defn rxp-emit2! [(op i64) (a i64) (b i64)] (-> i64)
+  (let [at (rxp-here)] (rxp-word! op) (rxp-word! a) (rxp-word! b) at))
+
+;; A forward branch is emitted before its target is known and patched once it is. The operand
+;; index is the instruction's own index plus the operand's position.
+(defn rxp-patch! [(at i64) (operand i64) (target i64)] (-> i64)
+  (let [p (rxp-program)
+        slot (+ at operand)]
+    (if (or (< slot 0) (>= slot (len (.code p))))
+        (panic-i "rxp-patch!: operand outside the program" slot)
+        0)
+    (set! (mut (.code p)) slot target)
+    0))
+
+;; Drop everything emitted from `at` on. A quantified atom is emitted once unquantified, then
+;; dropped and re-emitted inside the quantifier's branches, which is cheaper to get right than
+;; relocating the branches inside an already emitted body.
+(defn rxp-truncate! [(at i64)] (-> i64)
+  (let [p (rxp-program)]
+    (loop (if (<= (len (.code p)) at)
+              (break 0)
+              (do (pop! [i64] (mut (.code p))) (continue))))
+    0))
+
+(defn rxp-word-at [(i i64)] (-> i64)
+  (let [p (rxp-program)]
+    (if (or (< i 0) (>= i (len (.code p))))
+        (panic-i "rxp-word-at: index outside the program" i)
+        0)
+    (get (.code p) i)))
+
+(defn rxp-length [] (-> i64)
+  (len (.code (rxp-program))))
+
+;; ---------------------------------------------------------------------------
+;; The class table
+
+;; Begin a class; the ranges follow. Answers its index, which `CLASS` names.
+(defn rxp-class-begin! [(negated bool)] (-> i64)
+  (let [p (rxp-program)
+        at (len (.classes p))]
+    (push! [i64] (mut (.classes p)) (if negated 1 0))
+    (push! [i64] (mut (.classes p)) 0)  ; the range count, filled by `rxp-class-end!`
+    at))
+
+(defn rxp-class-range! [(at i64) (lo i64) (hi i64)] (-> i64)
+  (let [p (rxp-program)]
+    (if (> lo hi)
+        (panic-i "rxp-class-range!: an empty range reached the program" lo)
+        0)
+    (push! [i64] (mut (.classes p)) lo)
+    (push! [i64] (mut (.classes p)) hi)
+    (set! (mut (.classes p)) (+ at 1) (+ (get (.classes p) (+ at 1)) 1))
+    0))
+
+(defn rxp-class-negated? [(at i64)] (-> bool)
+  (= (get (.classes (rxp-program)) at) 1))
+
+(defn rxp-class-count [(at i64)] (-> i64)
+  (get (.classes (rxp-program)) (+ at 1)))
+
+(defn rxp-class-lo [(at i64) (k i64)] (-> i64)
+  (get (.classes (rxp-program)) (+ (+ at 2) (* k 2))))
+
+(defn rxp-class-hi [(at i64) (k i64)] (-> i64)
+  (get (.classes (rxp-program)) (+ (+ at 3) (* k 2))))
+
+(defn rxp-classes-length [] (-> i64)
+  (len (.classes (rxp-program))))
+
+(defn rxp-class-word-at [(i i64)] (-> i64)
+  (get (.classes (rxp-program)) i))
+
+(defn rxp-flags [] (-> i64)
+  (.flags (rxp-program)))
+
+(defn rxp-group-count [] (-> i64)
+  (.group-count (rxp-program)))
+
+;; Capture slots: two per group — start and end — with group zero the whole match.
+(defn rxp-slot-count [] (-> i64)
+  (* 2 (+ (rxp-group-count) 1)))

@@ -385,7 +385,9 @@ aot-take-2/
 │   │   │   └── demand.coil      ; intrinsics lowered only once something observes them
 │   │   ├── regex.coil       ; RegExp pattern early errors: strict, web-compat and v-mode grammars; re-exports its parts
 │   │   ├── regex/  { chars.coil  ; code-unit constants, grammar character classes, Unicode property tables
-│   │   │             class.coil } ; legacy classes and v-mode class sets
+│   │   │             class.coil   ; legacy classes and v-mode class sets
+│   │   │             program.coil  ; the compiled program a backtracking matcher runs
+│   │   │             compile.coil } ; a validated pattern → that program; refuses what it cannot compile
 │   │   ├── tstype.coil      ; TypeScript annotation syntax → our lattice
 │   │   └── decl.coil        ; hoisting, binding resolution, module records
 │   │

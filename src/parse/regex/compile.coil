@@ -1,0 +1,547 @@
+;; A validated pattern, compiled into a program for the backtracking matcher.
+
+;;
+;; This walk runs AFTER `regex-validate` has answered `RegexOk`, which is what lets it be this
+;; short: the grammar is already known well-formed, so every position that cannot be reached in a
+;; valid pattern is a `panic` naming itself rather than a diagnostic. The validator is also already
+;; a VALUE-producing walk where the value matters — `rx-character-escape!` answers the code point
+;; and advances — so the escapes are not written twice.
+;;
+;; What it does NOT compile, it refuses by name, and the caller keeps the existing
+;; `UNIMPLEMENTED: regular expression objects` refusal for that pattern. Refusing is the whole
+;; reason this is separate from the matcher: a construct that compiles to nothing, or to an
+;; approximation, would answer a wrong match rather than stop. The list is in `rxc-unsupported`.
+;;
+;; Order inside a Disjunction is the specification's, not leftmost-longest: `SPLIT` tries its first
+;; operand to exhaustion first (§22.2.2.3), so `/a|ab/.exec("ab")` answers "a". A greedy quantifier
+;; puts the body first, a lazy one puts the continuation first, and that single difference is the
+;; whole of greediness.
+(module aot.parse.regex.compile)
+(import "aot.util.arena"
+        :use
+        [compiler-allocator compiler-state CompilerStateSlot])
+(import "coil.primitive" :as primitive)
+(import "coil.arraylist" :use *)
+(import "aot.util.panic" :use *)
+(import "aot.parse.regex" :use *)
+(import "aot.parse.regex.program" :use *)
+
+;; The constructs this stage does not compile. Each is a correctness boundary, not a shortcut:
+;; without the matcher's side of it, compiling one would answer a wrong match.
+(defstruct RegexCompileState
+  [(refused (Option (slice u8)))
+   (next-group i64)
+   (initialized bool)])
+
+(defn rxc-state [] (-> (ptr RegexCompileState))
+  (compiler-state [RegexCompileState]
+                  (primitive/alloc-static CompilerStateSlot)))
+
+(defn rxc-refuse! [(what (slice u8))] (-> i64)
+  (let [c (rxc-state)]
+    (match (.refused c)
+      (Some [existing] 0)
+      (None [] (do (set! (.refused c) (Some what)) 0)))
+    0))
+
+(defn rxc-refused? [] (-> bool)
+  (match (.refused (rxc-state)) (Some [w] true) (None [] false)))
+
+(defn rxc-refusal [] (-> (slice u8))
+  (match (.refused (rxc-state)) (Some [w] w) (None [] "")))
+
+;; ---------------------------------------------------------------------------
+;; Character classes
+;;
+;; `\d`, `\w`, `\s` and their negations are expanded into ranges here rather than given the matcher
+;; a second vocabulary: one CLASS instruction matches all of them.
+(const RXC-SPACE-COUNT 10)
+
+(defn rxc-space-lo [(k i64)] (-> i64)
+  (cond (= k 0) 9  ; TAB
+        (= k 1) 10  ; LF
+        (= k 2) 11  ; VT
+        (= k 3) 12  ; FF
+        (= k 4) 13  ; CR
+        (= k 5) 32  ; SPACE
+        (= k 6) 160  ; NBSP
+        (= k 7) 5760  ; OGHAM SPACE MARK
+        (= k 8) 8192  ; EN QUAD .. ZERO WIDTH SPACE, and LS/PS
+        :else 65279))  ; ZERO WIDTH NO-BREAK SPACE
+
+(defn rxc-space-hi [(k i64)] (-> i64)
+  (cond (= k 0) 9
+        (= k 1) 10
+        (= k 2) 11
+        (= k 3) 12
+        (= k 4) 13
+        (= k 5) 32
+        (= k 6) 160
+        (= k 7) 5760
+        (= k 8) 8239
+        :else 65279))
+
+;; The ranges of one `\d`/`\w`/`\s` escape, added to the class open at `at`. WhiteSpace and
+;; LineTerminator together are what `\s` is (§22.2.1, CharacterClassEscape).
+(defn rxc-add-builtin-ranges! [(at i64) (kind i64)] (-> i64)
+  (cond (= kind RX-LOWER-D) (rxc-add-digit-ranges! at)
+        (= kind RX-LOWER-W) (rxc-add-word-ranges! at)
+        (= kind RX-LOWER-S) (rxc-add-space-ranges! at)
+        :else (panic-i "rxc-add-builtin-ranges!: not a class escape" kind)))
+
+(defn rxc-add-digit-ranges! [(at i64)] (-> i64)
+  (rxc-range! at 48 57))
+
+(defn rxc-add-word-ranges! [(at i64)] (-> i64)
+  (do
+    (rxc-range! at 48 57)
+    (rxc-range! at 65 90)
+    (rxc-range! at 95 95)
+    (rxc-range! at 97 122)
+    0))
+
+(defn rxc-add-space-ranges! [(at i64)] (-> i64)
+  (let [(mut k) 0]
+    (loop (if (>= (load k) RXC-SPACE-COUNT)
+              (break 0)
+              (do
+                (rxc-range! at (rxc-space-lo (load k)) (rxc-space-hi (load k)))
+                (set! (mut k) (+ (load k) 1))
+                (continue))))
+    0))
+
+(defn rxc-range! [(at i64) (lo i64) (hi i64)] (-> i64)
+  (rxp-class-range! at lo hi))
+
+;; A `\d`/`\w`/`\s` or its negation as a standalone atom: its own one-escape class.
+(defn rxc-emit-builtin-class! [(kind i64) (negated bool)] (-> i64)
+  (let [at (rxp-class-begin! negated)]
+    (rxc-add-builtin-ranges! at kind)
+    (rxp-emit1! RXOP-CLASS at)
+    0))
+
+;; Is the code point at the cursor a CharacterClassEscape introducer (after its backslash)?
+(defn rxc-class-escape-kind [(e i64)] (-> i64)
+  (cond (= e RX-LOWER-D) RX-LOWER-D
+        (= e RX-LOWER-W) RX-LOWER-W
+        (= e RX-LOWER-S) RX-LOWER-S
+        (= e RX-UPPER-D) RX-LOWER-D
+        (= e RX-UPPER-W) RX-LOWER-W
+        (= e RX-UPPER-S) RX-LOWER-S
+        :else 0))
+
+(defn rxc-class-escape-negated? [(e i64)] (-> bool)
+  (or (= e RX-UPPER-D) (= e RX-UPPER-W) (= e RX-UPPER-S)))
+
+;; One ClassAtom's code point, or -1 when it was a `\d`/`\w`/`\s` escape, which has no single value
+;; and has already added its ranges to the open class.
+(defn rxc-class-atom! [(at i64)] (-> i64)
+  (let [c (rx-peek)]
+    (if (= c RX-BACKSLASH)
+        (let [e (rx-peek-at 1)
+              kind (rxc-class-escape-kind e)]
+          (if (!= kind 0)
+              (do
+                (rx-advance-by! 2)
+                (let [negated (rxc-class-escape-negated? e)]
+                  (if negated
+                      ;; A negated escape inside a class is a set difference the range form cannot
+                      ;; express, and folding it in as ranges would be wrong whenever the class has
+                      ;; other members.
+                      (rxc-refuse! "a negated class escape inside a character class")
+                      (rxc-add-builtin-ranges! at kind)))
+                -1)
+              (do
+                (rx-advance!)
+                (let [value (rx-character-escape! (rx-peek) true)]
+                  (if (= value RX-INVALID)
+                      (let [ident (rx-peek)]
+                        (rx-identity-escape! ident)
+                        ident)
+                      value)))))
+        (do (rx-advance!) c))))
+
+;; ClassRanges: atoms and `lo-hi` ranges until the closing bracket.
+(defn rxc-class! [] (-> i64)
+  (let [negated (= (rx-peek-at 1) RX-CARET)
+        at (rxp-class-begin! negated)]
+    (rx-advance-by! (if negated 2 1))
+    (loop (if (rxc-refused?)
+              (break 0)
+              (let [c (rx-peek)]
+                (cond (= c RX-RBRACKET) (do (rx-advance!) (break 0))
+                      (= c RX-EOF)
+                        (do
+                          (panic "rxc-class!: unterminated class in a validated pattern")
+                          (break 0))
+                      :else
+                        (let [lo (rxc-class-atom! at)]
+                          (if (< lo 0)
+                              (continue)
+                              (if (and (= (rx-peek) RX-MINUS)
+                                       (and (!= (rx-peek-at 1) RX-RBRACKET)
+                                            (!= (rx-peek-at 1) RX-EOF)))
+                                  (do
+                                    (rx-advance!)
+                                    (let [hi (rxc-class-atom! at)]
+                                      (if (< hi 0)
+                                          (rxc-refuse! "a class escape as a range bound")
+                                          (rxc-range! at lo hi))
+                                      (continue)))
+                                  (do (rxc-range! at lo lo) (continue)))))))))
+    (rxp-emit1! RXOP-CLASS at)
+    0))
+
+;; ---------------------------------------------------------------------------
+;; Quantifiers
+(defstruct RegexQuant [(present bool) (min i64) (max i64) (greedy bool)])
+
+(const RXC-UNBOUNDED -1)
+
+(defn rxc-quantifier! [] (-> RegexQuant)
+  (let [c (rx-peek)]
+    (cond (= c RX-STAR) (do (rx-advance!) (rxc-lazy-opt 0 RXC-UNBOUNDED))
+          (= c RX-PLUS) (do (rx-advance!) (rxc-lazy-opt 1 RXC-UNBOUNDED))
+          (= c RX-QUESTION) (do (rx-advance!) (rxc-lazy-opt 0 1))
+          (= c RX-LBRACE) (rxc-braced!)
+          :else
+            (RegexQuant
+              :present false
+              :min 0
+              :max 0
+              :greedy true))))
+
+(defn rxc-lazy-opt [(lo i64) (hi i64)] (-> RegexQuant)
+  (let [lazy (= (rx-peek) RX-QUESTION)]
+    (if lazy (rx-advance!) 0)
+    (RegexQuant
+      :present true
+      :min lo
+      :max hi
+      :greedy (not lazy))))
+
+;; `{n}`, `{n,}` or `{n,m}`. A `{` that does not begin one is a PatternCharacter, which the
+;; validator already admitted, so the cursor is left where it was.
+(defn rxc-braced! [] (-> RegexQuant)
+  (let [(mut k) 1
+        (mut lo) 0
+        (mut digits) 0]
+    (loop (if (rx-digit? (rx-peek-at (load k)))
+              (do
+                (set! (mut lo)
+                      (+ (* (load lo) 10) (- (rx-peek-at (load k)) RX-ZERO)))
+                (set! (mut digits) (+ (load digits) 1))
+                (set! (mut k) (+ (load k) 1))
+                (continue))
+              (break 0)))
+    (if (= (load digits) 0)
+        (RegexQuant
+          :present false
+          :min 0
+          :max 0
+          :greedy true)
+        (let [after (rx-peek-at (load k))]
+          (cond (= after RX-RBRACE)
+                  (do
+                    (rx-advance-by! (+ (load k) 1))
+                    (rxc-lazy-opt (load lo) (load lo)))
+                (= after RX-COMMA)
+                  (let [(mut j) (+ (load k) 1)
+                        (mut hi) 0
+                        (mut hi-digits) 0]
+                    (loop (if (rx-digit? (rx-peek-at (load j)))
+                              (do
+                                (set! (mut hi)
+                                      (+ (* (load hi) 10)
+                                         (- (rx-peek-at (load j)) RX-ZERO)))
+                                (set! (mut hi-digits) (+ (load hi-digits) 1))
+                                (set! (mut j) (+ (load j) 1))
+                                (continue))
+                              (break 0)))
+                    (if (= (rx-peek-at (load j)) RX-RBRACE)
+                        (do
+                          (rx-advance-by! (+ (load j) 1))
+                          (rxc-lazy-opt (load lo)
+                                        (if (= (load hi-digits) 0)
+                                            RXC-UNBOUNDED
+                                            (load hi))))
+                        (RegexQuant
+                          :present false
+                          :min 0
+                          :max 0
+                          :greedy true)))
+                :else
+                  (RegexQuant
+                    :present false
+                    :min 0
+                    :max 0
+                    :greedy true))))))
+
+;; ---------------------------------------------------------------------------
+;; The walk
+;;
+;; A quantified term is compiled by RE-EMITTING its body: `a{2,4}` is `aa(a(a)?)?`. The body is
+;; recompiled from the same source span, which is why `rxc-term!` records where the body began.
+;; Copying the emitted words instead would have to relocate every branch inside them.
+(defn rxc-emit-repeat! [(body-start i64) (q RegexQuant)] (-> i64)
+  (let [saved (rx-pos)]
+    (if (= (.max q) RXC-UNBOUNDED)
+        (rxc-emit-unbounded! body-start q)
+        (rxc-emit-bounded! body-start q))
+    (if (rxc-refused?) 0 (rx-set-pos! saved))
+    0))
+
+;; `x*` greedy: L: SPLIT body, out ; body ; JMP L ; out:
+;; `x*` lazy:   L: SPLIT out, body ; body ; JMP L ; out:
+;; `x+` is the body once, then that loop. `x{n,}` is the body n times, then `x*`.
+(defn rxc-emit-unbounded! [(body-start i64) (q RegexQuant)] (-> i64)
+  (do
+    (rxc-emit-copies! body-start (.min q))
+    (if (rxc-refused?)
+        0
+        (let [loop-at (rxp-here)
+              split (rxp-emit2! RXOP-SPLIT 0 0)
+              body-at (rxp-here)]
+          (rxc-emit-copies! body-start 1)
+          (rxp-emit1! RXOP-JMP loop-at)
+          (let [out (rxp-here)]
+            (if (.greedy q)
+                (do (rxp-patch! split 1 body-at) (rxp-patch! split 2 out))
+                (do (rxp-patch! split 1 out) (rxp-patch! split 2 body-at)))
+            0)))))
+
+;; `x{n,m}` is the body n times, then (m - n) optional bodies, each its own SPLIT to the end.
+(defn rxc-emit-bounded! [(body-start i64) (q RegexQuant)] (-> i64)
+  (do
+    (rxc-emit-copies! body-start (.min q))
+    (let [optional (- (.max q) (.min q))
+          (mut splits) (al-new [i64] (compiler-allocator))
+          (mut k) 0]
+      (loop (if (or (>= (load k) optional) (rxc-refused?))
+                (break 0)
+                (let [split (rxp-emit2! RXOP-SPLIT 0 0)
+                      body-at (rxp-here)]
+                  (push! [i64] (mut splits) split)
+                  (rxc-emit-copies! body-start 1)
+                  (if (.greedy q)
+                      (rxp-patch! split 1 body-at)
+                      (rxp-patch! split 2 body-at))
+                  (set! (mut k) (+ (load k) 1))
+                  (continue))))
+      (let [out (rxp-here)]
+        (al-for [split (load splits)]
+                (if (.greedy q)
+                    (rxp-patch! split 2 out)
+                    (rxp-patch! split 1 out)))
+        (al-free! [i64] (mut splits)))
+      0)))
+
+;; The body `n` times, recompiled from its source span each time.
+(defn rxc-emit-copies! [(body-start i64) (n i64)] (-> i64)
+  (let [(mut k) 0]
+    (loop (if (or (>= (load k) n) (rxc-refused?))
+              (break 0)
+              (do
+                (rx-set-pos! body-start)
+                (rxc-atom!)
+                (set! (mut k) (+ (load k) 1))
+                (continue))))
+    0))
+
+;; One Atom, without its quantifier: the cursor is left after the atom.
+(defn rxc-atom! [] (-> i64)
+  (let [c (rx-peek)]
+    (cond (= c RX-CARET) (do (rx-advance!) (rxp-emit0! RXOP-BOL) 0)
+          (= c RX-DOLLAR) (do (rx-advance!) (rxp-emit0! RXOP-EOL) 0)
+          (= c RX-DOT)
+            (do
+              (rx-advance!)
+              (rxp-emit0! (if (= (primitive/iand (rxp-flags) RXFLAG-DOT-ALL) 0)
+                              RXOP-ANY
+                              RXOP-ANY-NL))
+              0)
+          (= c RX-LBRACKET) (rxc-class!)
+          (= c RX-LPAREN) (rxc-group!)
+          (= c RX-BACKSLASH) (rxc-escape-atom!)
+          (= c RX-EOF)
+            (do
+              (panic "rxc-atom!: end of pattern where an atom was expected")
+              0)
+          :else (do (rx-advance!) (rxp-emit1! RXOP-CHAR c) 0))))
+
+(defn rxc-escape-atom! [] (-> i64)
+  (let [e (rx-peek-at 1)
+        kind (rxc-class-escape-kind e)]
+    (cond (!= kind 0)
+            (do
+              (rx-advance-by! 2)
+              (rxc-emit-builtin-class! kind (rxc-class-escape-negated? e))
+              0)
+          (= e RX-LOWER-B) (do (rx-advance-by! 2) (rxp-emit1! RXOP-WORDB 0) 0)
+          (= e RX-UPPER-B) (do (rx-advance-by! 2) (rxp-emit1! RXOP-WORDB 1) 0)
+          (and (rx-digit? e) (!= e RX-ZERO))
+            (let [(mut k) 1
+                  (mut n) 0]
+              (loop (if (rx-digit? (rx-peek-at (load k)))
+                        (do
+                          (set! (mut n)
+                                (+ (* (load n) 10)
+                                   (- (rx-peek-at (load k)) RX-ZERO)))
+                          (set! (mut k) (+ (load k) 1))
+                          (continue))
+                        (break 0)))
+              (rx-advance-by! (load k))
+              (rxp-emit1! RXOP-BACKREF (load n))
+              0)
+          (= e RX-LOWER-P) (do (rxc-refuse! "a Unicode property escape") 0)
+          (= e RX-UPPER-P) (do (rxc-refuse! "a Unicode property escape") 0)
+          (= e RX-LOWER-K) (do (rxc-refuse! "a named backreference") 0)
+          :else
+            (do
+              (rx-advance!)
+              (let [value (rx-character-escape! (rx-peek) false)]
+                (if (= value RX-INVALID)
+                    (let [ident (rx-peek)]
+                      (rx-identity-escape! ident)
+                      (rxp-emit1! RXOP-CHAR ident))
+                    (rxp-emit1! RXOP-CHAR value))
+                0)))))
+
+;; `(`: a capturing group, `(?:` a non-capturing one. Every other `(?` form is an assertion or a
+;; named group, which this stage refuses.
+(defn rxc-group! [] (-> i64)
+  (let [c (rxc-state)]
+    (if (= (rx-peek-at 1) RX-QUESTION)
+        (if (= (rx-peek-at 2) RX-COLON)
+            (do
+              (rx-advance-by! 3)
+              (rxc-disjunction!)
+              (if (= (rx-peek) RX-RPAREN)
+                  (rx-advance!)
+                  (panic "rxc-group!: unterminated group in a validated pattern"))
+              0)
+            (do (rxc-refuse! "a lookaround or named group") 0))
+        (let [index (+ (.next-group c) 1)]
+          (set! (.next-group c) index)
+          (rx-advance!)
+          (rxp-emit1! RXOP-SAVE (* index 2))
+          (rxc-disjunction!)
+          (rxp-emit1! RXOP-SAVE (+ (* index 2) 1))
+          (if (= (rx-peek) RX-RPAREN)
+              (rx-advance!)
+              (panic "rxc-group!: unterminated group in a validated pattern"))
+          0))))
+
+;; Term :: Atom Quantifier?
+(defn rxc-term! [] (-> i64)
+  (let [body-start (rx-pos)
+        before (rxp-here)]
+    (rxc-atom!)
+    (if (rxc-refused?)
+        0
+        (let [q (rxc-quantifier!)]
+          (if (.present q)
+              (do
+                ;; The atom was emitted unquantified; drop it and re-emit under the quantifier.
+                (rxp-truncate! before)
+                (rxc-emit-repeat! body-start q)
+                0)
+              0)))))
+
+(defn rxc-alternative! [] (-> i64)
+  (do
+    (loop (if (rxc-refused?)
+              (break 0)
+              (let [c (rx-peek)]
+                (if (or (= c RX-EOF) (= c RX-BAR) (= c RX-RPAREN))
+                    (break 0)
+                    (do (rxc-term!) (continue))))))
+    0))
+
+;; Disjunction :: Alternative ( `|` Alternative )*
+;;
+;; Each `|` becomes `SPLIT here, next`, and every alternative but the last ends in a JMP to the
+;; end. The first operand is tried to exhaustion before the second, which is what makes the
+;; specification's ordered choice, not leftmost-longest.
+(defn rxc-disjunction! [] (-> i64)
+  (let [(mut jumps) (al-new [i64] (compiler-allocator))]
+    (loop (if (rxc-refused?)
+              (break 0)
+              (if (rxc-more-alternatives?)
+                  (let [split (rxp-emit2! RXOP-SPLIT 0 0)]
+                    (rxp-patch! split 1 (rxp-here))
+                    (rxc-alternative!)
+                    (push! [i64] (mut jumps) (rxp-emit1! RXOP-JMP 0))
+                    (rxp-patch! split 2 (rxp-here))
+                    (if (= (rx-peek) RX-BAR) (rx-advance!) 0)
+                    (continue))
+                  (do (rxc-alternative!) (break 0)))))
+    (let [end (rxp-here)]
+      (al-for [j (load jumps)] (rxp-patch! j 1 end))
+      (al-free! [i64] (mut jumps)))
+    0))
+
+;; Is there a `|` at this nesting level before the group or the pattern ends? The scan skips over
+;; classes and nested groups, which the validator has already proven balanced.
+(defn rxc-more-alternatives? [] (-> bool)
+  (let [(mut k) 0
+        (mut depth) 0
+        (mut in-class) false
+        (mut found) false]
+    (loop (let [c (rx-peek-at (load k))]
+            (cond (= c RX-EOF) (break 0)
+                  (= c RX-BACKSLASH)
+                    (do (set! (mut k) (+ (load k) 2)) (continue))
+                  (load in-class)
+                    (do
+                      (if (= c RX-RBRACKET) (set! (mut in-class) false) 0)
+                      (set! (mut k) (+ (load k) 1))
+                      (continue))
+                  (= c RX-LBRACKET)
+                    (do
+                      (set! (mut in-class) true)
+                      (set! (mut k) (+ (load k) 1))
+                      (continue))
+                  (= c RX-LPAREN)
+                    (do
+                      (set! (mut depth) (+ (load depth) 1))
+                      (set! (mut k) (+ (load k) 1))
+                      (continue))
+                  (= c RX-RPAREN)
+                    (if (= (load depth) 0)
+                        (break 0)
+                        (do
+                          (set! (mut depth) (- (load depth) 1))
+                          (set! (mut k) (+ (load k) 1))
+                          (continue)))
+                  (and (= c RX-BAR) (= (load depth) 0))
+                    (do (set! (mut found) true) (break 0))
+                  :else (do (set! (mut k) (+ (load k) 1)) (continue)))))
+    (load found)))
+
+;; ---------------------------------------------------------------------------
+;; Entry
+
+;; Compile a validated pattern. Answers true when a program was emitted; false when the pattern
+;; uses a construct this stage refuses, and `rxc-refusal` names it.
+(defn regex-compile! [(body (slice u8)) (flags i64) (group-count i64)] (-> bool)
+  (let [c (rxc-state)]
+    (set! (.refused c) (None [(slice u8)]))
+    (set! (.next-group c) 0)
+    (set! (.initialized c) true)
+    (if (!= (primitive/iand flags RXFLAG-IGNORE-CASE) 0)
+        (rxc-refuse! "the `i` flag")
+        0)
+    (if (!= (primitive/iand flags RXFLAG-UNICODE) 0)
+        (rxc-refuse! "the `u` and `v` flags")
+        0)
+    (rxp-reset! flags group-count)
+    (if (rxc-refused?)
+        false
+        (do
+          (rx-set-pos! 0)
+          (rxp-emit1! RXOP-SAVE 0)
+          (rxc-disjunction!)
+          (rxp-emit1! RXOP-SAVE 1)
+          (rxp-emit0! RXOP-MATCH)
+          (not (rxc-refused?))))))
