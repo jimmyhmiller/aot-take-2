@@ -1,0 +1,414 @@
+; The URI handling functions (ECMA-262 §19.2.6) and Annex B's `escape`/`unescape` (§B.2.1).
+;
+; `encodeURI`/`encodeURIComponent` are one Encode (§19.2.6.4) over two different unescaped sets, and
+; `decodeURI`/`decodeURIComponent` are one Decode (§19.2.6.3) over two different preserved sets, so
+; each pair is one loop with a flag rather than two transcriptions of the same algorithm.
+;
+; Encode and Decode are defined over UTF-8: a code point becomes its UTF-8 bytes, each written
+; `%XX`, and decoding reads the bytes back. That is the whole reason these four functions are
+; specified in terms of code POINTS while a JavaScript string holds code UNITS — an unpaired
+; surrogate has no UTF-8 encoding, and the specification's answer is a URIError rather than a
+; replacement character. Every malformed input below is one.
+;
+; The bit work is written with `%Div`, `%Mul`, `%Sub` and `%Add`: `cp >> 6` is `(%Div cp 64)`,
+; `cp & 63` is `(%Sub cp (%Mul (%Div cp 64) 64))`, and `0xC0 | x` for an `x` below 0x20 is
+; `(%Add 192 x)` because the bits cannot overlap. The compiler generation of jsl/ uses no shift or
+; remainder primitive and this file does not introduce the need for one.
+;
+; Each loop is one `:noinline` tail-recursive step that ACCUMULATES its output, as
+; `JsStringCaseFrom` does (docs/GAPS.md, the Date note on non-tail recursion at a dozen call sites).
+
+; A URIError raised by these functions: the same private-object shape as the other language-raised
+; errors, over %URIError.prototype%, which every realm that materializes `URIError` materializes.
+(builtin JsThrowURIError :transitioning true :noinline true :throws true :params [(message dyn)] :ret never
+  (let [(error (JsSetObjectLiteralPrototype (JsNewObjectRaw) (%IntrinsicPrototype "URIError.prototype")))
+        (described (JsCreateDataPropertyAttrs error (%PropertyKey "message") message 5))]
+    (%SetPendingException (JsFinishObjectLiteral described))))
+
+; ---------------------------------------------------------------------------
+; The character sets of §19.2.6.1
+
+; uriAlpha, DecimalDigit and uriMark `-_.!~*'()` — the set `encodeURIComponent` leaves alone.
+(builtin JsUriIsUnescaped :noinline true :params [(c int)] :ret bool
+  (if (%Le 65 c)
+      (if (%Le c 90) (%Eq 0 0)
+      (if (%Le 97 c)
+          ;; Above 'z' is where `~` lives, and 91..96 is where `_` does: both fall through to the
+          ;; marks rather than out of the set.
+          (if (%Le c 122) (%Eq 0 0) (JsUriIsMark c))
+          (JsUriIsMark c)))
+      (if (%Le 48 c)
+          (if (%Le c 57) (%Eq 0 0) (JsUriIsMark c))
+          (JsUriIsMark c))))
+
+(builtin JsUriIsMark :noinline true :params [(c int)] :ret bool
+  (if (%Eq c 45) (%Eq 0 0)          ; -
+  (if (%Eq c 95) (%Eq 0 0)          ; _
+  (if (%Eq c 46) (%Eq 0 0)          ; .
+  (if (%Eq c 33) (%Eq 0 0)          ; !
+  (if (%Eq c 126) (%Eq 0 0)         ; ~
+  (if (%Eq c 42) (%Eq 0 0)          ; *
+  (if (%Eq c 39) (%Eq 0 0)          ; '
+  (if (%Eq c 40) (%Eq 0 0)          ; (
+  (if (%Eq c 41) (%Eq 0 0)          ; )
+      (%Eq 0 1)))))))))))
+
+; uriReserved `;/?:@&=+$,` and `#`, which §19.2.6.5 adds to encodeURI's unescaped set and
+; §19.2.6.2 keeps escaped through decodeURI.
+(builtin JsUriIsReserved :noinline true :params [(c int)] :ret bool
+  (if (%Eq c 59) (%Eq 0 0)          ; ;
+  (if (%Eq c 47) (%Eq 0 0)          ; /
+  (if (%Eq c 63) (%Eq 0 0)          ; ?
+  (if (%Eq c 58) (%Eq 0 0)          ; :
+  (if (%Eq c 64) (%Eq 0 0)          ; @
+  (if (%Eq c 38) (%Eq 0 0)          ; &
+  (if (%Eq c 61) (%Eq 0 0)          ; =
+  (if (%Eq c 43) (%Eq 0 0)          ; +
+  (if (%Eq c 36) (%Eq 0 0)          ; $
+  (if (%Eq c 44) (%Eq 0 0)          ; ,
+  (if (%Eq c 35) (%Eq 0 0)          ; #
+      (%Eq 0 1)))))))))))))
+
+; `component` selects the pair: 1 leaves only uriUnescaped alone (encodeURIComponent), 0 also leaves
+; uriReserved and `#` alone (encodeURI).
+(builtin JsUriUnescapedFor :noinline true :params [(c int) (component int)] :ret bool
+  (if (JsUriIsUnescaped c)
+      (%Eq 0 0)
+      (if (%Eq component 1) (%Eq 0 1) (JsUriIsReserved c))))
+
+; ---------------------------------------------------------------------------
+; Hexadecimal
+
+; The uppercase hexadecimal digit of a nibble, as §19.2.6.4 writes them.
+(builtin JsUriHexDigit :params [(v int)] :ret int
+  (if (%Lt v 10) (%Add 48 v) (%Add 55 v)))
+
+; The value of a hexadecimal digit, or -1 for anything else. A private status, immediately turned
+; into a URIError by its only callers.
+(builtin JsUriHexValue :params [(c int)] :ret int
+  (if (%Le 48 c)
+      (if (%Le c 57) (%Sub c 48)
+      (if (%Le 65 c)
+          (if (%Le c 70) (%Sub c 55)
+          (if (%Le 97 c) (if (%Le c 102) (%Sub c 87) -1) -1))
+          -1))
+      -1))
+
+; One byte as `%XX`.
+(builtin JsUriPercent :transitioning true :noinline true :params [(b int)] :ret str
+  (%StringConcat (%StringConcat "%" (%StringFromCharCode (JsUriHexDigit (%Div b 16))))
+                 (%StringFromCharCode (JsUriHexDigit (%Sub b (%Mul (%Div b 16) 16))))))
+
+; ---------------------------------------------------------------------------
+; Encode (§19.2.6.4)
+
+; One code point as its UTF-8 bytes, each written `%XX`. The four widths of §11.1.1.
+(builtin JsUriEscapeCodePoint :transitioning true :noinline true :params [(cp int)] :ret str
+  (if (%Lt cp 128)
+      (JsUriPercent cp)
+      (if (%Lt cp 2048)
+          (%StringConcat (JsUriPercent (%Add 192 (%Div cp 64)))
+                         (JsUriPercent (%Add 128 (%Sub cp (%Mul (%Div cp 64) 64)))))
+          (if (%Lt cp 65536)
+              (%StringConcat (JsUriPercent (%Add 224 (%Div cp 4096)))
+                             (%StringConcat (JsUriPercent (%Add 128 (%Sub (%Div cp 64)
+                                                                         (%Mul (%Div cp 4096) 64))))
+                                            (JsUriPercent (%Add 128 (%Sub cp (%Mul (%Div cp 64) 64))))))
+              (%StringConcat (JsUriPercent (%Add 240 (%Div cp 262144)))
+                             (%StringConcat (JsUriPercent (%Add 128 (%Sub (%Div cp 4096)
+                                                                          (%Mul (%Div cp 262144) 64))))
+                                            (%StringConcat (JsUriPercent (%Add 128 (%Sub (%Div cp 64)
+                                                                                         (%Mul (%Div cp 4096) 64))))
+                                                           (JsUriPercent (%Add 128 (%Sub cp (%Mul (%Div cp 64) 64)))))))))))
+
+; Encode(string, unescapedSet) (§19.2.6.4). A high surrogate must be followed by a low one and a low
+; surrogate may not stand alone: either is the URIError of steps 4.d.i and 4.e.ii.
+;
+; Malformed input is reported as UNDEFINED, and `JsGlobalEncodeURI` raises the URIError. The result
+; of Encode is always a string, so undefined is unambiguous — and raising here instead would put the
+; throw two frames below the intrinsic body, where the exception sentinel does not reach the
+; JavaScript call site (docs/GAPS.md, the URI functions).
+(builtin JsUriEncodeFrom :transitioning true :noinline true
+  :params [(raw str) (i int) (component int) (out str)] :ret dyn
+  (if (%Lt i (%StringLength raw))
+      (let [(unit (%StringCharCode raw i))]
+        (if (JsUriUnescapedFor unit component)
+            (JsUriEncodeFrom raw (%Add i 1) component
+                             (%StringConcat out (%StringFromCharCode unit)))
+            (if (%Le 55296 unit)
+                (if (%Le unit 56319)
+                    (if (%Lt (%Add i 1) (%StringLength raw))
+                        (let [(low (%StringCharCode raw (%Add i 1)))]
+                          (if (%Le 56320 low)
+                              (if (%Le low 57343)
+                                  (JsUriEncodeFrom raw (%Add i 2) component
+                                                   (%StringConcat out
+                                                                  (JsUriEscapeCodePoint
+                                                                   (%Add 65536
+                                                                         (%Add (%Mul (%Sub unit 55296) 1024)
+                                                                               (%Sub low 56320))))))
+                                  (%Undefined))
+                              (%Undefined)))
+                        (%Undefined))
+                    (if (%Le unit 57343)
+                        (%Undefined)
+                        (JsUriEncodeFrom raw (%Add i 1) component
+                                         (%StringConcat out (JsUriEscapeCodePoint unit)))))
+                (JsUriEncodeFrom raw (%Add i 1) component
+                                 (%StringConcat out (JsUriEscapeCodePoint unit))))))
+      (%Box out)))
+
+; ---------------------------------------------------------------------------
+; Decode (§19.2.6.3)
+
+; The byte of the `%XX` at `i`, or -1 when `i` does not begin a complete, well-formed escape.
+(builtin JsUriEscapeByte :noinline true :params [(raw str) (i int)] :ret int
+  (if (%Lt (%Add i 2) (%StringLength raw))
+      (if (%Eq (%StringCharCode raw i) 37)
+          (let [(high (JsUriHexValue (%StringCharCode raw (%Add i 1))))]
+            (if (%Lt high 0)
+                -1
+                (let [(low (JsUriHexValue (%StringCharCode raw (%Add i 2))))]
+                  (if (%Lt low 0) -1 (%Add (%Mul high 16) low)))))
+          -1)
+      -1))
+
+; The number of bytes a UTF-8 lead byte begins, or -1 when it is not a lead byte. 0xC0 and 0xC1
+; begin only overlong forms and 0xF5.. are above the code-point range, so both are refused here.
+(builtin JsUriSequenceLength :noinline true :params [(b int)] :ret int
+  (if (%Le 194 b)
+      (if (%Le b 223) 2
+      (if (%Le b 239) 3
+      (if (%Le b 244) 4 -1)))
+      -1))
+
+; The low six bits of each continuation byte, folded into `cp`; -1 when a continuation byte is
+; missing, is not an escape, or is not 10xxxxxx.
+(builtin JsUriDecodeTail :transitioning true :noinline true :params [(raw str) (i int) (remaining int) (cp int)] :ret int
+  (if (%Eq remaining 0)
+      cp
+      (let [(b (JsUriEscapeByte raw i))]
+        (if (%Lt b 0)
+            -1
+            (if (%Le 128 b)
+                (if (%Le b 191)
+                    (JsUriDecodeTail raw (%Add i 3) (%Sub remaining 1)
+                                     (%Add (%Mul cp 64) (%Sub b 128)))
+                    -1)
+                -1)))))
+
+; A decoded code point as UTF-16: one unit, or the surrogate pair of §11.1.5.
+(builtin JsUriCodePointUnits :transitioning true :noinline true :params [(cp int)] :ret str
+  (if (%Le cp 65535)
+      (%StringFromCharCode cp)
+      (%StringConcat (%StringFromCharCode (%Add 55296 (%Div (%Sub cp 65536) 1024)))
+                     (%StringFromCharCode (%Add 56320
+                                                (%Sub (%Sub cp 65536)
+                                                      (%Mul (%Div (%Sub cp 65536) 1024) 1024)))))))
+
+; Is a decoded code point one the specification admits? Not a surrogate, not above the range, and
+; not an overlong encoding of something shorter.
+(builtin JsUriCodePointValid :noinline true :params [(cp int) (length int)] :ret bool
+  (if (%Le 55296 cp)
+      (if (%Le cp 57343) (%Eq 0 1) (JsUriCodePointInRange cp length))
+      (JsUriCodePointInRange cp length)))
+
+(builtin JsUriCodePointInRange :noinline true :params [(cp int) (length int)] :ret bool
+  (if (%Eq length 2)
+      (if (%Le 128 cp) (%Le cp 2047) (%Eq 0 1))
+      (if (%Eq length 3)
+          (if (%Le 2048 cp) (%Le cp 65535) (%Eq 0 1))
+          (if (%Le 65536 cp) (%Le cp 1114111) (%Eq 0 1)))))
+
+; Decode(string, preserveEscapeSet) (§19.2.6.3). Malformed input is UNDEFINED, as in Encode above.
+; A one-byte escape of a preserved character keeps its `%XX` TEXT — that is what makes `decodeURI("%2F")` answer `"%2F"` while
+; `decodeURIComponent("%2F")` answers `"/"`.
+(builtin JsUriDecodeFrom :transitioning true :noinline true
+  :params [(raw str) (i int) (component int) (out str)] :ret dyn
+  (if (%Lt i (%StringLength raw))
+      (let [(unit (%StringCharCode raw i))]
+        (if (%Ne unit 37)
+            (JsUriDecodeFrom raw (%Add i 1) component
+                             (%StringConcat out (%StringFromCharCode unit)))
+            (let [(b (JsUriEscapeByte raw i))]
+              (if (%Lt b 0)
+                  (%Undefined)
+                  (if (%Lt b 128)
+                      (if (JsUriPreserved b component)
+                          (JsUriDecodeFrom raw (%Add i 3) component
+                                           (%StringConcat out (JsUriThreeAt raw i)))
+                          (JsUriDecodeFrom raw (%Add i 3) component
+                                           (%StringConcat out (%StringFromCharCode b))))
+                      (let [(length (JsUriSequenceLength b))]
+                        (if (%Lt length 0)
+                            (%Undefined)
+                            (let [(cp (JsUriDecodeTail raw (%Add i 3) (%Sub length 1)
+                                                       (%Sub b (JsUriLeadBias length))))]
+                              (if (%Lt cp 0)
+                                  (%Undefined)
+                                  (if (JsUriCodePointValid cp length)
+                                      (JsUriDecodeFrom raw (%Add i (%Mul length 3)) component
+                                                       (%StringConcat out (JsUriCodePointUnits cp)))
+                                      (%Undefined)))))))))))
+      (%Box out)))
+
+; The bits a lead byte contributes: its value less the 110/1110/11110 marker.
+(builtin JsUriLeadBias :params [(length int)] :ret int
+  (if (%Eq length 2) 192 (if (%Eq length 3) 224 240)))
+
+; A preserved one-byte escape keeps its text: uriReserved and `#` for decodeURI, nothing for
+; decodeURIComponent.
+(builtin JsUriPreserved :params [(b int) (component int)] :ret bool
+  (if (%Eq component 1) (%Eq 0 1) (JsUriIsReserved b)))
+
+; The three code units of the escape at `i`, as they were written.
+(builtin JsUriThreeAt :transitioning true :params [(raw str) (i int)] :ret str
+  (%StringConcat (%StringConcat (%StringFromCharCode (%StringCharCode raw i))
+                                (%StringFromCharCode (%StringCharCode raw (%Add i 1))))
+                 (%StringFromCharCode (%StringCharCode raw (%Add i 2)))))
+
+; ---------------------------------------------------------------------------
+; The four global functions
+;
+; Each takes the `:function` intrinsic body shape: a standalone global function has no [[Construct]],
+; so `new encodeURI()` is the TypeError of §10.3.2, which `JsCalledAsFunction` decides.
+
+(builtin JsGlobalEncodeURI :transitioning true :throws true
+  :params [(this dyn) (newtarget dyn) (callee dyn) (a0 dyn)] :ret dyn
+  (if (JsCalledAsFunction newtarget)
+      (let [(text (JsToStringValue a0))]
+        (if (%IsException text)
+            text
+            (let [(result (JsUriEncodeFrom (%UnboxString text) 0 0 ""))]
+              (if (%IsUndefined result) (JsThrowURIError (%Box "URI malformed")) result))))
+      (JsThrowTypeError (%Box "encodeURI is not a constructor"))))
+
+(builtin JsGlobalEncodeURIComponent :transitioning true :throws true
+  :params [(this dyn) (newtarget dyn) (callee dyn) (a0 dyn)] :ret dyn
+  (if (JsCalledAsFunction newtarget)
+      (let [(text (JsToStringValue a0))]
+        (if (%IsException text)
+            text
+            (let [(result (JsUriEncodeFrom (%UnboxString text) 0 1 ""))]
+              (if (%IsUndefined result) (JsThrowURIError (%Box "URI malformed")) result))))
+      (JsThrowTypeError (%Box "encodeURIComponent is not a constructor"))))
+
+(builtin JsGlobalDecodeURI :transitioning true :throws true
+  :params [(this dyn) (newtarget dyn) (callee dyn) (a0 dyn)] :ret dyn
+  (if (JsCalledAsFunction newtarget)
+      (let [(text (JsToStringValue a0))]
+        (if (%IsException text)
+            text
+            (let [(result (JsUriDecodeFrom (%UnboxString text) 0 0 ""))]
+              (if (%IsUndefined result) (JsThrowURIError (%Box "URI malformed")) result))))
+      (JsThrowTypeError (%Box "decodeURI is not a constructor"))))
+
+(builtin JsGlobalDecodeURIComponent :transitioning true :throws true
+  :params [(this dyn) (newtarget dyn) (callee dyn) (a0 dyn)] :ret dyn
+  (if (JsCalledAsFunction newtarget)
+      (let [(text (JsToStringValue a0))]
+        (if (%IsException text)
+            text
+            (let [(result (JsUriDecodeFrom (%UnboxString text) 0 1 ""))]
+              (if (%IsUndefined result) (JsThrowURIError (%Box "URI malformed")) result))))
+      (JsThrowTypeError (%Box "decodeURIComponent is not a constructor"))))
+
+; ---------------------------------------------------------------------------
+; Annex B `escape` and `unescape` (§B.2.1)
+;
+; These are NOT the URI functions with a different set: they work on code UNITS, never on code
+; points, so an unpaired surrogate is `%uD800` rather than an error, and a unit above 0xFF is
+; `%uXXXX`. Keeping them here keeps the escape-writing helpers in one file.
+
+; escape's unescapedSet: uriAlpha, DecimalDigit and `@*_+-./`.
+(builtin JsEscapeUnescaped :noinline true :params [(c int)] :ret bool
+  (if (%Le 65 c)
+      (if (%Le c 90) (%Eq 0 0)
+      (if (%Le 97 c)
+          (if (%Le c 122) (%Eq 0 0) (JsEscapeIsPunct c))
+          (JsEscapeIsPunct c)))
+      (if (%Le 48 c)
+          (if (%Le c 57) (%Eq 0 0) (JsEscapeIsPunct c))
+          (JsEscapeIsPunct c))))
+
+(builtin JsEscapeIsPunct :noinline true :params [(c int)] :ret bool
+  (if (%Eq c 64) (%Eq 0 0)          ; @
+  (if (%Eq c 42) (%Eq 0 0)          ; *
+  (if (%Eq c 95) (%Eq 0 0)          ; _
+  (if (%Eq c 43) (%Eq 0 0)          ; +
+  (if (%Eq c 45) (%Eq 0 0)          ; -
+  (if (%Eq c 46) (%Eq 0 0)          ; .
+  (if (%Eq c 47) (%Eq 0 0)          ; /
+      (%Eq 0 1)))))))))
+
+(builtin JsEscapeFrom :transitioning true :noinline true :params [(raw str) (i int) (out str)] :ret str
+  (if (%Lt i (%StringLength raw))
+      (let [(unit (%StringCharCode raw i))]
+        (JsEscapeFrom raw (%Add i 1)
+                      (%StringConcat out
+                                     (if (JsEscapeUnescaped unit)
+                                         (%StringFromCharCode unit)
+                                         (if (%Lt unit 256)
+                                             (JsUriPercent unit)
+                                             (JsEscapeUnit unit))))))
+      out))
+
+; A unit above 0xFF as `%uXXXX`.
+(builtin JsEscapeUnit :transitioning true :noinline true :params [(unit int)] :ret str
+  (%StringConcat (%StringConcat "%u" (%StringFromCharCode (JsUriHexDigit (%Div unit 4096))))
+                 (%StringConcat (%StringFromCharCode (JsUriHexDigit (%Sub (%Div unit 256)
+                                                                          (%Mul (%Div unit 4096) 16))))
+                                (%StringConcat (%StringFromCharCode (JsUriHexDigit (%Sub (%Div unit 16)
+                                                                                         (%Mul (%Div unit 256) 16))))
+                                               (%StringFromCharCode (JsUriHexDigit (%Sub unit (%Mul (%Div unit 16) 16))))))))
+
+; The four hexadecimal digits of the `%uXXXX` at `i`, or -1 when they are not all there.
+(builtin JsUnescapeUnit :noinline true :params [(raw str) (i int)] :ret int
+  (if (%Lt (%Add i 5) (%StringLength raw))
+      (let [(a (JsUriHexValue (%StringCharCode raw (%Add i 2))))]
+        (if (%Lt a 0)
+            -1
+            (let [(b (JsUriHexValue (%StringCharCode raw (%Add i 3))))]
+              (if (%Lt b 0)
+                  -1
+                  (let [(c (JsUriHexValue (%StringCharCode raw (%Add i 4))))]
+                    (if (%Lt c 0)
+                        -1
+                        (let [(d (JsUriHexValue (%StringCharCode raw (%Add i 5))))]
+                          (if (%Lt d 0)
+                              -1
+                              (%Add (%Mul a 4096)
+                                    (%Add (%Mul b 256) (%Add (%Mul c 16) d)))))))))))
+      -1))
+
+; unescape (§B.2.1.2): `%uXXXX` then `%XX`, and anything else is copied. Unlike Decode, a `%` that
+; does not begin a complete escape is NOT an error — it is the character `%`.
+(builtin JsUnescapeFrom :transitioning true :noinline true :params [(raw str) (i int) (out str)] :ret str
+  (if (%Lt i (%StringLength raw))
+      (let [(unit (%StringCharCode raw i))]
+        (if (%Ne unit 37)
+            (JsUnescapeFrom raw (%Add i 1) (%StringConcat out (%StringFromCharCode unit)))
+            (let [(wide (if (%Lt (%Add i 1) (%StringLength raw))
+                            (if (%Eq (%StringCharCode raw (%Add i 1)) 117) (JsUnescapeUnit raw i) -1)
+                            -1))]
+              (if (%Le 0 wide)
+                  (JsUnescapeFrom raw (%Add i 6) (%StringConcat out (%StringFromCharCode wide)))
+                  (let [(b (JsUriEscapeByte raw i))]
+                    (if (%Le 0 b)
+                        (JsUnescapeFrom raw (%Add i 3) (%StringConcat out (%StringFromCharCode b)))
+                        (JsUnescapeFrom raw (%Add i 1) (%StringConcat out (%StringFromCharCode unit)))))))))
+      out))
+
+(builtin JsGlobalEscape :transitioning true :throws true
+  :params [(this dyn) (newtarget dyn) (callee dyn) (a0 dyn)] :ret dyn
+  (if (JsCalledAsFunction newtarget)
+      (let [(text (JsToStringValue a0))]
+        (if (%IsException text) text (%Box (JsEscapeFrom (%UnboxString text) 0 ""))))
+      (JsThrowTypeError (%Box "escape is not a constructor"))))
+
+(builtin JsGlobalUnescape :transitioning true :throws true
+  :params [(this dyn) (newtarget dyn) (callee dyn) (a0 dyn)] :ret dyn
+  (if (JsCalledAsFunction newtarget)
+      (let [(text (JsToStringValue a0))]
+        (if (%IsException text) text (%Box (JsUnescapeFrom (%UnboxString text) 0 ""))))
+      (JsThrowTypeError (%Box "unescape is not a constructor"))))

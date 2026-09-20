@@ -1113,9 +1113,28 @@ including concrete bulk memory, clearing RPC during trivial inlining and reconst
 architectural RPC Parm before code generation. Persisted compilation units and their serialized
 envelope remain outside the implemented boundary.
 
-### 2026-09-20 — Both bugs of the 2026-09-20 entries above are fixed
+### 2026-09-20 — The URI functions
 
-The swallowed exception was a missing `SxIntrinsic` arm in the may-throw walk; the SCCP panic was a
-call-target fact dropped by a later round. Each has a regression test in `tests/execution-test.coil`
-and the account of what was actually wrong is in its commit. The URI functions
-(`t262/uri-functions`) are unblocked by the first fix and can land once rebased.
+`encodeURI`, `encodeURIComponent`, `decodeURI`, `decodeURIComponent` (§19.2.6) and Annex B's
+`escape`/`unescape` (§B.2.1) execute (`jsl/compiler/uri.jsl`). Each pair is one loop over a flag:
+the two encode functions differ only in whether uriReserved joins the unescaped set, and the two
+decode functions only in whether a one-byte escape of a reserved character keeps its `%XX` text.
+
+Encode and Decode are defined over UTF-8, which is why they are specified in terms of code POINTS
+while a JavaScript string holds code UNITS: an unpaired surrogate has no UTF-8 encoding and the
+answer is a URIError, not a replacement character. Every malformed input is one — a truncated
+escape, a non-hexadecimal digit, a bad continuation byte, an overlong form, an encoded surrogate,
+a code point above the range.
+
+The malformed path is reported out of the recursive workers as `undefined` — unambiguous, since
+Encode and Decode always answer a string — and the intrinsic body raises the URIError once. That is
+not a workaround: raising two frames below the intrinsic body reached nothing until the may-throw
+walk learned about `SxIntrinsic` (above), and one throw site per function is the clearer shape
+regardless.
+
+Sixteen helpers are `:noinline`. Without that the decode loop exceeds the register allocator's split
+budget (`ra-run!: allocator exceeded its split budget`) — the same shape this file already warns
+about for a backtracking regular-expression VM.
+
+`escape`/`unescape` are NOT these functions over a different set: they work on code units, so an
+unpaired surrogate is `%uD800` rather than an error and a unit above 0xFF is `%uXXXX`.
