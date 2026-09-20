@@ -1138,3 +1138,25 @@ about for a backtracking regular-expression VM.
 
 `escape`/`unescape` are NOT these functions over a different set: they work on code units, so an
 unpaired surrogate is `%uD800` rather than an error and a unit above 0xFF is `%uXXXX`.
+
+### 2026-09-20 — Real-world packages: what runs, and the one gate
+
+Two packages from npm run end to end, unmodified, compiled to a native binary: **mitt** 3.0.1 (its
+whole emitter API, including the `*` wildcard) and **just-clone** 6.2.0 (deep clone of objects and
+arrays; its Date, Map and Set paths need the builtin tags below). A Script goal has no loader, so a three-line prelude Script supplies
+`module`/`exports`/`global` and the next Script reads `module.exports` — the units are given in
+order on the command line, which is what `aot run-script` already does.
+
+Getting there needed one fix, about real code rather than the corpus:
+
+- **A string property key is its string value, not its source spelling.** The key was interned from
+  the bytes between the quotes, so anything escaped or non-ASCII failed closed; lodash's
+  `deburredLetters` table is written `'\xc0': 'A'` and would not parse. Keys now decode and encode
+  as UTF-8 with the same pairing `rt-string-utf8!` uses, so a compile-time key and a run-time key
+  for the same string are the same bytes.
+**The gate for everything larger is regular expressions.** lodash 4.17.21 and acorn 8.14.0 both
+reach `UNIMPLEMENTED: regular expression objects` and stop; so does dequal, at the bare mention of
+`RegExp`. The TypeScript compiler needs generators and far more besides. The design for the engine
+is already written down above (2026-09-16, "Regular expressions: what is there and what the next
+change is") and is unchanged by this: compile the pattern to a program, keep one recursive `SPLIT`
+site, `:noinline`, and accumulate.
