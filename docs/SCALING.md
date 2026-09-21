@@ -381,6 +381,14 @@ the way. A cached owner now lasts until its Fun dies. Owner-walk steps in inline
    functions and does nothing for one big function; that case needs depths that survive an
    insertion (an order-maintenance labelling), or the per-function architecture of §2, where the
    function being optimized is small by construction.
+   A third option, cheaper than either and NOT yet designed against the code: the only consumer
+   of depths inside the fixpoint is the Region LCA (`idom-lca-nodes`, `region-lca-path`,
+   `region-lca-covered`), which uses them to decide which side to step. An LCA needs no depths —
+   step both sides alternately and stop at the first node one walk reaches that the other has
+   visited — so the fixpoint could ask for no depth at all and an inline would have nothing to
+   invalidate. The cost is a visited set on long walks, and the three variants carry dead-root
+   rules (`region-idom`'s header) that a rewrite must reproduce exactly; GCM keeps its depths. This
+   is a design to agree before coding, not a patch.
 2. **The constant storm, re-measured.** A node that folds to the shared `undefined` re-queues all
    ~1,500 of that constant's users, 2,255 times at N=120 (`x._outputs` in Simple's `iteratePeeps`).
    With that one push skipped for constants: N=500 runs 4,087 → 2,969 rounds, 14.1M → 4.0M visits,
@@ -391,6 +399,22 @@ the way. A cached owner now lasts until its Fun dies. Owner-walk steps in inline
    it is NOT the default: it landed as the measurement switch `AOT_NO_CONSTANT_REQUEUE`
    (`aot.codegen.iterpeeps`), pending a decision on whether ask order should be an accident of
    the worklist.
+
+   The evidence for making it the default, gathered the same night. The whole suite run with the
+   switch SET: 959 of 960 pass — every execution test, the budget and bloat ceilings, and the four
+   suites that assert `iter-check-fixpoint` — and the one failure is this document's own ratchet
+   (the hub shape's dep-ask RATIO, x280 against a x240 ceiling, because N=60 fell further than
+   N=120 did; both absolute counts are lower). `fib` and binary trees built each way run in the
+   same time (1,340 vs 1,340 ms; 441–472 vs 444–455 ms) from objects of the same size. And the wide
+   scaling program becomes LINEAR in the counts M0 gates on:
+
+   | N=60 → 120 (wide) | unset            | set              |
+   |-------------------|-----------------:|-----------------:|
+   | visits            | x3.31            | **x1.99**        |
+   | worklist pushes   | x3.16            | x2.29            |
+   | rounds            | x3.08            | **x1.62**        |
+   | depths computed   | 1,810,323        | 732,786          |
+   | dep asks          | 2,738,972        | 1,785,588        |
 3. **Dep asks.** Six per visit, nearly all refused as duplicates after a hash probe and two input
    scans. Constant factor, but 85M of them.
    Counted per visited kind: nearly all of them come from `Parm` visits — a Parm's `compute` is a
