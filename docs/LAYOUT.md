@@ -461,6 +461,7 @@ aot-take-2/
 │   ├── bloat-test.coil              ; graph-size budgets: node-count ceilings after optimization
 │   ├── versions-test.coil           ; callable version contracts, reuse, fallback and lifetime
 │   ├── budget-test.coil             ; compile-time budgets as gates: rounds, shape, wall time (docs/COMPILE-TIME.md §7)
+│   ├── scaling-test.coil            ; compile work must be LINEAR: count ratios at N and 2N, as ratchets (docs/SCALING.md §4 M0)
 │   ├── execution-test.coil          ; cases that must RUN, not merely compile
 │   └── differential-test.coil       ; compiled output vs. a JavaScript engine
 ├── benchmarks/              ; JavaScript/TypeScript input fixtures for native comparisons
