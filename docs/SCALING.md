@@ -427,3 +427,21 @@ the way. A cached owner now lasts until its Fun dies. Owner-walk steps in inline
 4. **`fun-self-recursive?`** is O(callers) per ask even with every owner cached. It was memoized
    once and un-memoized for a correctness reason recorded at the function; a sound key needs the
    Fun's caller edits AND its FunPtrs' uses AND inlines into it.
+
+### lodash, the same night
+
+Still does not finish: 25 minutes and killed, inside the optimizer fixpoint, with the landed fixes;
+the run with `AOT_NO_CONSTANT_REQUEUE` set was likewise still in the fixpoint when the night ended.
+Two things it showed that the synthetic programs do not:
+
+- **Phase 1 alone is 104–106 s**, before any optimizer round, and a sample puts ~97% of it in the
+  image-facts surface scan: `scan--has?` under `scan--copy-into!` (`aot.node.imagefacts.scan`). A
+  value that may be any of the program's functions has an entry set as large as the program, every
+  node it flows through holds its own copy as a list, and a copy is the product of two set sizes.
+  The obvious patch — a (nid, entry) pair set for membership — was built and measured and is
+  WORSE (phase 1 not finished at 170 s): the pairs number in the hundreds of millions, so a hash
+  probe per pair loses to a sequential scan of a list. The fix is representational — shared or
+  bit sets, or one "any function" summary element — and is a design, not a patch. It belongs with
+  M6 (summaries): this scan is exactly the global analysis this document wants to keep cheap.
+- The first optimizer fixpoint on lodash is 7 rounds and 8 s. The time is in the ones after it.
+
