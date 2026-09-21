@@ -424,6 +424,11 @@ the way. A cached owner now lasts until its Fun dies. Owner-walk steps in inline
    doing what they say; it is the hub (N callers) and the depth (N inlined calls in one function)
    that are ours. The storm in item 2 is what re-visits those Parms: with the switch set, dep asks
    fall 84.6M → 27.9M.
+   Sampled on lodash, the pair-set probe inside `n-add-dep!` is ~30% of the optimizer, with the
+   type meets of `Parm` compute (function-set interning) next. Tried and REJECTED on measurement:
+   answering "already registered?" by scanning the watched node's own list when it is short (exact —
+   objects byte-identical) made the peephole half 35% SLOWER, because each comparison in the scan
+   is a dynamic dispatch and the probe is one hash. The cost is the number of asks, not the ask.
 4. **`fun-self-recursive?`** is O(callers) per ask even with every owner cached. It was memoized
    once and un-memoized for a correctness reason recorded at the function; a sound key needs the
    Fun's caller edits AND its FunPtrs' uses AND inlines into it.
