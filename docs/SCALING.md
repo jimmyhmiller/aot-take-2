@@ -320,3 +320,86 @@ two pipelines are kept only for as long as the comparison needs them.
 - **The analysis could become the next bottleneck.** It is 4% of the optimizer today; at 100× the
   program it may not be. If so, the answer is native-image's: run it over summaries, not over the
   optimizer's graph. Not needed until a measurement says so.
+
+---
+
+## 7. Progress log
+
+What has landed against the plan, with the counts that justified it. Every row was found by a
+COUNTER, not a guess — three guesses made on the way (bounding the size walk, the clone's
+arena-sized bitmaps, skipping constants) were each refuted or reshaped by the count that followed.
+
+### 2026-09-20 — M0, and three of M1's quadratics
+
+The stress program is the worst shape found so far: N two-argument functions and
+`t = t + f_i(t, i)` for each — every call inlines, with its JSL operators, into ONE function whose
+dominator chain grows with N. `aot compile-script`, whole compile, wall clock on one machine
+(a description of the trend, not a gate — the gate is the counts):
+
+| N   | main `265c1ea` | + hub hints | + owner cache, caller-only size | + `AOT_NO_CONSTANT_REQUEUE` |
+|-----|---------------:|------------:|--------------------------------:|----------------------------:|
+| 250 |  not measured  |      5.3 s  |                           4.6 s |                       5.9 s |
+| 500 |        68.9 s  |     58.3 s  |                          46–49 s |                        31 s |
+
+Same rounds (4,087), same visits (14,065,762), same arena and **byte-identical objects** between
+the last two columns at both sizes.
+
+**M0.** `tests/scaling-test.coil` compiles two shapes at N and 2N and ratchets the RATIO of
+deterministic counts: peephole visits, worklist pushes, inline asks, rounds, use-scan steps, dep
+asks, depths computed. `AOT_TIME=1` prints the same counts per fixpoint, split by which half of a
+round paid. Still owed from M0: the quality baseline table (benchmarks/v8 warmed, static counts).
+
+**`n-del-use!` on a hub (M1).** Scanning from the end was NOT enough: the misses were duplicate
+edges (a Parm whose N callers all pass the same `undefined` uses it N times) and the KEEP edge
+(held across surgery on a hub while uses pile up behind it). Each (def, use) pair of a def with 32+
+outputs now keeps a validated stack of positions; the keep edge has one too. Use-scan steps at
+N=120: 4,233,274 → 411,089, and it now tracks visits (1.2 steps a visit) rather than hub size.
+
+**Body-size invalidation (M1).** Done as planned — the inline invalidates its CALLER only — plus
+one thing the plan did not say: the epoch is bumped for everyone before the defer list is retried,
+so "stale upward delays an inline" can never become "loses one". Measured gain was small (inline
+20.2 → 16.7 s at N=500): the walk was not where the inline half's time went.
+
+**Where it went: owners (new).** `fun-self-recursive?` asks the owner of EVERY caller of the
+callee, a shared runtime function has a caller per call site, and the owner cache died at any
+control edit — so every round re-walked the caller's whole dominator chain, recomputing depths on
+the way. A cached owner now lasts until its Fun dies. Owner-walk steps in inline 47,937,553 →
+144,261; depths computed in inline 29.7M → 1.5M; inline 16.1 → 5.4 s.
+
+### What the counters say is left (N=500, after the above)
+
+| cost                          | count        | where                          |
+|-------------------------------|-------------:|--------------------------------|
+| peephole visits               |   14,065,762 | 3,440 a round; 96% change nothing |
+| dep registrations asked       |   84,646,827 | peeps; 6 per visit             |
+| dominator depths computed     |   55,819,393 | peeps; 13,600 a round          |
+| self-recursion owner lookups  | ~40,000,000  | inline; asks × callers, cached |
+
+1. **Depths.** Every inline invalidates every cached depth (Simple's rule: "blows all cached
+   idepth fields past the inline point"), so each round re-depths the whole function being inlined
+   into. Scoping the version to the Fun helps programs whose inlines are spread over many
+   functions and does nothing for one big function; that case needs depths that survive an
+   insertion (an order-maintenance labelling), or the per-function architecture of §2, where the
+   function being optimized is small by construction.
+2. **The constant storm, re-measured.** A node that folds to the shared `undefined` re-queues all
+   ~1,500 of that constant's users, 2,255 times at N=120 (`x._outputs` in Simple's `iteratePeeps`).
+   With that one push skipped for constants: N=500 runs 4,087 → 2,969 rounds, 14.1M → 4.0M visits,
+   46 → 31 s, and the object is 12% SMALLER; N=250 is 2.7% larger. `iter-check-fixpoint` after
+   every round finds no violation the baseline does not also have — so no peephole was standing
+   behind the storm. What it stands in for is re-ASKING every call site each round, i.e. inline
+   order, and inlining is not confluent. That is a policy question, not a missing dependency, so
+   it is NOT the default: it landed as the measurement switch `AOT_NO_CONSTANT_REQUEUE`
+   (`aot.codegen.iterpeeps`), pending a decision on whether ask order should be an accident of
+   the worklist.
+3. **Dep asks.** Six per visit, nearly all refused as duplicates after a hash probe and two input
+   scans. Constant factor, but 85M of them.
+   Counted per visited kind: nearly all of them come from `Parm` visits — a Parm's `compute` is a
+   meet over every caller and registers a dependency on each, so one visit of a 500-caller Parm is
+   500 asks — and ALL of the depths in item 1 come from `If` visits, whose dominating-test hunt
+   walks the dominator chain to its predicate's definition or to the root. Both are Simple's rules
+   doing what they say; it is the hub (N callers) and the depth (N inlined calls in one function)
+   that are ours. The storm in item 2 is what re-visits those Parms: with the switch set, dep asks
+   fall 84.6M → 27.9M.
+4. **`fun-self-recursive?`** is O(callers) per ask even with every owner cached. It was memoized
+   once and un-memoized for a correctness reason recorded at the function; a sound key needs the
+   Fun's caller edits AND its FunPtrs' uses AND inlines into it.
