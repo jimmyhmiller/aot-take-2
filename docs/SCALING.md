@@ -588,3 +588,34 @@ blocks. Fib is dominated by those generic arithmetic and comparison calls and sl
 binary trees spends most of its time allocating and collecting, so its generated-code time remains
 inside the M0 range despite the static loss. M5 exists specifically to select precise contracts
 before local optimization and must recover at least the baseline specialization counts and runtime.
+
+### 2026-09-22 — M5/M6 contract and recursive-summary boundary
+
+Primary selection now runs once over the globally analysed call sites before any local body is
+optimized. It creates bounded contract entries, routes only sites whose argument and memory types
+prove containment, closes admission, and permits a later local site to retarget only to an exact
+entry already admitted. The latter recovers the integer Fibonacci entry's recursive calls without
+reopening global admission. The scaling test remains green (wide visits x1.99, hub visits x1.44 in
+the current N=60 → 120 run).
+
+The plan must read a primary entry's interface from the version registry. A primary body is copied
+AFTER global SCCP, so its copied Parm node initially retains the source body's merged type. Rebuilding
+the plan from that node silently replaced an admitted `int` contract with
+`dyn{bool,int,double,string}`. The registry is now authoritative for every live contract slot, and a
+regression checks that the plan preserves it. Each recursive component starts its own optimistic
+solve from TOP under those contracts. If exact closed-admission routing changes a recursive edge,
+the component repeats that solve, matching the whole-program optimizer's existing rule.
+
+This establishes the precise remaining M6 gap. In the narrow Fibonacci entry the parameter is now
+`dyn{int}`, and both recursive calls route back to that entry, but its return remains
+`dyn{bool,int,double,string,exception}`. The surviving `JsAddOperator` call consumes the two recursive
+results; its context-insensitive shared return is broad, which keeps those results broad and prevents
+the integer specialization that would in turn prove the return integer. Another worklist visit or
+another identical SCCP solve cannot break that semantic cycle. M6 therefore needs a return summary
+indexed by the callee contract (or an equivalent context-sensitive transfer), not a handwritten
+Fibonacci rule and not mutation justified by an unproved optimistic guess.
+
+Current generated-program timing after in-process warm-up is 9.8–10.2 ms per `fib(30)` iteration;
+this is NOT compiler wall time. It improves the first M5 prototype's 27–31 ms but remains slower
+than the M0 generated-runtime baseline of 7.39–7.47 ms. Binary trees remains about 475 ms, inside
+its M0 range. M5 is not complete until the static counts and generated runtime meet its gate.

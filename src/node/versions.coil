@@ -160,6 +160,26 @@
                   0)))
     (load count)))
 
+(defn versions-change-count [] (-> i64)
+  (.changes (function-versions)))
+
+;; Primary entries are created after global SCCP, so their copied Parm node types still describe
+;; the merged source body until the entry's local optimistic solve runs. The admitted contract is
+;; the authoritative interface during that gap. Slot zero is memory; argument slots follow.
+(defn versions-entry-contract-at [(entry i64) (slot i64)] (-> (Option i64))
+  (let [(mut found) (None [i64])]
+    (al-for [item (.items (function-versions))]
+            (let [v item]
+              (if (and (.accepted v) (= (.entry v) entry))
+                  (if (= slot 0)
+                      (set! (mut found) (Some (.memory v)))
+                      (if (and (> slot 0) (<= slot (len (.contract v))))
+                          (set! (mut found)
+                                (Some (get (.contract v) (- slot 1))))
+                          0))
+                  0)))
+    (load found)))
+
 ;; Compile-time construction and retained code growth are different resources. Budget the latter
 ;; against the live program before the first trial, rather than granting every small program the
 ;; full construction allowance. A zero percentage disables admission; otherwise tiny entries have
@@ -499,6 +519,290 @@
     (code-add! fresh)
     (code-add-outputs! fresh)
     1))
+
+;; M5 chooses entry contracts from the global analysis before local optimization. Unlike the
+;; legacy late trial, a primary entry is an interface the local pipeline has committed to build,
+;; not a speculative copy whose already-optimized size must justify itself. Construction and
+;; per-function count limits still bound the number of bodies, and every routed site still proves
+;; argument and memory containment through the ordinary version predicates above.
+(defn versions-create-primary! [(c (dyn NodeOps))
+                                (source (dyn NodeOps))
+                                (contract (ArrayList i64))] (-> i64)
+  (do
+    (if (!= (primitive/cast i64 (os/getenv c"AOT_VERSION_TRACE")) 0)
+        (let [(mut i) 0]
+          (print "version: primary {s} contract" (fun-name source))
+          (loop (if (>= (load i) (len contract))
+                    (break 0)
+                    (do
+                      (print " {s}" (ty-text (get contract (load i))))
+                      (set! (mut i) (+ (load i) 1))
+                      (continue))))
+          (println " memory {s}" (ty-text (versions-input-bound source CALL-MEM)))
+          0)
+        0)
+    (versions-create! c source contract)
+    (let [s (function-versions)
+          index (- (len (.items s)) 1)
+          v (get (.items s) index)]
+      (set! (mut (.items s))
+            index
+            (FunctionVersion
+              :source (.source v)
+              :name (.name v)
+              :entry (.entry v)
+              :fidx (.fidx v)
+              :contract (.contract v)
+              :memory (.memory v)
+              :accepted true))
+      (set! (.pending s) 0)
+      (match (arena-node (.entry v))
+        (Some [entry] (versions-route! c source entry (.fidx v)))
+        (None [] (panic "versions-create-primary!: copied entry disappeared"))))))
+
+(defn versions-contract-equal? [(lhs (ArrayList i64))
+                                (rhs (ArrayList i64))] (-> bool)
+  (let [(mut same) (= (len lhs) (len rhs))
+        (mut i) 0]
+    (loop (if (or (not (load same)) (>= (load i) (len lhs)))
+              (break 0)
+              (do
+                (if (!= (get lhs (load i)) (get rhs (load i)))
+                    (set! (mut same) false)
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load same)))
+
+(defn versions-route-primary-reuse! [(c (dyn NodeOps))
+                                     (source (dyn NodeOps))
+                                     (contract (ArrayList i64))
+                                     (memory i64)] (-> i64)
+  (let [(mut routed) 0]
+    (al-for [item (.items (function-versions))]
+            (let [v item]
+              (if (and (= (load routed) 0)
+                       (.accepted v)
+                       (= (.source v) (n-nid source))
+                       (= (.memory v) memory)
+                       (versions-contract-equal? (.contract v) contract)
+                       (versions-accepts? c (.contract v))
+                       (versions-memory-fits? c (.memory v)))
+                  (match (arena-node (.entry v))
+                    (Some [entry]
+                          ;; Primary entries have not run their local optimizer yet. Their result
+                          ;; is therefore not an admission predicate: callers retain the frozen
+                          ;; global CallEnd contract until M6 publishes the finished summary.
+                          (if (n-dead? entry)
+                              0
+                              (set! (mut routed)
+                                    (versions-route! c source entry (.fidx v)))))
+                    (None [] 0))
+                  0)))
+    (load routed)))
+
+;; A scoped local pass can expose evidence that global SCCP could not see, especially after a JSL
+;; arithmetic rule folds inside a recursive body. Admission remains closed: this operation creates
+;; no body and accepts no broader contract. It only retargets a surviving direct call to the exact
+;; primary entry that was already admitted from whole-program evidence.
+(defn versions-reroute-closed-round! [] (-> i64)
+  (if (not (and (.closed (function-versions)) (code-work-scope-active?)))
+      0
+      (let [limit (arena-node-count)
+            (mut nid) 1
+            (mut changed) 0]
+        (loop (if (or (> (load nid) limit) (> (load changed) 0))
+                  (break (load changed))
+                  (do
+                    (if (code-work-scope-accepts? (load nid))
+                        (match (arena-node (load nid))
+                          (Some [end]
+                                (if (and (= (n-op end) OP-CALLEND)
+                                         (not (n-dead? end))
+                                         (not (cend-folding? end))
+                                         (> (n-nins end) 0))
+                                    (let [c (cend-call end)
+                                          ft (n-ty (call-fptr c))]
+                                      (if (and (ty-funptr? ft)
+                                               (ty-funptr-single? ft))
+                                          (match (arena-function
+                                                   (ty-funptr-the-fidx ft))
+                                            (Some [current]
+                                                  (let [root-id
+                                                          (if (fun-version-entry? current)
+                                                              (fun-version-root current)
+                                                              (n-nid current))]
+                                                    (match (arena-node root-id)
+                                                      (Some [source]
+                                                            (let [(mut contract)
+                                                                    (versions-contract c source)
+                                                                  memory
+                                                                    (versions-input-bound
+                                                                      source
+                                                                      CALL-MEM)
+                                                                  (mut found) false]
+                                                              (al-for [item
+                                                                       (.items
+                                                                         (function-versions))]
+                                                                      (let [v item]
+                                                                        (if (and (not (load found))
+                                                                                 (.accepted v)
+                                                                                 (= (.source v)
+                                                                                    root-id)
+                                                                                 (= (.memory v)
+                                                                                    memory)
+                                                                                 (versions-contract-equal?
+                                                                                   (.contract v)
+                                                                                   (load contract))
+                                                                                 (!= (.entry v)
+                                                                                     (n-nid current)))
+                                                                            (match (arena-node
+                                                                                     (.entry v))
+                                                                              (Some [target]
+                                                                                    (if (or (n-dead?
+                                                                                              target)
+                                                                                            (not (call-linked?
+                                                                                                   c
+                                                                                                   current)))
+                                                                                        0
+                                                                                        (do
+                                                                                          (call-unlink!
+                                                                                            c
+                                                                                            current)
+                                                                                          (n-set-def!
+                                                                                            c
+                                                                                            (- (n-nins c)
+                                                                                               1)
+                                                                                            (Some
+                                                                                              (funptr-make
+                                                                                                target
+                                                                                                (.fidx v))))
+                                                                                          (call-link! c
+                                                                                                      target)
+                                                                                          (callend-set-never-inline!
+                                                                                            end)
+                                                                                          (if (!= (primitive/cast
+                                                                                                    i64
+                                                                                                    (os/getenv
+                                                                                                      c"AOT_VERSION_TRACE"))
+                                                                                                  0)
+                                                                                              (do
+                                                                                                (println
+                                                                                                  "version: local Call #{} {s} -> #{} ({s})"
+                                                                                                  (n-nid c)
+                                                                                                  (fun-name source)
+                                                                                                  (n-nid target)
+                                                                                                  (fun-code-name
+                                                                                                    target))
+                                                                                                0)
+                                                                                              0)
+                                                                                          (code-add! c)
+                                                                                          (code-add-outputs!
+                                                                                            c)
+                                                                                          (set! (mut found)
+                                                                                                true)
+                                                                                          (set! (mut changed)
+                                                                                                1)
+                                                                                          (set! (.changes
+                                                                                                  (function-versions))
+                                                                                                (+ (.changes
+                                                                                                     (function-versions))
+                                                                                                   1)))))
+                                                                              (None [] 0))
+                                                                            0)))
+                                                              (al-free! (mut contract))))
+                                                      (None [] 0))))
+                                            (None [] 0))
+                                          0))
+                                    0))
+                          (None [] 0))
+                        0)
+                    (set! (mut nid) (+ (load nid) 1))
+                    (continue)))))))
+
+;; Snapshot the analysed CallEnds: creating an entry appends a complete copied body to the arena,
+;; and those new internal sites are handled when their own component is optimized. One pass over
+;; the original sites is sufficient because a newly created contract is immediately reusable by
+;; every later compatible caller in the snapshot.
+(defn versions-select-primary-round! [] (-> i64)
+  (let [limit (arena-node-count)
+        (mut nid) 1
+        (mut changed) 0]
+    (versions-budget!)
+    (loop (if (> (load nid) limit)
+              (break 0)
+              (do
+                (match (arena-node (load nid))
+                  (Some [end]
+                        (if (and (= (n-op end) OP-CALLEND)
+                                 (not (n-dead? end))
+                                 (not (cend-folding? end))
+                                 (= (n-nins end) 2))
+                            (match (return-fun (n-in! end 1))
+                              (Some [source]
+                                    (let [c (cend-call end)]
+                                      (if (or (fun-version-entry? source)
+                                              (and (> (fun-version-root source) 0)
+                                                   (!= (fun-version-root source)
+                                                       (n-nid source)))
+                                              (not (call-linked? c source))
+                                              (ty-high? (n-ty c))
+                                              (!= (call-nargs c)
+                                                  (ty-sig-nargs (fun-sig source)))
+                                              (not (ty-funptr-single?
+                                                     (n-ty (call-fptr c)))))
+                                          0
+                                          (let [(mut contract) (versions-contract c source)
+                                                memory
+                                                  (versions-input-bound source CALL-MEM)
+                                                reused
+                                                  (versions-route-primary-reuse!
+                                                    c
+                                                    source
+                                                    (load contract)
+                                                    memory)]
+                                            (if (> reused 0)
+                                                (do
+                                                  (al-free! (mut contract))
+                                                  (set! (mut changed)
+                                                        (+ (load changed) reused)))
+                                                (if (or (>= (versions-count (n-nid source))
+                                                               (versions-limit source))
+                                                        (>= (fun-live-body-size source)
+                                                            VERSION-BODY-LIMIT)
+                                                        (> (+ (.nodes (function-versions))
+                                                              (+ (fun-live-body-size source) 1))
+                                                           VERSION-NODE-BUDGET)
+                                                        (not (versions-accepts?
+                                                               c
+                                                               (load contract)))
+                                                        (versions-attempted?
+                                                          (n-nid source)
+                                                          (load contract)
+                                                          memory)
+                                                        (not (versions-useful?
+                                                               (load contract)
+                                                               source)))
+                                                    (al-free! (mut contract))
+                                                    (set! (mut changed)
+                                                          (+ (load changed)
+                                                             (versions-create-primary!
+                                                               c
+                                                               source
+                                                               (load contract))))))))))
+                              (None [] 0))
+                            0))
+                  (None [] 0))
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))
+    (load changed)))
+
+;; Standalone entry point for graph tests and clients which need only one already-analysed layer.
+;; The production pipeline calls the round form to a fixed point and closes exactly once.
+(defn versions-select-primary! [] (-> i64)
+  (let [changed (versions-select-primary-round!)]
+    (versions-close-admission!)
+    changed))
 
 ;; Clean a trial before publishing its entry. Until this point no caller can fold using its
 ;; result, so an unprofitable body can be discarded without undoing any caller optimization.

@@ -9,7 +9,11 @@
 (module aot.codegen.pipeline)
 (import "aot.node.versions"
         :use
-        [versions-finish-opto! versions-prepare-codegen! versions-close-admission!])
+        [versions-finish-opto!
+         versions-prepare-codegen!
+         versions-close-admission!
+         versions-change-count
+         versions-select-primary-round!])
 (import "aot.util.arena" :use [compiler-allocator])
 (import "aot.print.text" :use *)
 (import "aot.print.dot" :use *)
@@ -213,6 +217,17 @@
     (opto-reset-to-top!)
     (opto-sccp!)
     (opto-resolve-numeric-modes!)
+    ;; M5 makes contracts an input to local optimization, not a late reward for a body which has
+    ;; already optimized well. Select every contract proved in the analysed graph as one snapshot.
+    ;; Copied bodies are consumers of those interfaces, not new global-analysis input: their local
+    ;; pass may reuse an exact admitted entry but cannot recursively manufacture more interfaces.
+    (versions-select-primary-round!)
+    (versions-close-admission!)
+    ;; Primary entries did not exist when required source/provider hooks were installed. Rebuild
+    ;; the root bitmap at the now-final arena extent; their construction hooks keep them live until
+    ;; `per-function-freeze!` records the contracts below.
+    (al-free! [bool] (mut required))
+    (set! (mut required) (pipeline-per-function-required-roots))
     ;; Generic accesses are graph construction, not a local peephole. Expand them before the owner
     ;; snapshot so every new node enters the correct component's first local solve.
     (let [before-expansion (arena-node-count)]
@@ -241,7 +256,25 @@
                       (if (> rooted 0)
                           (do
                             (per-function-link-callees! plan (load component))
-                            (set! (mut rounds) (+ (load rounds) (iter-run!)))
+                            (let [(mut version-retries) 0]
+                              (loop
+                                (let [before (versions-change-count)]
+                                  (per-function-reset-scope-to-top!)
+                                  (opto-sccp!)
+                                  (per-function-trace-component! plan
+                                                                 (load component)
+                                                                 c"after-sccp")
+                                  (set! (mut rounds)
+                                        (+ (load rounds) (iter-run!)))
+                                  (if (= before (versions-change-count))
+                                      (break 0)
+                                      (do
+                                        (set! (mut version-retries)
+                                              (+ (load version-retries) 1))
+                                        (if (> (load version-retries) 16)
+                                            (panic "pipeline: per-function version routing did not converge")
+                                            0)
+                                        (continue))))))
                             (let [(mut retries) 0]
                               (loop (if (= (iter-check-scope-fixpoint) 0)
                                         (break 0)
@@ -254,16 +287,8 @@
                                           (set! (mut rounds)
                                                 (+ (load rounds) (iter-run!)))
                                           (continue)))))
-                            ;; Surviving calls remain calls to separately compiled entries. Remove
-                            ;; temporary analysis edges before advancing to the next component.
-                            ;; Calls cloned by local inlining did not exist at the global freeze;
-                            ;; capture their locally proven result first.
                             (per-function-freeze-scoped-results!)
                             (call-unlink-all!)
-                            ;; Unlinking is the component boundary, not a new optimization graph.
-                            ;; CallEnd and Return summaries were frozen immediately above; solving
-                            ;; again against the severed discovery edges would incorrectly turn a
-                            ;; separately compiled entry's detached Return into dead control.
                             (per-function-unroot-component! plan
                                                             (load component)
                                                             entry-start)
@@ -305,6 +330,19 @@
                   (set! (mut fi) (+ (load fi) 1))
                   (continue)))))
     (jsl-mark-required-provider-entries! (mut required))
+    (let [(mut id) 1]
+      (loop (if (>= (load id) (len (load required)))
+                (break 0)
+                (do
+                  (match (arena-node (load id))
+                    (Some [node]
+                          (if (and (= (n-op node) OP-FUN)
+                                   (fun-version-entry? node))
+                              (set! (mut required) (load id) true)
+                              0))
+                    (None [] 0))
+                  (set! (mut id) (+ (load id) 1))
+                  (continue)))))
     (load required)))
 
 (defn pipeline-per-function-required-returns! [(stop (dyn NodeOps))
