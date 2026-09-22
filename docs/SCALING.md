@@ -619,3 +619,44 @@ Current generated-program timing after in-process warm-up is 9.8–10.2 ms per `
 this is NOT compiler wall time. It improves the first M5 prototype's 27–31 ms but remains slower
 than the M0 generated-runtime baseline of 7.39–7.47 ms. Binary trees remains about 475 ms, inside
 its M0 range. M5 is not complete until the static counts and generated runtime meet its gate.
+
+### 2026-09-22 — disconnected-function proof of concept
+
+`AOT_DISCONNECTED_FUNCTIONS=1` measures the smallest correct boundary found by the spike. It runs
+one interprocedural SCCP pass for reachability and interface discovery, snapshots those types and
+contracts, removes the discovery edges, and drains the ordinary peephole worklist one recursive
+component at a time. It does not publish closed-world image facts and it deliberately does not run
+local inlining or source specialization yet.
+
+The exclusions are findings, not intended policy. Compiling every materialized JSL helper under a
+broad declared `dyn` contract is invalid: helpers such as `JsDateParseValue` contain representation
+unboxes that are legal only in a selected specialization. Re-solving a component independently
+also needs exception-aware return summaries indexed by entry contract; without them,
+`baseIndexOfWith` loses the proven exclusion of the exception sentinel at its loop index Phi. The
+single analysis snapshot preserves both proofs for this experiment.
+
+The separate inline worklist is not component-scoped. Calling `iter-run!` once per component on
+Lodash repeatedly scanned a compilation-wide queue of 77,656 candidates and made phase 3 take
+6,161 seconds. Draining only the scoped ordinary worklist reduced phase 3 to 26.8–27.6 seconds.
+This names the immediate implementation task: partition or index the inline and specialization
+queues by owning component, then restore local transformations.
+
+Pinned Lodash 4.17.21 (`4c04561befdf653aef017a42ac5addf68ea943cdfca6bdee5ce04e04e8139f54`)
+reached register allocation in about 150 seconds:
+
+| phase | time |
+|---|---:|
+| realm/image surface analysis | 116.4–117.2 s |
+| pessimistic Iter | 4.8–4.9 s |
+| analysis snapshot plus component-local peepholes | 26.8–27.6 s |
+| typecheck through scheduling | 1.8 s |
+
+It then exposed a pre-existing backend limit in the enormous top-level Lodash function: register
+allocation still had an uncolourable numeric Phi after both 8 and 16 split rounds. Therefore the
+POC does not yet produce a Lodash object. Increasing the guard is not a fix and was reverted.
+
+On `fib-steady.js`, phase 3 is 73 ms and whole compilation is about 0.55 seconds. With local
+inlining intentionally disabled it produces 0 specializations, 0 inlines, 60 discharged guards,
+10,197 machine nodes and 2,255 blocks; the warmed generated loop takes 27.74 ms rather than the
+global pipeline's roughly 5.3 ms. The spike demonstrates the compile-time boundary and identifies
+the two missing interfaces, but it is not a replacement default or a code-quality result.
