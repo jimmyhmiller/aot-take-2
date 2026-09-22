@@ -1,5 +1,32 @@
 # Test262 conformance campaign
 
+## M0 scaling-quality baseline, 2026-09-21
+
+The scaling plan's fixed correctness backstop is a fresh, evenly distributed 3,000-file memory
+campaign at the pinned revision. Four persistent workers completed 5,754 variants in 234.450 s:
+
+| result | count |
+|---|---:|
+| passing files | 932 / 3,000 (31.06%) |
+| pass | 1,803 |
+| fail | 1,802 |
+| unsupported | 2,009 |
+| compiler error | 132 |
+| crash | 7 |
+| timeout | 1 |
+| harness error / not run | 0 / 0 |
+
+Revision: `419d3e0a2273ba01a3bfcbec423f2801425b8e93`. The retained evidence is
+`build/test262-m0-3000-20260921/`; its `summary.txt` records compiler/runtime fingerprints and its
+`results.tsv` names every verdict.
+
+The abnormal outcomes are part of the baseline, not hidden from it. Both variants of
+`Array/prototype/indexOf/15.4.4.14-5-12.js` deliberately terminate in the runtime allocator after
+requesting 34,359,738,360 bytes. Five class/object-method variants terminate compiler workers
+without a diagnostic. The sole timeout is the generated RegExp property-escape test
+`Diacritic.js`. Later scaling milestones compare the complete `results.tsv`, not only the passing
+file count.
+
 ## In-memory campaigns
 
 Build once, then run an exact, evenly distributed 1,000-file sample (use a new output directory):
