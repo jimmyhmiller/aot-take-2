@@ -1,5 +1,28 @@
 # Decisions
 
+## 2026-09-21 — A shared Constant gaining a user does not wake all its old users
+
+Simple's `IterPeeps.iteratePeeps` re-queues the replacement node's outputs whenever a peephole
+replaces one node with another existing node. The general rule is necessary: the existing node has
+gained a user, and an old user may have a peephole whose result depends on its siblings. It becomes
+quadratic in this compiler because GVN-shared Constants are program-wide hubs. Replacing 2,255
+nodes with the shared `undefined` at 120 call sites repeatedly woke roughly 1,500 old users; at
+1,000 sites, Constant bulk pushes contributed 253 million worklist entries.
+
+The replacement's new user is already queued through the replaced node's outputs. A Constant has
+no mutable inputs or computed state, so none of its old users can observe which other users the
+Constant has. Therefore, when the replacement is a Constant, the optimizer no longer queues the
+replacement's old outputs. All other replacements retain Simple's rule.
+
+This was first measured behind `AOT_NO_CONSTANT_REQUEUE`. With the exception enabled, doubling the
+wide scaling program grew visits by 1.99x instead of 3.31x and rounds by 1.62x instead of 3.08x.
+Running the exhaustive peephole-fixpoint check after every round found no omitted optimization, and
+all execution, budget and graph-fixpoint tests passed. The generated object may differ because
+removing the storm changes the order in which Simple's first-come, first-served inliner sees sites;
+that policy is deliberately not confluent. Fib and binary-trees performance and object sizes were
+unchanged; the N=500 stress object was 12% smaller and the N=250 object 3.3% larger. The measurement
+switch is removed: this is now the sole scheduling rule.
+
 ## 2026-09-17 — A JSL definition carries the proofs that collapse it
 
 Decision 3 of the compile-time architecture (2026-09-08) sent every JSL definition through one gate: a
