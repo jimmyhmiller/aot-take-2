@@ -41,7 +41,7 @@ program makes the compile quadratic. Three such things were measured:
 | per-round cost | measurement | state |
 |---|---|---|
 | Specialization walked the entire arena every round | 1,370 walks over 37k–93k ids at N=250; ~1,200 CallEnds re-asked per walk; every verdict UNHANDLED but at most one — 1.6 M proof checks for 259 specializations, 44% of the optimizer | **fixed** (a candidate worklist, Simple's own `_workInline` design): 7.0 → 2.5 s, 28 → 7.7 s, 69 → 30 s |
-| Every fold into a GVN-shared constant re-queues all of that constant's users | 31,638 bulk pushes totalling **253 million** worklist entries at N=1000 | **open.** Skipping it halved the visits and CHANGED THE OUTCOME (4,493 inlines for 2,697), so those re-queues stand in for dependencies nothing registers |
+| Every fold into a GVN-shared constant re-queues all of that constant's users | 31,638 bulk pushes totalling **253 million** worklist entries at N=1000 | **fixed.** A Constant's old users cannot gain a user-sensitive peephole when the Constant gains another user; the replacement's new user is queued through the replaced node. Exhaustive fixpoint checks found no missed peephole. Inlining order changes because the removed storm no longer perturbs the worklist |
 | Each inline *ask* grows with the program | 0.036 ms at N=250, 0.24 ms at N=1000 | **open.** The body-size cache is invalidated for every function after every inline |
 
 A fourth appeared only on lodash: `n-del-use!` finds the use to remove by scanning the def's output
@@ -396,9 +396,9 @@ the way. A cached owner now lasts until its Fun dies. Owner-walk steps in inline
    every round finds no violation the baseline does not also have — so no peephole was standing
    behind the storm. What it stands in for is re-ASKING every call site each round, i.e. inline
    order, and inlining is not confluent. That is a policy question, not a missing dependency, so
-   it is NOT the default: it landed as the measurement switch `AOT_NO_CONSTANT_REQUEUE`
-   (`aot.codegen.iterpeeps`), pending a decision on whether ask order should be an accident of
-   the worklist.
+   it first landed as the measurement switch `AOT_NO_CONSTANT_REQUEUE`. The 2026-09-21 decision
+   makes the Constant exception the sole rule: ask order is not allowed to remain an accident of
+   an unrelated hub's fanout.
 
    The evidence for making it the default, gathered the same night. The whole suite run with the
    switch SET: 959 of 960 pass — every execution test, the budget and bloat ceilings, and the four
@@ -449,4 +449,3 @@ Two things it showed that the synthetic programs do not:
   bit sets, or one "any function" summary element — and is a design, not a patch. It belongs with
   M6 (summaries): this scan is exactly the global analysis this document wants to keep cheap.
 - The first optimizer fixpoint on lodash is 7 rounds and 8 s. The time is in the ones after it.
-
