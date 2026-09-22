@@ -360,9 +360,28 @@ in-process warm-up) are:
 | `fib-steady.js` | 7.39–7.47 ms | 5.81–5.91 ms | 13 | 157 | 292 | 4,964 | 1,057 |
 | `binarytrees-steady.js` | 454–504 ms | 44.1–50.9 ms | 14 | 247 | 570 | 7,159 | 1,538 |
 
-The V8 and real-program rows remain to complete the M0 table. Richards currently reaches the
-backend after phase 1 in 10.2 s and Opto in 172.1 s (1,534 inlines), then reproduces the allocator
-split-budget panic in the shared harness; this is a measured baseline failure, not a timing result.
+The current compiler does not produce runnable code for any V8 suite program, so their M0 baseline
+is an exact failure outcome rather than a generated-code time. The older node-count/failure table
+in `benchmarks/README.md` covers all eight programs. Fresh 2026-09-21 measurements establish the
+current boundaries rather than carrying those outcomes forward as assumptions:
+
+| workload | measured current outcome |
+|---|---|
+| Richards | phase 1 10.203 s; Opto 172.095 s and 1,534 inlines; allocator split-budget panic on harness Phi #140474 |
+| EarleyBoyer | frontend refusal: mapped arguments object whose observable formal aliasing includes a write |
+| RegExp | phase 1 19.761 s; phase 2 1.579 s and 63 specializations; still in Opto after 10 min (8:44 CPU, 2.10 GB resident), stopped at the M0 cutoff |
+| DeltaBlue, Crypto, RayTrace, Splay | prior checked-in baseline: allocator split-budget panic in their common harness; no generated-code timing |
+| NavierStokes | prior checked-in baseline: allocator split-budget panic; no generated-code timing |
+
+The real-program rows pin both the input and the cutoff. A successful compile reports every phase;
+a refusal is a zero-ambiguity frontend outcome, and a cutoff records the last completed phase plus
+CPU and resident memory:
+
+| input | identity | measured current outcome |
+|---|---|---|
+| lodash | 4.17.21; SHA-256 `4c04561befdf653aef017a42ac5addf68ea943cdfca6bdee5ce04e04e8139f54` | phase 1 97.284 s; phase 2 4.426 s (7 rounds, 7 specializations, 0 inlines, 698,130 visits); still in Opto after 10:23 (10:22 CPU, 3.66 GB resident), stopped |
+| acorn | 8.14.0; SHA-256 `bec194b9abb10147d3bb77e544d95cf1c7b4f9f42dad00dfc83791909ebf49c7` | frontend refusal: strict and non-simple arguments objects require the `%ThrowTypeError%` callee accessor |
+| Test262 harness | pinned `assert.js` + `sta.js` from revision below | phase 1 4.014 s; phase 2 0.113 s; phase 3 73.370 s; remaining phases 2.636 s; 0 specializations, 1,077 inlines, 1,081 guards discharged, 60,178 machine nodes, 12,830 blocks, 5 allocation rounds |
 
 The pinned 3,000-file Test262 backstop is recorded in `docs/TEST262.md`: 932 passing files from
 5,754 variants in 234.450 s, with exact verdict counts and all eight abnormal terminations named.
