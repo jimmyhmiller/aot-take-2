@@ -535,3 +535,56 @@ Two things it showed that the synthetic programs do not:
   bit sets, or one "any function" summary element — and is a design, not a patch. It belongs with
   M6 (summaries): this scan is exactly the global analysis this document wants to keep cheap.
 - The first optimizer fixpoint on lodash is 7 rounds and 8 s. The time is in the ones after it.
+
+### 2026-09-22 — M4 flagged per-function prototype
+
+`AOT_PER_FUNCTION=1` now follows the M4 boundary: one global SCCP records each live entry's erased
+Parm contract and the retained caller graph, Tarjan orders recursive components bottom-up, all
+discovery edges are removed, and each component alone receives a worklist and temporary entry
+roots. Calls to finished components are restored only while the caller is optimized. Calls inside
+an SCC are also restored for its local fixpoint, but are marked never-inline so mutual recursion
+cannot unroll the component. Frozen CallEnd and Return summaries survive the next unlink. The final
+whole-unit backend is deliberately still shared by the prototype; M7 replaces that handoff with
+parallel per-function backend work and cached artifacts.
+
+Published source identities root their stable shared-ABI adapters during global SCCP; private local
+bodies remain reachable through concrete adapter calls. Treating those bodies as externally
+callable widened the hidden arguments-vector contract to `dyn` and was caught by two Test262
+`JsRestFrom` representation proofs. Planned Fun nodes have an explicit compilation-unit lifetime
+pin because Return ownership is metadata, not a graph edge. This matters after local optimization
+eliminates the last Parm or FunPtr use.
+
+The deterministic scaling gate passes under the flag:
+
+| N=60 → 120 | wide | hub |
+|---|---:|---:|
+| visits | x1.67 | x1.39 |
+| worklist pushes | x2.19 | x1.97 |
+| inline asks | x1.74 | x1.41 |
+| rounds | x1.72 | x1.00 |
+| use-scan steps | x2.09 | x1.67 |
+| dependency asks | x2.90 | x2.98 |
+| dominator depths | x1.81 | x1.53 |
+
+The pinned 3,000-file Test262 campaign preserved all **1,803 passing variants and 932 passing
+files**. Compiler errors (132), crashes (7) and unsupported variants (2,009) are identical to M0.
+The sole verdict-table difference is
+`built-ins/RegExp/property-escapes/generated/Diacritic.js` mode 1: M0 timed out, while the flagged
+run completed as the same ordinary failure class as mode 2. There were no flagged timeouts.
+
+M4 quality table (Apple M2 Max, 2026-09-22, three process runs after the workload's unchanged
+in-process warm-up):
+
+| workload | M0 time | M4 time | specializations | inlines | guards discharged | machine nodes | blocks |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `fib-steady.js` | 7.39–7.47 ms | 30.61–30.75 ms | 0 | 30 | 6 | 7,539 | 1,665 |
+| `binarytrees-steady.js` | 454–504 ms | 489.15–492.55 ms | 2 | 30 | 8 | 8,323 | 1,809 |
+
+Every regression has the same named source: **JSL operator contracts are not yet primary**. Early
+unlinking removes the global caller feedback that admitted 13/14 JSL specializations and then let
+their small integer/property bodies inline (157/247 total in M0). The generic shared entries remain
+calls, so their guards remain instead of being discharged and the backend receives more nodes and
+blocks. Fib is dominated by those generic arithmetic and comparison calls and slows accordingly;
+binary trees spends most of its time allocating and collecting, so its generated-code time remains
+inside the M0 range despite the static loss. M5 exists specifically to select precise contracts
+before local optimization and must recover at least the baseline specialization counts and runtime.

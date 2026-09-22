@@ -335,7 +335,7 @@
 ;; Input 0 is the Call. Inputs 1.. are the linked Returns — one per function this call site may
 ;; reach. Exactly one means a resolved direct call.
 (defstruct CallEndNode
-  [(hdr NodeHdr) (folding bool) (never-inline bool) (decision i64)])
+  [(hdr NodeHdr) (folding bool) (never-inline bool) (frozen-ty i64) (decision i64)])
 
 (defn cend-call [(e (dyn NodeOps))] (-> (dyn NodeOps))
   (n-in! e 0))
@@ -355,6 +355,18 @@
 (defn cend-decision [(e (dyn NodeOps))] (-> i64)
   (.decision (primitive/cast (ptr CallEndNode) (hdr e))))
 
+;; M4's early unlink retains the closed SCCP result as a call-site contract. A temporarily restored
+;; outbound edge computes normally; an unlinked recursive or surviving call cannot reconstruct its
+;; callee result until M6 introduces entry summaries, so it returns the proven frozen tuple.
+(defn callend-freeze-result! [(e (dyn NodeOps))] (-> i64)
+  (do
+    (if (!= (n-op e) OP-CALLEND)
+        (panic "callend-freeze-result!: node is not a CallEnd")
+        0)
+    (set! (.frozen-ty (primitive/cast (ptr CallEndNode) (hdr e)))
+          (ty-erase-widen (n-ty e)))
+    0))
+
 ;; The result type: a tuple of (control, memory, value), matching Return projection positions.
 ;;
 ;; A call's result is a back edge too, when the call recurses: `return 1 + down(n - 1)` feeds each
@@ -364,7 +376,30 @@
 ;; bounded by the same pessimistic answer. Simple has the same cycle but no range that grows along it:
 ;; its integer arithmetic carries a widen stage, never a narrower range, into a call result.
 (defn cend-compute [(e (dyn NodeOps))] (-> i64)
-  (cend--widen-value e (cend--compute-state e)))
+  (let [frozen (.frozen-ty (primitive/cast (ptr CallEndNode) (hdr e)))]
+    (if (and (!= frozen TY-INVALID) (= (n-nins e) 1))
+      ;; The result contract freezes value precision, not reachability. If local cleanup proves
+      ;; the Call control dead, the CallEnd and its projections must become dead as well or an
+      ;; impossible arm survives into selection with a live frozen tuple.
+      (match (n-in-safe e 0)
+        (Some [call]
+              (if (= (n-ty call) TY-XCTRL)
+                  (ty-tuple-of3 TY-XCTRL (ty-mem-top 1) TY-TOP)
+                  (if (and (ty-tuple? frozen)
+                           (= (ty-tuple-at frozen RETURN-CTRL) TY-XCTRL))
+                      (n-ty e)
+                      frozen)))
+        (None [] (n-ty e)))
+      (let [computed (cend--widen-value e (cend--compute-state e))]
+        ;; The global SCCP tuple is a proven call-site summary. Local callee analysis may be less
+        ;; precise under its one merged contract, but graph rewrites do not invalidate that proof;
+        ;; constrain the linked result by the frozen summary just as Parm constrains by its entry
+        ;; contract. A globally dead summary cannot constrain a call a local root made live.
+        (if (and (!= frozen TY-INVALID)
+                 (and (ty-tuple? frozen)
+                      (!= (ty-tuple-at frozen RETURN-CTRL) TY-XCTRL)))
+            (ty-join computed frozen)
+            computed)))))
 
 (defn cend--widen-value [(e (dyn NodeOps)) (state i64)] (-> i64)
   (if (not (and (ty-tuple? state) (> (ty-tuple-len state) RETURN-VALUE)))
@@ -574,6 +609,7 @@
         d (primitive/make-dyn NodeOps p)]
     (set! (.folding p) false)
     (set! (.never-inline p) false)
+    (set! (.frozen-ty p) TY-INVALID)
     (set! (.decision p) INLINE-DEFER)
     (n-init! d OP-CALLEND)
     (n-add-def! d (Some c))
@@ -713,7 +749,7 @@
         (mut nid) 1
         (mut removed) 0]
     (loop (if (> (load nid) limit)
-              (break (load removed))
+              (break 0)
               (do
                 (match (arena-node (load nid))
                   (Some [fun]
@@ -742,7 +778,29 @@
                             0))
                   (None [] 0))
                 (set! (mut nid) (+ (load nid) 1))
-                (continue))))))
+                (continue))))
+    ;; Fun caller inputs are authoritative while both halves exist. A copied or folded Call can
+    ;; disappear before its CallEnd, however, leaving only Return->CallEnd discovery edges. No such
+    ;; edge is executable CFG and frozen CallEnd summaries preserve its result, so sweep every
+    ;; residual half before serialization or selection.
+    (set! (mut nid) 1)
+    (loop (if (> (load nid) limit)
+              (break 0)
+              (do
+                (match (arena-node (load nid))
+                  (Some [end]
+                        (if (and (= (n-op end) OP-CALLEND) (not (n-dead? end)))
+                            (loop (if (<= (n-nins end) 1)
+                                      (break 0)
+                                      (do
+                                        (n-del-def! end (- (n-nins end) 1))
+                                        (set! (mut removed) (+ (load removed) 1))
+                                        (continue))))
+                            0))
+                  (None [] 0))
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))
+    (load removed)))
 
 ;; Has this concrete call-graph edge already been installed?  Fun inputs are the authoritative
 ;; call graph; checking them prevents SCCP revisits from duplicating Region/Parm paths.

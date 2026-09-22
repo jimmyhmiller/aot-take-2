@@ -308,6 +308,7 @@ aot-take-2/
 │   ├── codegen/
 │   │   ├── codegen.coil     ; the CODE singleton, Phase, driver()          CodeGen
 │   │   ├── pipeline.coil    ; source-to-object/link/run phase orchestration
+│   │   ├── perfunction.coil ; frozen contracts + retained call graph for local optimization
 │   │   ├── iterpeeps.coil   ; peepholes to fixpoint                        IterPeeps
 │   │   ├── opto.coil        ; optimistic interprocedural SCCP + call graph Opto
 │   │   ├── typecheck.coil   ; the last check for bad programs
