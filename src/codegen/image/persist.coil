@@ -1,0 +1,428 @@
+;; Arena-independent native image artifacts.
+;;
+;; A CodeImage owns all of its bytes, names, relocations and Script metadata and contains no
+;; compiler-generation pointer. This codec makes that boundary durable. Its explicit versioned
+;; format is validated in full before a reader allocates fields, so a truncated or stale cache
+;; entry is a miss rather than a half-built image. Installation retains the stronger target and
+;; relocation checks.
+(module aot.codegen.image.persist)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use [subslice slice-data])
+(import "aot.codegen.objfile" :use [obj-put1! obj-put4! obj-put8! obj-put-slice!])
+(import "aot.codegen.encoding" :use [EncMapSite EncUnitSite])
+(import "aot.codegen.compunit" :use [CuScriptDecl CuScriptDeclarations])
+(import "aot.rt.rt" :use [rt-read-u32 rt-read-u64])
+(import "aot.util.panic" :use [panic])
+(import "aot.codegen.image"
+        :use
+        [CodeImage ImageSymbol ImageFixup ImageScript ImageRealmObject image-copy])
+
+(const IMAGE-ARTIFACT-VERSION 1)
+
+(const IMAGE-ARTIFACT-HEADER-BYTES 24)
+
+(defstruct ImageArtifactCursor [(bytes (slice u8)) (at i64) (ok bool)])
+
+(defn image-artifact-put-bytes! [(out (mut (ArrayList u8)))
+                                 (bytes (slice u8))] (-> i64)
+  (obj-put8! (mut out) (len bytes))
+  (obj-put-slice! (mut out) bytes))
+
+(defn image-artifact-put-fixups! [(out (mut (ArrayList u8)))
+                                  (records (ArrayList ImageFixup))] (-> i64)
+  (obj-put8! (mut out) (len records))
+  (al-for [record records]
+          (let [r record]
+            (obj-put8! (mut out) (.kind r))
+            (obj-put8! (mut out) (.offset r))
+            (obj-put8! (mut out) (.symbol r))))
+  0)
+
+(defn image-artifact-encode [(im (ptr CodeImage))] (-> (slice u8))
+  (if (!= (.installations im) 0)
+      (panic "image-artifact-encode: image is installed")
+      0)
+  (let [(mut out) (al-new [u8] (alloc/malloc-allocator))]
+    (obj-put-slice! (mut out) "AOTIMAGE")
+    (obj-put4! (mut out) IMAGE-ARTIFACT-VERSION)
+    (obj-put4! (mut out) 0)
+    (obj-put8! (mut out) (.entry im))
+    (image-artifact-put-bytes! (mut out) (.text im))
+    (image-artifact-put-bytes! (mut out) (.data im))
+    (image-artifact-put-bytes! (mut out) (.maps im))
+    (image-artifact-put-bytes! (mut out) (.shapes im))
+    (obj-put8! (mut out) (len (.symbols im)))
+    (al-for [symbol (.symbols im)]
+            (let [s symbol]
+              (obj-put8! (mut out) (.segment s))
+              (obj-put8! (mut out) (.offset s))
+              (image-artifact-put-bytes! (mut out) (.name s))
+              (image-artifact-put-bytes! (mut out) (.abi s))))
+    (image-artifact-put-fixups! (mut out) (.fixups im))
+    (image-artifact-put-fixups! (mut out) (.code-fixups im))
+    (obj-put8! (mut out) (len (.map-sites im)))
+    (al-for [site (.map-sites im)]
+            (let [s site]
+              (obj-put8! (mut out) (.offset s))
+              (obj-put8! (mut out) (.local-id s))
+              (obj-put8! (mut out) (.reg s))))
+    (obj-put8! (mut out) (len (.unit-sites im)))
+    (al-for [site (.unit-sites im)]
+            (let [s site]
+              (obj-put8! (mut out) (.offset s))
+              (obj-put8! (mut out) (.kind s))
+              (obj-put8! (mut out) (.local-id s))
+              (obj-put8! (mut out) (.reg s))))
+    (obj-put8! (mut out) (len (.scripts im)))
+    (al-for [script (.scripts im)]
+            (let [s script]
+              (obj-put1! (mut out) (if (.strict (.declarations s)) 1 0))
+              (obj-put8! (mut out) (len (.entries (.declarations s))))
+              (let [(mut d) 0]
+                (loop (if (>= (load d) (len (.entries (.declarations s))))
+                          (break 0)
+                          (let [decl (get (.entries (.declarations s)) (load d))]
+                            (image-artifact-put-bytes! (mut out) (.name decl))
+                            (obj-put8! (mut out) (.kind decl))
+                            (obj-put8! (mut out) (.function-ordinal decl))
+                            (set! (mut d) (+ (load d) 1))
+                            (continue)))))
+              (obj-put8! (mut out) (len (.functions s)))
+              (let [(mut f) 0]
+                (loop (if (>= (load f) (len (.functions s)))
+                          (break 0)
+                          (do
+                            (obj-put8! (mut out) (get (.functions s) (load f)))
+                            (set! (mut f) (+ (load f) 1))
+                            (continue)))))
+              (obj-put8! (mut out) (.initializer s))))
+    (obj-put8! (mut out) (len (.realm-objects im)))
+    (al-for [object (.realm-objects im)]
+            (let [o object]
+              (obj-put8! (mut out) (.kind o))
+              (image-artifact-put-bytes! (mut out) (.name o))
+              (obj-put8! (mut out) (.offset o))
+              (obj-put1! (mut out) (if (.callable o) 1 0))))
+    (al-into-slice (mut out))))
+
+(defn image-artifact-remaining [(c (ptr ImageArtifactCursor))] (-> i64)
+  (- (len (.bytes c)) (.at c)))
+
+(defn image-artifact-can-read? [(c (ptr ImageArtifactCursor)) (bytes i64)] (-> bool)
+  (and (.ok c) (>= bytes 0) (<= bytes (image-artifact-remaining c))))
+
+(defn image-artifact-read1! [(c (ptr ImageArtifactCursor))] (-> i64)
+  (if (not (image-artifact-can-read? c 1))
+      (do (set! (.ok c) false) 0)
+      (let [v (primitive/cast i64 (get (.bytes c) (.at c)))]
+        (set! (.at c) (+ (.at c) 1))
+        v)))
+
+(defn image-artifact-read4! [(c (ptr ImageArtifactCursor))] (-> i64)
+  (if (not (image-artifact-can-read? c 4))
+      (do (set! (.ok c) false) 0)
+      (let [v (rt-read-u32 (slice-data (.bytes c)) (.at c))]
+        (set! (.at c) (+ (.at c) 4))
+        v)))
+
+(defn image-artifact-read8! [(c (ptr ImageArtifactCursor))] (-> i64)
+  (if (not (image-artifact-can-read? c 8))
+      (do (set! (.ok c) false) 0)
+      (let [v (rt-read-u64 (slice-data (.bytes c)) (.at c))]
+        (set! (.at c) (+ (.at c) 8))
+        v)))
+
+(defn image-artifact-read-bytes! [(c (ptr ImageArtifactCursor))] (-> (slice u8))
+  (let [n (image-artifact-read8! c)]
+    (if (not (image-artifact-can-read? c n))
+        (do (set! (.ok c) false) "")
+        (let [bytes (subslice (.bytes c) (.at c) (+ (.at c) n))]
+          (set! (.at c) (+ (.at c) n))
+          bytes))))
+
+(defn image-artifact-read-count! [(c (ptr ImageArtifactCursor))
+                                  (minimum-record-bytes i64)] (-> i64)
+  (let [n (image-artifact-read8! c)]
+    (if (or (< n 0)
+            (and (> n 0)
+                 (> n (/ (image-artifact-remaining c) minimum-record-bytes))))
+        (do (set! (.ok c) false) 0)
+        n)))
+
+(defn image-artifact-copy [(bytes (slice u8))] (-> (slice u8))
+  (image-copy bytes))
+
+(defn image-artifact-scan-words! [(c (ptr ImageArtifactCursor))
+                                  (words i64)
+                                  (minimum-record-bytes i64)] (-> i64)
+  (let [n (image-artifact-read-count! c minimum-record-bytes)
+        (mut i) 0
+        (mut word) 0]
+    (loop (if (>= (load i) n)
+              (break 0)
+              (do
+                (set! (mut word) 0)
+                (loop (if (>= (load word) words)
+                          (break 0)
+                          (do
+                            (image-artifact-read8! c)
+                            (set! (mut word) (+ (load word) 1))
+                            (continue))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn image-artifact-scan-symbols! [(c (ptr ImageArtifactCursor))] (-> i64)
+  (let [n (image-artifact-read-count! c 32)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break 0)
+              (do
+                (image-artifact-read8! c)
+                (image-artifact-read8! c)
+                (image-artifact-read-bytes! c)
+                (image-artifact-read-bytes! c)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn image-artifact-scan-scripts! [(c (ptr ImageArtifactCursor))] (-> i64)
+  (let [n (image-artifact-read-count! c 25)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break 0)
+              (do
+                (let [strict (image-artifact-read1! c)]
+                  (if (> strict 1) (set! (.ok c) false) 0))
+                (let [decls (image-artifact-read-count! c 24)
+                      (mut d) 0]
+                  (loop (if (>= (load d) decls)
+                            (break 0)
+                            (do
+                              (image-artifact-read-bytes! c)
+                              (image-artifact-read8! c)
+                              (image-artifact-read8! c)
+                              (set! (mut d) (+ (load d) 1))
+                              (continue)))))
+                (let [funs (image-artifact-read-count! c 8)
+                      (mut f) 0]
+                  (loop (if (>= (load f) funs)
+                            (break 0)
+                            (do
+                              (image-artifact-read8! c)
+                              (set! (mut f) (+ (load f) 1))
+                              (continue)))))
+                (image-artifact-read8! c)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn image-artifact-scan-realm-objects! [(c (ptr ImageArtifactCursor))] (-> i64)
+  (let [n (image-artifact-read-count! c 25)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break 0)
+              (do
+                (image-artifact-read8! c)
+                (image-artifact-read-bytes! c)
+                (image-artifact-read8! c)
+                (let [callable (image-artifact-read1! c)]
+                  (if (> callable 1) (set! (.ok c) false) 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn image-artifact-valid? [(bytes (slice u8))] (-> bool)
+  (if (or (< (len bytes) IMAGE-ARTIFACT-HEADER-BYTES)
+          (!= (subslice bytes 0 8) "AOTIMAGE"))
+      false
+      (let [c (primitive/alloc-stack ImageArtifactCursor)]
+        (set! c (ImageArtifactCursor :bytes bytes :at 8 :ok true))
+        (if (!= (image-artifact-read4! c) IMAGE-ARTIFACT-VERSION)
+            (set! (.ok c) false)
+            0)
+        (if (!= (image-artifact-read4! c) 0) (set! (.ok c) false) 0)
+        (image-artifact-read8! c)
+        (image-artifact-read-bytes! c)
+        (image-artifact-read-bytes! c)
+        (image-artifact-read-bytes! c)
+        (image-artifact-read-bytes! c)
+        (image-artifact-scan-symbols! c)
+        (image-artifact-scan-words! c 3 24)
+        (image-artifact-scan-words! c 3 24)
+        (image-artifact-scan-words! c 3 24)
+        (image-artifact-scan-words! c 4 32)
+        (image-artifact-scan-scripts! c)
+        (image-artifact-scan-realm-objects! c)
+        (and (.ok c) (= (.at c) (len bytes))))))
+
+(defn image-artifact-read-symbols! [(c (ptr ImageArtifactCursor))] (-> (ArrayList ImageSymbol))
+  (let [n (image-artifact-read8! c)
+        (mut out) (al-new [ImageSymbol] (alloc/malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break 0)
+              (let [segment (image-artifact-read8! c)]
+                (let [offset (image-artifact-read8! c)]
+                  (let [name (image-artifact-copy (image-artifact-read-bytes! c))]
+                    (let [abi (image-artifact-copy (image-artifact-read-bytes! c))]
+                      (push! [ImageSymbol]
+                             (mut out)
+                             (ImageSymbol
+                               :segment segment
+                               :offset offset
+                               :name name
+                               :abi abi)))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load out)))
+
+(defn image-artifact-read-fixups! [(c (ptr ImageArtifactCursor))] (-> (ArrayList ImageFixup))
+  (let [n (image-artifact-read8! c)
+        (mut out) (al-new [ImageFixup] (alloc/malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break 0)
+              (let [kind (image-artifact-read8! c)]
+                (let [offset (image-artifact-read8! c)]
+                  (let [symbol (image-artifact-read8! c)]
+                    (push! [ImageFixup]
+                           (mut out)
+                           (ImageFixup :kind kind :offset offset :symbol symbol))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load out)))
+
+(defn image-artifact-read-map-sites! [(c (ptr ImageArtifactCursor))] (-> (ArrayList EncMapSite))
+  (let [n (image-artifact-read8! c)
+        (mut out) (al-new [EncMapSite] (alloc/malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break 0)
+              (let [offset (image-artifact-read8! c)]
+                (let [local-id (image-artifact-read8! c)]
+                  (let [reg (image-artifact-read8! c)]
+                    (push! [EncMapSite]
+                           (mut out)
+                           (EncMapSite :offset offset :local-id local-id :reg reg))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load out)))
+
+(defn image-artifact-read-unit-sites! [(c (ptr ImageArtifactCursor))] (-> (ArrayList EncUnitSite))
+  (let [n (image-artifact-read8! c)
+        (mut out) (al-new [EncUnitSite] (alloc/malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break 0)
+              (let [offset (image-artifact-read8! c)]
+                (let [kind (image-artifact-read8! c)]
+                  (let [local-id (image-artifact-read8! c)]
+                    (let [reg (image-artifact-read8! c)]
+                      (push! [EncUnitSite]
+                             (mut out)
+                             (EncUnitSite
+                               :offset offset
+                               :kind kind
+                               :local-id local-id
+                               :reg reg)))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load out)))
+
+(defn image-artifact-read-script! [(c (ptr ImageArtifactCursor))] (-> ImageScript)
+  (let [strict (= (image-artifact-read1! c) 1)]
+    (let [decl-count (image-artifact-read8! c)
+          (mut declarations) (al-new [CuScriptDecl] (alloc/malloc-allocator))
+          (mut d) 0]
+    (loop (if (>= (load d) decl-count)
+              (break 0)
+              (let [name (image-artifact-copy (image-artifact-read-bytes! c))]
+                (let [kind (image-artifact-read8! c)]
+                  (let [ordinal (image-artifact-read8! c)]
+                    (push! [CuScriptDecl]
+                           (mut declarations)
+                           (CuScriptDecl
+                             :name name
+                             :kind kind
+                             :function-ordinal ordinal))))
+                (set! (mut d) (+ (load d) 1))
+                (continue))))
+    (let [function-count (image-artifact-read8! c)
+          (mut functions) (al-new [i64] (alloc/malloc-allocator))
+          (mut f) 0]
+      (loop (if (>= (load f) function-count)
+                (break 0)
+                (do
+                  (push! [i64] (mut functions) (image-artifact-read8! c))
+                  (set! (mut f) (+ (load f) 1))
+                  (continue))))
+      (let [owned-declarations (al-into-slice (mut declarations))
+            owned-functions (al-into-slice (mut functions))]
+        (ImageScript
+          :declarations
+            (CuScriptDeclarations
+              :strict strict
+              :entries owned-declarations)
+          :functions owned-functions
+          :initializer (image-artifact-read8! c)))))))
+
+(defn image-artifact-read-scripts! [(c (ptr ImageArtifactCursor))] (-> (ArrayList ImageScript))
+  (let [n (image-artifact-read8! c)
+        (mut out) (al-new [ImageScript] (alloc/malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break 0)
+              (do
+                (push! [ImageScript] (mut out) (image-artifact-read-script! c))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load out)))
+
+(defn image-artifact-read-realm-objects! [(c (ptr ImageArtifactCursor))]
+  (-> (ArrayList ImageRealmObject))
+  (let [n (image-artifact-read8! c)
+        (mut out) (al-new [ImageRealmObject] (alloc/malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break 0)
+              (let [kind (image-artifact-read8! c)]
+                (let [name (image-artifact-copy (image-artifact-read-bytes! c))]
+                  (let [offset (image-artifact-read8! c)]
+                    (let [callable (= (image-artifact-read1! c) 1)]
+                      (push! [ImageRealmObject]
+                             (mut out)
+                             (ImageRealmObject
+                               :kind kind
+                               :name name
+                               :offset offset
+                               :callable callable)))))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load out)))
+
+(defn image-artifact-decode [(bytes (slice u8))] (-> (Option CodeImage))
+  (if (not (image-artifact-valid? bytes))
+      (None [CodeImage])
+      (let [c (alloc/unwrap-ptr
+                (alloc/create [ImageArtifactCursor] (alloc/malloc-allocator)))]
+        (set! c (ImageArtifactCursor :bytes bytes :at 8 :ok true))
+        (image-artifact-read4! c)
+        (image-artifact-read4! c)
+        (let [(mut im) (primitive/zeroed CodeImage)]
+          (set! (.entry (mut im)) (image-artifact-read8! c))
+          (let [borrowed (image-artifact-read-bytes! c)]
+            (let [owned (image-artifact-copy borrowed)]
+              (set! (.text (mut im)) owned)))
+          (let [borrowed (image-artifact-read-bytes! c)]
+            (set! (.data (mut im)) (image-artifact-copy borrowed)))
+          (set! (.maps (mut im)) (image-artifact-copy (image-artifact-read-bytes! c)))
+          (set! (.shapes (mut im)) (image-artifact-copy (image-artifact-read-bytes! c)))
+          (set! (.symbols (mut im)) (image-artifact-read-symbols! c))
+          (set! (.fixups (mut im)) (image-artifact-read-fixups! c))
+          (set! (.code-fixups (mut im)) (image-artifact-read-fixups! c))
+          (set! (.map-sites (mut im)) (image-artifact-read-map-sites! c))
+          (set! (.unit-sites (mut im)) (image-artifact-read-unit-sites! c))
+          (set! (.scripts (mut im)) (image-artifact-read-scripts! c))
+          (set! (.realm-objects (mut im)) (image-artifact-read-realm-objects! c))
+          (set! (.installations (mut im)) 0)
+          (alloc/destroy [ImageArtifactCursor] (alloc/malloc-allocator) c)
+          (Some (load im))))))

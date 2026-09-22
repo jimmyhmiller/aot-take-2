@@ -335,6 +335,7 @@ aot-take-2/
 │   │   │                literal.coil } ; f64 literal islands
 │   │   ├── image.coil       ; owned native images, Script entries and realm-object identities; capture; re-exports its parts
 │   │   ├── image/  { abi.coil      ; versioned entry signature classes and export/import compatibility
+│   │   │             persist.coil  ; validated arena-independent CodeImage artifact bytes
 │   │   │             install.coil  ; executable memory, bindings, import resolution, relocation, unit sites
 │   │   │             run.coil }    ; fresh realm data, shared realm objects, the native entry
 │   │   ├── sourcecache.coil ; bounded Script/host image caches, exact source/JSL keys, leased handles and owned Script programs
