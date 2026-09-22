@@ -39,6 +39,7 @@
    (fidx i64)
    (contract (ArrayList i64))
    (memory i64)
+   (declared bool)
    (accepted bool)])
 
 (defstruct VersionPolicy [(name (slice u8)) (limit i64)])
@@ -56,6 +57,10 @@
    (growth-percent i64)
    (growth-limit i64)
    (retained-nodes i64)
+   (speculative-call i64)
+   (speculative-entry i64)
+   (rejected-calls (ArrayList i64))
+   (rejected-entries (ArrayList i64))
    (budgeted bool)])
 
 (defn function-versions [] (-> (ptr FunctionVersions))
@@ -67,6 +72,8 @@
         (do
           (set! (.items s) (al-new [FunctionVersion] (compiler-allocator)))
           (set! (.policies s) (al-new [VersionPolicy] (compiler-allocator)))
+          (set! (.rejected-calls s) (al-new [i64] (compiler-allocator)))
+          (set! (.rejected-entries s) (al-new [i64] (compiler-allocator)))
           (set! (.ready s) true)
           0))
     s))
@@ -87,6 +94,10 @@
     (set! (.growth-percent s) 1)
     (set! (.growth-limit s) 0)
     (set! (.retained-nodes s) 0)
+    (set! (.speculative-call s) 0)
+    (set! (.speculative-entry s) 0)
+    (al-clear! (mut (.rejected-calls s)))
+    (al-clear! (mut (.rejected-entries s)))
     (set! (.budgeted s) false)
     (let [raw (os/getenv c"AOT_VERSION_GROWTH_PERCENT")]
       (if (= (primitive/cast i64 raw) 0)
@@ -455,7 +466,7 @@
                 (set! (mut path) (+ (load path) 1))
                 (continue))))))
 
-(defn versions-create! [(c (dyn NodeOps))
+(defn versions-create! [(pending-call i64)
                         (source (dyn NodeOps))
                         (contract (ArrayList i64))] (-> i64)
   (let [before (arena-node-count)
@@ -510,11 +521,12 @@
              :fidx fidx
              :contract contract
              :memory memory
+             :declared false
              :accepted false))
     (set! (.nodes (function-versions))
           (+ (.nodes (function-versions)) (- (arena-node-count) before)))
     (set! (.pending (function-versions)) (len (.items (function-versions))))
-    (set! (.pending-call (function-versions)) (n-nid c))
+    (set! (.pending-call (function-versions)) pending-call)
     (set! (.pending-size (function-versions)) (fun-live-body-size source))
     (code-add! fresh)
     (code-add-outputs! fresh)
@@ -541,7 +553,7 @@
           (println " memory {s}" (ty-text (versions-input-bound source CALL-MEM)))
           0)
         0)
-    (versions-create! c source contract)
+    (versions-create! (n-nid c) source contract)
     (let [s (function-versions)
           index (- (len (.items s)) 1)
           v (get (.items s) index)]
@@ -554,11 +566,63 @@
               :fidx (.fidx v)
               :contract (.contract v)
               :memory (.memory v)
+              :declared (.declared v)
               :accepted true))
       (set! (.pending s) 0)
       (match (arena-node (.entry v))
         (Some [entry] (versions-route! c source entry (.fidx v)))
         (None [] (panic "versions-create-primary!: copied entry disappeared"))))))
+
+;; A JSL specialization rule is a finite contract the checked source itself declares useful. M5
+;; may need that interface before any one call site has converged enough to select it (a loop or
+;; recursive result can depend on the interface's return). Create the ordinary copied entry without
+;; routing a call. It remains subject to the same per-function and construction budgets, and later
+;; routing still requires the usual containment proof. A successful creation takes ownership of
+;; `contract`; the caller retains it when this returns zero.
+(defn versions-create-primary-unrouted! [(source (dyn NodeOps))
+                                         (contract (ArrayList i64))] (-> i64)
+  (let [memory (versions-input-bound source CALL-MEM)
+        reject
+          (or (>= (versions-count (n-nid source)) (versions-limit source))
+              (>= (fun-live-body-size source) VERSION-BODY-LIMIT)
+              (> (+ (.nodes (function-versions))
+                    (+ (fun-live-body-size source) 1))
+                 VERSION-NODE-BUDGET)
+              (versions-attempted? (n-nid source) contract memory)
+              (not (versions-useful? contract source)))]
+    (if reject
+        0
+        (do
+          (if (!= (primitive/cast i64 (os/getenv c"AOT_VERSION_TRACE")) 0)
+              (let [(mut i) 0]
+                (print "version: declared {s} contract" (fun-name source))
+                (loop (if (>= (load i) (len contract))
+                          (break 0)
+                          (do
+                            (print " {s}"
+                                   (ty-text (get contract (load i))))
+                            (set! (mut i) (+ (load i) 1))
+                            (continue))))
+                (println " memory {s}" (ty-text memory))
+                0)
+              0)
+          (versions-create! 0 source contract)
+          (let [s (function-versions)
+                index (- (len (.items s)) 1)
+                v (get (.items s) index)]
+            (set! (mut (.items s))
+                  index
+                  (FunctionVersion
+                    :source (.source v)
+                    :name (.name v)
+                    :entry (.entry v)
+                    :fidx (.fidx v)
+                    :contract (.contract v)
+                    :memory (.memory v)
+                    :declared true
+                    :accepted true))
+            (set! (.pending s) 0)
+            1)))))
 
 (defn versions-contract-equal? [(lhs (ArrayList i64))
                                 (rhs (ArrayList i64))] (-> bool)
@@ -601,6 +665,218 @@
                   0)))
     (load routed)))
 
+(defn versions--speculation-rejected? [(call-id i64) (entry-id i64)] (-> bool)
+  (let [s (function-versions)
+        (mut i) 0
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) (len (.rejected-calls s))))
+              (break 0)
+              (do
+                (if (and (= (get (.rejected-calls s) (load i)) call-id)
+                         (= (get (.rejected-entries s) (load i)) entry-id))
+                    (set! (mut found) true)
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
+(defn versions--contract-compatible? [(c (dyn NodeOps))
+                                       (contract (ArrayList i64))] (-> bool)
+  (let [(mut i) 0
+        (mut compatible) (= (call-nargs c) (len contract))]
+    (loop (if (or (not (load compatible)) (>= (load i) (len contract)))
+              (break 0)
+              (let [actual (n-ty (call-arg c (load i)))
+                    overlap
+                      (if (= actual TY-INVALID)
+                          TY-TOP
+                          (ty-join actual (get contract (load i))))]
+                (if (or (= actual TY-INVALID) (ty-high? overlap))
+                    (set! (mut compatible) false)
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load compatible)))
+
+(defn versions--entry-index [(entry-id i64)] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (loop (if (or (>= (load i) (len (.items (function-versions))))
+                  (>= (load found) 0))
+              (break 0)
+              (let [v (get (.items (function-versions)) (load i))]
+                (if (= (.entry v) entry-id)
+                    (set! (mut found) (load i))
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load found)))
+
+;; Settle the single hypothesis installed after the preceding complete local solve. Success merely
+;; confirms ordinary containment. Failure restores the generic source edge and records this
+;; (call, contract) pair so a later solve may try the next declared contract without oscillating.
+(defn versions--settle-speculation! [] (-> i64)
+  (let [s (function-versions)]
+    (if (= (.speculative-call s) 0)
+        0
+        (let [call-id (.speculative-call s)
+              entry-id (.speculative-entry s)
+              index (versions--entry-index entry-id)]
+          (if (< index 0)
+              (panic "versions: speculative entry vanished")
+              0)
+          (let [v (get (.items s) index)
+                c
+                  (match (arena-node call-id)
+                    (Some [node] node)
+                    (None [] (unreachable-node)))
+                entry
+                  (match (arena-node entry-id)
+                    (Some [node] node)
+                    (None [] (unreachable-node)))]
+            (set! (.speculative-call s) 0)
+            (set! (.speculative-entry s) 0)
+            (if (and (not (n-dead? c))
+                     (call-linked? c entry)
+                     (versions-accepts? c (.contract v)))
+                (do
+                  (match (call-cend c)
+                    (Some [end] (callend-clear-never-inline! end))
+                    (None [] 0))
+                  (if (!= (primitive/cast i64 (os/getenv c"AOT_VERSION_TRACE")) 0)
+                      (do
+                        (println "version: confirmed Call #{} -> #{} ({s})"
+                                 call-id
+                                 entry-id
+                                 (fun-code-name entry))
+                        0)
+                      0)
+                  0)
+                (do
+                  (push! [i64] (mut (.rejected-calls s)) call-id)
+                  (push! [i64] (mut (.rejected-entries s)) entry-id)
+                  (if (and (not (n-dead? c)) (call-linked? c entry))
+                      (match (arena-node (.source v))
+                        (Some [source]
+                              (let [fidx (arena-function-fidx source)]
+                                (if (< fidx 0)
+                                    (panic "versions: source has no function index")
+                                    0)
+                                (call-unlink! c entry)
+                                (n-set-def! c
+                                            (- (n-nins c) 1)
+                                            (Some (funptr-make source fidx)))
+                                (call-link! c source)
+                                ;; The hold belongs to the provisional route, not to the call
+                                ;; site. A rejected hypothesis restores the generic call's
+                                ;; ordinary inline policy just as a confirmed one does.
+                                (match (call-cend c)
+                                  (Some [end] (callend-clear-never-inline! end))
+                                  (None [] 0))
+                                (code-add! c)
+                                (code-add-outputs! c)
+                                (set! (.changes s) (+ (.changes s) 1))
+                                (fun-size-epoch-bump!)
+                                (invalidate-cfg!)
+                                (if (!= (primitive/cast i64
+                                                         (os/getenv c"AOT_VERSION_TRACE"))
+                                       0)
+                                    (do
+                                      (println "version: rejected Call #{} -> #{} ({s})"
+                                               call-id
+                                               entry-id
+                                               (fun-code-name entry))
+                                      0)
+                                    0)
+                                1))
+                        (None [] (panic "versions: speculative source vanished")))
+                      0))))))))
+
+(defn versions--speculate-round! [] (-> i64)
+  (let [s (function-versions)
+        limit (arena-node-count)
+        (mut nid) 1
+        (mut changed) 0]
+    (loop (if (or (> (load nid) limit) (> (load changed) 0))
+              (break (load changed))
+              (do
+                (if (code-work-scope-accepts? (load nid))
+                    (match (arena-node (load nid))
+                      (Some [end]
+                            (if (and (= (n-op end) OP-CALLEND)
+                                     (not (n-dead? end))
+                                     (not (cend-folding? end))
+                                     (> (n-nins end) 0))
+                                (let [c (cend-call end)
+                                      ft (n-ty (call-fptr c))]
+                                  (if (and (ty-funptr? ft)
+                                           (ty-funptr-single? ft))
+                                      (match (arena-function (ty-funptr-the-fidx ft))
+                                        (Some [source]
+                                              (if (and (not (fun-version-entry? source))
+                                                       (call-linked? c source))
+                                                  (let [(mut found) false]
+                                                    (al-for [item (.items s)]
+                                                            (let [v item]
+                                                              (if (and (not (load found))
+                                                                       (.accepted v)
+                                                                       (.declared v)
+                                                                       (= (.source v)
+                                                                          (n-nid source))
+                                                                       (versions-memory-fits?
+                                                                         c
+                                                                         (.memory v))
+                                                                       (not (versions-accepts?
+                                                                              c
+                                                                              (.contract v)))
+                                                                       (versions--contract-compatible?
+                                                                         c
+                                                                         (.contract v))
+                                                                       (not (versions--speculation-rejected?
+                                                                              (n-nid c)
+                                                                              (.entry v))))
+                                                                  (match (arena-node (.entry v))
+                                                                    (Some [target]
+                                                                          (if (n-dead? target)
+                                                                              0
+                                                                              (do
+                                                                                (versions-route!
+                                                                                  c
+                                                                                  source
+                                                                                  target
+                                                                                  (.fidx v))
+                                                                                (callend-set-never-inline!
+                                                                                  end)
+                                                                                (set! (.speculative-call s)
+                                                                                      (n-nid c))
+                                                                                (set! (.speculative-entry s)
+                                                                                      (.entry v))
+                                                                                (set! (mut found) true)
+                                                                                (set! (mut changed) 1)
+                                                                                (if (!= (primitive/cast
+                                                                                          i64
+                                                                                          (os/getenv
+                                                                                            c"AOT_VERSION_TRACE"))
+                                                                                        0)
+                                                                                    (do
+                                                                                      (println "version: hypothesize Call #{} {s} -> #{} ({s})"
+                                                                                               (n-nid c)
+                                                                                               (fun-name source)
+                                                                                               (n-nid target)
+                                                                                               (fun-code-name target))
+                                                                                      0)
+                                                                                    0))))
+                                                                    (None [] 0))
+                                                                  0))))
+                                                  0))
+                                        (None [] 0))
+                                      0))
+                                0))
+                      (None [] 0))
+                    0)
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))))
+
 ;; A scoped local pass can expose evidence that global SCCP could not see, especially after a JSL
 ;; arithmetic rule folds inside a recursive body. Admission remains closed: this operation creates
 ;; no body and accepts no broader contract. It only retargets a surviving direct call to the exact
@@ -608,10 +884,13 @@
 (defn versions-reroute-closed-round! [] (-> i64)
   (if (not (and (.closed (function-versions)) (code-work-scope-active?)))
       0
-      (let [limit (arena-node-count)
-            (mut nid) 1
-            (mut changed) 0]
-        (loop (if (or (> (load nid) limit) (> (load changed) 0))
+      (let [settled (versions--settle-speculation!)]
+        (if (> settled 0)
+            settled
+            (let [limit (arena-node-count)
+                  (mut nid) 1
+                  (mut changed) 0]
+              (loop (if (or (> (load nid) limit) (> (load changed) 0))
                   (break (load changed))
                   (do
                     (if (code-work-scope-accepts? (load nid))
@@ -679,8 +958,10 @@
                                                                                                 (.fidx v))))
                                                                                           (call-link! c
                                                                                                       target)
-                                                                                          (callend-set-never-inline!
-                                                                                            end)
+                                                                                          (if (.declared v)
+                                                                                              0
+                                                                                              (callend-set-never-inline!
+                                                                                                end))
                                                                                           (if (!= (primitive/cast
                                                                                                     i64
                                                                                                     (os/getenv
@@ -699,6 +980,18 @@
                                                                                           (code-add! c)
                                                                                           (code-add-outputs!
                                                                                             c)
+                                                                                          ;; A failed hypothesis was
+                                                                                          ;; evaluated under the prior
+                                                                                          ;; recursive edge set. An
+                                                                                          ;; exact reroute changes that
+                                                                                          ;; equation, so it may be
+                                                                                          ;; sound on the next solve.
+                                                                                          (al-clear!
+                                                                                            (mut (.rejected-calls
+                                                                                                   (function-versions))))
+                                                                                          (al-clear!
+                                                                                            (mut (.rejected-entries
+                                                                                                   (function-versions))))
                                                                                           (set! (mut found)
                                                                                                 true)
                                                                                           (set! (mut changed)
@@ -718,7 +1011,10 @@
                           (None [] 0))
                         0)
                     (set! (mut nid) (+ (load nid) 1))
-                    (continue)))))))
+                    (continue))))
+              (if (> (load changed) 0)
+                  (load changed)
+                  (versions--speculate-round!)))))))
 
 ;; Snapshot the analysed CallEnds: creating an entry appends a complete copied body to the arena,
 ;; and those new internal sites are handled when their own component is optimized. One pass over
@@ -872,6 +1168,7 @@
                         :fidx (.fidx v)
                         :contract (.contract v)
                         :memory (.memory v)
+                        :declared (.declared v)
                         :accepted true))
                 (fun-set-approx-size! entry size)
                 (set! (.retained-nodes s) (+ (.retained-nodes s) size))
@@ -960,7 +1257,9 @@
                                                                                          CALL-MEM)))
                                          (versions-useful? (load contract)
                                                            source))
-                                    (versions-create! c source (load contract))
+                                    (versions-create! (n-nid c)
+                                                      source
+                                                      (load contract))
                                     (do (al-free! (mut contract)) 0))))))))))))
 
 ;; One rewrite per drained worklist. All argument proofs are re-read after ordinary cleanup.

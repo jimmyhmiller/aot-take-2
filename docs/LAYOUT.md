@@ -109,8 +109,8 @@ CallEnd and re-exports `fun.coil` (Fun, Parm, FunPtr) and `inline.coil`; `contro
 
 ### Modules: a facade and its parts
 
-A module is one concern. When a module outgrows that — roughly a thousand lines, or a second
-concern you can name — it is split into a directory named after it:
+A module is one concern. When it contains a second concern that is clearer as an independently
+named part, it is split into a directory named after it; file length alone does not require a split:
 
 ```
 codegen/regalloc.coil         (module aot.codegen.regalloc)      the driver; re-exports the parts

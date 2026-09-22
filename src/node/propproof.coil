@@ -13,6 +13,7 @@
 (import "aot.node.node" :use *)
 (import "aot.node.constant" :use *)
 (import "aot.node.control" :use *)
+(import "aot.node.call" :use [call-mem])
 (import "aot.node.phi" :use *)
 (import "aot.node.dynamic" :use *)
 (import "aot.node.memory" :use *)
@@ -25,7 +26,9 @@
         [PROP-STORE
          PROP-SET
          PROP-MEM
+         PROP-OBJECT
          PROP-RESULT-MEM
+         PROP-VALUE
          prop-access-kind
          prop-storage-pointer
          prop-holder-drop!])
@@ -43,8 +46,14 @@
 ;; loop termination. Our extra query asks for a complete property shape at the same memory point.
 ;; A join retains a shape only when every reachable arm proves that exact shape; cycles and open
 ;; merges conservatively return unknown. No provisional dead arm is used as a proof here.
-;; Calls are barriers. Initial-image facts enter only through START-INITIAL-MEM, never arbitrary
-;; Start memory or an unknown caller. This query does not change the heap image or create nodes.
+;; Simple's LoadNode stops at a CallEnd projection; its source marks bypassing a no-alias call as a
+;; TODO. Simple instead represents the private/public transition explicitly with EscapeNode: loads
+;; of its own allocation follow private memory, loads of a distinct New follow public memory, and
+;; all other pointers stop. Our JavaScript allocations do not carry one Escape per property alias,
+;; so a call is bypassed only when a bounded all-use proof shows that the exact fresh allocation is
+;; still private in this activation. Initial-image facts enter only through START-INITIAL-MEM, never
+;; arbitrary Start memory or an unknown caller. This query does not change the heap image or create
+;; nodes.
 (defn prop-state-shape [(state PropStatic)] (-> i64)
   (match state
     (PropUnknown [] -1)
@@ -134,6 +143,91 @@
         answer (prop-memory-state-walk mem object dep (mut path) (mut fuel))]
     (al-free! (mut path))
     answer))
+
+(defn propproof--fun? [(n (dyn NodeOps))] (-> bool)
+  (= (n-op n) OP-FUN))
+
+;; Prove that `call_` cannot observe or mutate `object`. The object must be the value projection of
+;; a fresh New in the same function as the call. Its complete use graph may carry identity through
+;; representation nodes and Phis, initialize its own storage, or publish it only through Return
+;; after this activation ends. Passing it, storing it as a value, reading through it, or meeting an
+;; unrecognized use refuses the proof. Every inspected node is a dependency; exhausting the bounded
+;; walk loses precision. This is the all-use counterpart of Simple's explicit EscapeNode boundary.
+(defn prop-call-cannot-reach? [(object (dyn NodeOps))
+                               (call_ (dyn NodeOps))
+                               (dep (dyn NodeOps))] (-> bool)
+  (if (not (and (= (n-op object) OP-PROJ)
+                (= (proj-idx object) 0)
+                (= (n-op (n-in! object 0)) OP-NEW)))
+      false
+      (let [allocation (n-in! object 0)
+            owner
+              (cfg-owner-fun (n-in! allocation 0)
+                             (primitive/fnptr-of propproof--fun?))
+            caller
+              (cfg-owner-fun (n-in! call_ 0)
+                             (primitive/fnptr-of propproof--fun?))
+            (mut valid)
+              (match owner
+                (Some [f]
+                      (match caller
+                        (Some [g] (n-same? f g))
+                        (None [] false)))
+                (None [] false))
+            (mut work) (al-new [(dyn NodeOps)] (compiler-allocator))
+            (mut i) 0]
+        (push! [(dyn NodeOps)] (mut work) object)
+        (loop (if (or (not (load valid)) (>= (load i) (len (load work))))
+                  (break 0)
+                  (let [value (get (load work) (load i))]
+                    (n-add-dep! value dep)
+                    (let [(mut output) 0]
+                      (loop (if (or (not (load valid))
+                                    (>= (load output) (n-nouts value)))
+                                (break 0)
+                                (do
+                                  (match (n-out value (load output))
+                                    (None [] 0)
+                                    (Some [use_]
+                                          (let [op (n-op use_)]
+                                            (n-add-dep! use_ dep)
+                                            (cond (or (= op OP-BOX)
+                                                      (= op OP-UNBOX)
+                                                      (= op OP-CAST)
+                                                      (= op OP-PHI))
+                                                    (let [(mut seen) false]
+                                                      (al-for [prior (load work)]
+                                                              (if (n-same? prior use_)
+                                                                  (set! (mut seen) true)
+                                                                  0))
+                                                      (if (load seen)
+                                                          0
+                                                          (if (>= (len (load work)) 128)
+                                                              (set! (mut valid) false)
+                                                              (push! [(dyn NodeOps)]
+                                                                     (mut work)
+                                                                     use_))))
+                                                  (= op OP-RETURN) 0
+                                                  (and (= op OP-STORE)
+                                                       (n-same? (n-in! use_ MEM-PTR)
+                                                                value)
+                                                       (not (n-same? (n-in! use_ STORE-VAL)
+                                                                     value)))
+                                                    0
+                                                  (and (= op OP-PROPSTORE)
+                                                       (= (prop-access-kind use_) PROP-STORE)
+                                                       (n-same? (n-in! use_ PROP-OBJECT)
+                                                                value)
+                                                       (not (n-same? (n-in! use_ PROP-VALUE)
+                                                                     value)))
+                                                    0
+                                                  :else (set! (mut valid) false)))))
+                                  (set! (mut output) (+ (load output) 1))
+                                  (continue)))))
+                    (set! (mut i) (+ (load i) 1))
+                    (continue))))
+        (al-free! (mut work))
+        (load valid))))
 
 (defn prop-memory-state-walk [(mem (dyn NodeOps))
                               (object (dyn NodeOps))
@@ -232,6 +326,16 @@
                     (and (= (n-op source) OP-NEW)
                          (= (proj-idx mem) 1))
                       (prop-memory-state-walk (new-memory source)
+                                              object
+                                              dep
+                                              (mut path)
+                                              (mut fuel))
+                    (and (= (n-op source) OP-CALLEND)
+                         (= (proj-idx mem) RETURN-MEM)
+                         (prop-call-cannot-reach? object
+                                                  (n-in! source 0)
+                                                  dep))
+                      (prop-memory-state-walk (call-mem (n-in! source 0))
                                               object
                                               dep
                                               (mut path)
