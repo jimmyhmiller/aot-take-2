@@ -364,6 +364,9 @@ The V8 and real-program rows remain to complete the M0 table. Richards currently
 backend after phase 1 in 10.2 s and Opto in 172.1 s (1,534 inlines), then reproduces the allocator
 split-budget panic in the shared harness; this is a measured baseline failure, not a timing result.
 
+The pinned 3,000-file Test262 backstop is recorded in `docs/TEST262.md`: 932 passing files from
+5,754 variants in 234.450 s, with exact verdict counts and all eight abnormal terminations named.
+
 **`n-del-use!` on a hub (M1).** Scanning from the end was NOT enough: the misses were duplicate
 edges (a Parm whose N callers all pass the same `undefined` uses it N times) and the KEEP edge
 (held across surgery on a hub while uses pile up behind it). Each (def, use) pair of a def with 32+
