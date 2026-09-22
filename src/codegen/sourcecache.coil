@@ -1,11 +1,14 @@
-;; Process-local retained Script compilation cache. Simple's Encoding separates owned bytes
+;; Retained Script compilation cache. Simple's Encoding separates owned bytes
 
 ;; and relocations from installed addresses; CodeImage captures that boundary here. This cache
-;; stores those artifacts, never graph nodes or installed realm state. Simple has no equivalent
-;; JavaScript source/JSL cache or lease protocol.
+;; stores those artifacts, never graph nodes or installed realm state. The immutable JSL provider
+;; additionally has a cross-process graph/image artifact in `aot.codegen.providercache`; ordinary
+;; Script and host entries remain process-local. Simple has no equivalent JavaScript source/JSL
+;; cache or lease protocol.
 ;;
 ;; Exact ordered source bytes, worklist seed, and the complete production JSL snapshot form the
-;; key. The running executable fixes compiler/runtime/target versions. External-mutation Script
+;; in-memory key. The provider's disk key also hashes the exact running executable, which fixes
+;; compiler/runtime/target versions. External-mutation Script
 ;; compilation is the only mode admitted. Handles are monotonic, not reusable slot indices.
 ;; Acquisition invalidates compiler scratch, even on a hit; borrowed input is copied first.
 ;; A bounded LRU evicts only unleased, uninstalled artifacts. Cache teardown validates the whole
@@ -14,6 +17,7 @@
 (import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
 (import "coil.arraylist" :use *)
 (import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
 (import "coil.str" :use [sb-new sb-push-str! sb-push-i64! sb-str sb-free!])
 (import "aot.util.panic" :use [panic])
 (import "aot.util.arena" :use [compiler-session-reset! compiler-region])
@@ -38,7 +42,16 @@
         [pipeline-encode-script-unit!
          pipeline-capture-script-image
          pipeline-script-sequence-image
-         pipeline-shared-jsl-image])
+         pipeline-shared-jsl-artifact
+         ProviderArtifact])
+(import "aot.codegen.providercache"
+        :use
+        [ProviderCacheLock
+         provider-cache-load
+         provider-cache-publish!
+         provider-cache-lock!
+         provider-cache-unlock!])
+(import "aot.codegen.serialize" :use [ser-read-graph])
 (import "aot.jsl.reader"
         :use
         [jsl-library jsl-load-library! JSL-COMPILER-INDEX])
@@ -58,6 +71,8 @@
    (libraries (ArrayList (ptr CachedJslLibrary)))
    (library-hits i64)
    (library-misses i64)
+   (provider-disk-hits i64)
+   (provider-disk-misses i64)
    (hosts (ArrayList (ptr CachedScriptHost)))
    (capacity i64)
    (clock i64)
@@ -73,7 +88,11 @@
   [(image CodeImage) (count i64) (seed i64) (used i64)])
 
 (defstruct CachedJslLibrary
-  [(image CodeImage) (library (ArrayList (slice u8))) (seed i64) (users i64)])
+  [(image CodeImage)
+   (graph (slice u8))
+   (library (ArrayList (slice u8)))
+   (seed i64)
+   (users i64)])
 
 ;; Process-wide identities prevent a handle from one cache accidentally naming another's slot.
 (defn source-cache-next-handle! [] (-> i64)
@@ -91,6 +110,8 @@
     :libraries (al-new [(ptr CachedJslLibrary)] (alloc/malloc-allocator))
     :library-hits 0
     :library-misses 0
+    :provider-disk-hits 0
+    :provider-disk-misses 0
     :hosts (al-new [(ptr CachedScriptHost)] (alloc/malloc-allocator))
     :capacity capacity
     :clock 0
@@ -101,6 +122,72 @@
     :host-misses 0
     :host-evictions 0
     :scratch-peak 0))
+
+(defn source-cache-provider-artifact-free! [(artifact (ptr ProviderArtifact))] (-> i64)
+  (do
+    (image-free! (field artifact image))
+    (alloc/free [u8] (alloc/malloc-allocator) (.graph artifact))
+    0))
+
+(defn source-cache-provider-trace [(event (slice u8))] (-> i64)
+  (if (= (primitive/cast i64 (os/getenv c"AOT_PROVIDER_TRACE")) 0)
+      0
+      (do (println "aot provider cache: {s}" event) 0)))
+
+(defn source-cache-provider-disk-artifact [(cache (ptr SourceCache))
+                                           (key (ArrayList (slice u8)))
+                                           (seed i64)] (-> (Option ProviderArtifact))
+  (match (provider-cache-load key seed)
+    (Some [loaded]
+      (let [artifact (primitive/alloc-stack ProviderArtifact)]
+        (set! artifact loaded)
+        ;; A container and native image can both be intact while the graph format is stale. Decode
+        ;; it in the disposable compiler generation before admitting the disk hit.
+        (match (ser-read-graph (.graph artifact))
+          (Some [_]
+            (do
+              (set! (.provider-disk-hits cache) (+ (.provider-disk-hits cache) 1))
+              (source-cache-provider-trace "hit")
+              (compiler-session-reset!)
+              (Some (load artifact))))
+          (None []
+            (do
+              (source-cache-provider-artifact-free! artifact)
+              (compiler-session-reset!)
+              (None [ProviderArtifact]))))))
+    (None [] (None [ProviderArtifact]))))
+
+(defn source-cache-provider-build [(key (ArrayList (slice u8)))
+                                   (seed i64)] (-> ProviderArtifact)
+  (let [built (pipeline-shared-jsl-artifact seed)
+        owned (primitive/alloc-stack ProviderArtifact)]
+    (set! owned built)
+    (provider-cache-publish! key seed owned)
+    built))
+
+(defn source-cache-provider-artifact [(cache (ptr SourceCache))
+                                      (key (ArrayList (slice u8)))
+                                      (seed i64)] (-> ProviderArtifact)
+  (compiler-session-reset!)
+  (match (source-cache-provider-disk-artifact cache key seed)
+    (Some [loaded] loaded)
+    (None []
+      (do
+        (set! (.provider-disk-misses cache) (+ (.provider-disk-misses cache) 1))
+        (source-cache-provider-trace "miss")
+        (match (provider-cache-lock! key seed)
+          (None [] (source-cache-provider-build key seed))
+          (Some [acquired]
+            (let [lock (primitive/alloc-stack ProviderCacheLock)]
+              (set! lock acquired)
+              ;; A contender may have published while flock blocked. Recheck under the lock.
+              (match (source-cache-provider-disk-artifact cache key seed)
+                (Some [loaded]
+                  (do (provider-cache-unlock! lock) loaded))
+                (None []
+                  (let [built (source-cache-provider-build key seed)]
+                    (provider-cache-unlock! lock)
+                    built))))))))))
 
 ;; Artifact identity is exact JSL bytes plus seed; compiler, runtime and target ABI/layout are
 ;; fixed by this running executable. Keep at most capacity+1 snapshots: one spare allows a miss
@@ -132,13 +219,15 @@
                    (< (load victim) 0))
               (panic "source-cache-library!: all library snapshots are in use")
               0)
-          (compiler-session-reset!)
-          (set! library
-                (CachedJslLibrary
-                  :image (pipeline-shared-jsl-image seed)
-                  :library owned
-                  :seed seed
-                  :users 0))
+          (let [artifact (primitive/alloc-stack ProviderArtifact)]
+            (set! artifact (source-cache-provider-artifact cache key seed))
+            (set! library
+                  (CachedJslLibrary
+                    :image (.image artifact)
+                    :graph (.graph artifact)
+                    :library owned
+                    :seed seed
+                    :users 0)))
           (let [(mut actual) (source-cache-library-key)]
             (if (not (source-cache-strings-equal? owned (load actual)))
                 (panic "source-cache-library!: JSL changed during provider compilation")
@@ -149,6 +238,7 @@
           (if (>= (len (.libraries cache)) (+ (.capacity cache) 1))
               (let [old (get (.libraries cache) (load victim))]
                 (image-free! (field old image))
+                (alloc/free [u8] (alloc/malloc-allocator) (.graph old))
                 (source-cache-free-strings! (field old library))
                 (alloc/destroy [CachedJslLibrary] a old)
                 (set! (mut (.libraries cache)) (load victim) library))
@@ -605,6 +695,7 @@
               (panic "source-cache-free!: library remains in use")
               0)
           (image-free! (field library image))
+          (alloc/free [u8] (alloc/malloc-allocator) (.graph library))
           (source-cache-free-strings! (field library library))
           (alloc/destroy [CachedJslLibrary] (alloc/malloc-allocator) library))
   (al-free! (mut (.libraries cache)))

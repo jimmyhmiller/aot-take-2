@@ -339,6 +339,7 @@ aot-take-2/
 │   │   │             install.coil  ; executable memory, bindings, import resolution, relocation, unit sites
 │   │   │             run.coil }    ; fresh realm data, shared realm objects, the native entry
 │   │   ├── sourcecache.coil ; bounded Script/host image caches, exact source/JSL keys, leased handles and owned Script programs
+│   │   ├── providercache.coil ; exact compiler/JSL-keyed, checksummed, atomically published provider graph and image artifacts
 │   │   ├── serialize.coil   ; ideal-graph artifact facade; re-exports its parts
 │   │   ├── serialize/  { bytes.coil  ; checked little-endian graph artifact cursor and writer
 │   │   │                 types.coil  ; complete structural lattice table round-trip
