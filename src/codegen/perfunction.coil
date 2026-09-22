@@ -1,0 +1,681 @@
+;; Frozen function contracts and the retained call graph for the per-function pipeline.
+;;
+;; Final Simple keeps the concrete Call -> Fun and Return -> CallEnd discovery edges through its
+;; one global pessimistic fixpoint. The per-function pipeline deliberately diverges: optimistic
+;; SCCP first reaches the same whole-program answer, then this module records that answer and the
+;; call graph before those analysis-only edges are removed. Later local optimization consumes this
+;; snapshot instead of attempting to rediscover global facts from an already-unlinked graph.
+(module aot.codegen.perfunction)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.os" :as os)
+(import "coil.primitive" :as primitive)
+(import "aot.util.arena"
+        :use
+        [compiler-allocator compiler-state CompilerStateSlot])
+(import "aot.util.panic" :use *)
+(import "aot.node.node" :use *)
+(import "aot.node.call" :use *)
+(import "aot.node.control" :use [return-freeze-local! start-make])
+(import "aot.node.ownership" :use *)
+(import "aot.type.type"
+        :use
+        [TY-CTRL
+         TY-INVALID
+         TY-TOP
+         TY-XCTRL
+         ty-high?
+         ty-sig-nargs])
+(import "aot.type.scalar" :use [ty-erase-widen])
+
+;; Contract slot zero is memory; source arguments follow in call order. `callers` contains the
+;; concrete Call nids SCCP linked to this entry, before early unlinking destroys those edges.
+(defstruct PerFunctionEntry
+  [(fun i64)
+   (contract (ArrayList i64))
+   (callers (ArrayList i64))
+   (callees (ArrayList i64))
+   (members (ArrayList i64))
+   (component i64)])
+
+(defstruct PerFunctionPlan
+  [(entries (ArrayList PerFunctionEntry))
+   ;; Entry indices in bottom-up component order; offsets delimit the components.
+   (order (ArrayList i64))
+   (offsets (ArrayList i64))])
+
+(defstruct PerFunctionFlag [(state i64)])
+
+(defn per-function-flag [] (-> (ptr PerFunctionFlag))
+  (compiler-state [PerFunctionFlag] (primitive/alloc-static CompilerStateSlot)))
+
+;; Presence switch, matching AOT_NO_SPECIALIZE: even `AOT_PER_FUNCTION=0` selects the prototype.
+(defn per-function-enabled? [] (-> bool)
+  (let [flag (per-function-flag)]
+    (if (= (.state flag) 0)
+        (set! (.state flag)
+              (if (!= (primitive/cast i64 (os/getenv c"AOT_PER_FUNCTION")) 0)
+                  1
+                  2))
+        0)
+    (= (.state flag) 1)))
+
+(defn per-function--contract [(fun (dyn NodeOps))] (-> (ArrayList i64))
+  (let [(mut contract) (al-new [i64] (compiler-allocator))]
+    (match (fun-mem-parm fun)
+      (Some [memory]
+            (push! [i64] (mut contract) (ty-erase-widen (n-ty memory))))
+      (None [] (push! [i64] (mut contract) TY-TOP)))
+    (let [nargs (ty-sig-nargs (fun-sig fun))
+          (mut arg) 0]
+      (loop (if (>= (load arg) nargs)
+                (break 0)
+                (do
+                  (match (fun-parm fun (load arg))
+                    (Some [parm]
+                          (push! [i64]
+                                 (mut contract)
+                                 (ty-erase-widen (n-ty parm))))
+                    ;; An unused Parm may already have been collected. Preserve its positional
+                    ;; slot so the remaining contracts still line up with call arguments.
+                    (None [] (push! [i64] (mut contract) TY-INVALID)))
+                  (set! (mut arg) (+ (load arg) 1))
+                  (continue)))))
+    (load contract)))
+
+(defn per-function--callers [(fun (dyn NodeOps))] (-> (ArrayList i64))
+  (let [(mut callers) (al-new [i64] (compiler-allocator))
+        (mut input) 1]
+    (loop (if (>= (load input) (n-nins fun))
+              (break 0)
+              (do
+                (match (n-in fun (load input))
+                  (Some [caller]
+                        (if (= (n-op caller) OP-CALL)
+                            (push! [i64] (mut callers) (n-nid caller))
+                            0))
+                  (None [] 0))
+                (set! (mut input) (+ (load input) 1))
+                (continue))))
+    (load callers)))
+
+(defn per-function--index [(entries (mut (ArrayList PerFunctionEntry)))
+                           (by-fun (mut (HashMap i64 i64)))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len (load entries)))
+              (break 0)
+              (do
+                (let [entry (al-elem [PerFunctionEntry] entries (load i))]
+                  (set! (mut by-fun) (.fun entry) (load i)))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))
+
+;; Convert the callee-owned caller lists into caller-owned adjacency while ownership is still
+;; derivable from the linked graph. Duplicate call sites remain duplicate edges; Tarjan is linear
+;; in edges and does not require a set probe here.
+(defn per-function--build-edges! [(entries (mut (ArrayList PerFunctionEntry)))
+                                  (by-fun (mut (HashMap i64 i64)))] (-> i64)
+  (let [owners (ownership-compute)
+        (mut callee) 0
+        (mut edges) 0
+        (mut nid) 1]
+    (loop (if (> (load nid) (arena-node-count))
+              (break 0)
+              (do
+                (match (arena-node (load nid))
+                  (Some [node]
+                        (match (get (load by-fun) (ownership-of owners node))
+                          (Some [entry]
+                                (push! [i64]
+                                       (mut (.members (al-elem [PerFunctionEntry]
+                                                               entries
+                                                               entry)))
+                                       (load nid)))
+                          (None [] 0)))
+                  (None [] 0))
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))
+    (loop (if (>= (load callee) (len (load entries)))
+              (break 0)
+              (do
+                (let [entry (al-elem [PerFunctionEntry] entries (load callee))
+                      (mut ci) 0]
+                  (loop (if (>= (load ci) (len (.callers entry)))
+                            (break 0)
+                            (do
+                              (match (arena-node (get (.callers entry)
+                                                      (load ci)))
+                                (Some [call]
+                                      (let [owner (ownership-of owners call)]
+                                        (match (get (load by-fun) owner)
+                                          (Some [caller]
+                                                (do
+                                                  (push! [i64]
+                                                         (mut (.callees (al-elem [PerFunctionEntry]
+                                                                                 entries
+                                                                                 caller)))
+                                                         (load callee))
+                                                  (set! (mut edges)
+                                                        (+ (load edges) 1))))
+                                          ;; A Start-level call is a root edge, not a function SCC
+                                          ;; edge. Shared/global ownership is therefore expected.
+                                          (None [] 0))))
+                                (None [] 0))
+                              (set! (mut ci) (+ (load ci) 1))
+                              (continue)))))
+                (set! (mut callee) (+ (load callee) 1))
+                (continue))))
+    (ownership-free! owners)
+    (load edges)))
+
+(defn per-function--fill-i64 [(values (mut (ArrayList i64)))
+                              (count i64)
+                              (value i64)] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) count)
+              (break 0)
+              (do
+                (push! [i64] (mut values) value)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    0))
+
+;; Iterative Tarjan. Edges point caller -> callee, so SCCs close in the desired bottom-up order:
+;; a callee component is emitted before every non-recursive caller component that depends on it.
+(defn per-function--components! [(plan (ptr PerFunctionPlan))] (-> i64)
+  (let [count (len (.entries plan))
+        (mut index) (al-new [i64] (compiler-allocator))
+        (mut low) (al-new [i64] (compiler-allocator))
+        (mut on-stack) (al-new [bool] (compiler-allocator))
+        (mut tarjan) (al-new [i64] (compiler-allocator))
+        (mut dfs-node) (al-new [i64] (compiler-allocator))
+        (mut dfs-next) (al-new [i64] (compiler-allocator))
+        (mut dfs-parent) (al-new [i64] (compiler-allocator))
+        (mut next-index) 0
+        (mut components) 0
+        (mut root) 0]
+    (per-function--fill-i64 (mut index) count -1)
+    (per-function--fill-i64 (mut low) count -1)
+    (let [(mut i) 0]
+      (loop (if (>= (load i) count)
+                (break 0)
+                (do
+                  (push! [bool] (mut on-stack) false)
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    (push! [i64] (mut (.offsets plan)) 0)
+    (loop (if (>= (load root) count)
+              (break 0)
+              (do
+                (if (!= (get (load index) (load root)) -1)
+                    0
+                    (do
+                      (set! (mut index) (load root) (load next-index))
+                      (set! (mut low) (load root) (load next-index))
+                      (set! (mut next-index) (+ (load next-index) 1))
+                      (push! [i64] (mut tarjan) (load root))
+                      (set! (mut on-stack) (load root) true)
+                      (push! [i64] (mut dfs-node) (load root))
+                      (push! [i64] (mut dfs-next) 0)
+                      (push! [i64] (mut dfs-parent) -1)
+                      (loop (if (= (len (load dfs-node)) 0)
+                                (break 0)
+                                (let [frame (- (len (load dfs-node)) 1)
+                                      node (get (load dfs-node) frame)
+                                      entry
+                                        (al-elem [PerFunctionEntry]
+                                                 (mut (.entries plan))
+                                                 node)
+                                      edge (get (load dfs-next) frame)]
+                                  (if (< edge (len (.callees entry)))
+                                      (let [child (get (.callees entry) edge)]
+                                        (set! (mut dfs-next) frame (+ edge 1))
+                                        (if (= (get (load index) child) -1)
+                                            (do
+                                              (set! (mut index)
+                                                    child
+                                                    (load next-index))
+                                              (set! (mut low)
+                                                    child
+                                                    (load next-index))
+                                              (set! (mut next-index)
+                                                    (+ (load next-index) 1))
+                                              (push! [i64] (mut tarjan) child)
+                                              (set! (mut on-stack) child true)
+                                              (push! [i64] (mut dfs-node) child)
+                                              (push! [i64] (mut dfs-next) 0)
+                                              (push! [i64]
+                                                     (mut dfs-parent)
+                                                     node))
+                                            (if (get (load on-stack) child)
+                                                (if (< (get (load index) child)
+                                                       (get (load low) node))
+                                                    (set! (mut low)
+                                                          node
+                                                          (get (load index)
+                                                               child))
+                                                    0)
+                                                0)))
+                                      (let [parent (get (load dfs-parent) frame)]
+                                        (pop! (mut dfs-node))
+                                        (pop! (mut dfs-next))
+                                        (pop! (mut dfs-parent))
+                                        (if (and (>= parent 0)
+                                                 (< (get (load low) node)
+                                                    (get (load low) parent)))
+                                            (set! (mut low)
+                                                  parent
+                                                  (get (load low) node))
+                                            0)
+                                        (if (= (get (load low) node)
+                                               (get (load index) node))
+                                            (do
+                                              (loop (match (pop! [i64]
+                                                                 (mut tarjan))
+                                                      (Some [member]
+                                                            (do
+                                                              (set! (mut on-stack)
+                                                                    member
+                                                                    false)
+                                                              (set! (.component (al-elem [PerFunctionEntry]
+                                                                                         (mut (.entries plan))
+                                                                                         member))
+                                                                    (load components))
+                                                              (push! [i64]
+                                                                     (mut (.order plan))
+                                                                     member)
+                                                              (if (= member
+                                                                     node)
+                                                                  (break 0)
+                                                                  (continue))))
+                                                      (None []
+                                                            (panic "per-function Tarjan stack underflow"))))
+                                              (set! (mut components)
+                                                    (+ (load components) 1))
+                                              (push! [i64]
+                                                     (mut (.offsets plan))
+                                                     (len (.order plan)))
+                                              0)
+                                            0))))))))
+                (set! (mut root) (+ (load root) 1))
+                (continue))))
+    (al-free! [i64] (mut index))
+    (al-free! [i64] (mut low))
+    (al-free! [bool] (mut on-stack))
+    (al-free! [i64] (mut tarjan))
+    (al-free! [i64] (mut dfs-node))
+    (al-free! [i64] (mut dfs-next))
+    (al-free! [i64] (mut dfs-parent))
+    (load components)))
+
+;; Snapshot every reachable local entry after global SCCP and before call-unlink-all!. A kept Return
+;; can keep an uncalled JSL graph allocated while its Fun is TOP/XCTRL; such a body has no SCCP
+;; contract and is not a compilation component. Published source entries were rooted before SCCP,
+;; so this filter cannot discard an externally required definition.
+(defn per-function-plan [] (-> (ptr PerFunctionPlan))
+  (let [plan
+          (alloc/unwrap-ptr [PerFunctionPlan]
+                            (alloc/create [PerFunctionPlan]
+                                          (compiler-allocator)))
+        (mut entries) (al-new [PerFunctionEntry] (compiler-allocator))
+        (mut by-fun) (hm-new [i64 i64] (compiler-allocator) (i64-keyops))
+        limit (arena-node-count)
+        (mut nid) 1]
+    (loop (if (> (load nid) limit)
+              (break 0)
+              (do
+                (match (arena-node (load nid))
+                  (Some [node]
+                        (if (and (= (n-op node) OP-FUN)
+                                 (and (not (n-dead? node))
+                                      (and (not (ty-high? (n-ty node)))
+                                           (!= (n-ty node) TY-XCTRL))))
+                            (push! [PerFunctionEntry]
+                                   (mut entries)
+                                   (PerFunctionEntry
+                                     :fun (n-nid node)
+                                     :contract (per-function--contract node)
+                                     :callers (per-function--callers node)
+                                     :callees
+                                       (al-new [i64] (compiler-allocator))
+                                     :members
+                                       (al-new [i64] (compiler-allocator))
+                                     :component -1))
+                            0))
+                  (None [] 0))
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))
+    (set! (.entries plan) (load entries))
+    (set! (.order plan) (al-new [i64] (compiler-allocator)))
+    (set! (.offsets plan) (al-new [i64] (compiler-allocator)))
+    (per-function--index (mut (.entries plan)) (mut by-fun))
+    (per-function--build-edges! (mut (.entries plan)) (mut by-fun))
+    (per-function--components! plan)
+    (hm-free! (mut by-fun))
+    plan))
+
+(defn per-function-entry-count [(plan (ptr PerFunctionPlan))] (-> i64)
+  (len (.entries plan)))
+
+(defn per-function-entry-at [(plan (ptr PerFunctionPlan))
+                             (index i64)] (-> (ptr PerFunctionEntry))
+  (al-elem (mut (.entries plan)) index))
+
+(defn per-function-contract-at [(entry (ptr PerFunctionEntry)) (slot i64)] (-> i64)
+  (get (.contract entry) slot))
+
+(defn per-function-caller-count [(entry (ptr PerFunctionEntry))] (-> i64)
+  (len (.callers entry)))
+
+(defn per-function-caller-at [(entry (ptr PerFunctionEntry)) (index i64)] (-> i64)
+  (get (.callers entry) index))
+
+(defn per-function-component-count [(plan (ptr PerFunctionPlan))] (-> i64)
+  (- (len (.offsets plan)) 1))
+
+(defn per-function-component-size [(plan (ptr PerFunctionPlan))
+                                   (component i64)] (-> i64)
+  (- (get (.offsets plan) (+ component 1)) (get (.offsets plan) component)))
+
+(defn per-function-component-entry [(plan (ptr PerFunctionPlan))
+                                    (component i64)
+                                    (index i64)] (-> (ptr PerFunctionEntry))
+  (per-function-entry-at plan
+                         (get (.order plan)
+                              (+ (get (.offsets plan) component) index))))
+
+(defn per-function-entry-fun [(entry (ptr PerFunctionEntry))] (-> i64)
+  (.fun entry))
+
+;; Admit and seed exactly one recursive component. Shared/global boundary nodes stay frozen; new
+;; nodes created by local rewrites inherit the active arena scope.
+(defn per-function-scope-begin! [(plan (ptr PerFunctionPlan))
+                                 (component i64)] (-> i64)
+  (do
+    (code-work-scope-begin!)
+    (let [size (per-function-component-size plan component)
+          (mut i) 0
+          (mut seeded) 0]
+      (loop (if (>= (load i) size)
+                (break 0)
+                (let [entry
+                        (per-function-component-entry plan component (load i))
+                      (mut member) 0]
+                  (loop (if (>= (load member) (len (.members entry)))
+                            (break 0)
+                            (let [nid (get (.members entry) (load member))]
+                              (code-work-scope-allow! nid)
+                              (match (arena-node nid)
+                                (Some [node]
+                                      (if (n-dead? node)
+                                          0
+                                          (do
+                                            ;; Global SCCP already proved this node under the exact
+                                            ;; frozen entry contract and frozen outbound results.
+                                            ;; Preserve that proof; resetting to the coarser
+                                            ;; pessimistic snapshot creates a different,
+                                            ;; order-dependent local analysis.
+                                            (code-add! node)
+                                            (set! (mut seeded)
+                                                  (+ (load seeded) 1)))))
+                                (None [] 0))
+                              (set! (mut member) (+ (load member) 1))
+                              (continue))))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      (load seeded))))
+
+;; A separately optimized entry is executable even though its discovery callers were removed.
+;; Reuse Fun's final-Simple unknown-caller hook as a temporary local root: Parms then read their
+;; frozen declarations, and the hook is removed before the next component or the backend handoff.
+(defn per-function-root-component! [(plan (ptr PerFunctionPlan))
+                                    (component i64)
+                                    (required (ArrayList bool))] (-> i64)
+  (let [root (start-make TY-CTRL)
+        size (per-function-component-size plan component)
+        (mut i) 0
+        (mut rooted) 0]
+    (loop (if (>= (load i) size)
+              (break 0)
+              (let [entry (per-function-component-entry plan component (load i))]
+                (match (arena-node (.fun entry))
+                  (Some [fun]
+                        (cond (n-dead? fun) 0
+                              (fun-unknown-callers? fun)  ;; Late realm materialization happens after the required-root
+                              ;; snapshot. Its callable adapters already have a real Start hook;
+                              ;; that makes the component executable even though this pass did
+                              ;; not need to install another hook.
+                              (set! (mut rooted) (+ (load rooted) 1))
+                                (and (not (get required (n-nid fun)))
+                                     (or (ty-high? (n-ty fun))
+                                         (= (n-ty fun) TY-XCTRL)))
+                              0 :else
+                              (do
+                                (fun-add-unknown-callers! fun root)
+                                (set! (mut rooted) (+ (load rooted) 1)))))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load rooted)))
+
+(defn per-function-unroot-component! [(plan (ptr PerFunctionPlan))
+                                      (component i64)
+                                      (entry-start (dyn NodeOps))] (-> i64)
+  (let [size (per-function-component-size plan component)
+        (mut i) 0
+        (mut unrooted) 0]
+    (loop (if (>= (load i) size)
+              (break 0)
+              (let [entry (per-function-component-entry plan component (load i))]
+                (match (arena-node (.fun entry))
+                  (Some [fun]
+                        (if (or (n-dead? fun) (not (fun-unknown-callers? fun)))
+                            0
+                            ;; The prototype still has one whole-unit backend. Every separately
+                            ;; optimized entry therefore needs an executable root after discovery
+                            ;; edges are gone; otherwise surviving FunPtr code words name bodies
+                            ;; collected between components. Replace the temporary root atomically.
+                            (n-set-def! fun 1 (Some entry-start))))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (load unrooted)))
+
+;; Restore outbound protocol edges to already-frozen callees and the recursive component's own
+;; edges. An SCC needs those internal edges to compute its local fixpoint; suppress inlining on
+;; them separately so mutual recursion cannot unroll the component.
+(defn per-function-link-callees! [(plan (ptr PerFunctionPlan))
+                                  (component i64)] (-> i64)
+  (let [(mut linked) 0
+        (mut callee-index) 0]
+    (loop (if (>= (load callee-index) (len (.entries plan)))
+              (break 0)
+              (let [callee
+                      (al-elem [PerFunctionEntry]
+                               (mut (.entries plan))
+                               (load callee-index))]
+                (match (arena-node (.fun callee))
+                  (Some [fun]
+                        (let [(mut caller-index) 0]
+                          (loop (if (>= (load caller-index)
+                                        (len (.callers callee)))
+                                    (break 0)
+                                    (let [caller-id
+                                            (get (.callers callee)
+                                                 (load caller-index))]
+                                      (if (code-work-scope-accepts? caller-id)
+                                          (match (arena-node caller-id)
+                                            (Some [call]
+                                                  (if (and (= (n-op call)
+                                                              OP-CALL)
+                                                           (not (n-dead? call)))
+                                                      (do
+                                                        (if (= (.component callee)
+                                                               component)
+                                                            (match (call-cend call)
+                                                              (Some [end]
+                                                                    (callend-set-never-inline! end))
+                                                              (None [] 0))
+                                                            0)
+                                                        (if (call-linked? call
+                                                                          fun)
+                                                            0
+                                                            (do
+                                                              (call-link! call
+                                                                          fun)
+                                                              (set! (mut linked)
+                                                                    (+ (load linked)
+                                                                       1)))))
+                                                      0))
+                                            (None [] 0))
+                                          0)
+                                      (set! (mut caller-index)
+                                            (+ (load caller-index) 1))
+                                      (continue))))))
+                  (None [] 0))
+                (set! (mut callee-index) (+ (load callee-index) 1))
+                (continue))))
+    (load linked)))
+
+(defn per-function-scope-end! [] (-> i64)
+  (code-work-scope-end!))
+
+;; A local structural rebuild is not monotone with respect to the old global graph, so one sparse
+;; drain can expose a dependency that was never registered in the opposite direction. The scoped
+;; fixpoint verifier detects that case; reseed every admitted live node before the next drain.
+(defn per-function-reseed-scope! [] (-> i64)
+  (let [limit (arena-node-count)
+        (mut nid) 1
+        (mut seeded) 0]
+    (loop (if (> (load nid) limit)
+              (break 0)
+              (do
+                (if (code-work-scope-accepts? (load nid))
+                    (match (arena-node (load nid))
+                      (Some [node]
+                            (if (n-dead? node)
+                                0
+                                (do
+                                  (code-add! node)
+                                  (set! (mut seeded) (+ (load seeded) 1)))))
+                      (None [] 0))
+                    0)
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))
+    (load seeded)))
+
+;; Local inlining can copy call sites and Returns after the global freeze. A copied CallEnd starts
+;; without its source site's proof because its arguments are different; once the component reaches
+;; its own fixpoint, however, its current tuple is precisely the result summary that must survive
+;; removal of the temporary callee edge. Freeze every new or old member at that boundary.
+(defn per-function-freeze-scoped-results! [] (-> i64)
+  (let [limit (arena-node-count)
+        (mut nid) 1
+        (mut frozen) 0]
+    (loop (if (> (load nid) limit)
+              (break 0)
+              (do
+                (if (code-work-scope-accepts? (load nid))
+                    (match (arena-node (load nid))
+                      (Some [node]
+                            (if (n-dead? node)
+                                0
+                                (cond (= (n-op node) OP-CALLEND)
+                                        (do
+                                          (callend-freeze-result! node)
+                                          (set! (mut frozen)
+                                                (+ (load frozen) 1)))
+                                      (= (n-op node) OP-RETURN)
+                                        (return-freeze-local! node)
+                                      :else 0)))
+                      (None [] 0))
+                    0)
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))
+    (load frozen)))
+
+(defn per-function-freeze! [(plan (ptr PerFunctionPlan))] (-> i64)
+  (let [(mut frozen) 0]
+    (al-for [item (.entries plan)]
+            (let [entry item]
+              (match (arena-node (.fun entry))
+                (Some [fun]
+                      (do
+                        ;; Return names its owning Fun as metadata, not as a graph input. Once local
+                        ;; optimization eliminates every Parm and FunPtr use, a separately compiled
+                        ;; entry would otherwise be collected even though its kept Return is still a
+                        ;; compilation-unit root. Pin the authoritative plan entry through the one
+                        ;; whole-unit backend; arena reset releases the compiler-lifetime pin.
+                        (n-keep! fun)
+                        (match (fun-mem-parm fun)
+                          (Some [memory]
+                                (do
+                                  (parm-freeze-contract! memory
+                                                         (get (.contract entry)
+                                                              0))
+                                  0))
+                          (None [] 0))
+                        (let [(mut arg) 0]
+                          (loop (if (>= (+ (load arg) 1)
+                                        (len (.contract entry)))
+                                    (break 0)
+                                    (do
+                                      (match (fun-parm fun (load arg))
+                                        (Some [parm]
+                                              (let [contract
+                                                      (get (.contract entry)
+                                                           (+ (load arg) 1))]
+                                                (if (= contract TY-INVALID)
+                                                    (panic "per-function-freeze!: live Parm has no contract")
+                                                    (do
+                                                      (parm-freeze-contract! parm
+                                                                             contract)
+                                                      0))))
+                                        (None []
+                                              (if (= (get (.contract entry)
+                                                          (+ (load arg) 1))
+                                                     TY-INVALID)
+                                                  0
+                                                  (panic "per-function-freeze!: contracted Parm vanished"))))
+                                      (set! (mut arg) (+ (load arg) 1))
+                                      (continue)))))
+                        (set! (mut frozen) (+ (load frozen) 1))))
+                (None []
+                      (panic "per-function-freeze!: function vanished before freeze")))))
+    (let [(mut nid) 1]
+      (loop (if (> (load nid) (arena-node-count))
+                (break 0)
+                (do
+                  (match (arena-node (load nid))
+                    (Some [node]
+                          (if (n-dead? node)
+                              0
+                              (cond (= (n-op node) OP-CALLEND)
+                                      (callend-freeze-result! node)
+                                    (= (n-op node) OP-RETURN)
+                                      (return-freeze-local! node)
+                                    :else 0)))
+                    (None [] 0))
+                  (set! (mut nid) (+ (load nid) 1))
+                  (continue)))))
+    (load frozen)))
+
+(defn per-function-plan-free! [(plan (ptr PerFunctionPlan))] (-> i64)
+  (do
+    (al-for [item (.entries plan)]
+            (let [entry item]
+              (let [(mut contract) (.contract entry)
+                    (mut callers) (.callers entry)]
+                (al-free! [i64] (mut contract))
+                (al-free! [i64] (mut callers))
+                (let [(mut callees) (.callees entry)]
+                  (al-free! [i64] (mut callees)))
+                (let [(mut members) (.members entry)]
+                  (al-free! [i64] (mut members)))
+                0)))
+    (al-free! [PerFunctionEntry] (mut (.entries plan)))
+    (al-free! [i64] (mut (.order plan)))
+    (al-free! [i64] (mut (.offsets plan)))
+    0))

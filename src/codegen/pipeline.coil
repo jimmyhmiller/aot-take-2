@@ -39,6 +39,7 @@
 (import "aot.codegen.machine" :use *)
 (import "aot.codegen.iterpeeps" :use *)
 (import "aot.codegen.opto" :use *)
+(import "aot.codegen.perfunction" :use *)
 (import "aot.facts" :use *)
 (import "aot.codegen.typecheck" :use *)
 (import "aot.codegen.looptree" :use *)
@@ -189,6 +190,235 @@
                           (set! (mut round) (+ (load round) 1))
                           (continue))))))))
     (if (> (versions-close-admission!) 0) (opto-run!) 0)))
+
+;; M4 comparison path. Global SCCP still discovers the complete call graph and proves the one
+;; contract for every entry. From FREEZE onward each recursive component owns its worklist; only an
+;; outbound call is temporarily relinked, and local inlining always clones its separately compiled
+;; callee. This is intentionally selected in the same binary as the baseline pipeline.
+(defn pipeline-opto-per-function! [(stop (dyn NodeOps))] (-> i64)
+  (let [(mut required) (pipeline-per-function-required-roots)
+        entry-start (parser-entry-start)]
+    ;; Published source entries are real closed-world roots, not callers invented after analysis.
+    ;; Install their ordinary Fun/Parm Start arms before SCCP and settle the pessimistic bound that
+    ;; SCCP is required not to cross.
+    (pipeline-per-function-required-hooks! (load required) entry-start true)
+    (iter-peeps!)
+    (imagefacts-compute-with-boundary! (.external-mutation (parser-state)))
+    (mem-commit-code-word-facts!)
+    (parser-prepare-opto! stop)
+    ;; Published entries must participate in the global SCCP graph so their internal calls and
+    ;; Return contracts are discovered. `parser-prepare-opto!` detached every non-process Return;
+    ;; temporarily restore precisely the entries the compilation unit promises to emit.
+    (pipeline-per-function-required-returns! stop (load required) true)
+    (opto-reset-to-top!)
+    (opto-sccp!)
+    (opto-resolve-numeric-modes!)
+    ;; Generic accesses are graph construction, not a local peephole. Expand them before the owner
+    ;; snapshot so every new node enters the correct component's first local solve.
+    (let [before-expansion (arena-node-count)]
+      (property-expand-all!)
+      ;; Expansion happens after SCCP, so its fresh nodes have no saved pessimistic bound. Settle
+      ;; their constructor-computed types under the proven surrounding graph, then save that
+      ;; local-safe bound for the component reset below.
+      (pipeline-settle-expanded-nodes! before-expansion))
+    (code-clear-worklists!)
+    (let [plan (per-function-plan)]
+      (pipeline-per-function-required-returns! stop (load required) false)
+      (per-function-freeze! plan)
+      (pipeline-per-function-required-hooks! (load required) entry-start false)
+      (call-unlink-all!)
+      (let [count (per-function-component-count plan)
+            (mut component) 0
+            (mut rounds) 0]
+        (loop (if (>= (load component) count)
+                  (break 0)
+                  (do
+                    (per-function-scope-begin! plan (load component))
+                    (let [rooted
+                            (per-function-root-component! plan
+                                                          (load component)
+                                                          (load required))]
+                      (if (> rooted 0)
+                          (do
+                            (per-function-link-callees! plan (load component))
+                            (set! (mut rounds) (+ (load rounds) (iter-run!)))
+                            (let [(mut retries) 0]
+                              (loop (if (= (iter-check-scope-fixpoint) 0)
+                                        (break 0)
+                                        (do
+                                          (set! (mut retries) (+ (load retries) 1))
+                                          (if (> (load retries) 16)
+                                              (panic "pipeline: per-function optimizer did not converge")
+                                              0)
+                                          (per-function-reseed-scope!)
+                                          (set! (mut rounds)
+                                                (+ (load rounds) (iter-run!)))
+                                          (continue)))))
+                            ;; Surviving calls remain calls to separately compiled entries. Remove
+                            ;; temporary analysis edges before advancing to the next component.
+                            ;; Calls cloned by local inlining did not exist at the global freeze;
+                            ;; capture their locally proven result first.
+                            (per-function-freeze-scoped-results!)
+                            (call-unlink-all!)
+                            ;; Unlinking is the component boundary, not a new optimization graph.
+                            ;; CallEnd and Return summaries were frozen immediately above; solving
+                            ;; again against the severed discovery edges would incorrectly turn a
+                            ;; separately compiled entry's detached Return into dead control.
+                            (per-function-unroot-component! plan
+                                                            (load component)
+                                                            entry-start)
+                            0)
+                          0))
+                    (per-function-scope-end!)
+                    (set! (mut component) (+ (load component) 1))
+                    (continue))))
+        (per-function-plan-free! plan)
+        (al-free! [bool] (mut required))
+        (load rounds)))))
+
+;; Functions the source frontend will publish to the backend are local roots even when closed-world
+;; SCCP saw no ordinary caller. JSL entries are rooted only when SCCP kept them live.
+(defn pipeline-per-function-required-roots [] (-> (ArrayList bool))
+  (let [(mut required) (al-new [bool] (compiler-allocator))
+        (mut nid) 0]
+    (loop (if (> (load nid) (arena-node-count))
+              (break 0)
+              (do
+                (push! [bool] (mut required) false)
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))
+    (set! (mut required) (n-nid (parser-entry-fun)) true)
+    (let [(mut fi) 0]
+      (loop (if (>= (load fi) (len (.funs (parser-state))))
+                (break 0)
+                (do
+                  (if (syntax-fun-lowered? (load fi))
+                      (let [syntax (syntax-fun-at (load fi))]
+                        ;; Function objects publish their stable shared-ABI adapters. The local
+                        ;; body is private and remains reachable through the adapter's concrete
+                        ;; call; inventing an unknown caller for it would widen its hidden vector
+                        ;; and actual-count contracts back to `dyn`.
+                        (if (!= (.adapter-nid syntax) 0)
+                            (set! (mut required) (.adapter-nid syntax) true)
+                            0))
+                      0)
+                  (set! (mut fi) (+ (load fi) 1))
+                  (continue)))))
+    (jsl-mark-required-provider-entries! (mut required))
+    (load required)))
+
+(defn pipeline-per-function-required-returns! [(stop (dyn NodeOps))
+                                                (required (ArrayList bool))
+                                                (install bool)] (-> i64)
+  (let [entry (parser-entry-fun)
+        (mut changed) 0]
+    (if install
+        (let [(mut nid) 1]
+          (loop (if (>= (load nid) (len required))
+                    (break 0)
+                    (do
+                      (if (get required (load nid))
+                          (match (arena-node (load nid))
+                            (Some [fun]
+                                  (if (and (= (n-op fun) OP-FUN)
+                                           (not (n-same? fun entry)))
+                                      (match (fun-ret fun)
+                                        (Some [ret]
+                                              (do
+                                                (stop-add-return! stop ret)
+                                                (set! (mut changed)
+                                                      (+ (load changed) 1))))
+                                        (None [] 0))
+                                      0))
+                            (None [] 0))
+                          0)
+                      (set! (mut nid) (+ (load nid) 1))
+                      (continue)))))
+        (let [(mut i) 0]
+          (loop (if (>= (load i) (n-nins stop))
+                    (break 0)
+                    (match (n-in stop (load i))
+                      (Some [ret]
+                            (match (return-fun ret)
+                              (Some [fun]
+                                    (if (and (not (n-same? fun entry))
+                                             (and (< (n-nid fun) (len required))
+                                                  (get required (n-nid fun))))
+                                        (do
+                                          (n-del-def! stop (load i))
+                                          (set! (mut changed) (+ (load changed) 1))
+                                          (continue))
+                                        (do
+                                          (set! (mut i) (+ (load i) 1))
+                                          (continue))))
+                              (None []
+                                    (do
+                                      (set! (mut i) (+ (load i) 1))
+                                      (continue)))))
+                      (None []
+                            (do
+                              (set! (mut i) (+ (load i) 1))
+                              (continue))))))))
+    (load changed)))
+
+(defn pipeline-per-function-required-hooks! [(required (ArrayList bool))
+                                              (start (dyn NodeOps))
+                                              (install bool)] (-> i64)
+  (let [(mut nid) 1
+        (mut changed) 0]
+    (loop (if (>= (load nid) (len required))
+              (break 0)
+              (do
+                (if (get required (load nid))
+                    (match (arena-node (load nid))
+                      (Some [fun]
+                            (if (and (= (n-op fun) OP-FUN)
+                                     (and (not (n-dead? fun))
+                                          (not (fun-folding? fun))))
+                                (if install
+                                    (if (fun-unknown-callers? fun)
+                                        0
+                                        (do
+                                          (fun-add-unknown-callers! fun start)
+                                          (set! (mut changed) (+ (load changed) 1))))
+                                    (if (fun-unknown-callers? fun)
+                                        (do
+                                          (fun-drop-unknown-callers! fun)
+                                          (set! (mut changed) (+ (load changed) 1)))
+                                        0))
+                                0))
+                      (None [] 0))
+                    0)
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))
+    (load changed)))
+
+(defn pipeline-settle-expanded-nodes! [(before i64)] (-> i64)
+  (let [limit (arena-node-count)
+        (mut nid) (+ before 1)]
+    (loop (if (> (load nid) limit)
+              (break 0)
+              (do
+                (match (arena-node (load nid))
+                  (Some [node]
+                        (if (n-dead? node)
+                            0
+                            (code-add! node)))
+                  (None [] 0))
+                (set! (mut nid) (+ (load nid) 1))
+                (continue))))
+    (let [visits (iter-peeps!)]
+      (set! (mut nid) (+ before 1))
+      (loop (if (> (load nid) (arena-node-count))
+                (break 0)
+                (do
+                  (match (arena-node (load nid))
+                    (Some [node]
+                          (if (n-dead? node) 0 (n-set-pesi-ty! node (n-ty node))))
+                    (None [] 0))
+                  (set! (mut nid) (+ (load nid) 1))
+                  (continue))))
+      visits)))
 
 
 (defn pipeline-selected-start? [(n (dyn NodeOps))] (-> bool)
@@ -375,17 +605,19 @@
         (iter-run!)
         (code-enter-phase! PHASE-OPTO)
         (parser-close-world!)
-        (pipeline-opto-under-facts! stop)
-        ;; Sweep the complete arena after the last rationed inline. Nodes disconnected by that
-        ;; final graph surgery (especially Call/CallEnd shells) may not otherwise receive another
-        ;; sparse-worklist visit, but later CFG passes require the live graph to be closed.
-        (iter-seed-all!)
-        (iter-run!)
-        ;; Property accesses that no proof resolved take the generic dispatch exactly once, after
-        ;; inlining has had every chance to expose their owners; peephole the expansions.
-        (property-expand-all!)
-        (iter-seed-all!)
-        (iter-run!)
+        (if (per-function-enabled?)
+            (pipeline-opto-per-function! stop)
+            (do
+              (pipeline-opto-under-facts! stop)
+              ;; Sweep the complete arena after the last rationed inline. Nodes disconnected by
+              ;; that final graph surgery may otherwise miss a sparse-worklist visit.
+              (iter-seed-all!)
+              (iter-run!)
+              ;; Property accesses unresolved by proof take generic dispatch exactly once, after
+              ;; inlining has had every chance to expose their owners.
+              (property-expand-all!)
+              (iter-seed-all!)
+              (iter-run!)))
         (parser-finish-opto! stop)
         (jsl-finish-opto! stop)
         (versions-finish-opto! stop)
@@ -404,6 +636,10 @@
           (jsl-prepare-codegen! start)
           (versions-prepare-codegen! start)
           (call-unlink-all!)
+          ;; Installing final entry hooks and removing the last discovery edges changes control
+          ;; reachability. Remove unreachable Return sinks before instruction selection walks
+          ;; backward from Stop; frozen call summaries make another optimizer pass unnecessary.
+          (stop-idealize stop)
           (n-unkeep! start)
           (pipeline-encode-machine! stop)
           graph)))))
@@ -411,11 +647,46 @@
 ;; The source frontend and generated Script hosts share the backend phase order from final
 ;; Simple's CodeGen.driver: selection, global/local scheduling, allocation, encoding, export.
 ;; Precise GC maps use final instruction offsets between layout and emission.
+(defn pipeline-prune-selected-stop! [(stop (dyn NodeOps))] (-> i64)
+  (let [(mut i) 0
+        (mut removed) 0]
+    (loop (if (>= (load i) (n-nins stop))
+              (break 0)
+              (match (n-in stop (load i))
+                (Some [input]
+                      (let [state (n-ty input)
+                            unreachable-return
+                              (match (mach-of input)
+                                (Some [mach]
+                                      (and (= (m-ideal-op mach) OP-RETURN)
+                                           (and (!= state TY-INVALID)
+                                                (and (ty-tuple? state)
+                                                     (= (ty-tuple-at state RETURN-CTRL)
+                                                        TY-XCTRL)))))
+                                (None [] false))]
+                        (if unreachable-return
+                            (do
+                              (n-del-def! stop (load i))
+                              (set! (mut removed) (+ (load removed) 1))
+                              (continue))
+                            (do
+                              (set! (mut i) (+ (load i) 1))
+                              (continue)))))
+                (None []
+                      (do
+                        (n-del-def! stop (load i))
+                        (set! (mut removed) (+ (load removed) 1))
+                        (continue))))))
+    (load removed)))
+
 (defn pipeline-encode-machine! [(stop (dyn NodeOps))] (-> i64)
   (do
     (code-enter-phase! PHASE-SELECT)
     (let [selected-stop (arm64-select-graph stop)
-          selected-start (pipeline-find-selected-start selected-stop)]
+          selected-start
+            (do
+              (pipeline-prune-selected-stop! selected-stop)
+              (pipeline-find-selected-start selected-stop))]
       (code-set-roots! selected-start selected-stop)
       (code-enter-phase! PHASE-SCHEDULE)
       (gcm-build-cfg!)
@@ -592,12 +863,15 @@
                 (do
                   (code-enter-phase! PHASE-OPTO)
                   (parser-close-world!)
-                  (pipeline-opto-under-facts! stop)
-                  (iter-seed-all!)
-                  (iter-run!)
-                  (property-expand-all!)
-                  (iter-seed-all!)
-                  (iter-run!)
+                  (if (per-function-enabled?)
+                      (pipeline-opto-per-function! stop)
+                      (do
+                        (pipeline-opto-under-facts! stop)
+                        (iter-seed-all!)
+                        (iter-run!)
+                        (property-expand-all!)
+                        (iter-seed-all!)
+                        (iter-run!)))
                   (parser-finish-opto! stop)
                   (jsl-finish-opto! stop)
                   (versions-finish-opto! stop)

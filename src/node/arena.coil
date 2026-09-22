@@ -1,5 +1,4 @@
 ;; The node arena: dense node ids, the function-index registry, external functions, and the iterate and inline worklists.
-
 (module aot.node.arena)
 (import "aot.util.arena"
         :use
@@ -40,6 +39,10 @@
    (deferred (ArrayList i64))  ; candidates that answered DEFER, retried after any inline fires
    (specialize-work WorkList)  ; the same discipline for source re-lowering: CallEnds to ask
    (specialize-deferred (ArrayList i64))  ; asked, answered DEFER; retried after any growth fires
+   ;; M4 local optimization: existing members are selected explicitly; nodes constructed while a
+   ;; scope is active inherit membership in that component.
+   (work-scope-active bool)
+   (work-scope-members (ArrayList bool))
    ;; Every (dep, watcher) pair currently in some node's `deps`, so adding one is a lookup and not
    ;; a scan of the dep's lists: a Fun watched by hundreds of CallEnds made that scan half of Opto.
    (dep-pairs (HashMap i64 bool))
@@ -72,8 +75,10 @@
           (set! (.deferred t) (al-new [i64] a))
           (set! (.specialize-work t) (WorkList::new 1))
           (set! (.specialize-deferred t) (al-new [i64] a))
+          (set! (.work-scope-active t) false)
+          (set! (.work-scope-members t) (al-new [bool] a))
           (set! (.dep-pairs t) (hm-new [i64 bool] a (i64-keyops)))
-      (set! (.use-pos t) (hm-new [i64 i64] a (i64-keyops)))
+          (set! (.use-pos t) (hm-new [i64 i64] a (i64-keyops)))
           (set! (.use-pos t) (hm-new [i64 i64] a (i64-keyops)))
           (set! (.next-nid t) 1)
           (set! (.mid-assert t) false)
@@ -113,6 +118,8 @@
       (set! (.deferred t) (al-new [i64] a))
       (set! (.specialize-work t) (WorkList::new seed))
       (set! (.specialize-deferred t) (al-new [i64] a))
+      (set! (.work-scope-active t) false)
+      (set! (.work-scope-members t) (al-new [bool] a))
       (set! (.dep-pairs t) (hm-new [i64 bool] a (i64-keyops)))
       (set! (.ctrl-version t) 1)
       (set! (.cfg-edit-version t) 1)
@@ -273,10 +280,12 @@
 (defn code-add! [(n (dyn NodeOps))] (-> i64)
   (do
     (arena-boot!)
-    (if (.mid-assert (arena))
+    (if (or (.mid-assert (arena))
+            (not (code-work-scope-accepts? (n-nid n))))
         0
         (do
-          (set! (.pushes (code-work-push-stat)) (+ (.pushes (code-work-push-stat)) 1))
+          (set! (.pushes (code-work-push-stat))
+                (+ (.pushes (code-work-push-stat)) 1))
           (push! (mut (.work (arena))) (n-nid n))))))
 
 (defn code-add-outputs! [(n (dyn NodeOps))] (-> i64)
@@ -315,6 +324,49 @@
     (al-clear! [i64] (mut (.specialize-deferred (arena))))
     0))
 
+(defn code-work-scope-accepts? [(id i64)] (-> bool)
+  (let [t (arena)]
+    (or (not (.work-scope-active t))
+        (and (>= id 0)
+             (and (< id (len (.work-scope-members t)))
+                  (get (.work-scope-members t) id))))))
+
+(defn code-work-scope-active? [] (-> bool)
+  (do (arena-boot!) (.work-scope-active (arena))))
+
+;; Start with no old members. The owner snapshot explicitly admits nodes in the component; all
+;; nodes created by its rewrites are local by construction and inherit membership in arena-register!.
+(defn code-work-scope-begin! [] (-> i64)
+  (do
+    (arena-boot!)
+    (code-clear-worklists!)
+    (let [t (arena)
+          (mut i) 0]
+      (al-clear! [bool] (mut (.work-scope-members t)))
+      (loop (if (> (load i) (arena-node-count))
+                (break 0)
+                (do
+                  (push! [bool] (mut (.work-scope-members t)) false)
+                  (set! (mut i) (+ (load i) 1))
+                  (continue))))
+      (set! (.work-scope-active t) true)
+      0)))
+
+(defn code-work-scope-allow! [(id i64)] (-> i64)
+  (let [t (arena)]
+    (if (or (not (.work-scope-active t))
+            (<= id 0)
+            (>= id (len (.work-scope-members t))))
+        (panic-i "code-work-scope-allow!: invalid scoped node" id)
+        (set! (mut (.work-scope-members t)) id true))))
+
+(defn code-work-scope-end! [] (-> i64)
+  (do
+    (arena-boot!)
+    (code-clear-worklists!)
+    (set! (.work-scope-active (arena)) false)
+    0))
+
 (defn code-seed [] (-> i64)
   (do (arena-boot!) (seed0 (.work (arena)))))
 
@@ -329,6 +381,9 @@
       (set! (.next-nid t) (+ id 1))
       (push! [(Option (dyn NodeOps))] (mut (.nodes t)) (Some n))
       (push! [i64] (mut (.gvn-next t)) 0)
+      (if (.work-scope-active t)
+          (push! [bool] (mut (.work-scope-members t)) true)
+          0)
       id)))
 
 ;; ---------------------------------------------------------------------------
@@ -340,7 +395,9 @@
 (defn code-inline-push! [(id i64)] (-> i64)
   (do
     (arena-boot!)
-    (if (.mid-assert (arena)) 0 (push! (mut (.inline-work (arena))) id))))
+    (if (or (.mid-assert (arena)) (not (code-work-scope-accepts? id)))
+        0
+        (push! (mut (.inline-work (arena))) id))))
 
 (defn code-inline-pop! [] (-> (Option i64))
   (do (arena-boot!) (pop! (mut (.inline-work (arena))))))
@@ -353,7 +410,12 @@
 
 ;; Park a candidate that answered DEFER. It is retried only after some OTHER inline actually fired.
 (defn code-defer-inline! [(id i64)] (-> i64)
-  (do (arena-boot!) (push! [i64] (mut (.deferred (arena))) id) 0))
+  (do
+    (arena-boot!)
+    (if (code-work-scope-accepts? id)
+        (push! [i64] (mut (.deferred (arena))) id)
+        0)
+    0))
 
 ;; ---------------------------------------------------------------------------
 ;; The SPECIALIZE worklist — the inline worklist's discipline, for source re-lowering
@@ -371,13 +433,20 @@
 (defn code-specialize-push! [(id i64)] (-> i64)
   (do
     (arena-boot!)
-    (if (.mid-assert (arena)) 0 (push! (mut (.specialize-work (arena))) id))))
+    (if (or (.mid-assert (arena)) (not (code-work-scope-accepts? id)))
+        0
+        (push! (mut (.specialize-work (arena))) id))))
 
 (defn code-specialize-pop! [] (-> (Option i64))
   (do (arena-boot!) (pop! (mut (.specialize-work (arena))))))
 
 (defn code-defer-specialize! [(id i64)] (-> i64)
-  (do (arena-boot!) (push! [i64] (mut (.specialize-deferred (arena))) id) 0))
+  (do
+    (arena-boot!)
+    (if (code-work-scope-accepts? id)
+        (push! [i64] (mut (.specialize-deferred (arena))) id)
+        0)
+    0))
 
 (defn code-requeue-specialize-deferred! [] (-> i64)
   (do

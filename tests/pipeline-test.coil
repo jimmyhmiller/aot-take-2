@@ -26,6 +26,7 @@
 (import "aot.codegen.encoding" :use *)
 (import "aot.codegen.objfile" :use *)
 (import "aot.codegen.pipeline" :use *)
+(import "aot.codegen.perfunction" :use *)
 (import "aot.node.cpus.arm64" :use *)
 (import "aot.node.cpus.arm64.call" :use *)
 (import "aot.jsl.lower" :use *)
@@ -37,6 +38,160 @@
 
 (defn pipeline-test-ideal-op [(n (dyn NodeOps))] (-> i64)
   (match (mach-of n) (Some [mach] (m-ideal-op mach)) (None [] (n-op n))))
+
+(deftest per_function_plan_preserves_sccp_contract_and_callers_across_unlink
+         (do
+           (boot! 3101)
+           (let [start (start-make TY-CTRL)
+                 signature (ty-tuple-of2 (ty-int-bot) (ty-int-bot))
+                 fun (fun-make start signature "contract-callee")
+                 parm (parm-make fun 0 (ty-int-bot) "value")
+                 ret
+                   (return-make fun
+                                (None [(dyn NodeOps)])
+                                parm
+                                (None [(dyn NodeOps)])
+                                (Some fun))
+                 call (call-make start)]
+             (fun-set-ret! fun ret)
+             (n-keep! ret)
+             (fun-drop-unknown-callers! fun)
+             (call-add-arg! call (con-int 7))
+             (call-set-fptr! call (funptr-make fun 3101))
+             (callend-make call)
+             (call-link! call fun)
+             ;; Model the closed SCCP answer captured at the M4 FREEZE boundary.
+             (n-set-ty! parm (ty-int-con 7))
+             (let [plan (per-function-plan)]
+               (assert-eq (per-function-entry-count plan) 1)
+               (assert-eq (per-function-component-count plan) 1)
+               (assert-eq (per-function-component-size plan 0) 1)
+               (let [entry (per-function-entry-at plan 0)]
+                 (assert-eq (per-function-contract-at entry 1) (ty-int-con 7))
+                 (assert-eq (per-function-caller-count entry) 1)
+                 (assert-eq (per-function-caller-at entry 0) (n-nid call)))
+               (per-function-freeze! plan)
+               (call-unlink-all!)
+               (assert-eq (parm-declared parm) (ty-int-con 7))
+               (assert-eq (n-ty parm) (ty-int-con 7))
+               (assert-eq (n-nins fun) 1)
+               (assert-eq (n-nins parm) 1)
+               (per-function-plan-free! plan)
+               (n-unkeep! ret)))))
+
+(deftest per_function_components_are_iterative_and_bottom_up
+         (do
+           (boot! 3102)
+           (let [start (start-make TY-CTRL)
+                 signature (ty-tuple-of2 (ty-int-bot) (ty-int-bot))
+                 caller (fun-make start signature "caller")
+                 middle (fun-make start signature "middle")
+                 leaf (fun-make start signature "leaf")
+                 caller-parm (parm-make caller 0 (ty-int-bot) "x")
+                 middle-parm (parm-make middle 0 (ty-int-bot) "x")
+                 leaf-parm (parm-make leaf 0 (ty-int-bot) "x")
+                 caller-ret
+                   (return-make caller
+                                (None [(dyn NodeOps)])
+                                caller-parm
+                                (None [(dyn NodeOps)])
+                                (Some caller))
+                 middle-ret
+                   (return-make middle
+                                (None [(dyn NodeOps)])
+                                middle-parm
+                                (None [(dyn NodeOps)])
+                                (Some middle))
+                 leaf-ret
+                   (return-make leaf
+                                (None [(dyn NodeOps)])
+                                leaf-parm
+                                (None [(dyn NodeOps)])
+                                (Some leaf))]
+             (fun-set-ret! caller caller-ret)
+             (fun-set-ret! middle middle-ret)
+             (fun-set-ret! leaf leaf-ret)
+             (n-keep! caller-ret)
+             (n-keep! middle-ret)
+             (n-keep! leaf-ret)
+             (fun-drop-unknown-callers! caller)
+             (fun-drop-unknown-callers! middle)
+             (fun-drop-unknown-callers! leaf)
+             (let [to-middle (call-make caller)
+                   to-leaf (call-make middle)
+                   recursive (call-make leaf)]
+               (call-add-arg! to-middle caller-parm)
+               (call-set-fptr! to-middle (funptr-make middle 3103))
+               (callend-make to-middle)
+               (call-link! to-middle middle)
+               (call-add-arg! to-leaf middle-parm)
+               (call-set-fptr! to-leaf (funptr-make leaf 3104))
+               (callend-make to-leaf)
+               (call-link! to-leaf leaf)
+               (call-add-arg! recursive leaf-parm)
+               (call-set-fptr! recursive (funptr-make leaf 3104))
+               (let [recursive-end (callend-make recursive)]
+                 (call-link! recursive leaf)
+               (let [plan (per-function-plan)]
+                 (assert-eq (per-function-component-count plan) 3)
+                 (assert-eq
+                   (per-function-entry-fun (per-function-component-entry plan 0 0))
+                   (n-nid leaf))
+                 (assert-eq
+                   (per-function-entry-fun (per-function-component-entry plan 1 0))
+                   (n-nid middle))
+                 (assert-eq
+                   (per-function-entry-fun (per-function-component-entry plan 2 0))
+                   (n-nid caller))
+                 (call-unlink-all!)
+                 (assert (> (per-function-scope-begin! plan 0) 0))
+                 ;; An explicit cross-component wakeup is rejected by the arena scope.
+                 (code-add! caller)
+                 (let [(mut saw-leaf) false
+                       (mut saw-caller) false]
+                   (loop (match (code-work-pop!)
+                           (Some [nid]
+                                 (do
+                                   (if (= nid (n-nid leaf))
+                                       (set! (mut saw-leaf) true)
+                                       0)
+                                   (if (= nid (n-nid caller))
+                                       (set! (mut saw-caller) true)
+                                       0)
+                                   (continue)))
+                           (None [] (break 0))))
+                   (assert (load saw-leaf))
+                   (assert (not (load saw-caller))))
+                 ;; A node made by this local pass belongs to it without recomputing ownership.
+                 (let [fresh (add-make leaf-parm (con-int 1))]
+                   (code-add! fresh)
+                   (let [(mut saw-fresh) false]
+                     (loop (match (code-work-pop!)
+                             (Some [nid]
+                                   (do
+                                     (if (= nid (n-nid fresh))
+                                         (set! (mut saw-fresh) true)
+                                         0)
+                                     (continue)))
+                             (None [] (break 0))))
+                     (assert (load saw-fresh))))
+                 ;; An SCC is solved with its own edges present, but those cyclic edges are never
+                 ;; inline candidates: otherwise mutual recursion would unroll the component.
+                 (assert-eq (per-function-link-callees! plan 0) 1)
+                 (assert (call-linked? recursive leaf))
+                 (assert-eq (callend-inline-candidate recursive-end) INLINE-NEVER)
+                 (call-unlink-all!)
+                 (per-function-scope-end!)
+                 (per-function-scope-begin! plan 2)
+                 (assert-eq (per-function-link-callees! plan 2) 1)
+                 (assert (call-linked? to-middle middle))
+                 (assert (not (call-linked? to-leaf leaf)))
+                 (call-unlink-all!)
+                 (per-function-scope-end!)
+                 (per-function-plan-free! plan))))
+             (n-unkeep! caller-ret)
+             (n-unkeep! middle-ret)
+             (n-unkeep! leaf-ret))))
 
 ;; A block head has exactly one CFG tail. In particular, a Return and a Call cannot both be direct
 ;; control children of the same Fun: local scheduling would be free to emit either terminal first.
