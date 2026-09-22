@@ -339,7 +339,10 @@ aot-take-2/
 │   │   │             install.coil  ; executable memory, bindings, import resolution, relocation, unit sites
 │   │   │             run.coil }    ; fresh realm data, shared realm objects, the native entry
 │   │   ├── sourcecache.coil ; bounded Script/host image caches, exact source/JSL keys, leased handles and owned Script programs
-│   │   ├── serialize.coil   ; the ideal graph into the object file
+│   │   ├── serialize.coil   ; ideal-graph artifact facade; re-exports its parts
+│   │   ├── serialize/  { bytes.coil  ; checked little-endian graph artifact cursor and writer
+│   │   │                 types.coil  ; complete structural lattice table round-trip
+│   │   │                 nodes.coil } ; deterministic graph order, node payloads and edges
 │   │   ├── compunit.coil    ; owned Script declarations, shape/key assembly, static-image remapping; dependency tree, cross-unit IR linking
 │   │   ├── callabi.coil     ; cross-unit call signature: three direct actuals and managed overflow
 │   │   ├── objfile.coil     ; Mach-O and ELF writing/reading
