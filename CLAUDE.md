@@ -217,8 +217,8 @@ When a `--fix` suggestion looks wrong, check it rather than accepting it. Report
 - A module is one concern. When one outgrows that, split it into a directory named after it and
   keep the original module as the facade that re-exports the parts (`docs/LAYOUT.md` §5). Move code
   with the metaprograms in `tools/refactor/` — split, rename, methods — never by hand and never with
-  a script; `docs/REFACTORING.md` is the workflow. `coil lint --use aot.lint.size` lists the
-  functions and files that have grown too large.
+  a script; `docs/REFACTORING.md` is the workflow. `coil lint --use aot.lint.size` is an advisory
+  long-function report; a file threshold is reported only when explicitly requested.
 - An import states a dependency. `coil lint` reports an unused one and `--fix` removes it.
 - `docs/DESIGN.md` is the architecture. `docs/DECISIONS.md` is law — code contradicting it is a bug
   in the code or an amendment to the file, never a silent divergence.
