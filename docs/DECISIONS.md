@@ -4337,3 +4337,23 @@ symbols — which is what `fun-code-name` is, beside `fun-name`. Recursive calls
 selection and ordinary optimistic graph typing. After admission, private entries resume ordinary
 closed-world caller-meet typing. No deoptimization or handwritten semantic summary is
 introduced.
+## 2026-09-22 — Ideal-node ownership is derived in a linear batch pass
+
+Final Simple derives data-node ownership when GCM and register allocation need it: Return and Parm
+carry their Fun, CFG nodes walk dominators, pinned data follows control, and otherwise ownership is
+found through consuming uses. We use the same semantic rules before unlinking. A backward worklist
+replaces recursive user walks, giving every live node either one Fun or the explicit shared/global
+boundary without risking a deep-chain stack overflow. Interprocedural Call, Fun, Parm, FunPtr,
+CallEnd/Return and Stop edges terminate propagation.
+
+Ownership carries provenance. A direct/control owner or an owner inherited from a definition may
+continue forward into an unfinished sink such as an Unbox or MemMerge. An owner inferred from a
+consumer propagates only backward; otherwise a program-wide Constant would learn one consumer's
+Fun and incorrectly broadcast it into every other function. Value Projections inherit their
+multi-result producer, and CallEnd follows its caller-side Call rather than a linked callee Return.
+
+This M3 spike rejects per-function arenas for the current graph representation. They would change
+allocation, GVN and constant identity before M4 can compare the flagged pipeline with the existing
+one, while derived ownership already supplies the scoping invariant M4 needs. `verify-all` rejects
+ordinary edges between distinct nonzero owners. Shared/global definitions may enter a function;
+function-owned values may leave only through the declared interprocedural boundaries.
