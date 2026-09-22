@@ -1,0 +1,451 @@
+;; Cross-process storage for the immutable JSL provider artifact.
+;;
+;; The filename is a dual content hash over the exact compiler executable, seed and ordered JSL
+;; snapshot. The file repeats that identity and carries checksums over both payloads, so a hash
+;; collision, stale version, truncation or concurrent partial write is a miss. Publication writes
+;; a pid-qualified temporary file and renames it atomically; concurrent equal writers therefore
+;; publish the same complete bytes and readers see either the old complete file or the new one.
+(module aot.codegen.providercache)
+(import "coil.alloc" :as alloc)
+(import "coil.args" :as args)
+(import "coil.arraylist" :use *)
+(import "coil.fs" :as fs)
+(import "coil.io" :as io)
+(import "coil.os" :as os)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use [slice-data subslice])
+(import "coil.str" :as str)
+(import "aot.codegen.objfile" :use [obj-put-slice! obj-put8!])
+(import "aot.codegen.serialize.bytes" :use *)
+(import "aot.codegen.image" :use [image-artifact-encode image-artifact-decode])
+(import "aot.codegen.pipeline" :use [ProviderArtifact])
+
+(extern mkdir :cc c [(ptr i8) i32] (-> i32))
+
+(extern rename :cc c [(ptr i8) (ptr i8)] (-> i32))
+
+(extern unlink :cc c [(ptr i8)] (-> i32))
+
+(extern flock :cc c [i32 i32] (-> i32))
+
+(extern fsync :cc c [i32] (-> i32))
+
+(const PROVIDER-CACHE-VERSION 1)
+
+(const PROVIDER-CACHE-DIR-MODE 493)  ; 0o755
+
+(defstruct ProviderHash [(a i64) (b i64)])
+
+(defstruct ProviderCacheLock [(file fs/File) (held bool)])
+
+(defn provider-hash-new [] (-> ProviderHash)
+  (ProviderHash :a -3750763034362895579 :b 7640891576956012809))
+
+(defn provider-hash-byte! [(h (ptr ProviderHash)) (byte i64)] (-> i64)
+  (do
+    (set! (.a h)
+          (primitive/imul (primitive/ixor (.a h) byte) 1099511628211))
+    (set! (.b h)
+          (primitive/imul (primitive/ixor (primitive/rotl (.b h) 13)
+                                          (+ byte -7046029254386353131))
+                          -7046029254386353131))
+    0))
+
+(defn provider-hash-i64! [(h (ptr ProviderHash)) (value i64)] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) 8)
+              (break 0)
+              (do
+                (provider-hash-byte! h
+                                     (& (primitive/ishr value (* (load i) 8))
+                                        255))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))))
+
+(defn provider-hash-bytes! [(h (ptr ProviderHash)) (bytes (slice u8))] (-> i64)
+  (do
+    (provider-hash-i64! h (len bytes))
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (len bytes))
+                (break 0)
+                (do
+                  (provider-hash-byte! h
+                                       (primitive/cast i64 (get bytes (load i))))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))))
+
+(defn provider-cache-read-nonempty [(path (slice u8))] (-> (Option (slice u8)))
+  (try (let [bytes
+               (try-or! (fs/read-file (alloc/malloc-allocator) path)
+                        (None [(slice u8)]))]
+         (if (= (len bytes) 0)
+             (do
+               (alloc/free [u8] (alloc/malloc-allocator) bytes)
+               (None [(slice u8)]))
+             (Some bytes)))))
+
+(defn provider-cache-compiler-on-path [(name (slice u8))] (-> (Option (slice u8)))
+  (let [raw (os/getenv c"PATH")]
+    (if (= (primitive/cast i64 raw) 0)
+        (None [(slice u8)])
+        (let [path (str/cstr->str raw)
+              (mut lo) 0
+              (mut found) (None [(slice u8)])]
+          (loop (if (or (> (load lo) (len path))
+                        (match (load found) (Some [_] true) (None [] false)))
+                    (break 0)
+                    (let [(mut hi) (load lo)]
+                      (loop (if (or (>= (load hi) (len path))
+                                    (= (get path (load hi)) 58))
+                                (break 0)
+                                (do (set! (mut hi) (+ (load hi) 1)) (continue))))
+                      (let [dir
+                              (if (= (load hi) (load lo))
+                                  "."
+                                  (subslice path (load lo) (load hi)))
+                            candidate (provider-cache-join dir name)]
+                        (set! (mut found)
+                              (provider-cache-read-nonempty candidate))
+                        (alloc/free [u8] (alloc/malloc-allocator) candidate))
+                      (set! (mut lo) (+ (load hi) 1))
+                      (continue))))
+          (load found)))))
+
+(defn provider-cache-compiler-bytes [] (-> (Option (slice u8)))
+  (if (= (args/args-count) 0)
+      (None [(slice u8)])
+      (let [name (args/args-nth 0)]
+        (match (provider-cache-read-nonempty name)
+          (Some [bytes] (Some bytes))
+          (None []
+                (if (os/slice-has-byte? name (primitive/cast u8 47))
+                    (None [(slice u8)])
+                    (provider-cache-compiler-on-path name)))))))
+
+(defn provider-cache-key [(library (ArrayList (slice u8)))
+                          (seed i64)
+                          (compiler (slice u8))] (-> ProviderHash)
+  (let [h (primitive/alloc-stack ProviderHash)]
+    (set! h (provider-hash-new))
+    (provider-hash-bytes! h "aot-take-2 provider cache")
+    (provider-hash-i64! h PROVIDER-CACHE-VERSION)
+    (provider-hash-i64! h seed)
+    (provider-hash-bytes! h compiler)
+    (provider-hash-i64! h (len library))
+    (al-for [source library] (provider-hash-bytes! h source))
+    (load h)))
+
+(defn provider-cache-join [(left (slice u8)) (right (slice u8))] (-> (slice u8))
+  (let [(mut out) (str/sb-new (alloc/malloc-allocator))]
+    (str/sb-push-str! (mut out) left)
+    (if (and (> (len left) 0) (!= (get left (- (len left) 1)) 47))
+        (str/sb-push-str! (mut out) "/")
+        0)
+    (str/sb-push-str! (mut out) right)
+    (str/sb-finish! (mut out))))
+
+(defn provider-cache-concat [(left (slice u8)) (right (slice u8))] (-> (slice u8))
+  (let [(mut out) (str/sb-new (alloc/malloc-allocator))]
+    (str/sb-push-str! (mut out) left)
+    (str/sb-push-str! (mut out) right)
+    (str/sb-finish! (mut out))))
+
+(defn provider-cache-cstr [(value (slice u8))] (-> (slice u8))
+  (let [(mut out) (al-new [u8] (alloc/malloc-allocator))]
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (len value))
+                (break 0)
+                (do
+                  (push! [u8] (mut out) (get value (load i)))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    (push! [u8] (mut out) (primitive/cast u8 0))
+    (al-into-slice (mut out))))
+
+(defn provider-cache-mkdir! [(path (slice u8))] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        cpath (provider-cache-cstr path)]
+    ;; Existing directories and a racing creator are both success for our purposes. A later
+    ;; read/write is the authoritative check for an unusable path.
+    (mkdir (primitive/cast (ptr i8) (slice-data cpath)) PROVIDER-CACHE-DIR-MODE)
+    (alloc/free [u8] a cpath)
+    0))
+
+(defn provider-cache-root [] (-> (Option (slice u8)))
+  (let [configured (os/getenv c"AOT_PROVIDER_CACHE_DIR")]
+    (if (!= (primitive/cast i64 configured) 0)
+        (let [value (str/cstr->str configured)]
+          (if (= (len value) 0)
+              (None [(slice u8)])
+              (let [owned (provider-cache-join value "")]
+                (provider-cache-mkdir! owned)
+                (Some owned))))
+        (let [home (os/getenv c"HOME")]
+          (if (= (primitive/cast i64 home) 0)
+              (None [(slice u8)])
+              (let [cache (provider-cache-join (str/cstr->str home) ".cache")]
+                (provider-cache-mkdir! cache)
+                (let [project (provider-cache-join cache "aot-take-2")]
+                  (provider-cache-mkdir! project)
+                  (let [providers (provider-cache-join project "providers")]
+                    (provider-cache-mkdir! providers)
+                    (alloc/free [u8] (alloc/malloc-allocator) cache)
+                    (alloc/free [u8] (alloc/malloc-allocator) project)
+                    (Some providers)))))))))
+
+(defn provider-cache-path [(root (slice u8)) (key ProviderHash)] (-> (slice u8))
+  (let [(mut name) (str/sb-new (alloc/malloc-allocator))]
+    (str/sb-push-i64! (mut name) (.a key))
+    (str/sb-push-str! (mut name) "-")
+    (str/sb-push-i64! (mut name) (.b key))
+    (str/sb-push-str! (mut name) ".provider")
+    (let [path (provider-cache-join root (str/sb-str (load name)))]
+      (str/sb-free! (mut name))
+      path)))
+
+(defn provider-cache-copy [(bytes (slice u8))] (-> (slice u8))
+  (let [(mut out) (al-new [u8] (alloc/malloc-allocator))]
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (len bytes))
+                (break 0)
+                (do
+                  (push! [u8] (mut out) (get bytes (load i)))
+                  (set! (mut i) (+ (load i) 1))
+                  (continue)))))
+    (al-into-slice (mut out))))
+
+(defn provider-cache-payload-hash [(graph (slice u8))
+                                   (image (slice u8))] (-> ProviderHash)
+  (let [h (primitive/alloc-stack ProviderHash)]
+    (set! h (provider-hash-new))
+    (provider-hash-bytes! h graph)
+    (provider-hash-bytes! h image)
+    (load h)))
+
+(defn provider-cache-write-exclusive [(path (slice u8))
+                                      (bytes (slice u8))] (-> bool)
+  (let [cpath (provider-cache-cstr path)
+        opened
+          (fs/file-open (primitive/cast (ptr i8) (slice-data cpath))
+                        (| fs/O_WRONLY (| fs/O_CREAT fs/O_EXCL))
+                        fs/FILE_MODE_DEFAULT)]
+    (alloc/free [u8] (alloc/malloc-allocator) cpath)
+    (try (let [value (try-or! opened false)]
+           (let [file (primitive/alloc-stack fs/File)
+                 writer (primitive/alloc-stack io/Writer)]
+             (set! file value)
+             (fs/file-writer writer file)
+             (let [wrote
+                     (match (io/write-all writer
+                                          (primitive/cast (ptr i8)
+                                                          (slice-data bytes))
+                                          (len bytes))
+                       (Err [_] -1)
+                       (Ok [count] count))
+                   synced (= (fsync (primitive/cast i32 (fs/file-fd file))) 0)]
+               (fs/file-close file)
+               (and (= wrote (len bytes)) synced)))))))
+
+(defn provider-cache-encode [(key ProviderHash)
+                             (seed i64)
+                             (artifact (ptr ProviderArtifact))] (-> (slice u8))
+  (let [image (image-artifact-encode (field artifact image))
+        payload (provider-cache-payload-hash (.graph artifact) image)
+        (mut out) (al-new [u8] (alloc/malloc-allocator))]
+    (obj-put-slice! (mut out) "AOTPROV\0")
+    (obj-put8! (mut out) PROVIDER-CACHE-VERSION)
+    (obj-put8! (mut out) (.a key))
+    (obj-put8! (mut out) (.b key))
+    (obj-put8! (mut out) seed)
+    (ser-put-bytes! (mut out) (.graph artifact))
+    (ser-put-bytes! (mut out) image)
+    (obj-put8! (mut out) (.a payload))
+    (obj-put8! (mut out) (.b payload))
+    (alloc/free [u8] (alloc/malloc-allocator) image)
+    (al-into-slice (mut out))))
+
+(defn provider-cache-header! [(c (ptr SerCursor))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) 8)
+              (break 0)
+              (do
+                (if (!= (ser-read1! c)
+                        (primitive/cast i64 (get "AOTPROV\0" (load i))))
+                    (set! (.ok c) false)
+                    0)
+                (set! (mut i) (+ (load i) 1))
+                (continue)))))
+  0)
+
+(defn provider-cache-decode [(bytes (slice u8))
+                             (key ProviderHash)
+                             (seed i64)] (-> (Option ProviderArtifact))
+  (let [c (primitive/alloc-stack SerCursor)]
+    (set! c
+          (SerCursor
+            :bytes bytes
+            :at 0
+            :ok true))
+    (provider-cache-header! c)
+    (if (!= (ser-read8! c) PROVIDER-CACHE-VERSION) (set! (.ok c) false) 0)
+    (if (!= (ser-read8! c) (.a key)) (set! (.ok c) false) 0)
+    (if (!= (ser-read8! c) (.b key)) (set! (.ok c) false) 0)
+    (if (!= (ser-read8! c) seed) (set! (.ok c) false) 0)
+    (let [graph (ser-read-bytes! c)
+          image-bytes (ser-read-bytes! c)
+          expected-a (ser-read8! c)
+          expected-b (ser-read8! c)
+          actual (provider-cache-payload-hash graph image-bytes)]
+      (if (or (!= expected-a (.a actual)) (!= expected-b (.b actual)))
+          (set! (.ok c) false)
+          0)
+      (if (or (not (.ok c)) (!= (.at c) (len bytes)))
+          (None [ProviderArtifact])
+          (match (image-artifact-decode image-bytes)
+            (None [] (None [ProviderArtifact]))
+            (Some [image]
+                  (Some (ProviderArtifact :graph (provider-cache-copy graph)
+                          :image image))))))))
+
+(defn provider-cache-load [(library (ArrayList (slice u8)))
+                           (seed i64)] (-> (Option ProviderArtifact))
+  (match (provider-cache-compiler-bytes)
+    (None [] (None [ProviderArtifact]))
+    (Some [compiler]
+          (let [key (provider-cache-key library seed compiler)]
+            (alloc/free [u8] (alloc/malloc-allocator) compiler)
+            (match (provider-cache-root)
+              (None [] (None [ProviderArtifact]))
+              (Some [root]
+                    (let [path (provider-cache-path root key)
+                          bytes
+                            (try (let [contents
+                                         (try-or! (fs/read-file (alloc/malloc-allocator)
+                                                                path)
+                                                  "")]
+                                   contents))
+                          result
+                            (if (= (len bytes) 0)
+                                (None [ProviderArtifact])
+                                (provider-cache-decode bytes key seed))]
+                      (if (> (len bytes) 0)
+                          (alloc/free [u8] (alloc/malloc-allocator) bytes)
+                          0)
+                      (alloc/free [u8] (alloc/malloc-allocator) path)
+                      (alloc/free [u8] (alloc/malloc-allocator) root)
+                      result)))))))
+
+(defn provider-cache-publish! [(library (ArrayList (slice u8)))
+                               (seed i64)
+                               (artifact (ptr ProviderArtifact))] (-> bool)
+  (match (provider-cache-compiler-bytes)
+    (None [] false)
+    (Some [compiler]
+          (let [key (provider-cache-key library seed compiler)]
+            (alloc/free [u8] (alloc/malloc-allocator) compiler)
+            (match (provider-cache-root)
+              (None [] false)
+              (Some [root]
+                    (let [path (provider-cache-path root key)
+                          (mut suffix) (str/sb-new (alloc/malloc-allocator))]
+                      (str/sb-push-str! (mut suffix) ".tmp-")
+                      (str/sb-push-i64! (mut suffix)
+                                        (primitive/cast i64 (os/getpid)))
+                      (let [tmp
+                              (provider-cache-concat path
+                                                     (str/sb-str (load suffix)))
+                            bytes (provider-cache-encode key seed artifact)
+                            wrote (provider-cache-write-exclusive tmp bytes)
+                            ctmp (provider-cache-cstr tmp)
+                            cpath (provider-cache-cstr path)
+                            published
+                              (and wrote
+                                   (= (rename (primitive/cast (ptr i8)
+                                                              (slice-data ctmp))
+                                              (primitive/cast (ptr i8)
+                                                              (slice-data cpath)))
+                                      0))]
+                        (if (not published)
+                            (unlink (primitive/cast (ptr i8) (slice-data ctmp)))
+                            0)
+                        (alloc/free [u8] (alloc/malloc-allocator) ctmp)
+                        (alloc/free [u8] (alloc/malloc-allocator) cpath)
+                        (alloc/free [u8] (alloc/malloc-allocator) bytes)
+                        (str/sb-free! (mut suffix))
+                        (alloc/free [u8] (alloc/malloc-allocator) tmp)
+                        (alloc/free [u8] (alloc/malloc-allocator) path)
+                        (alloc/free [u8] (alloc/malloc-allocator) root)
+                        published))))))))
+
+(defn provider-cache-lock! [(library (ArrayList (slice u8)))
+                            (seed i64)] (-> (Option ProviderCacheLock))
+  (match (provider-cache-compiler-bytes)
+    (None [] (None [ProviderCacheLock]))
+    (Some [compiler]
+          (let [key (provider-cache-key library seed compiler)]
+            (alloc/free [u8] (alloc/malloc-allocator) compiler)
+            (match (provider-cache-root)
+              (None [] (None [ProviderCacheLock]))
+              (Some [root]
+                    (let [path (provider-cache-path root key)
+                          lock-path (provider-cache-concat path ".lock")
+                          cpath (provider-cache-cstr lock-path)
+                          opened
+                            (fs/file-open (primitive/cast (ptr i8)
+                                                          (slice-data cpath))
+                                          (| fs/O_RDWR fs/O_CREAT)
+                                          fs/FILE_MODE_DEFAULT)]
+                      (alloc/free [u8] (alloc/malloc-allocator) cpath)
+                      (alloc/free [u8] (alloc/malloc-allocator) lock-path)
+                      (alloc/free [u8] (alloc/malloc-allocator) path)
+                      (alloc/free [u8] (alloc/malloc-allocator) root)
+                      (try (let [file
+                                   (try-or! opened (None [ProviderCacheLock]))]
+                             (let [storage (primitive/alloc-stack fs/File)]
+                               (set! storage file)
+                               (if (= (flock (primitive/cast i32
+                                                             (fs/file-fd storage))
+                                             2)
+                                      0)
+                                   (Some (ProviderCacheLock :file file
+                                           :held true))
+                                   (do
+                                     (fs/file-close storage)
+                                     (None [ProviderCacheLock])))))))))))))
+
+(defn provider-cache-unlock! [(lock (ptr ProviderCacheLock))] (-> i64)
+  (if (not (.held lock))
+      0
+      (do
+        (flock (primitive/cast i32 (.fd (.file lock))) 8)
+        (let [file (primitive/alloc-stack fs/File)]
+          (set! file (.file lock))
+          (fs/file-close file))
+        (set! (.held lock) false)
+        0)))
+
+;; Test/support operation for one exact identity; never removes a directory or another key.
+(defn provider-cache-remove! [(library (ArrayList (slice u8))) (seed i64)] (-> bool)
+  (match (provider-cache-compiler-bytes)
+    (None [] false)
+    (Some [compiler]
+          (let [key (provider-cache-key library seed compiler)]
+            (alloc/free [u8] (alloc/malloc-allocator) compiler)
+            (match (provider-cache-root)
+              (None [] false)
+              (Some [root]
+                    (let [path (provider-cache-path root key)
+                          lock-path (provider-cache-concat path ".lock")
+                          cpath (provider-cache-cstr path)
+                          clock (provider-cache-cstr lock-path)
+                          removed
+                            (= (unlink (primitive/cast (ptr i8)
+                                                       (slice-data cpath)))
+                               0)]
+                      (unlink (primitive/cast (ptr i8) (slice-data clock)))
+                      (alloc/free [u8] (alloc/malloc-allocator) cpath)
+                      (alloc/free [u8] (alloc/malloc-allocator) clock)
+                      (alloc/free [u8] (alloc/malloc-allocator) lock-path)
+                      (alloc/free [u8] (alloc/malloc-allocator) path)
+                      (alloc/free [u8] (alloc/malloc-allocator) root)
+                      removed)))))))

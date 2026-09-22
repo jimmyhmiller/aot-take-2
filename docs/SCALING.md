@@ -403,6 +403,32 @@ control edit — so every round re-walked the caller's whole dominator chain, re
 the way. A cached owner now lasts until its Fun dies. Owner-walk steps in inline 47,937,553 →
 144,261; depths computed in inline 29.7M → 1.5M; inline 16.1 → 5.4 s.
 
+### 2026-09-22 — M2 provider artifact and cross-process cache
+
+The provider now crosses both durable boundaries named by M2. `CodeImage` has a versioned,
+fully validated arena-independent codec. The ideal graph codec writes the complete structural type
+table and a deterministic closure from Stop through ordered inputs and semantic back-references;
+loading allocates every node shell first, then reconnects exact ordered edges. The real JSL provider
+graph re-encodes byte-for-byte after compiler-region destruction: **4,884,523 bytes identical**.
+
+The disk container is keyed by a dual content hash over the exact compiler executable, worklist
+seed and exact ordered JSL snapshot. It repeats the key, checksums the graph and native-image
+payloads, validates both formats, writes a pid-qualified temporary file and publishes by atomic
+rename. A per-key advisory file lock serializes publishers; after acquiring it a contender checks
+the cache again, so it never recompiles a provider another process just published.
+
+M2 gate, using one prebuilt `tools/memory-run.coil` executable and a fresh cache directory:
+
+- sequential processes reported `miss`, then `hit`;
+- two processes started simultaneously both completed successfully, produced one artifact, and
+  only one entered the 52,918-node provider compile; the waiter reported `miss` then `hit` after
+  the lock and proceeded directly to its 44-node host;
+- a different seed and a one-byte-different ordered JSL snapshot are misses.
+
+Thus the second retained-program compilation spends zero time compiling JSL; the provider cost is
+paid once for each exact compiler/JSL/seed identity. The final disk-layer gate passed **965/965**
+after a clean release build.
+
 ### What the counters say is left (N=500, after the above)
 
 | cost                          | count        | where                          |
