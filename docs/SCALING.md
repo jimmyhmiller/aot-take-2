@@ -347,7 +347,22 @@ the last two columns at both sizes.
 **M0.** `tests/scaling-test.coil` compiles two shapes at N and 2N and ratchets the RATIO of
 deterministic counts: peephole visits, worklist pushes, inline asks, rounds, use-scan steps, dep
 asks, depths computed. `AOT_TIME=1` prints the same counts per fixpoint, split by which half of a
-round paid. Still owed from M0: the quality baseline table (benchmarks/v8 warmed, static counts).
+round paid. It also prints one final static row: specializations, inlines, discharged Cast guards,
+machine nodes, blocks and allocation rounds. A discharge is counted only when the real peephole
+replaces a Cast with its already-proven input; the expensive fixpoint assertion does not count its
+speculative probe.
+
+The first current-baseline rows (Apple M2 Max, 2026-09-21, three process runs after each workload's
+in-process warm-up) are:
+
+| workload | aot-take-2 | Node 26.5.0 | specializations | inlines | guards discharged | machine nodes | blocks |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `fib-steady.js` | 7.39–7.47 ms | 5.81–5.91 ms | 13 | 157 | 292 | 4,964 | 1,057 |
+| `binarytrees-steady.js` | 454–504 ms | 44.1–50.9 ms | 14 | 247 | 570 | 7,159 | 1,538 |
+
+The V8 and real-program rows remain to complete the M0 table. Richards currently reaches the
+backend after phase 1 in 10.2 s and Opto in 172.1 s (1,534 inlines), then reproduces the allocator
+split-budget panic in the shared harness; this is a measured baseline failure, not a timing result.
 
 **`n-del-use!` on a hub (M1).** Scanning from the end was NOT enough: the misses were duplicate
 edges (a Parm whose N callers all pass the same `undefined` uses it N times) and the KEEP edge
