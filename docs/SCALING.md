@@ -429,6 +429,29 @@ Thus the second retained-program compilation spends zero time compiling JSL; the
 paid once for each exact compiler/JSL/seed identity. The final disk-layer gate passed **965/965**
 after a clean release build.
 
+### 2026-09-22 — M3 ownership spike
+
+The spike chose **derived ownership**, following final Simple's `GlobalCodeMotion.useFun` and
+`RegAlloc.funOf`, rather than changing allocation and GVN identity to per-function arenas before
+the flagged pipeline exists. Return, Parm and Fun name their owner directly; control nodes use the
+nearest dominating Fun; pinned data uses that control; unpinned chains receive ownership backward
+from their users. Conflicting consumers identify an intentional shared/global boundary.
+
+The implementation is a batch worklist rather than a recursive query. Direct owners seed it and
+ownership propagates backward over ordinary value edges. Ownership inherited from control or a
+definition may also move forward into an unfinished sink; ownership inferred from a user may not,
+so a shared Constant never broadcasts one consumer's Fun into its other consumers. A node changes
+only from unknown to one Fun and at most once more to shared, so the pass is linear and an
+8,192-node value-chain regression requires no native recursion. Propagation stops at the declared
+interprocedural edges: Fun caller arms, Parm arguments, FunPtr identity, Stop roots and CallEnd's
+linked callee Returns. CallEnd itself follows its caller-side Call because its dominator may cross
+into a linked Return; value Projections inherit their multi-result producer.
+
+`verify-all` now reports the named `function-edge` error when two nonzero owners differ across any
+ordinary edge. A focused corruption routes a first function's Parm through a shared Add into a
+second function and proves that shared-node classification cannot conceal the illegal input edge.
+The complete JSL provider graph passes the invariant. The final release gate passed **967/967**.
+
 ### What the counters say is left (N=500, after the above)
 
 | cost                          | count        | where                          |

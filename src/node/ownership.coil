@@ -1,0 +1,220 @@
+;; Function ownership for every live ideal node.
+;;
+;; Final Simple does not store a function field on data nodes. GlobalCodeMotion.useFun applies
+;; these rules in order: Return and Parm name their Fun directly; a node with control belongs to
+;; that control's nearest dominating Fun; an unpinned value chain follows its users until it finds
+;; their function, and conflicting consuming functions mean the value is a shared global boundary.
+;; RegAlloc.funOf uses the same direct Return/Parm/Fun/CFG/control cases after global values have
+;; been split. We retain the pre-split shared-boundary answer because the ideal graph deliberately
+;; shares constants and other Start-level producers until GCM.
+;;
+;; This is the same search run backwards as a worklist: seed direct owners, then propagate each
+;; user's owner into its unpinned definitions. A node changes at most twice (unknown -> one Fun ->
+;; shared), so construction is linear in nodes plus edges and cannot overflow on a deep value chain.
+(module aot.node.ownership)
+(import "coil.alloc" :as alloc :use [unwrap-ptr create box!])
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "aot.util.arena" :use [compiler-allocator])
+(import "aot.node.node" :use *)
+(import "aot.node.control" :use [return-fun-nid])
+(import "aot.node.cfgof" :use [cfg-of cfg-owner-fun])
+
+(const OWNER-SHARED -1)
+
+(defstruct NodeOwners
+  [(owners (ArrayList i64))
+   (direct (ArrayList bool))
+   ;; True only when ownership arrived from control or a definition, so it may continue forward.
+   ;; An owner inferred from a user must not broadcast through a shared Constant to other users.
+   (forward (ArrayList bool))])
+
+(defn ownership--fun? [(n (dyn NodeOps))] (-> bool)
+  (= (n-op n) OP-FUN))
+
+(defn ownership--cfg-owner [(n (dyn NodeOps))] (-> i64)
+  (match (cfg-of n)
+    (Some [_]
+          (match (cfg-owner-fun n (primitive/fnptr-of ownership--fun?))
+            (Some [fun] (n-nid fun))
+            (None [] 0)))
+    (None [] 0)))
+
+(defn ownership--direct [(n (dyn NodeOps))] (-> i64)
+  (let [op (n-op n)]
+    (cond (= op OP-FUN) (n-nid n)
+          (= op OP-PARM)
+            (match (n-in n 0) (Some [fun] (n-nid fun)) (None [] 0))
+          (= op OP-RETURN) (return-fun-nid n)
+          ;; A value projection belongs with the multi-result producer, whose own input zero is
+          ;; the executable control. Proj itself deliberately has no separate control edge.
+          (= op OP-PROJ)
+            (match (n-in n 0)
+              (Some [multi] (ownership--direct multi))
+              (None [] 0))
+          ;; A linked CallEnd's idom may be the callee Return. Its executable control and result
+          ;; still belong to the caller represented by the Call half.
+          (= op OP-CALLEND)
+            (match (n-in n 0)
+              (Some [call] (ownership--cfg-owner call))
+              (None [] 0))
+          (match (cfg-of n) (Some [_] true) (None [] false))
+            (ownership--cfg-owner n)
+          (> (n-nins n) 0)
+            (match (n-in n 0)
+              (Some [ctrl]
+                    (match (cfg-of ctrl)
+                      (Some [_]
+                            (if (= (n-op ctrl) OP-CALLEND)
+                                (ownership--direct ctrl)
+                                (ownership--cfg-owner ctrl)))
+                      (None [] 0)))
+              (None [] 0))
+          :else 0)))
+
+(defn ownership--merge! [(table (ptr NodeOwners))
+                         (id i64)
+                         (incoming i64)
+                         (forward bool)
+                         (work (mut (ArrayList i64)))] (-> i64)
+  (if (or (get (.direct table) id) (= incoming 0))
+      0
+      (let [old (get (.owners table) id)
+            fresh
+              (cond (= old OWNER-SHARED) OWNER-SHARED
+                    (= incoming OWNER-SHARED) OWNER-SHARED
+                    (= old 0) incoming
+                    (= old incoming) old
+                    :else OWNER-SHARED)]
+        (let [old-forward (get (.forward table) id)
+              fresh-forward
+                (if (= fresh OWNER-SHARED)
+                    false
+                    (or old-forward forward))]
+          (if (and (= old fresh) (= old-forward fresh-forward))
+              0
+              (do
+              (set! (mut (.owners table)) id fresh)
+              (set! (mut (.forward table)) id fresh-forward)
+              (push! [i64] (mut work) id)
+              0))))))
+
+;; Interprocedural protocol edges do not make the producer part of the consumer's body. CallEnd's
+;; input zero is its caller-side executable control; its later Return inputs are callee metadata.
+(defn ownership--propagates-input? [(use_ (dyn NodeOps)) (input i64)] (-> bool)
+  (let [op (n-op use_)]
+    (cond (= op OP-CALLEND) (= input 0)
+          (= op OP-PARM) false
+          (= op OP-FUN) false
+          (= op OP-FUNPTR) false
+          (= op OP-STOP) false
+          :else true)))
+
+(defn ownership--accepts-definition? [(use_ (dyn NodeOps))
+                                      (def_ (dyn NodeOps))] (-> bool)
+  (let [op (n-op use_)]
+    (cond (= op OP-CALLEND) (= (n-op def_) OP-CALL)
+          (= op OP-PARM) false
+          (= op OP-FUN) false
+          (= op OP-FUNPTR) false
+          (= op OP-STOP) false
+          :else true)))
+
+(defn ownership-compute [] (-> (ptr NodeOwners))
+  (let [a (compiler-allocator)
+        table (alloc/unwrap-ptr [NodeOwners] (alloc/create [NodeOwners] a))
+        limit (+ (arena-node-count) 1)
+        (mut work) (al-new [i64] a)
+        (mut i) 0]
+    (set! (.owners table) (al-new [i64] a))
+    (set! (.direct table) (al-new [bool] a))
+    (set! (.forward table) (al-new [bool] a))
+    (loop (if (>= (load i) limit)
+              (break 0)
+              (do
+                (push! [i64] (mut (.owners table)) 0)
+                (push! [bool] (mut (.direct table)) false)
+                (push! [bool] (mut (.forward table)) false)
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (set! (mut i) 1)
+    (loop (if (>= (load i) limit)
+              (break 0)
+              (do
+                (match (arena-node (load i))
+                  (Some [n]
+                        (if (n-dead? n)
+                            0
+                            (let [owner (ownership--direct n)]
+                              (if (= owner 0)
+                                  0
+                                  (do
+                                    (set! (mut (.owners table)) (load i) owner)
+                                    (set! (mut (.direct table)) (load i) true)
+                                    (set! (mut (.forward table)) (load i) true)
+                                    (push! [i64] (mut work) (load i))
+                                    0)))))
+                  (None [] 0))
+                (set! (mut i) (+ (load i) 1))
+                (continue))))
+    (loop (match (pop! [i64] (mut work))
+            (None [] (break 0))
+            (Some [use-id]
+                  (match (arena-node use-id)
+                    (Some [use_]
+                          (let [owner (get (.owners table) use-id)
+                                (mut input) 0]
+                            (loop (if (>= (load input) (n-nins use_))
+                                      (break 0)
+                                      (do
+                                        (if (ownership--propagates-input? use_
+                                                                          (load input))
+                                            (match (n-in use_ (load input))
+                                              (Some [def_]
+                                                    (ownership--merge! table
+                                                                       (n-nid def_)
+                                                                       owner
+                                                                       false
+                                                                       (mut work)))
+                                              (None [] 0))
+                                            0)
+                                        (set! (mut input) (+ (load input) 1))
+                                        (continue))))
+                            ;; A just-built or kept sink can have no owned user yet (for example an
+                            ;; Unbox before iteration or a parser MemMerge). Carry ownership forward
+                            ;; too. Shared nodes are already OWNER-SHARED and never become local
+                            ;; again; protocol edges terminate both directions.
+                            (let [(mut output) 0]
+                              (loop (if (or (not (get (.forward table) use-id))
+                                            (>= (load output) (n-nouts use_)))
+                                        (break 0)
+                                        (do
+                                          (match (n-out use_ (load output))
+                                            (Some [out]
+                                                  (if (ownership--accepts-definition? out use_)
+                                                      (ownership--merge! table
+                                                                         (n-nid out)
+                                                                         owner
+                                                                         true
+                                                                         (mut work))
+                                                      0))
+                                            (None [] 0))
+                                          (set! (mut output) (+ (load output) 1))
+                                          (continue)))))))
+                    (None [] 0))
+                  (continue))))
+    (al-free! [i64] (mut work))
+    table))
+
+;; Zero is the public shared/global boundary spelling. OWNER-SHARED is an internal construction
+;; state, not a node identity.
+(defn ownership-of [(table (ptr NodeOwners)) (n (dyn NodeOps))] (-> i64)
+  (let [owner (get (.owners table) (n-nid n))]
+    (if (> owner 0) owner 0)))
+
+(defn ownership-free! [(table (ptr NodeOwners))] (-> i64)
+  (do
+    (al-free! [i64] (mut (.owners table)))
+    (al-free! [bool] (mut (.direct table)))
+    (al-free! [bool] (mut (.forward table)))
+    0))
