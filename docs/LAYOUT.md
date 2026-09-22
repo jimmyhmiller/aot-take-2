@@ -260,7 +260,8 @@ aot-take-2/
 │   │
 │   ├── node/
 │   │   ├── node.coil        ; NodeHdr, NodeOps, header accessors, edges, deps, kill/subsume,
-│   │   │                    ;   the in-progress windows; re-exports op, arena, origin, gvn, peephole, cfgcache
+│   │   │                    ;   the in-progress windows; re-exports op, arena, origin, gvn, peephole, cfgcache, usepos
+│   │   ├── usepos.coil      ; hub-aware reverse-edge position hints and removal
 │   │   ├── op.coil          ; the OP-* constants: serialization tag and case key
 │   │   ├── arena.coil       ; dense node ids, the fidx registry, external functions, the iterate and inline worklists
 │   │   ├── origin.coil      ; the source range a node was built for
